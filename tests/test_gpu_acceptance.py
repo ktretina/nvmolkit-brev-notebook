@@ -58,6 +58,8 @@ def test_nvmolkit_gpu_workflow():
     for cluster_id, cluster in enumerate(clusters):
         for molecule_index in cluster:
             cluster_by_index[molecule_index] = cluster_id
+    assert len(clusters) > 1
+    assert cluster_by_index[0] != cluster_by_index[3]
     for smiles_index in range(len(smiles)):
         repeated_cluster_ids = {
             cluster_by_index[smiles_index + repeat_index * len(smiles)]
