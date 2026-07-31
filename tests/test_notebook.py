@@ -1,3 +1,6 @@
+import ast
+import json
+import subprocess
 from pathlib import Path
 
 import nbformat
@@ -8,6 +11,7 @@ NOTEBOOK_PATH = (
     / "notebooks"
     / "nvmolkit_nemotron_demo.ipynb"
 )
+REPO_ROOT = NOTEBOOK_PATH.parents[1]
 
 STORY_HEADINGS = [
     "# nvMolKit + Nemotron",
@@ -19,40 +23,82 @@ STORY_HEADINGS = [
     "## 6. What the results mean",
 ]
 
-REQUIRED_SOURCE_TERMS = [
+REQUIRED_CALLS = {
     "MorganFingerprintGenerator",
     "crossTanimotoSimilarity",
     "fused_butina",
     "EmbedMolecules",
     "MMFFOptimizeMoleculesConfs",
     "torch.cuda.synchronize",
-    "MolsToGridImage",
+    "Draw.MolsToGridImage",
     "sns.heatmap",
     "py3Dmol.view",
-]
+}
 
 
 def read_notebook():
-    notebook = nbformat.read(NOTEBOOK_PATH, as_version=4)
+    stored = json.loads(NOTEBOOK_PATH.read_text(encoding="utf-8"))
+    assert stored["nbformat"] == 4
+
+    notebook = nbformat.read(NOTEBOOK_PATH, as_version=nbformat.NO_CONVERT)
     nbformat.validate(notebook)
     return notebook
 
 
-def test_notebook_is_valid_and_story_headings_are_in_order():
+def dotted_name(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = dotted_name(node.value)
+        return f"{parent}.{node.attr}" if parent else node.attr
+    return None
+
+
+def test_notebook_has_exact_v4_story_structure_and_is_only_source_notebook():
     notebook = read_notebook()
-    markdown = "\n".join(
-        cell.source for cell in notebook.cells if cell.cell_type == "markdown"
+    headings = [
+        line
+        for cell in notebook.cells
+        if cell.cell_type == "markdown"
+        for line in cell.source.splitlines()
+        if line.startswith("#")
+    ]
+    tracked_notebooks = subprocess.run(
+        ["git", "ls-files", "--", "*.ipynb"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    source_notebooks = sorted(
+        str(path.relative_to(REPO_ROOT))
+        for path in (REPO_ROOT / "notebooks").rglob("*.ipynb")
+        if ".ipynb_checkpoints" not in path.parts and "executed" not in path.parts
+    )
+    intro = notebook.cells[0].source
+
+    assert headings == STORY_HEADINGS
+    assert tracked_notebooks == ["notebooks/nvmolkit_nemotron_demo.ipynb"]
+    assert source_notebooks == ["notebooks/nvmolkit_nemotron_demo.ipynb"]
+    assert all(
+        phrase in intro
+        for phrase in ("API entry-point map", "runtime requirements", "recipes", "boundaries")
     )
 
-    positions = [markdown.index(heading) for heading in STORY_HEADINGS]
-    assert positions == sorted(positions)
 
-
-def test_notebook_contains_required_workflow_and_visuals():
+def test_notebook_code_calls_required_workflow_and_visuals():
     notebook = read_notebook()
-    source = "\n".join(cell.source for cell in notebook.cells)
+    code = "\n".join(
+        cell.source for cell in notebook.cells if cell.cell_type == "code"
+    )
+    tree = ast.parse(code)
+    called_names = {
+        dotted_name(node.func)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+    }
 
-    assert all(term in source for term in REQUIRED_SOURCE_TERMS)
+    assert REQUIRED_CALLS <= called_names
 
 
 def test_notebook_contains_no_api_key_and_no_saved_execution_state():
