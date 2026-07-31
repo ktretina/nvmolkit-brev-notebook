@@ -12,7 +12,8 @@ PLAN_SYSTEM_PROMPT = """You plan parameters for one fixed molecular workflow:
 Morgan fingerprints, Tanimoto similarity, Butina clustering, ETKDGv3 conformer
 generation, and MMFF94 minimization. Return exact JSON containing only these five
 keys: fingerprint_radius, fingerprint_size, cluster_cutoff,
-representative_count, conformers_per_representative. Never propose arbitrary code.
+representative_count, conformers_per_representative. Do not request code execution
+or propose arbitrary code.
 Forbid scientific overclaims: computed descriptors or geometries do not establish
 biological or clinical outcomes."""
 

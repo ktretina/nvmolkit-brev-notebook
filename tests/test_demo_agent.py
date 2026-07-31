@@ -87,7 +87,7 @@ def test_request_plan_accepts_valid_nemotron_json():
     call = completions.calls[0]
     assert call["temperature"] == 0.2
     assert call["max_tokens"] == 400
-    assert "arbitrary code" in call["messages"][0]["content"]
+    assert "do not request code execution" in call["messages"][0]["content"].lower()
     assert "scientific overclaims" in call["messages"][0]["content"]
 
 
