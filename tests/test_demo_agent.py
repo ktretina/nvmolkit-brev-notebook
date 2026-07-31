@@ -3,7 +3,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from demo_agent import DEFAULT_PLAN, parse_plan
+from demo_agent import DEFAULT_PLAN, WorkflowPlan, parse_plan
 
 
 EXPECTED_DEFAULT_PLAN = {
@@ -18,6 +18,10 @@ EXPECTED_DEFAULT_PLAN = {
 def test_accepts_default_plan():
     assert DEFAULT_PLAN == EXPECTED_DEFAULT_PLAN
     assert parse_plan(json.dumps(DEFAULT_PLAN)).model_dump() == EXPECTED_DEFAULT_PLAN
+
+
+def test_workflow_plan_uses_approved_defaults():
+    assert WorkflowPlan() == WorkflowPlan(**DEFAULT_PLAN)
 
 
 @pytest.mark.parametrize(

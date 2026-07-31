@@ -15,11 +15,11 @@ DEFAULT_PLAN = {
 class WorkflowPlan(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    fingerprint_radius: Literal[2, 3]
-    fingerprint_size: Literal[1024, 2048]
-    cluster_cutoff: float = Field(ge=0.2, le=0.8)
-    representative_count: int = Field(ge=1, le=6)
-    conformers_per_representative: int = Field(ge=1, le=8)
+    fingerprint_radius: Literal[2, 3] = 2
+    fingerprint_size: Literal[1024, 2048] = 1024
+    cluster_cutoff: float = Field(default=0.5, ge=0.2, le=0.8)
+    representative_count: int = Field(default=4, ge=1, le=6)
+    conformers_per_representative: int = Field(default=4, ge=1, le=8)
 
 
 def parse_plan(raw: str) -> WorkflowPlan:
