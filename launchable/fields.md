@@ -1,7 +1,7 @@
 # Brev Console fields
 
 - **Name:** `nvMolKit + Nemotron Notebook`
-- **Description:** Launch a GPU-backed JupyterLab demo where hosted Nemotron proposes bounded workflow parameters and nvMolKit runs molecular similarity, clustering, conformer generation, and geometry optimization.
+- **Description:** A guided GPU notebook for nvMolKit fingerprints, similarity, clustering, conformers, and MMFF94 optimization with bounded hosted Nemotron planning.
 - **Source:** User-approved repository at the accepted release commit; do not assume public publication.
 - **Runtime:** VM mode.
 - **Hardware:** One NVIDIA GPU with compute capability 7.0 or newer and a driver compatible with CUDA 12.6 or newer; 50 GiB disk.
