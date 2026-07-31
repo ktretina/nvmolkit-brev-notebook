@@ -106,7 +106,7 @@ def request_plan(
         return _default_after_error(exc)
 
     try:
-        raw = response.choices[0].message.content
+        raw = response.choices[0].message.content or ""
     except (IndexError, AttributeError) as exc:
         return _default_after_error(exc)
 

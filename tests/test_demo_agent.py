@@ -110,19 +110,24 @@ def test_request_plan_accepts_valid_nemotron_json():
 
 def test_request_plan_falls_back_for_invalid_json():
     invalid_plans = (
-        ("not JSON", "validation"),
-        ("{}", "missing required plan fields"),
-        (json.dumps({"fingerprint_radius": 2}), "fingerprint_size"),
+        ("not JSON", "validation", "not JSON"),
+        ("{}", "missing required plan fields", "{}"),
+        (
+            json.dumps({"fingerprint_radius": 2}),
+            "fingerprint_size",
+            json.dumps({"fingerprint_radius": 2}),
+        ),
+        (None, "validation", ""),
     )
 
-    for raw, expected_error in invalid_plans:
-        completions = FakeCompletions(content=raw)
+    for content, expected_error, expected_raw in invalid_plans:
+        completions = FakeCompletions(content=content)
         decision = request_plan("test-key", client=fake_client(completions))
 
         assert decision.source == "default_after_error"
         assert decision.plan.model_dump() == EXPECTED_DEFAULT_PLAN
         assert expected_error in decision.error.lower()
-        assert decision.raw == raw
+        assert decision.raw == expected_raw
 
     with pytest.raises(ValueError, match="(?i)missing required plan fields"):
         parse_plan("{}")
