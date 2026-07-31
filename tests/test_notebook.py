@@ -29,6 +29,7 @@ REQUIRED_CALLS = {
     "fused_butina",
     "EmbedMolecules",
     "MMFFOptimizeMoleculesConfs",
+    "Point3D",
     "torch.cuda.synchronize",
     "Draw.MolsToGridImage",
     "sns.heatmap",
@@ -92,13 +93,47 @@ def test_notebook_code_calls_required_workflow_and_visuals():
         cell.source for cell in notebook.cells if cell.cell_type == "code"
     )
     tree = ast.parse(code)
-    called_names = {
-        dotted_name(node.func)
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    called_names = {dotted_name(node.func) for node in calls}
+    fused_butina_call = next(
+        call for call in calls if dotted_name(call.func) == "fused_butina"
+    )
+    mmff_call = next(
+        call for call in calls if dotted_name(call.func) == "MMFFOptimizeMoleculesConfs"
+    )
+    mmff_keywords = {keyword.arg: keyword.value for keyword in mmff_call.keywords}
+    referenced_names = {
+        dotted_name(node)
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
+        if isinstance(node, (ast.Name, ast.Attribute))
+    }
+    string_literals = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
 
     assert REQUIRED_CALLS <= called_names
+    assert len(fused_butina_call.args) == 1
+    assert isinstance(fused_butina_call.args[0], ast.Call)
+    assert dotted_name(fused_butina_call.args[0].func) == "fingerprints.torch"
+    assert dotted_name(mmff_keywords["output"]) == "CoordinateOutput.DEVICE"
+    assert {
+        "optimization_result.energies.numpy",
+        "optimization_result.converged.numpy",
+        "optimization_result.mol_indices.numpy",
+        "optimization_result.conf_indices.numpy",
+        "optimization_result.per_molecule",
+    } <= called_names
+    assert {
+        "optimization_result.energies",
+        "optimization_result.converged",
+        "optimization_result.mol_indices",
+        "optimization_result.conf_indices",
+        "optimization_result.per_molecule",
+    } <= referenced_names
+    assert "converged_conformers" in string_literals
+    assert "optimized_conformers" not in string_literals
 
 
 def test_notebook_contains_no_api_key_and_no_saved_execution_state():
