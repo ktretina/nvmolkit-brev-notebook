@@ -16,12 +16,11 @@ EXPECTED_DEFAULT_PLAN = {
 
 
 def test_accepts_default_plan():
+    parsed_plan = parse_plan(json.dumps(DEFAULT_PLAN))
+
     assert DEFAULT_PLAN == EXPECTED_DEFAULT_PLAN
-    assert parse_plan(json.dumps(DEFAULT_PLAN)).model_dump() == EXPECTED_DEFAULT_PLAN
-
-
-def test_workflow_plan_uses_approved_defaults():
-    assert WorkflowPlan() == WorkflowPlan(**DEFAULT_PLAN)
+    assert parsed_plan.model_dump() == EXPECTED_DEFAULT_PLAN
+    assert WorkflowPlan() == parsed_plan
 
 
 @pytest.mark.parametrize(
