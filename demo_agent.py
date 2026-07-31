@@ -39,6 +39,9 @@ class WorkflowPlan(BaseModel):
     conformers_per_representative: int = Field(default=4, ge=1, le=8)
 
 
+REQUIRED_PLAN_KEYS = frozenset(WorkflowPlan.model_fields)
+
+
 @dataclass(frozen=True)
 class PlanDecision:
     plan: WorkflowPlan
@@ -48,6 +51,19 @@ class PlanDecision:
 
 
 def parse_plan(raw: str) -> WorkflowPlan:
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Plan JSON validation failed: {exc}") from exc
+
+    if not isinstance(decoded, dict):
+        raise ValueError("Plan JSON must be a top-level object")
+
+    missing_fields = REQUIRED_PLAN_KEYS.difference(decoded)
+    if missing_fields:
+        missing = ", ".join(sorted(missing_fields))
+        raise ValueError(f"Missing required plan fields: {missing}")
+
     return WorkflowPlan.model_validate_json(raw)
 
 

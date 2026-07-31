@@ -52,7 +52,7 @@ def test_rejects_out_of_contract_plan_fields(field, invalid_value):
 def test_rejects_prose_wrapped_json():
     raw = f"Here is the plan:\n{json.dumps(EXPECTED_DEFAULT_PLAN)}"
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValueError, match="validation"):
         parse_plan(raw)
 
 
@@ -109,14 +109,23 @@ def test_request_plan_accepts_valid_nemotron_json():
 
 
 def test_request_plan_falls_back_for_invalid_json():
-    completions = FakeCompletions(content="not JSON")
+    invalid_plans = (
+        ("not JSON", "validation"),
+        ("{}", "missing required plan fields"),
+        (json.dumps({"fingerprint_radius": 2}), "fingerprint_size"),
+    )
 
-    decision = request_plan("test-key", client=fake_client(completions))
+    for raw, expected_error in invalid_plans:
+        completions = FakeCompletions(content=raw)
+        decision = request_plan("test-key", client=fake_client(completions))
 
-    assert decision.source == "default_after_error"
-    assert decision.plan.model_dump() == EXPECTED_DEFAULT_PLAN
-    assert "validation" in decision.error.lower()
-    assert decision.raw == "not JSON"
+        assert decision.source == "default_after_error"
+        assert decision.plan.model_dump() == EXPECTED_DEFAULT_PLAN
+        assert expected_error in decision.error.lower()
+        assert decision.raw == raw
+
+    with pytest.raises(ValueError, match="(?i)missing required plan fields"):
+        parse_plan("{}")
 
 
 def test_request_plan_falls_back_when_offline():
