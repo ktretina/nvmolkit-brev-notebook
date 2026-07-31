@@ -16,6 +16,8 @@ This repository provides a bounded molecular-computing demo: Brev hosts a GPU-ba
 3. Keep access set to **Only my organization** and configure a Secure Link on port `8888`; do not expose unrestricted public TCP.
 4. Deploy, open JupyterLab through the Secure Link, and run `notebooks/nvmolkit_nemotron_demo.ipynb`.
 
+**Restart:** This demo is qualified for a fresh launch only. After a VM stop/start, perform a fresh redeploy and re-enter the masked `NVIDIA_API_KEY`; do not expect `nohup` or key persistence or claim auto-restart.
+
 ## Verify
 
 Run the local deterministic checks with `pytest`. GPU acceptance remains a separate future gate: on a compatible NVIDIA GPU, run `RUN_GPU_TESTS=1 pytest` and retain the result before calling the Launchable GPU-accepted.
