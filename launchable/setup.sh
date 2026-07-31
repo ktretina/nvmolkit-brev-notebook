@@ -11,13 +11,25 @@ JUPYTER_EXEC="${PROJECT_DIR}/${VENV_DIR}/bin/jupyter"
 
 cd "${PROJECT_DIR}"
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "Error: Python >=3.11 and <3.15 is required." >&2
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "Error: this Launchable requires Linux x86-64 with CPython 3.12; found OS $(uname -s)." >&2
   exit 1
 fi
 
-if ! python3 -c 'import sys; raise SystemExit(not ((3, 11) <= sys.version_info < (3, 15)))'; then
-  echo "Error: Python >=3.11 and <3.15 is required; found $(python3 --version 2>&1)." >&2
+machine="$(uname -m)"
+if [[ "${machine}" != "x86_64" && "${machine,,}" != "amd64" ]]; then
+  echo "Error: this Launchable requires Linux x86-64 with CPython 3.12; found architecture ${machine}." >&2
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Error: this Launchable requires Linux x86-64 with CPython 3.12; python3 was not found." >&2
+  exit 1
+fi
+
+if ! python3 -c 'import sys; raise SystemExit(not (sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 12)))'; then
+  found_python="$(python3 -c 'import platform; print(f"{platform.python_implementation()} {platform.python_version()}")' 2>&1 || python3 --version 2>&1)"
+  echo "Error: this Launchable requires Linux x86-64 with CPython 3.12; found ${found_python}." >&2
   exit 1
 fi
 

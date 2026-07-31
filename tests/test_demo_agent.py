@@ -91,6 +91,16 @@ def test_request_plan_accepts_valid_nemotron_json():
     assert call["max_tokens"] == 400
     prompt = call["messages"][0]["content"].lower()
     assert "do not request code execution" in prompt
+    assert all(
+        constraint in prompt
+        for constraint in (
+            "fingerprint_radius: 2 or 3",
+            "fingerprint_size: 1024 or 2048",
+            "cluster_cutoff: 0.2 through 0.8",
+            "representative_count: 1 through 6",
+            "conformers_per_representative: 1 through 8",
+        )
+    )
     assert "scientific overclaims" in prompt
     assert "outputs do not establish" in prompt
     assert all(
@@ -157,4 +167,17 @@ def test_request_explanation_states_claim_boundary_and_returns_content():
     prompt = completions.calls[0]["messages"][-1]["content"]
     assert json.dumps(summary, sort_keys=True) in prompt
     assert "not evidence of binding" in prompt
+    assert all(
+        term in prompt
+        for term in (
+            "binding",
+            "activity",
+            "ADMET",
+            "efficacy",
+            "safety",
+            "synthesizability",
+            "clinical relevance",
+            "experimentally validated conformations",
+        )
+    )
     assert result == "A bounded explanation."

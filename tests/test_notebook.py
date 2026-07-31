@@ -77,6 +77,10 @@ def test_notebook_has_exact_v4_story_structure_and_is_only_source_notebook():
         if ".ipynb_checkpoints" not in path.parts and "executed" not in path.parts
     )
     intro = notebook.cells[0].source
+    setup = (REPO_ROOT / "launchable" / "setup.sh").read_text(encoding="utf-8")
+    fields = (REPO_ROOT / "launchable" / "fields.md").read_text(encoding="utf-8")
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
 
     assert headings == STORY_HEADINGS
     assert tracked_notebooks == ["notebooks/nvmolkit_nemotron_demo.ipynb"]
@@ -85,6 +89,26 @@ def test_notebook_has_exact_v4_story_structure_and_is_only_source_notebook():
         phrase in intro
         for phrase in ("API entry-point map", "runtime requirements", "recipes", "boundaries")
     )
+    assert all(
+        requirement in setup
+        for requirement in (
+            "sys.implementation.name",
+            "(3, 12)",
+            '"Linux"',
+            '"x86_64"',
+        )
+    )
+    assert "Runtime: Linux x86-64 with CPython 3.12" in fields
+    assert "Linux x86-64 with CPython 3.12" in readme
+    assert "qualified for a fresh launch" not in fields.lower()
+    assert "qualified for a fresh launch" not in readme.lower()
+    assert "not yet live-qualified" in fields
+    assert "not yet live-qualified" in readme
+    assert all(
+        acceptance in fields.lower() and acceptance in readme.lower()
+        for acceptance in ("gpu", "hosted inference", "rendered visuals", "secure link")
+    )
+    assert ".jupyter.pid" in gitignore
 
 
 def test_notebook_code_calls_required_workflow_and_visuals():
@@ -133,7 +157,45 @@ def test_notebook_code_calls_required_workflow_and_visuals():
         "optimization_result.per_molecule",
     } <= referenced_names
     assert "converged_conformers" in string_literals
+    assert {
+        "requested_conformers",
+        "generated_conformers",
+        "mmff_attempted_conformers",
+    } <= string_literals
     assert "optimized_conformers" not in string_literals
+
+    requested_assignment = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "requested_conformers"
+            for target in node.targets
+        )
+    )
+    embed_call = next(call for call in calls if dotted_name(call.func) == "EmbedMolecules")
+    assert requested_assignment.lineno < embed_call.lineno
+
+    explanation_call = next(
+        call for call in calls if dotted_name(call.func) == "request_explanation"
+    )
+    explanation_line = explanation_call.lineno
+    lines = code.splitlines()
+    before_explanation = "\n".join(lines[: explanation_line - 1])
+    after_explanation = "\n".join(lines[explanation_line:])
+    boundary_terms = (
+        "binding",
+        "activity",
+        "ADMET",
+        "efficacy",
+        "safety",
+        "synthesizability",
+        "clinical relevance",
+        "experimentally validated conformations",
+    )
+    assert all(term in before_explanation for term in boundary_terms)
+    assert "Agent-generated interpretation; verify independently" in before_explanation
+    assert all(term in after_explanation for term in boundary_terms)
 
 
 def test_notebook_contains_no_api_key_and_no_saved_execution_state():

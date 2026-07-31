@@ -14,7 +14,9 @@ Morgan fingerprints, Tanimoto similarity, Butina clustering, ETKDGv3 conformer
 generation, and MMFF94 minimization. Return exact JSON containing only these five
 keys: fingerprint_radius, fingerprint_size, cluster_cutoff,
 representative_count, conformers_per_representative. Do not request code execution
-or propose arbitrary code.
+or propose arbitrary code. Allowed values are fingerprint_radius: 2 or 3;
+fingerprint_size: 1024 or 2048; cluster_cutoff: 0.2 through 0.8;
+representative_count: 1 through 6; conformers_per_representative: 1 through 8.
 Forbid scientific overclaims: outputs do not establish binding, activity, ADMET,
 efficacy, safety, synthesizability, or clinical relevance. Outputs also do not
 establish experimentally validated conformations."""
@@ -142,7 +144,8 @@ def request_explanation(
                     "Explain this summary in no more than 120 words: "
                     f"{serialized_summary}\n"
                     "Computed descriptors and geometries are not evidence of binding, "
-                    "activity, ADMET, efficacy, safety, or clinical relevance."
+                    "activity, ADMET, efficacy, safety, synthesizability, or clinical "
+                    "relevance, and they are not experimentally validated conformations."
                 ),
             },
         ],

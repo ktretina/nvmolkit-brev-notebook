@@ -11,12 +11,14 @@ This repository provides a bounded molecular-computing demo: Brev hosts a GPU-ba
 
 ## Launch
 
+Use Linux x86-64 with CPython 3.12 in VM mode; the setup script rejects other runtime envelopes before creating the environment or installing packages.
+
 1. Create the Launchable in the Brev web Console using [`launchable/fields.md`](launchable/fields.md).
 2. Enter `NVIDIA_API_KEY` only in the required masked parameter field.
 3. Keep access set to **Only my organization** and configure a Secure Link on port `8888`; do not expose unrestricted public TCP.
 4. Deploy, open JupyterLab through the Secure Link, and run `notebooks/nvmolkit_nemotron_demo.ipynb`.
 
-**Restart:** This demo is qualified for a fresh launch only. After a VM stop/start, perform a fresh redeploy and re-enter the masked `NVIDIA_API_KEY`; do not expect `nohup` or key persistence or claim auto-restart.
+**Qualification:** This demo is designed for fresh deployment only; it is not yet live-qualified. GPU execution, hosted inference, rendered visuals, and Secure Link access require live acceptance. After a VM stop/start, perform a fresh redeploy and re-enter the masked `NVIDIA_API_KEY`; do not expect `nohup` or key persistence or claim auto-restart.
 
 ## Verify
 
