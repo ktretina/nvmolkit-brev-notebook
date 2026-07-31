@@ -17,6 +17,9 @@ representative_count, conformers_per_representative. Do not request code executi
 or propose arbitrary code. Allowed values are fingerprint_radius: 2 or 3;
 fingerprint_size: 1024 or 2048; cluster_cutoff: 0.2 through 0.8;
 representative_count: 1 through 6; conformers_per_representative: 1 through 8.
+nvMolKit is for GPU-accelerated batched operations and has no CPU fallback.
+RDKit is used for molecule parsing, display, and isolated/single-molecule CPU utilities.
+This demo uses a batch, so the GPU path makes sense.
 Forbid scientific overclaims: outputs do not establish binding, activity, ADMET,
 efficacy, safety, synthesizability, or clinical relevance. Outputs also do not
 establish experimentally validated conformations."""

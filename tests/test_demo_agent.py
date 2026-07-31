@@ -101,6 +101,17 @@ def test_request_plan_accepts_valid_nemotron_json():
             "conformers_per_representative: 1 through 8",
         )
     )
+    assert all(
+        guidance in prompt
+        for guidance in (
+            "nvmolkit is for gpu-accelerated batched operations",
+            "no cpu fallback",
+            "rdkit is used for molecule parsing, display",
+            "isolated/single-molecule cpu utilities",
+            "this demo uses a batch",
+            "gpu path makes sense",
+        )
+    )
     assert "scientific overclaims" in prompt
     assert "outputs do not establish" in prompt
     assert all(
