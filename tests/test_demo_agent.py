@@ -5,6 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 from demo_agent import (
+    DEFAULT_MODEL,
     DEFAULT_PLAN,
     WorkflowPlan,
     parse_plan,
@@ -85,10 +86,26 @@ def test_request_plan_accepts_valid_nemotron_json():
     assert decision.raw == raw
     assert decision.plan.fingerprint_radius == 3
     call = completions.calls[0]
+    assert call["model"] == DEFAULT_MODEL
     assert call["temperature"] == 0.2
     assert call["max_tokens"] == 400
-    assert "do not request code execution" in call["messages"][0]["content"].lower()
-    assert "scientific overclaims" in call["messages"][0]["content"]
+    prompt = call["messages"][0]["content"].lower()
+    assert "do not request code execution" in prompt
+    assert "scientific overclaims" in prompt
+    assert "outputs do not establish" in prompt
+    assert all(
+        term in prompt
+        for term in (
+            "binding",
+            "activity",
+            "admet",
+            "efficacy",
+            "safety",
+            "synthesizability",
+            "clinical relevance",
+            "experimentally validated conformations",
+        )
+    )
 
 
 def test_request_plan_falls_back_for_invalid_json():
@@ -119,11 +136,11 @@ def test_request_plan_rejects_empty_api_key():
 
 def test_request_explanation_states_claim_boundary_and_returns_content():
     completions = FakeCompletions(content="A bounded explanation.")
+    summary = {"method": "Butina", "clusters": 3}
 
-    result = request_explanation(
-        "test-key", "Computed 3 clusters.", client=fake_client(completions)
-    )
+    result = request_explanation("test-key", summary, client=fake_client(completions))
 
     prompt = completions.calls[0]["messages"][-1]["content"]
+    assert json.dumps(summary, sort_keys=True) in prompt
     assert "not evidence of binding" in prompt
     assert result == "A bounded explanation."

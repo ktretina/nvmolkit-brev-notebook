@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from typing import Literal
 
@@ -14,8 +15,9 @@ generation, and MMFF94 minimization. Return exact JSON containing only these fiv
 keys: fingerprint_radius, fingerprint_size, cluster_cutoff,
 representative_count, conformers_per_representative. Do not request code execution
 or propose arbitrary code.
-Forbid scientific overclaims: computed descriptors or geometries do not establish
-biological or clinical outcomes."""
+Forbid scientific overclaims: outputs do not establish binding, activity, ADMET,
+efficacy, safety, synthesizability, or clinical relevance. Outputs also do not
+establish experimentally validated conformations."""
 
 
 DEFAULT_PLAN = {
@@ -53,6 +55,15 @@ def _client(api_key: str) -> OpenAI:
     return OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key)
 
 
+def _default_after_error(exc: Exception, raw: str | None = None) -> PlanDecision:
+    return PlanDecision(
+        plan=WorkflowPlan.model_validate(DEFAULT_PLAN),
+        source="default_after_error",
+        error=str(exc),
+        raw=raw,
+    )
+
+
 def request_plan(
     api_key: str,
     model: str = DEFAULT_MODEL,
@@ -61,7 +72,6 @@ def request_plan(
     if not api_key:
         raise ValueError("NVIDIA_API_KEY must not be empty")
 
-    raw = None
     try:
         active_client = client or _client(api_key)
         response = active_client.chat.completions.create(
@@ -76,35 +86,32 @@ def request_plan(
             temperature=0.2,
             max_tokens=400,
         )
+    except (APIError, RuntimeError) as exc:
+        return _default_after_error(exc)
+
+    try:
         raw = response.choices[0].message.content
-        return PlanDecision(
-            plan=parse_plan(raw), source="nemotron", error=None, raw=raw
-        )
-    except (
-        APIError,
-        ValidationError,
-        RuntimeError,
-        ValueError,
-        IndexError,
-        AttributeError,
-    ) as exc:
-        return PlanDecision(
-            plan=WorkflowPlan.model_validate(DEFAULT_PLAN),
-            source="default_after_error",
-            error=str(exc),
-            raw=raw,
-        )
+    except (IndexError, AttributeError) as exc:
+        return _default_after_error(exc)
+
+    try:
+        plan = parse_plan(raw)
+    except (ValidationError, ValueError) as exc:
+        return _default_after_error(exc, raw)
+
+    return PlanDecision(plan=plan, source="nemotron", error=None, raw=raw)
 
 
 def request_explanation(
     api_key: str,
-    summary: str,
+    summary: dict[str, int | float | str],
     model: str = DEFAULT_MODEL,
     client=None,
 ) -> str:
     if not api_key:
         raise ValueError("NVIDIA_API_KEY must not be empty")
 
+    serialized_summary = json.dumps(summary, sort_keys=True)
     active_client = client or _client(api_key)
     response = active_client.chat.completions.create(
         model=model,
@@ -116,7 +123,8 @@ def request_explanation(
             {
                 "role": "user",
                 "content": (
-                    f"Explain this summary in no more than 120 words: {summary}\n"
+                    "Explain this summary in no more than 120 words: "
+                    f"{serialized_summary}\n"
                     "Computed descriptors and geometries are not evidence of binding, "
                     "activity, ADMET, efficacy, safety, or clinical relevance."
                 ),
