@@ -1,7 +1,9 @@
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from openai import AuthenticationError, PermissionDeniedError
 from pydantic import ValidationError
 
 from demo_agent import (
@@ -21,6 +23,14 @@ EXPECTED_DEFAULT_PLAN = {
     "representative_count": 4,
     "conformers_per_representative": 4,
 }
+
+VALID_API_KEY = "nvapi-"
+AUTH_GUIDANCE = (
+    "NVIDIA_API_KEY must be a hosted Developer API key. Generate it from the "
+    "Nemotron build.nvidia.com model page, then paste only the bare key; it "
+    "starts with nvapi-. An NGC personal key is a different credential and "
+    "must not be substituted."
+)
 
 
 def test_accepts_default_plan():
@@ -79,7 +89,7 @@ def test_request_plan_accepts_valid_nemotron_json():
     raw = json.dumps({**EXPECTED_DEFAULT_PLAN, "fingerprint_radius": 3})
     completions = FakeCompletions(content=raw)
 
-    decision = request_plan("test-key", client=fake_client(completions))
+    decision = request_plan(VALID_API_KEY, client=fake_client(completions))
 
     assert decision.source == "nemotron"
     assert decision.error is None
@@ -143,7 +153,7 @@ def test_request_plan_falls_back_for_invalid_json():
 
     for content, expected_error, expected_raw in invalid_plans:
         completions = FakeCompletions(content=content)
-        decision = request_plan("test-key", client=fake_client(completions))
+        decision = request_plan(VALID_API_KEY, client=fake_client(completions))
 
         assert decision.source == "default_after_error"
         assert decision.plan.model_dump() == EXPECTED_DEFAULT_PLAN
@@ -157,7 +167,7 @@ def test_request_plan_falls_back_for_invalid_json():
 def test_request_plan_falls_back_when_offline():
     completions = FakeCompletions(error=RuntimeError("offline"))
 
-    decision = request_plan("test-key", client=fake_client(completions))
+    decision = request_plan(VALID_API_KEY, client=fake_client(completions))
 
     assert decision.source == "default_after_error"
     assert decision.plan.model_dump() == EXPECTED_DEFAULT_PLAN
@@ -169,11 +179,73 @@ def test_request_plan_rejects_empty_api_key():
         request_plan("")
 
 
+@pytest.mark.parametrize("request_name", ["plan", "explanation"])
+def test_requests_reject_non_hosted_key_before_network_call(request_name):
+    completions = FakeCompletions(content="unused")
+    secret = "ngc-secret-marker"
+
+    with pytest.raises(ValueError, match="hosted Developer API key") as exc_info:
+        if request_name == "plan":
+            request_plan(secret, client=fake_client(completions))
+        else:
+            request_explanation(secret, {}, client=fake_client(completions))
+
+    assert str(exc_info.value) == AUTH_GUIDANCE
+    assert secret not in str(exc_info.value)
+    assert completions.calls == []
+
+
+@pytest.mark.parametrize("request_name", ["plan", "explanation"])
+def test_requests_translate_authentication_error_to_hosted_key_guidance(request_name):
+    response = httpx.Response(
+        401,
+        request=httpx.Request("POST", "https://integrate.api.nvidia.com/v1/chat/completions"),
+    )
+    auth_error = AuthenticationError(
+        "Authentication failed",
+        response=response,
+        body=None,
+    )
+    completions = FakeCompletions(error=auth_error)
+
+    with pytest.raises(ValueError) as exc_info:
+        if request_name == "plan":
+            request_plan(VALID_API_KEY, client=fake_client(completions))
+        else:
+            request_explanation(VALID_API_KEY, {}, client=fake_client(completions))
+
+    assert str(exc_info.value) == AUTH_GUIDANCE
+    assert completions.calls
+
+
+@pytest.mark.parametrize("request_name", ["plan", "explanation"])
+def test_requests_translate_permission_denied_to_hosted_key_guidance(request_name):
+    response = httpx.Response(
+        403,
+        request=httpx.Request("POST", "https://integrate.api.nvidia.com/v1/chat/completions"),
+    )
+    permission_error = PermissionDeniedError(
+        "Permission denied",
+        response=response,
+        body=None,
+    )
+    completions = FakeCompletions(error=permission_error)
+
+    with pytest.raises(ValueError) as exc_info:
+        if request_name == "plan":
+            request_plan(VALID_API_KEY, client=fake_client(completions))
+        else:
+            request_explanation(VALID_API_KEY, {}, client=fake_client(completions))
+
+    assert str(exc_info.value) == AUTH_GUIDANCE
+    assert completions.calls
+
+
 def test_request_explanation_states_claim_boundary_and_returns_content():
     completions = FakeCompletions(content="A bounded explanation.")
     summary = {"method": "Butina", "clusters": 3}
 
-    result = request_explanation("test-key", summary, client=fake_client(completions))
+    result = request_explanation(VALID_API_KEY, summary, client=fake_client(completions))
 
     prompt = completions.calls[0]["messages"][-1]["content"]
     assert json.dumps(summary, sort_keys=True) in prompt

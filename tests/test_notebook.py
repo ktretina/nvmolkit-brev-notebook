@@ -207,7 +207,7 @@ def test_notebook_contains_no_api_key_and_no_saved_execution_state():
     notebook = read_notebook()
     source = "\n".join(cell.source for cell in notebook.cells)
 
-    assert "nvapi-" not in source
+    assert source.count("nvapi-") == 1
     for cell in notebook.cells:
         if cell.cell_type == "code":
             assert cell.outputs == []
@@ -433,7 +433,10 @@ def test_notebook_prompts_for_missing_api_key_without_exposing_it():
     assert 'os.environ["NVIDIA_API_KEY"]' not in code
     assert "NEMOTRON_MODEL" not in code
     assert 'model = "nvidia/nemotron-3-nano-30b-a3b"' in code
-    assert getpass_call.args[0].value == "NVIDIA API key (input hidden): "
+    assert getpass_call.args[0].value == (
+        "Hosted NVIDIA Developer API key from the Nemotron build.nvidia.com "
+        "model page (starts with nvapi-; bare key only; input hidden): "
+    )
     assert any(
         isinstance(node, ast.Raise) for node in ast.walk(getpass_if)
     ), "The missing-key fallback must reject empty input."
