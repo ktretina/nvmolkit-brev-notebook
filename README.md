@@ -11,14 +11,14 @@ This repository provides a bounded molecular-computing demo: Brev hosts a GPU-ba
 
 ## Launch
 
-Use Linux x86-64 with CPython 3.12 in VM mode; the setup script rejects other runtime envelopes before creating the environment or installing packages.
+Use Linux x86-64 with CPython 3.12 in VM mode. Enable Jupyter in the Brev Console so the Brev-managed Jupyter runtime is available; the setup script installs into that runtime and does not manage the Jupyter service.
 
 1. Create the Launchable in the Brev web Console using [`launchable/fields.md`](launchable/fields.md).
-2. Enter `NVIDIA_API_KEY` only in the required masked parameter field.
-3. Keep access set to **Only my organization** and configure a Secure Link on port `8888`; do not expose unrestricted public TCP.
-4. Deploy, open JupyterLab through the Secure Link, and run `notebooks/nvmolkit_nemotron_demo.ipynb`.
+2. Enable Brev-managed Jupyter and keep access set to **Only my organization** with a Secure Link on port `8888`; do not expose unrestricted public TCP.
+3. Deploy, open JupyterLab through the Secure Link, and run `notebooks/nvmolkit_nemotron_demo.ipynb`.
+4. When requested, enter `NVIDIA_API_KEY` in the notebook's hidden prompt. Do not rely on setup-variable persistence for the key; never save it in the notebook or its outputs.
 
-**Qualification:** This demo is designed for fresh deployment only; it is not yet live-qualified. GPU execution, hosted inference, rendered visuals, and Secure Link access require live acceptance. After a VM stop/start, perform a fresh redeploy and re-enter the masked `NVIDIA_API_KEY`; do not expect `nohup` or key persistence or claim auto-restart.
+**Qualification:** This demo is designed for fresh deployment only; it is not yet live-qualified. GPU execution, hosted inference, rendered visuals, and Secure Link access require live acceptance. After a VM stop/start, verify the managed Jupyter service, rerun the notebook, and enter the key again if prompted; do not claim auto-restart without live evidence.
 
 ## Verify
 
