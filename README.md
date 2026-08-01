@@ -1,11 +1,14 @@
 # nvMolKit + Nemotron Notebook
 
-This repository provides a bounded molecular-computing demo: Brev hosts a GPU-backed JupyterLab session, hosted Nemotron proposes validated workflow parameters and explains computed summaries, and nvMolKit performs the GPU chemistry operations.
+This repository provides a bounded molecular-computing demo: Brev hosts a GPU-backed JupyterLab session, hosted Nemotron emits one forced OpenAI-compatible `analyze_molecule_library` function call and explains its compact result summary, and nvMolKit performs the GPU chemistry operations.
+
+The public BioNeMo Agent Toolkit skill informs the five-argument tool contract and nvMolKit API boundaries; it is not loaded at runtime. The notebook validates the requested function and arguments, executes the single allow-listed local function, and returns only its JSON-safe summary to Nemotron. Nemotron does not execute the notebook's Python code.
 
 ## What runs where
 
 - **Brev:** Provisions the GPU VM and provides the organization-only Secure Link to JupyterLab.
-- **Nemotron:** Runs as a hosted NVIDIA API model; the notebook sends it bounded planning and explanation requests.
+- **Nemotron:** Runs as a hosted NVIDIA API model; it requests the forced bounded function and conservatively interprets the returned tool summary.
+- **Notebook:** Validates the five strict arguments, executes the allow-listed function once, and performs the assistant/tool message round trip.
 - **nvMolKit:** Runs on the Brev GPU for fingerprints, similarity, clustering, conformer generation, and geometry optimization.
 - **RDKit:** Runs in the notebook environment for molecule parsing, preparation, and display.
 
