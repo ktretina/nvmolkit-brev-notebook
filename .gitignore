@@ -1,1 +1,9 @@
 .worktrees/
+.venv/
+__pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
+.jupyter.pid
+*.pyc
+*.log
+notebooks/executed/
