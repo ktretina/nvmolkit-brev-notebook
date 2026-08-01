@@ -226,7 +226,7 @@ def test_setup_uses_brev_managed_python_and_leaves_jupyter_to_brev():
     assert '"${PYTHON}" -m pip install --upgrade pip' in setup
     assert '"${PYTHON}" -m pip install -r requirements.txt' in setup
     assert '"${PYTHON}" - <<\'PY\'' in setup
-    assert 'url = "http://127.0.0.1:8888/api/"' in setup
+    assert 'url = "http://127.0.0.1:8888/api"' in setup
     assert "/api/status" not in setup
     assert "while time.monotonic() < deadline" in setup
     assert "urllib.request.urlopen" in setup
@@ -345,7 +345,7 @@ def run_health_probe(server_mode):
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             if server_mode == "redirect":
-                if self.path == "/api/":
+                if self.path == "/api":
                     self.send_response(302)
                     self.send_header("Location", "/login")
                     self.end_headers()
@@ -358,7 +358,7 @@ def run_health_probe(server_mode):
                     self.wfile.write(body)
                 return
 
-            if self.path != "/api/":
+            if self.path != "/api":
                 self.send_error(404)
                 return
             body = b'{"version": "4.4.5"}'
@@ -377,7 +377,7 @@ def run_health_probe(server_mode):
     try:
         probe = re.sub(
             r'url = "http://127\.0\.0\.1:8888/[^"]+"',
-            f'url = "http://127.0.0.1:{server.server_port}/api/"',
+            f'url = "http://127.0.0.1:{server.server_port}/api"',
             health_probe_source(),
         )
         probe = probe.replace(

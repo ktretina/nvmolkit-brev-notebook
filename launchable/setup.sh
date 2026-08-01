@@ -53,7 +53,7 @@ import time
 import urllib.error
 import urllib.request
 
-url = "http://127.0.0.1:8888/api/"
+url = "http://127.0.0.1:8888/api"
 deadline = time.monotonic() + 60
 last_error = "not ready"
 
