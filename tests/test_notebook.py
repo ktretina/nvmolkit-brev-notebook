@@ -22,7 +22,7 @@ STORY_HEADINGS = [
     "# nvMolKit + Nemotron",
     "## 1. Preflight",
     "## 2. Molecular sample",
-    "## 3. Nemotron plan",
+    "## 3. Nemotron tool call",
     "## 4. Fingerprints, similarity, and clusters",
     "## 5. Conformers and MMFF94",
     "## 6. What the results mean",
@@ -201,6 +201,143 @@ def test_notebook_code_calls_required_workflow_and_visuals():
     assert all(term in before_explanation for term in boundary_terms)
     assert "Agent-generated interpretation; verify independently" in before_explanation
     assert all(term in after_explanation for term in boundary_terms)
+
+
+def test_notebook_validates_one_tool_call_before_allow_listed_executor():
+    notebook = read_notebook()
+    code = "\n".join(
+        cell.source for cell in notebook.cells if cell.cell_type == "code"
+    )
+    tree = ast.parse(code)
+    executors = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "analyze_molecule_library"
+    ]
+
+    assert len(executors) == 1
+    executor = executors[0]
+    assert [argument.arg for argument in executor.args.args] == ["mols", "plan"]
+    executor_calls = {
+        dotted_name(node.func)
+        for node in ast.walk(executor)
+        if isinstance(node, ast.Call)
+    }
+    assert {
+        "MorganFingerprintGenerator",
+        "crossTanimotoSimilarity",
+        "fused_butina",
+        "EmbedMolecules",
+        "MMFFOptimizeMoleculesConfs",
+    } <= executor_calls
+
+    executor_invocations = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and dotted_name(node.func) == "analyze_molecule_library"
+    ]
+    assert len(executor_invocations) == 1
+    invocation = executor_invocations[0]
+    assert [dotted_name(argument) for argument in invocation.args] == ["mols", "plan"]
+
+    tool_request = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and dotted_name(node.func) == "request_tool_call"
+    )
+    plan_assignment = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "plan" for target in node.targets)
+        and dotted_name(node.value) == "decision.plan"
+    )
+    allow_list_guard = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and "decision.tool_name" in {
+            dotted_name(child)
+            for child in ast.walk(node.test)
+            if isinstance(child, (ast.Name, ast.Attribute))
+        }
+        and any(isinstance(child, ast.Raise) for child in ast.walk(node))
+    )
+    fallback_guard = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and "decision.source" in {
+            dotted_name(child)
+            for child in ast.walk(node.test)
+            if isinstance(child, (ast.Name, ast.Attribute))
+        }
+        and any(isinstance(child, ast.Raise) for child in ast.walk(node))
+    )
+    fallback_strings = {
+        node.value
+        for node in ast.walk(fallback_guard)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert any("Scientific tool was not executed" in value for value in fallback_strings)
+    assert (
+        tool_request.lineno
+        < plan_assignment.lineno
+        < fallback_guard.lineno
+        < allow_list_guard.lineno
+        < invocation.lineno
+    )
+
+    summary_assignment = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "summary" for target in node.targets)
+        and node.value is invocation
+    )
+    explanation = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and dotted_name(node.func) == "request_explanation"
+    )
+    assert summary_assignment.lineno < explanation.lineno
+    assert [dotted_name(argument) for argument in explanation.args[:3]] == [
+        "api_key",
+        "decision",
+        "summary",
+    ]
+    assert "**Requested tool:**" in code
+    assert "**Validated arguments:**" in code
+
+
+def test_notebook_executor_returns_compact_json_safe_summary():
+    notebook = read_notebook()
+    code = "\n".join(
+        cell.source for cell in notebook.cells if cell.cell_type == "code"
+    )
+    tree = ast.parse(code)
+    executor = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "analyze_molecule_library"
+    )
+    returns = [node for node in ast.walk(executor) if isinstance(node, ast.Return)]
+    assert len(returns) == 1
+    assert dotted_name(returns[0].value) == "summary"
+    summary_assignment = next(
+        node
+        for node in ast.walk(executor)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "summary" for target in node.targets)
+    )
+    assert isinstance(summary_assignment.value, ast.Dict)
+    assert all(
+        isinstance(key, ast.Constant) and isinstance(key.value, str)
+        for key in summary_assignment.value.keys
+    )
 
 
 def test_notebook_contains_no_api_key_and_no_saved_execution_state():
@@ -460,3 +597,15 @@ def test_launch_instructions_use_brev_managed_jupyter_and_hidden_key_prompt():
         assert "NEMOTRON_MODEL" not in instructions
 
     assert "hidden notebook prompt" in read_notebook().cells[1].source
+
+
+def test_docs_assign_tool_contract_and_execution_to_the_correct_components():
+    intro = read_notebook().cells[0].source.lower()
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8").lower()
+
+    for documentation in (intro, readme):
+        assert "agent toolkit skill" in documentation
+        assert "tool contract" in documentation
+        assert "notebook" in documentation and "executes" in documentation
+        assert "model executes python" not in documentation
+        assert "dynamically loaded" not in documentation

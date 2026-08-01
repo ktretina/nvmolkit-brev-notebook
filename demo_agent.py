@@ -9,6 +9,9 @@ from pydantic import ValidationError
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 DEFAULT_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
+NEMOTRON_TOOL_EXTRA_BODY = {
+    "chat_template_kwargs": {"enable_thinking": False}
+}
 AUTH_GUIDANCE = (
     "NVIDIA_API_KEY must be a hosted Developer API key. Generate it from the "
     "Nemotron build.nvidia.com model page, then paste only the bare key; it "
@@ -17,8 +20,8 @@ AUTH_GUIDANCE = (
 )
 PLAN_SYSTEM_PROMPT = """You plan parameters for one fixed molecular workflow:
 Morgan fingerprints, Tanimoto similarity, Butina clustering, ETKDGv3 conformer
-generation, and MMFF94 minimization. Return exact JSON containing only these five
-keys: fingerprint_radius, fingerprint_size, cluster_cutoff,
+generation, and MMFF94 minimization. Call analyze_molecule_library exactly once
+with only these five arguments: fingerprint_radius, fingerprint_size, cluster_cutoff,
 representative_count, conformers_per_representative. Do not request code execution
 or propose arbitrary code. Allowed values are fingerprint_radius: 2 or 3;
 fingerprint_size: 1024 or 2048; cluster_cutoff: 0.2 through 0.8;
@@ -51,6 +54,19 @@ class WorkflowPlan(BaseModel):
 
 
 REQUIRED_PLAN_KEYS = frozenset(WorkflowPlan.model_fields)
+TOOL_NAME = "analyze_molecule_library"
+TOOL_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": TOOL_NAME,
+        "description": "Run the fixed nvMolKit molecular-library analysis workflow.",
+        "strict": True,
+        "parameters": {
+            **WorkflowPlan.model_json_schema(),
+            "required": sorted(REQUIRED_PLAN_KEYS),
+        },
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -58,7 +74,9 @@ class PlanDecision:
     plan: WorkflowPlan
     source: Literal["nemotron", "default_after_error"]
     error: str | None
-    raw: str | None
+    tool_name: str
+    tool_call_id: str
+    raw_arguments: str
 
 
 def parse_plan(raw: str) -> WorkflowPlan:
@@ -87,16 +105,18 @@ def _validate_api_key(api_key: str) -> None:
         raise ValueError(AUTH_GUIDANCE)
 
 
-def _default_after_error(exc: Exception, raw: str | None = None) -> PlanDecision:
+def _default_after_error(exc: Exception) -> PlanDecision:
     return PlanDecision(
         plan=WorkflowPlan.model_validate(DEFAULT_PLAN),
         source="default_after_error",
         error=str(exc),
-        raw=raw,
+        tool_name=TOOL_NAME,
+        tool_call_id=f"default-{TOOL_NAME}",
+        raw_arguments=json.dumps(DEFAULT_PLAN),
     )
 
 
-def request_plan(
+def request_tool_call(
     api_key: str,
     model: str = DEFAULT_MODEL,
     client=None,
@@ -111,9 +131,15 @@ def request_plan(
                 {"role": "system", "content": PLAN_SYSTEM_PROMPT},
                 {
                     "role": "user",
-                    "content": "Choose valid parameters for the fixed workflow and return exact JSON only.",
+                    "content": (
+                        "Choose valid parameters and request the fixed "
+                        "analyze_molecule_library tool."
+                    ),
                 },
             ],
+            tools=[TOOL_DEFINITION],
+            tool_choice={"type": "function", "function": {"name": TOOL_NAME}},
+            extra_body=NEMOTRON_TOOL_EXTRA_BODY,
             temperature=0.2,
             max_tokens=400,
         )
@@ -123,27 +149,51 @@ def request_plan(
         return _default_after_error(exc)
 
     try:
-        raw = response.choices[0].message.content or ""
-    except (IndexError, AttributeError) as exc:
+        tool_calls = response.choices[0].message.tool_calls
+        if not tool_calls:
+            raise ValueError("Missing required tool call")
+        if len(tool_calls) != 1:
+            raise ValueError("Expected exactly one tool call")
+        tool_call = tool_calls[0]
+        if getattr(tool_call, "type", None) != "function":
+            raise ValueError("Invalid or missing tool call type; expected function")
+        if tool_call.function is None:
+            raise ValueError("Malformed tool call")
+        tool_name = tool_call.function.name
+        tool_call_id = tool_call.id
+        raw_arguments = tool_call.function.arguments
+        if not all(isinstance(value, str) and value for value in (tool_call_id, raw_arguments)):
+            raise ValueError("Malformed tool call")
+        if tool_name != TOOL_NAME:
+            raise ValueError(f"Unexpected tool requested: {tool_name}")
+    except (IndexError, AttributeError, TypeError, ValueError) as exc:
         return _default_after_error(exc)
 
     try:
-        plan = parse_plan(raw)
+        plan = parse_plan(raw_arguments)
     except (ValidationError, ValueError) as exc:
-        return _default_after_error(exc, raw)
+        return _default_after_error(exc)
 
-    return PlanDecision(plan=plan, source="nemotron", error=None, raw=raw)
+    return PlanDecision(
+        plan=plan,
+        source="nemotron",
+        error=None,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        raw_arguments=raw_arguments,
+    )
 
 
 def request_explanation(
     api_key: str,
+    decision: PlanDecision,
     summary: dict[str, int | float | str],
     model: str = DEFAULT_MODEL,
     client=None,
 ) -> str:
     _validate_api_key(api_key)
 
-    serialized_summary = json.dumps(summary, sort_keys=True)
+    serialized_summary = json.dumps(summary)
     active_client = client or _client(api_key)
     try:
         response = active_client.chat.completions.create(
@@ -151,19 +201,34 @@ def request_explanation(
             messages=[
                 {
                     "role": "system",
-                    "content": "Explain workflow results accurately and conservatively in 120 words or fewer.",
-                },
-                {
-                    "role": "user",
                     "content": (
-                        "Explain this summary in no more than 120 words: "
-                        f"{serialized_summary}\n"
-                        "Computed descriptors and geometries are not evidence of binding, "
-                        "activity, ADMET, efficacy, safety, synthesizability, or clinical "
-                        "relevance, and they are not experimentally validated conformations."
+                        "Explain the completed workflow results accurately and conservatively in "
+                        "120 words or fewer. Computed descriptors and geometries are not evidence "
+                        "of binding, activity, ADMET, efficacy, safety, synthesizability, or "
+                        "clinical relevance, and they are not experimentally validated conformations."
                     ),
                 },
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": decision.tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": decision.tool_name,
+                                "arguments": decision.raw_arguments,
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": decision.tool_call_id,
+                    "content": serialized_summary,
+                },
             ],
+            extra_body=NEMOTRON_TOOL_EXTRA_BODY,
             temperature=0.2,
             max_tokens=220,
         )
