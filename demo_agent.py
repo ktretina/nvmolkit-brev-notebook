@@ -2,13 +2,19 @@ import json
 from dataclasses import dataclass
 from typing import Literal
 
-from openai import APIError, OpenAI
+from openai import APIError, AuthenticationError, OpenAI, PermissionDeniedError
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic import ValidationError
 
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 DEFAULT_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
+AUTH_GUIDANCE = (
+    "NVIDIA_API_KEY must be a hosted Developer API key. Generate it from the "
+    "Nemotron build.nvidia.com model page, then paste only the bare key; it "
+    "starts with nvapi-. An NGC personal key is a different credential and "
+    "must not be substituted."
+)
 PLAN_SYSTEM_PROMPT = """You plan parameters for one fixed molecular workflow:
 Morgan fingerprints, Tanimoto similarity, Butina clustering, ETKDGv3 conformer
 generation, and MMFF94 minimization. Return exact JSON containing only these five
@@ -76,6 +82,11 @@ def _client(api_key: str) -> OpenAI:
     return OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key)
 
 
+def _validate_api_key(api_key: str) -> None:
+    if not api_key or not api_key.startswith("nvapi-"):
+        raise ValueError(AUTH_GUIDANCE)
+
+
 def _default_after_error(exc: Exception, raw: str | None = None) -> PlanDecision:
     return PlanDecision(
         plan=WorkflowPlan.model_validate(DEFAULT_PLAN),
@@ -90,8 +101,7 @@ def request_plan(
     model: str = DEFAULT_MODEL,
     client=None,
 ) -> PlanDecision:
-    if not api_key:
-        raise ValueError("NVIDIA_API_KEY must not be empty")
+    _validate_api_key(api_key)
 
     try:
         active_client = client or _client(api_key)
@@ -107,6 +117,8 @@ def request_plan(
             temperature=0.2,
             max_tokens=400,
         )
+    except (AuthenticationError, PermissionDeniedError):
+        raise ValueError(AUTH_GUIDANCE) from None
     except (APIError, RuntimeError) as exc:
         return _default_after_error(exc)
 
@@ -129,30 +141,32 @@ def request_explanation(
     model: str = DEFAULT_MODEL,
     client=None,
 ) -> str:
-    if not api_key:
-        raise ValueError("NVIDIA_API_KEY must not be empty")
+    _validate_api_key(api_key)
 
     serialized_summary = json.dumps(summary, sort_keys=True)
     active_client = client or _client(api_key)
-    response = active_client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": "Explain workflow results accurately and conservatively in 120 words or fewer.",
-            },
-            {
-                "role": "user",
-                "content": (
-                    "Explain this summary in no more than 120 words: "
-                    f"{serialized_summary}\n"
-                    "Computed descriptors and geometries are not evidence of binding, "
-                    "activity, ADMET, efficacy, safety, synthesizability, or clinical "
-                    "relevance, and they are not experimentally validated conformations."
-                ),
-            },
-        ],
-        temperature=0.2,
-        max_tokens=220,
-    )
+    try:
+        response = active_client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Explain workflow results accurately and conservatively in 120 words or fewer.",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Explain this summary in no more than 120 words: "
+                        f"{serialized_summary}\n"
+                        "Computed descriptors and geometries are not evidence of binding, "
+                        "activity, ADMET, efficacy, safety, synthesizability, or clinical "
+                        "relevance, and they are not experimentally validated conformations."
+                    ),
+                },
+            ],
+            temperature=0.2,
+            max_tokens=220,
+        )
+    except (AuthenticationError, PermissionDeniedError):
+        raise ValueError(AUTH_GUIDANCE) from None
     return response.choices[0].message.content or ""
