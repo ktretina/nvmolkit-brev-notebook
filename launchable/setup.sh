@@ -1,13 +1,8 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-VENV_DIR=".venv"
-PORT="${JUPYTER_PORT:-8888}"
-PID_FILE="${PROJECT_DIR}/.jupyter.pid"
-LOG_FILE="${PROJECT_DIR}/jupyter.log"
-JUPYTER_EXEC="${PROJECT_DIR}/${VENV_DIR}/bin/jupyter"
 
 cd "${PROJECT_DIR}"
 
@@ -22,71 +17,25 @@ if [[ "${machine}" != "x86_64" && "${machine,,}" != "amd64" ]]; then
   exit 1
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "Error: this Launchable requires Linux x86-64 with CPython 3.12; python3 was not found." >&2
-  exit 1
-fi
-
-if ! python3 -c 'import sys; raise SystemExit(not (sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 12)))'; then
-  found_python="$(python3 -c 'import platform; print(f"{platform.python_implementation()} {platform.python_version()}")' 2>&1 || python3 --version 2>&1)"
-  echo "Error: this Launchable requires Linux x86-64 with CPython 3.12; found ${found_python}." >&2
-  exit 1
-fi
-
-if [[ ! "${PORT}" =~ ^[0-9]{1,5}$ ]] || (( 10#${PORT} < 1 || 10#${PORT} > 65535 )); then
-  echo "Error: JUPYTER_PORT must be an integer from 1 through 65535." >&2
-  exit 1
-fi
-
-if [[ -f "${PID_FILE}" ]]; then
-  IFS= read -r existing_pid <"${PID_FILE}" || existing_pid=""
-  if [[ "${existing_pid}" =~ ^[0-9]+$ ]] && kill -0 "${existing_pid}" 2>/dev/null; then
-    if ! python3 - "${existing_pid}" "${JUPYTER_EXEC}" "${PROJECT_DIR}" "${PORT}" <<'PY'
-import os
-import pathlib
-import sys
-
-pid, jupyter_exec, project_dir, port = sys.argv[1:]
-try:
-    argv = [os.fsdecode(value) for value in pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if value]
-except OSError:
-    raise SystemExit(1)
-
-required = {
-    jupyter_exec,
-    f"--ServerApp.root_dir={project_dir}",
-    f"--port={port}",
+is_cpython_312() {
+  "$1" -c 'import sys; raise SystemExit(not (sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 12)))'
 }
-raise SystemExit(not required.issubset(argv))
-PY
-    then
-      echo "Error: .jupyter.pid names a live process that cannot be verified as this Launchable's JupyterLab; refusing to stop it." >&2
-      exit 1
-    fi
 
-    kill "${existing_pid}"
-    for _ in {1..50}; do
-      if ! kill -0 "${existing_pid}" 2>/dev/null; then
-        break
-      fi
-      sleep 0.1
-    done
-    if kill -0 "${existing_pid}" 2>/dev/null; then
-      echo "Error: the verified prior JupyterLab process did not stop; refusing to start another." >&2
-      exit 1
-    fi
-  fi
-  rm -f "${PID_FILE}"
+managed_python="${HOME}/.venv/bin/python3"
+if [[ ! -x "${managed_python}" ]] || ! is_cpython_312 "${managed_python}"; then
+  echo "Error: Brev-managed ${managed_python} must be CPython 3.12." >&2
+  exit 1
 fi
+PYTHON="${managed_python}"
 
-if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
-  python3 -m venv "${VENV_DIR}"
+echo "Installing into $("${PYTHON}" -c 'import sys; print(sys.executable)') ($("${PYTHON}" --version 2>&1))."
+if ! "${PYTHON}" -m pip --version >/dev/null 2>&1; then
+  "${PYTHON}" -m ensurepip --upgrade
 fi
+"${PYTHON}" -m pip install --upgrade pip
+"${PYTHON}" -m pip install -r requirements.txt
 
-"${VENV_DIR}/bin/python" -m pip install --upgrade pip
-"${VENV_DIR}/bin/python" -m pip install -r requirements.txt
-
-"${VENV_DIR}/bin/python" - <<'PY'
+"${PYTHON}" - <<'PY'
 import nvmolkit
 import torch
 
@@ -98,50 +47,45 @@ print(f"PyTorch: {torch.__version__} (CUDA {torch.version.cuda})")
 print(f"nvMolKit: {nvmolkit.__version__}")
 PY
 
-nohup "${JUPYTER_EXEC}" lab \
-  --ip=0.0.0.0 \
-  --port="${PORT}" \
-  --ServerApp.port_retries=0 \
-  --no-browser \
-  --ServerApp.root_dir="${PROJECT_DIR}" \
-  --IdentityProvider.token='' \
-  --PasswordIdentityProvider.hashed_password='' \
-  >"${LOG_FILE}" 2>&1 &
-jupyter_pid=$!
-printf '%s\n' "${jupyter_pid}" >"${PID_FILE}"
-
-if ! "${VENV_DIR}/bin/python" - "${jupyter_pid}" "${PORT}" <<'PY'
-import os
-import sys
+"${PYTHON}" - <<'PY'
+import json
 import time
 import urllib.error
 import urllib.request
 
-pid = int(sys.argv[1])
-url = f"http://127.0.0.1:{sys.argv[2]}/api"
-deadline = time.monotonic() + 30
+url = "http://127.0.0.1:8888/api/"
+deadline = time.monotonic() + 60
+last_error = "not ready"
 
 while time.monotonic() < deadline:
     try:
-        os.kill(pid, 0)
-    except OSError:
-        raise SystemExit(2)
-    try:
-        with urllib.request.urlopen(url, timeout=1) as response:
-            if response.status == 200:
-                raise SystemExit(0)
-    except (OSError, urllib.error.URLError):
-        pass
-    time.sleep(0.5)
-
-raise SystemExit(1)
+        with urllib.request.urlopen(url, timeout=2) as response:
+            if response.geturl() != url:
+                last_error = f"redirected to {response.geturl()}"
+            elif response.status != 200:
+                last_error = f"HTTP {response.status}"
+            else:
+                try:
+                    payload = json.load(response)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    last_error = f"invalid JSON: {exc}"
+                else:
+                    version = payload.get("version") if isinstance(payload, dict) else None
+                    if isinstance(version, str) and version.strip():
+                        print(
+                            "Brev-managed Jupyter health probe passed "
+                            f"(version {version})."
+                        )
+                        break
+                    last_error = "JSON response lacks a nonempty string version"
+    except (OSError, urllib.error.URLError) as exc:
+        last_error = str(exc)
+    time.sleep(1)
+else:
+    raise RuntimeError(
+        f"Brev-managed Jupyter did not become healthy at {url} within 60 seconds: "
+        f"{last_error}"
+    )
 PY
-then
-  echo "Error: JupyterLab did not become ready on the configured port; recent log output follows." >&2
-  tail -n 40 "${LOG_FILE}" >&2 || true
-  kill "${jupyter_pid}" 2>/dev/null || true
-  rm -f "${PID_FILE}"
-  exit 1
-fi
 
-echo "JupyterLab started (PID ${jupyter_pid}) on port ${PORT}. Open it only through the organization-only Brev Secure Link; do not expose this port publicly."
+echo "Setup complete. Brev manages JupyterLab and its Secure Link on port 8888."
