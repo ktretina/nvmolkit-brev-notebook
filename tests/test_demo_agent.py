@@ -576,8 +576,9 @@ def test_valid_conclusion_is_strict_frozen_and_evidence_grounded():
         lambda value: value["sections"][4].__setitem__("evidence_keys", ["E05"]),
         lambda value: value.__setitem__("headline", "A library with 2 regimes"),
         lambda value: value["sections"][3].__setitem__("prose", "There are 3 qualitative groups."),
+        lambda value: value["sections"][3].__setitem__("prose", "There are ٣ qualitative groups."),
     ],
-    ids=("duplicate", "missing", "empty", "unknown", "wrong-theme", "global-missing", "digit-headline", "digit-prose"),
+    ids=("duplicate", "missing", "empty", "unknown", "wrong-theme", "global-missing", "digit-headline", "digit-prose", "unicode-digit"),
 )
 def test_invalid_conclusion_fails_closed_without_retaining_prose(mutation):
     arguments = synthesis_arguments()
@@ -603,6 +604,8 @@ def test_run_workflow_adds_one_checked_eighth_turn_and_retains_stage_results():
     )
 
     assert result.turn_count == 8 == len(completions.calls)
+    assert tuple(item.stage for item in result.plan.stages) == STAGES
+    assert result.plan.stages[0].rationale == plan_arguments()["stages"][0]["rationale"]
     assert len(result.stage_results) == 6
     assert tuple(item.stage for item in result.stage_results) == STAGES
     assert result.messages[-1]["role"] == "assistant"
@@ -614,7 +617,9 @@ def test_run_workflow_adds_one_checked_eighth_turn_and_retains_stage_results():
     }
 
 
-def test_invalid_final_synthesis_preserves_report_withholds_text_and_does_not_retry():
+def test_invalid_final_synthesis_displays_only_preserved_evidence_and_does_not_retry(monkeypatch):
+    shown = []
+    monkeypatch.setattr("IPython.display.display", lambda *items: shown.extend(items))
     invalid = synthesis_arguments()
     invalid["headline"] = "Rejected synthesis"
     invalid["sections"][0]["evidence_keys"] = []
@@ -622,7 +627,7 @@ def test_invalid_final_synthesis_preserves_report_withholds_text_and_does_not_re
 
     with pytest.raises(demo_agent.ConclusionValidationError) as error:
         demo_agent.run_workflow(
-            "Analyze.", VALID_API_KEY, display_events=False,
+            "Analyze.", VALID_API_KEY, display_events=True,
             client=fake_client(completions), executors={**fake_executors(), "build_workflow_report": lambda state: full_report()},
         )
 
@@ -630,6 +635,9 @@ def test_invalid_final_synthesis_preserves_report_withholds_text_and_does_not_re
     assert error.value.report == full_report()
     assert error.value.rejected_prose is None
     assert "Rejected" not in str(error.value)
+    rendered = "\n".join(getattr(item, "data", str(item)) for item in shown)
+    assert all(key in rendered for key in ("E01", "E02", "E03", "E04", "E05", "E06"))
+    assert "Rejected synthesis" not in rendered
 
 
 def test_display_workflow_shows_only_three_headings_stage_artifacts_and_checked_content(monkeypatch):
@@ -646,5 +654,6 @@ def test_display_workflow_shows_only_three_headings_stage_artifacts_and_checked_
     assert rendered.count("## Continuous execution") == 1
     assert rendered.count("## Checked conclusion") == 1
     assert all(stage in rendered for stage in STAGES)
+    assert all(item.rationale in rendered for item in result.plan.stages)
     assert all(f"figure-{stage}" in rendered for stage in STAGES)
     assert result.conclusion.headline in rendered

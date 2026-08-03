@@ -209,6 +209,7 @@ class AgentSession:
 class ScientificLoopResult:
     messages: tuple[dict[str, Any], ...]
     report: WorkflowReport
+    plan: WorkflowPlan
     stage_results: tuple[StageResult, ...]
     turn_count: int
 
@@ -217,6 +218,7 @@ class ScientificLoopResult:
 class WorkflowResult:
     messages: tuple[dict[str, Any], ...]
     report: WorkflowReport
+    plan: WorkflowPlan
     conclusion: SubmitSynthesisArgs
     stage_results: tuple[StageResult, ...]
     turn_count: int = 8
@@ -279,7 +281,7 @@ def validate_conclusion(conclusion: SubmitSynthesisArgs, report: WorkflowReport)
     valid = set(themes) == set(_REQUIRED_CONCLUSION_EVIDENCE) and len(themes) == len(set(themes))
     valid &= report_keys == EvidenceKey.__args__ and cited == known
     valid &= all(_REQUIRED_CONCLUSION_EVIDENCE[item.theme] <= set(item.evidence_keys) for item in conclusion.sections)
-    valid &= not any(character.isascii() and character.isdigit() for character in prose)
+    valid &= not any(character.isdigit() for character in prose)
     if not valid:
         raise ConclusionValidationError(report)
     return conclusion
@@ -513,23 +515,27 @@ def run_scientific_loop(
         raise ToolCallError("The scientific report could not be built.") from None
     if not isinstance(report, WorkflowReport):
         raise ToolCallError("The scientific report was invalid.")
-    return ScientificLoopResult(tuple(session.messages), report, tuple(stage_results), session.turn_count)
+    return ScientificLoopResult(tuple(session.messages), report, plan, tuple(stage_results), session.turn_count)
+
+
+def _report_evidence(report: WorkflowReport) -> str:
+    return "\n".join(
+        f"- **{item.key} — {item.label}** (`{item.provenance}`): `{item.payload_json}`"
+        for item in report.evidence
+    )
 
 
 def _display_workflow(result: WorkflowResult) -> None:
     from IPython.display import Markdown, display
 
-    plan = "Inspect, represent, compare, cluster, sample conformers, then optimize."
+    plan = "\n".join(f"- `{item.stage}` — {item.rationale}" for item in result.plan.stages)
     display(Markdown(f"## Nemotron plan\n{plan}"))
     display(Markdown("## Continuous execution"))
     for stage in result.stage_results:
         display(Markdown(f"### {stage.display_label}\n```json\n{_serialize(stage.summary)}\n```"))
         for figure in stage.figures:
             display(figure)
-    evidence = "\n".join(
-        f"- **{item.key} — {item.label}** (`{item.provenance}`): `{item.payload_json}`"
-        for item in result.report.evidence
-    )
+    evidence = _report_evidence(result.report)
     sections = "\n\n".join(
         f"### {section.theme.replace('_', ' ').title()}\n{section.prose} "
         f"*Evidence: {', '.join(section.evidence_keys)}*"
@@ -559,8 +565,11 @@ def run_workflow(
         conclusion = _request_call(session, active_client, "submit_synthesis", SubmitSynthesisArgs, DEFAULT_MODEL)
         conclusion = validate_conclusion(conclusion, scientific.report)
     except ToolCallError:
+        if display_events:
+            from IPython.display import Markdown, display
+            display(Markdown(_report_evidence(scientific.report)))
         raise ConclusionValidationError(scientific.report) from None
-    result = WorkflowResult(tuple(session.messages), scientific.report, conclusion, scientific.stage_results, session.turn_count)
+    result = WorkflowResult(tuple(session.messages), scientific.report, scientific.plan, conclusion, scientific.stage_results, session.turn_count)
     if display_events:
         _display_workflow(result)
     return result
