@@ -61,6 +61,8 @@ class WorkflowState:
     conformer_molecules: list[Any] = field(default_factory=list)
     optimization_result: Any = None
     summaries: dict[str, dict[str, Any]] = field(default_factory=dict)
+    invalid_ids: tuple[str, ...] = ()
+    embedding_parameters: tuple[int, str, int] | None = None
 
 
 _NEXT_STAGE = {
@@ -129,6 +131,7 @@ def inspect_library(
 
     state.records = records
     state.molecules = molecules
+    state.invalid_ids = tuple(invalid_ids)
     state.summaries = summaries
     state.phase = WorkflowPhase.INSPECTED
 
@@ -302,6 +305,40 @@ def _cluster_size_figure(cluster_sizes: list[int]):
     return figure
 
 
+def _eligibility_groups(
+    records: list[dict[str, Any]], molecules: list[Any], clusters: list[list[int]]
+) -> list[dict[str, Any]]:
+    """Derive MMFF94-eligible cluster members from retained molecule artifacts."""
+    from rdkit.Chem import AllChem
+
+    groups: list[dict[str, Any]] = []
+    for cluster_id, cluster in enumerate(clusters):
+        members = []
+        for molecule_index in cluster:
+            molecule = Chem.AddHs(Chem.Mol(molecules[molecule_index]))
+            if AllChem.MMFFHasAllMoleculeParams(molecule):
+                record = records[molecule_index]
+                members.append({
+                    "molecule_id": str(record["id"]),
+                    "source_row": int(record["source_row"]),
+                    "cluster_id": int(cluster_id),
+                    "molecule_index": int(molecule_index),
+                })
+        if members:
+            members.sort(key=lambda record: record["source_row"])
+            groups.append({
+                "cluster_id": int(cluster_id),
+                "cluster_size": len(cluster),
+                "minimum_source_row": min(
+                    int(records[index]["source_row"]) for index in cluster
+                ),
+                "is_singleton": len(cluster) == 1,
+                "members": members,
+            })
+    groups.sort(key=lambda group: (-group["cluster_size"], group["minimum_source_row"]))
+    return groups
+
+
 def generate_morgan_fingerprints(
     state: WorkflowState,
     *,
@@ -441,48 +478,24 @@ def discover_fused_butina_clusters(
     ):
         raise RuntimeError("Every molecule must be assigned exactly once.")
 
-    from rdkit.Chem import AllChem
-
-    candidates_by_cluster: list[dict[str, Any]] = []
-    eligible_singleton_count = 0
-    for cluster_id, cluster in enumerate(clusters):
-        eligible_indices = [
-            molecule_index
-            for molecule_index in cluster
-            if bool(
-                AllChem.MMFFHasAllMoleculeParams(
-                    Chem.AddHs(Chem.Mol(state.molecules[molecule_index]))
-                )
-            )
-        ]
-        if not eligible_indices:
-            continue
-        is_singleton = len(cluster) == 1
-        eligible_singleton_count += int(is_singleton)
-        candidates_by_cluster.append(
-            {
-                "cluster_id": int(cluster_id),
-                "candidate_ids": [
-                    str(state.records[index]["id"]) for index in eligible_indices
-                ],
-                "source_rows": [
-                    int(state.records[index]["source_row"])
-                    for index in eligible_indices
-                ],
-                "is_singleton": bool(is_singleton),
-            }
-        )
-
     cluster_metrics = _cluster_artifact_metrics(clusters, molecule_count, cutoff)
-    eligible_cluster_count = len(candidates_by_cluster)
+    groups = _eligibility_groups(state.records, state.molecules, clusters)
     summary: dict[str, Any] = {
         "entry_point": "fused_butina",
         **cluster_metrics,
         "representative_eligibility": {
-            "eligible_cluster_count": int(eligible_cluster_count),
-            "eligible_singleton_count": int(eligible_singleton_count),
-            "maximum_representative_count": int(eligible_cluster_count),
-            "candidates_by_cluster": candidates_by_cluster,
+            "eligible_cluster_count": len(groups),
+            "eligible_singleton_count": sum(group["is_singleton"] for group in groups),
+            "maximum_representative_count": len(groups),
+            "candidates_by_cluster": [
+                {
+                    "cluster_id": group["cluster_id"],
+                    "candidate_ids": [member["molecule_id"] for member in group["members"]],
+                    "source_rows": [member["source_row"] for member in group["members"]],
+                    "is_singleton": group["is_singleton"],
+                }
+                for group in sorted(groups, key=lambda group: group["cluster_id"])
+            ],
         },
     }
     figure = _cluster_size_figure([len(cluster) for cluster in clusters])
@@ -501,76 +514,6 @@ def discover_fused_butina_clusters(
     )
 
 
-def _validated_eligibility(state: WorkflowState) -> list[dict[str, Any]]:
-    try:
-        eligibility = state.summaries["discover_fused_butina_clusters"][
-            "representative_eligibility"
-        ]
-        candidates = eligibility["candidates_by_cluster"]
-    except (KeyError, TypeError) as error:
-        raise RuntimeError("Clustering eligibility is missing.") from error
-    if not isinstance(candidates, list):
-        raise RuntimeError("Clustering eligibility candidates are invalid.")
-
-    validated: list[dict[str, Any]] = []
-    seen_clusters: set[int] = set()
-    for candidate_group in candidates:
-        if set(candidate_group) != {
-            "cluster_id",
-            "candidate_ids",
-            "source_rows",
-            "is_singleton",
-        }:
-            raise RuntimeError("Clustering eligibility contains unexpected keys.")
-        cluster_id = int(candidate_group["cluster_id"])
-        if cluster_id in seen_clusters or not 0 <= cluster_id < len(state.clusters):
-            raise RuntimeError("Clustering eligibility has duplicate or unknown cluster provenance.")
-        seen_clusters.add(cluster_id)
-        candidate_ids = list(candidate_group["candidate_ids"])
-        source_rows = list(candidate_group["source_rows"])
-        if len(candidate_ids) != len(source_rows) or not candidate_ids:
-            raise RuntimeError("Clustering eligibility candidate provenance is incomplete.")
-        cluster_members = set(state.clusters[cluster_id])
-        member_records: list[dict[str, Any]] = []
-        used_indices: set[int] = set()
-        for molecule_id, source_row in zip(candidate_ids, source_rows):
-            matches = [
-                index
-                for index in cluster_members
-                if str(state.records[index]["id"]) == str(molecule_id)
-                and int(state.records[index]["source_row"]) == int(source_row)
-            ]
-            if len(matches) != 1 or matches[0] in used_indices:
-                raise RuntimeError("Clustering eligibility has unknown representative provenance.")
-            molecule_index = matches[0]
-            used_indices.add(molecule_index)
-            member_records.append(
-                {
-                    "molecule_id": str(molecule_id),
-                    "source_row": int(source_row),
-                    "cluster_id": cluster_id,
-                    "molecule_index": molecule_index,
-                }
-            )
-        member_records.sort(key=lambda record: record["source_row"])
-        validated.append(
-            {
-                "cluster_id": cluster_id,
-                "cluster_size": len(state.clusters[cluster_id]),
-                "minimum_source_row": min(
-                    int(state.records[index]["source_row"])
-                    for index in state.clusters[cluster_id]
-                ),
-                "is_singleton": bool(candidate_group["is_singleton"]),
-                "members": member_records,
-            }
-        )
-    validated.sort(
-        key=lambda group: (-group["cluster_size"], group["minimum_source_row"])
-    )
-    return validated
-
-
 def select_representatives(
     state: WorkflowState,
     representative_count: int,
@@ -585,7 +528,7 @@ def select_representatives(
         policy = RepresentativePolicy(representative_policy)
     except (ValueError, TypeError) as error:
         raise ValueError("representative policy is invalid") from error
-    groups = _validated_eligibility(state)
+    groups = _eligibility_groups(state.records, state.molecules, state.clusters)
     if len(groups) < 3:
         raise RuntimeError("at least 3 eligible distinct clusters are required")
 
@@ -714,6 +657,11 @@ def embed_representative_conformers(
     summaries = dict(state.summaries)
     summaries["embed_representative_conformers"] = summary
     state.representative_records = representative_records
+    state.embedding_parameters = (
+        int(representative_count),
+        policy.value,
+        int(conformers_per_representative),
+    )
     state.conformer_molecules = conformer_molecules
     state.summaries = summaries
     state.phase = WorkflowPhase.EMBEDDED
@@ -782,6 +730,49 @@ def _optimized_structure_figure(
     return figure
 
 
+def _optimization_records(
+    result: Any, molecules: list[Any], representatives: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    arrays = [
+        _host_array(getattr(result, name).torch()).reshape(-1)
+        for name in ("energies", "converged", "mol_indices", "conf_indices")
+    ]
+    energies, convergence, molecule_indices, conformer_indices = arrays
+    if len({len(array) for array in arrays}) != 1:
+        raise RuntimeError("MMFF94 result buffers must have the same length.")
+    if not np.isfinite(energies).all():
+        raise RuntimeError("MMFF94 energies contain non-finite values.")
+    convergence_values = [int(value) for value in convergence.tolist()]
+    if set(convergence_values) - {0, 1}:
+        raise RuntimeError("MMFF94 convergence flags must be binary.")
+    expected_pairs = {
+        (molecule_index, conformer_index)
+        for molecule_index, molecule in enumerate(molecules)
+        for conformer_index in range(molecule.GetNumConformers())
+    }
+    pairs = [
+        (int(molecule_index), int(conformer_index))
+        for molecule_index, conformer_index in zip(
+            molecule_indices.tolist(), conformer_indices.tolist()
+        )
+    ]
+    if len(pairs) != len(set(pairs)) or set(pairs) != expected_pairs:
+        raise RuntimeError("MMFF94 molecule/conformer indices are incomplete or duplicated.")
+    return [
+        {
+            "molecule_id": str(representatives[molecule_index]["molecule_id"]),
+            "cluster_id": int(representatives[molecule_index]["cluster_id"]),
+            "conformer_index": conformer_index,
+            "energy_kcal_mol": float(energy),
+            "converged": bool(did_converge),
+            "optimization_molecule_index": molecule_index,
+        }
+        for energy, did_converge, (molecule_index, conformer_index) in zip(
+            energies.tolist(), convergence_values, pairs
+        )
+    ]
+
+
 def optimize_conformers_mmff94(state: WorkflowState) -> StageResult:
     """Run nvMolKit MMFF94 and reconcile every molecule/conformer result pair."""
     if state.phase is not WorkflowPhase.EMBEDDED:
@@ -801,31 +792,11 @@ def optimize_conformers_mmff94(state: WorkflowState) -> StageResult:
         molecules, maxIters=500, output=_coordinate_output_device()
     )
     _synchronize_cuda()
-    arrays = [
-        _host_array(getattr(result, field_name).torch()).reshape(-1)
-        for field_name in ("energies", "converged", "mol_indices", "conf_indices")
-    ]
-    energies, convergence, molecule_indices, conformer_indices = arrays
-    if len({len(array) for array in arrays}) != 1:
-        raise RuntimeError("MMFF94 result buffers must have the same length.")
-    if not np.isfinite(energies).all():
-        raise RuntimeError("MMFF94 energies contain non-finite values.")
-    convergence_values = [int(value) for value in convergence.tolist()]
-    if set(convergence_values) - {0, 1}:
-        raise RuntimeError("MMFF94 convergence flags must be binary.")
+    per_conformer_records = _optimization_records(result, molecules, successful_records)
     result_pairs = [
-        (int(molecule_index), int(conformer_index))
-        for molecule_index, conformer_index in zip(
-            molecule_indices.tolist(), conformer_indices.tolist()
-        )
+        (record["optimization_molecule_index"], record["conformer_index"])
+        for record in per_conformer_records
     ]
-    expected_pairs = {
-        (molecule_index, conformer_index)
-        for molecule_index, molecule in enumerate(molecules)
-        for conformer_index in range(molecule.GetNumConformers())
-    }
-    if len(result_pairs) != len(set(result_pairs)) or set(result_pairs) != expected_pairs:
-        raise RuntimeError("MMFF94 molecule/conformer indices are incomplete or duplicated.")
 
     per_molecule = result.per_molecule()
     if len(per_molecule) != len(molecules):
@@ -857,21 +828,6 @@ def optimize_conformers_mmff94(state: WorkflowState) -> StageResult:
         for atom_index, (x, y, z) in enumerate(coordinates):
             conformer.SetAtomPosition(atom_index, Point3D(float(x), float(y), float(z)))
 
-    per_conformer_records: list[dict[str, Any]] = []
-    for energy, did_converge, (molecule_index, conformer_index) in zip(
-        energies.tolist(), convergence_values, result_pairs
-    ):
-        representative = successful_records[molecule_index]
-        per_conformer_records.append(
-            {
-                "molecule_id": representative["molecule_id"],
-                "cluster_id": representative["cluster_id"],
-                "conformer_index": conformer_index,
-                "energy_kcal_mol": float(energy),
-                "converged": bool(did_converge),
-                "optimization_molecule_index": molecule_index,
-            }
-        )
     per_conformer_records.sort(
         key=lambda record: (
             record["optimization_molecule_index"], record["conformer_index"]
@@ -925,13 +881,6 @@ def optimize_conformers_mmff94(state: WorkflowState) -> StageResult:
     )
 
 
-def _require_exact_keys(
-    summary: dict[str, Any], expected: set[str], stage: str
-) -> None:
-    if set(summary) != expected:
-        raise RuntimeError(f"{stage} has missing or unexpected keys.")
-
-
 def _reject_nonfinite(value: Any) -> None:
     if isinstance(value, dict):
         for nested in value.values():
@@ -948,351 +897,226 @@ def _canonical_json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def _similarity_evidence(state: WorkflowState) -> dict[str, Any]:
+    if state.similarity is None:
+        raise RuntimeError("similarity artifact is missing.")
+    matrix = _host_array(state.similarity.torch())
+    molecule_count = len(state.records)
+    if (
+        matrix.shape != (molecule_count, molecule_count)
+        or not np.isfinite(matrix).all()
+        or np.any((matrix < 0) | (matrix > 1))
+        or not np.allclose(matrix, matrix.T, rtol=0, atol=1e-7)
+        or not np.allclose(np.diag(matrix), 1, rtol=0, atol=1e-7)
+    ):
+        raise RuntimeError("Similarity artifact invariants are invalid.")
+    metrics = _similarity_artifact_metrics(matrix, state.records)
+    return {
+        "matrix_shape": metrics["matrix_shape"],
+        "q1": metrics["q1"],
+        "median": metrics["median"],
+        "q3": metrics["q3"],
+        "p90": metrics["p90"],
+        "max_off_diagonal": metrics["max"],
+        "most_similar_pair": metrics["most_similar_nonidentical_pair"],
+        "similarity_unit": "Tanimoto coefficient",
+    }
+
+
+def _representative_evidence(state: WorkflowState) -> dict[str, Any]:
+    if state.embedding_parameters is None:
+        raise RuntimeError("embedding run parameters are missing.")
+    requested, policy, conformers_per_representative = state.embedding_parameters
+    representatives: list[dict[str, Any]] = []
+    seen_clusters: set[int] = set()
+    for record in state.representative_records:
+        molecule_index = int(record["molecule_index"])
+        cluster_id = int(record["cluster_id"])
+        if (
+            not 0 <= molecule_index < len(state.records)
+            or not 0 <= cluster_id < len(state.clusters)
+            or molecule_index not in state.clusters[cluster_id]
+            or cluster_id in seen_clusters
+        ):
+            raise RuntimeError("representative provenance is duplicate or unknown.")
+        source = state.records[molecule_index]
+        if (
+            str(record["molecule_id"]) != str(source["id"])
+            or int(record["source_row"]) != int(source["source_row"])
+        ):
+            raise RuntimeError("representative provenance is duplicate or unknown.")
+        generated = int(record["generated_conformer_count"])
+        if not 0 <= generated <= conformers_per_representative:
+            raise RuntimeError("Embedding totals are unreconciled.")
+        seen_clusters.add(cluster_id)
+        representatives.append(
+            {
+                "molecule_id": str(record["molecule_id"]),
+                "source_row": int(record["source_row"]),
+                "cluster_id": cluster_id,
+            }
+        )
+    generated_total = sum(
+        int(record["generated_conformer_count"])
+        for record in state.representative_records
+    )
+    return {
+        "requested_representative_count": requested,
+        "selected_representative_count": len(representatives),
+        "selection_shortfall": requested - len(representatives),
+        "representative_policy": policy,
+        "representatives": representatives,
+        "requested_conformers_per_representative": conformers_per_representative,
+        "generated_conformer_count": generated_total,
+        "partial_embedding_ids": [
+            str(record["molecule_id"])
+            for record in state.representative_records
+            if 0 < int(record["generated_conformer_count"])
+            < conformers_per_representative
+        ],
+        "zero_embedding_ids": [
+            str(record["molecule_id"])
+            for record in state.representative_records
+            if int(record["generated_conformer_count"]) == 0
+        ],
+        "count_unit": "conformers",
+    }
+
+
+def _optimization_evidence(
+    state: WorkflowState, generated_conformer_count: int
+) -> dict[str, Any]:
+    if state.optimization_result is None:
+        raise RuntimeError("Optimization artifact is missing.")
+    representatives = [
+        record
+        for record in state.representative_records
+        if int(record["generated_conformer_count"]) > 0
+    ]
+    if len(representatives) != len(state.conformer_molecules):
+        raise RuntimeError("Embedded molecule provenance is unreconciled.")
+    rows = _optimization_records(
+        state.optimization_result, state.conformer_molecules, representatives
+    )
+    if len(rows) != generated_conformer_count:
+        raise RuntimeError("Conformer pairs are incomplete or duplicated.")
+    rows.sort(
+        key=lambda record: (
+            record["optimization_molecule_index"], record["conformer_index"]
+        )
+    )
+
+    selected: list[dict[str, Any]] = []
+    for molecule_index in range(len(representatives)):
+        converged_rows = [
+            record
+            for record in rows
+            if record["optimization_molecule_index"] == molecule_index
+            and record["converged"]
+        ]
+        if not converged_rows:
+            continue
+        minimum = min(
+            converged_rows,
+            key=lambda record: (
+                record["energy_kcal_mol"], record["conformer_index"]
+            ),
+        )
+        selected.append(
+            {
+                **{key: minimum[key] for key in (
+                    "molecule_id", "cluster_id", "conformer_index",
+                    "energy_kcal_mol", "converged",
+                )},
+                "selected_conformer_id": (
+                    f"{minimum['molecule_id']}:conf-{minimum['conformer_index']}"
+                ),
+            }
+        )
+    public_rows = [
+        {key: row[key] for key in (
+            "molecule_id", "cluster_id", "conformer_index",
+            "energy_kcal_mol", "converged",
+        )}
+        for row in rows
+    ]
+    converged_count = sum(row["converged"] for row in rows)
+    return {
+        "attempted_conformer_count": len(rows),
+        "converged_conformer_count": int(converged_count),
+        "unconverged_conformer_count": len(rows) - int(converged_count),
+        "per_conformer_records": public_rows,
+        "selected_conformer_records": selected,
+        "energy_unit": "kcal/mol",
+        "comparison_scope": "within molecule only",
+    }
+
+
 def build_workflow_report(state: WorkflowState) -> WorkflowReport:
-    """Validate the complete workflow and freeze only canonical structured evidence."""
+    """Build immutable E01-E06 evidence directly from retained artifacts."""
     if state.phase is not WorkflowPhase.OPTIMIZED:
         raise RuntimeError("build_workflow_report requires an OPTIMIZED workflow")
-    required_stages = (
-        "inspect_library",
-        "generate_morgan_fingerprints",
-        "measure_tanimoto_similarity",
-        "discover_fused_butina_clusters",
-        "embed_representative_conformers",
-        "optimize_conformers_mmff94",
-    )
-    if any(stage not in state.summaries for stage in required_stages):
-        raise RuntimeError("Workflow evidence is missing a required stage.")
-    inspect, fingerprint, similarity, cluster, embed, optimize = (
-        state.summaries[stage] for stage in required_stages
-    )
-    _require_exact_keys(
-        inspect,
-        {"raw_count", "valid_count", "invalid_count", "invalid_ids", "preview_count", "executor"},
-        "inspect_library",
-    )
-    _require_exact_keys(
-        fingerprint,
-        {"entry_point", "fingerprint_radius", "fingerprint_size", "molecule_count", "packed_shape", "active_bits_min", "active_bits_median", "active_bits_max", "cuda_device"},
-        "generate_morgan_fingerprints",
-    )
-    _require_exact_keys(
-        similarity,
-        {"entry_point", "matrix_shape", "q1", "median", "q3", "p90", "max", "most_similar_nonidentical_pair"},
-        "measure_tanimoto_similarity",
-    )
-    _require_exact_keys(
-        cluster,
-        {"entry_point", "cluster_cutoff", "molecule_count", "cluster_count", "singleton_count", "singleton_fraction", "largest_cluster_sizes", "assignment_count", "representative_eligibility"},
-        "discover_fused_butina_clusters",
-    )
-    _require_exact_keys(
-        embed,
-        {"entry_point", "selection_executor", "requested_representative_count", "selected_representative_count", "selection_shortfall", "representative_policy", "representatives", "requested_conformers_per_representative", "generated_conformer_count", "partial_embedding_ids", "zero_embedding_ids"},
-        "embed_representative_conformers",
-    )
-    _require_exact_keys(
-        optimize,
-        {"entry_point", "attempted_conformer_count", "converged_conformer_count", "unconverged_conformer_count", "per_conformer_records", "selected_conformer_records"},
-        "optimize_conformers_mmff94",
-    )
-
-    expected_provenance = {
-        "executor": (inspect, "RDKit input validation"),
-        "MorganFingerprintGenerator": (fingerprint, "MorganFingerprintGenerator"),
-        "crossTanimotoSimilarity": (similarity, "crossTanimotoSimilarity"),
-        "fused_butina": (cluster, "fused_butina"),
-        "EmbedMolecules": (embed, "EmbedMolecules"),
-        "MMFFOptimizeMoleculesConfs": (optimize, "MMFFOptimizeMoleculesConfs"),
-    }
-    for field, (summary, expected_value) in expected_provenance.items():
-        actual = summary[field if field == "executor" else "entry_point"]
-        if actual != expected_value:
-            raise RuntimeError("Workflow stage provenance mismatch.")
-    for summary in (inspect, fingerprint, similarity, cluster, embed, optimize):
-        _reject_nonfinite(summary)
-
-    valid_count = int(inspect["valid_count"])
-    if int(inspect["raw_count"]) != valid_count + int(inspect["invalid_count"]):
-        raise RuntimeError("Input row totals are unreconciled.")
-    if len(state.records) != valid_count or len(state.molecules) != valid_count:
+    molecule_count = len(state.records)
+    if molecule_count < 2 or len(state.molecules) != molecule_count:
         raise RuntimeError("Validated molecule rows are unreconciled.")
     if state.fingerprints is None:
         raise RuntimeError("fingerprint artifact is missing.")
     if state.fingerprint_parameters is None:
         raise RuntimeError("fingerprint run parameters are missing.")
-    artifact_fingerprint_metrics = _fingerprint_artifact_metrics(state.fingerprints)
-    artifact_fingerprint_metrics.pop("active_bits")
-    expected_fingerprint_summary = {
-        "entry_point": "MorganFingerprintGenerator",
-        "fingerprint_radius": int(state.fingerprint_parameters[0]),
-        "fingerprint_size": int(state.fingerprint_parameters[1]),
-        **artifact_fingerprint_metrics,
-    }
-    if fingerprint != expected_fingerprint_summary:
-        raise RuntimeError("fingerprint summary drifted from the retained artifact.")
-    packed_shape = [int(value) for value in fingerprint["packed_shape"]]
-    if packed_shape != [valid_count, int(fingerprint["fingerprint_size"]) // 32]:
+    radius, fingerprint_size = state.fingerprint_parameters
+    fingerprint = _fingerprint_artifact_metrics(state.fingerprints)
+    expected_shape = [molecule_count, fingerprint_size // 32]
+    if fingerprint["packed_shape"] != expected_shape:
         raise RuntimeError("Fingerprint dimensions are unreconciled.")
-    if list(state.fingerprints.torch().shape) != packed_shape:
-        raise RuntimeError("Fingerprint artifact dimensions are unreconciled.")
-    if state.similarity is None:
-        raise RuntimeError("similarity artifact is missing.")
-    matrix_shape = [int(value) for value in similarity["matrix_shape"]]
-    if matrix_shape != [valid_count, valid_count]:
-        raise RuntimeError("Similarity matrix dimensions are unreconciled.")
-    if not 0 <= float(similarity["q1"]) <= float(similarity["median"]) <= float(similarity["q3"]) <= 1:
-        raise RuntimeError("Similarity quantiles are invalid.")
-    if not 0 <= float(similarity["p90"]) <= 1 or not 0 <= float(similarity["max"]) <= 1:
-        raise RuntimeError("Similarity values are invalid.")
-    similarity_matrix = _host_array(state.similarity.torch())
-    if (
-        list(similarity_matrix.shape) != matrix_shape
-        or not np.isfinite(similarity_matrix).all()
-        or np.any((similarity_matrix < 0) | (similarity_matrix > 1))
-        or not np.allclose(similarity_matrix, similarity_matrix.T, rtol=0, atol=1e-7)
-        or not np.allclose(np.diag(similarity_matrix), 1, rtol=0, atol=1e-7)
-    ):
-        raise RuntimeError("Similarity artifact invariants are invalid.")
-    expected_similarity_summary = {
-        "entry_point": "crossTanimotoSimilarity",
-        **_similarity_artifact_metrics(similarity_matrix, state.records),
-    }
-    if similarity != expected_similarity_summary:
-        raise RuntimeError("similarity summary drifted from the retained artifact.")
-    assigned = [index for members in state.clusters for index in members]
-    if (
-        int(cluster["assignment_count"]) != valid_count
-        or int(cluster["cluster_count"]) != len(state.clusters)
-        or sorted(assigned) != list(range(valid_count))
-    ):
-        raise RuntimeError("Cluster assignment is incomplete or duplicated.")
+
+    similarity = _similarity_evidence(state)
     if state.cluster_cutoff is None:
         raise RuntimeError("cluster cutoff artifact is missing.")
-    expected_cluster_summary = {
-        "entry_point": "fused_butina",
-        **_cluster_artifact_metrics(
-            state.clusters, valid_count, state.cluster_cutoff
-        ),
-        "representative_eligibility": cluster["representative_eligibility"],
-    }
-    if cluster != expected_cluster_summary:
-        raise RuntimeError("cluster summary drifted from the retained artifact.")
-    _validated_eligibility(state)
-
-    known_representatives = {
-        (str(state.records[index]["id"]), int(state.records[index]["source_row"]), cluster_id)
-        for cluster_id, members in enumerate(state.clusters)
-        for index in members
-    }
-    representatives = embed["representatives"]
-    if len(representatives) != int(embed["selected_representative_count"]):
-        raise RuntimeError("Selected representative totals are unreconciled.")
-    representative_keys: list[tuple[str, int, int]] = []
-    for representative in representatives:
-        _require_exact_keys(
-            representative, {"molecule_id", "source_row", "cluster_id"}, "representative"
-        )
-        key = (
-            str(representative["molecule_id"]),
-            int(representative["source_row"]),
-            int(representative["cluster_id"]),
-        )
-        if key not in known_representatives or key in representative_keys:
-                raise RuntimeError("representative provenance is duplicate or unknown.")
-        representative_keys.append(key)
-    if int(embed["selection_shortfall"]) != int(embed["requested_representative_count"]) - len(representatives):
-        raise RuntimeError("Representative selection shortfall is unreconciled.")
-    state_representatives = [
-        {
-            "molecule_id": record["molecule_id"],
-            "source_row": record["source_row"],
-            "cluster_id": record["cluster_id"],
-        }
-        for record in state.representative_records
-    ]
-    if state_representatives != representatives:
-        raise RuntimeError("Representative provenance is unreconciled with embedded artifacts.")
-    generated_count = sum(
-        int(record["generated_conformer_count"])
-        for record in state.representative_records
+    assigned = [index for cluster in state.clusters for index in cluster]
+    if sorted(assigned) != list(range(molecule_count)):
+        raise RuntimeError("Cluster assignment is incomplete or duplicated.")
+    cluster = _cluster_artifact_metrics(
+        state.clusters, molecule_count, state.cluster_cutoff
     )
-    partial_ids = [
-        record["molecule_id"]
-        for record in state.representative_records
-        if 0 < int(record["generated_conformer_count"])
-        < int(embed["requested_conformers_per_representative"])
-    ]
-    zero_ids = [
-        record["molecule_id"]
-        for record in state.representative_records
-        if int(record["generated_conformer_count"]) == 0
-    ]
-    if (
-        generated_count != int(embed["generated_conformer_count"])
-        or partial_ids != embed["partial_embedding_ids"]
-        or zero_ids != embed["zero_embedding_ids"]
-    ):
-        raise RuntimeError("Embedding totals are unreconciled.")
-
-    per_records = optimize["per_conformer_records"]
-    public_per_records: list[dict[str, Any]] = []
-    pair_keys: set[tuple[str, int]] = set()
-    optimization_representatives = [
-        record
-        for record in state.representative_records
-        if int(record["generated_conformer_count"]) > 0
-    ]
-    for record in per_records:
-        _require_exact_keys(
-            record,
-            {"molecule_id", "cluster_id", "conformer_index", "energy_kcal_mol", "converged", "optimization_molecule_index"},
-            "per_conformer_record",
-        )
-        optimization_molecule_index = int(record["optimization_molecule_index"])
-        if not 0 <= optimization_molecule_index < len(optimization_representatives):
-            raise RuntimeError("conformer provenance has an unknown molecule index.")
-        authoritative_representative = optimization_representatives[
-            optimization_molecule_index
-        ]
-        if (
-            str(record["molecule_id"])
-            != str(authoritative_representative["molecule_id"])
-            or int(record["cluster_id"])
-            != int(authoritative_representative["cluster_id"])
-        ):
-            raise RuntimeError(
-                "conformer provenance does not match its selected representative."
-            )
-        pair = (str(record["molecule_id"]), int(record["conformer_index"]))
-        if pair in pair_keys:
-            raise RuntimeError("Conformer pairs are incomplete or duplicated.")
-        pair_keys.add(pair)
-        public_per_records.append(
-            {
-                key: record[key]
-                for key in ("molecule_id", "cluster_id", "conformer_index", "energy_kcal_mol", "converged")
-            }
-        )
-    attempted = len(per_records)
-    converged_count = sum(bool(record["converged"]) for record in per_records)
-    if (
-        attempted != int(optimize["attempted_conformer_count"])
-        or converged_count != int(optimize["converged_conformer_count"])
-        or attempted - converged_count != int(optimize["unconverged_conformer_count"])
-        or attempted != int(embed["generated_conformer_count"])
-    ):
-        raise RuntimeError("convergence totals are unreconciled.")
-    if state.optimization_result is None:
-        raise RuntimeError("Optimization artifact is missing.")
-    result_energies = _host_array(
-        state.optimization_result.energies.torch()
-    ).reshape(-1)
-    result_convergence = _host_array(
-        state.optimization_result.converged.torch()
-    ).reshape(-1)
-    result_molecule_indices = _host_array(
-        state.optimization_result.mol_indices.torch()
-    ).reshape(-1)
-    result_conformer_indices = _host_array(
-        state.optimization_result.conf_indices.torch()
-    ).reshape(-1)
-    if len({len(result_energies), len(result_convergence), len(result_molecule_indices), len(result_conformer_indices)}) != 1:
-        raise RuntimeError("Optimization artifact buffers are unreconciled.")
-    if not np.isfinite(result_energies).all():
-        raise RuntimeError("energy artifact contains non-finite values.")
-    artifact_convergence_values = [int(value) for value in result_convergence.tolist()]
-    if set(artifact_convergence_values) - {0, 1}:
-        raise RuntimeError("convergence artifact contains non-binary values.")
-    artifact_by_pair: dict[tuple[int, int], tuple[float, bool]] = {}
-    for energy, converged, molecule_index, conformer_index in zip(
-        result_energies.tolist(),
-        artifact_convergence_values,
-        result_molecule_indices.tolist(),
-        result_conformer_indices.tolist(),
-    ):
-        pair = (int(molecule_index), int(conformer_index))
-        if pair in artifact_by_pair:
-            raise RuntimeError("Conformer pairs are duplicated in the optimization artifact.")
-        artifact_by_pair[pair] = (float(energy), bool(int(converged)))
-    summary_by_pair = {
-        (int(record["optimization_molecule_index"]), int(record["conformer_index"])): record
-        for record in per_records
-    }
-    if len(summary_by_pair) != len(per_records) or set(artifact_by_pair) != set(summary_by_pair):
-        raise RuntimeError("Conformer pairs are unreconciled with the optimization artifact.")
-    for pair, record in summary_by_pair.items():
-        artifact_energy, artifact_converged = artifact_by_pair[pair]
-        if not np.isclose(
-            artifact_energy, float(record["energy_kcal_mol"]), rtol=0, atol=1e-7
-        ):
-            raise RuntimeError("energy artifact is unreconciled with conformer evidence.")
-        if artifact_converged is not bool(record["converged"]):
-            raise RuntimeError(
-                "convergence artifact is unreconciled with conformer evidence."
-            )
-
-    expected_selected: dict[int, dict[str, Any]] = {}
-    for molecule_index in {
-        int(record["optimization_molecule_index"]) for record in per_records
-    }:
-        eligible = [
-            record
-            for record in per_records
-            if int(record["optimization_molecule_index"]) == molecule_index
-            and bool(record["converged"])
-        ]
-        if eligible:
-            expected_selected[molecule_index] = min(
-                eligible,
-                key=lambda record: (
-                    float(record["energy_kcal_mol"]),
-                    int(record["conformer_index"]),
-                ),
-            )
-    selected_records = optimize["selected_conformer_records"]
-    if len(selected_records) != len(expected_selected):
-        raise RuntimeError("selected conformer records are missing or duplicated.")
-    public_selected_records: list[dict[str, Any]] = []
-    selected_molecule_indices: set[int] = set()
-    for record in selected_records:
-        _require_exact_keys(
-            record,
-            {"molecule_id", "cluster_id", "conformer_index", "energy_kcal_mol", "converged", "optimization_molecule_index", "selected_conformer_id"},
-            "selected_conformer_record",
-        )
-        molecule_index = int(record["optimization_molecule_index"])
-        expected = expected_selected.get(molecule_index)
-        expected_id = (
-            None
-            if expected is None
-            else f"{expected['molecule_id']}:conf-{expected['conformer_index']}"
-        )
-        if (
-            molecule_index in selected_molecule_indices
-            or expected is None
-            or any(record[key] != expected[key] for key in expected)
-            or record["selected_conformer_id"] != expected_id
-        ):
-            raise RuntimeError("selected conformer is not the valid within-molecule minimum.")
-        selected_molecule_indices.add(molecule_index)
-        public_selected_records.append(
-            {
-                key: record[key]
-                for key in ("molecule_id", "cluster_id", "conformer_index", "energy_kcal_mol", "converged", "selected_conformer_id")
-            }
-        )
+    embedding = _representative_evidence(state)
+    optimization = _optimization_evidence(
+        state, embedding["generated_conformer_count"]
+    )
 
     payloads = (
-        ("E01", "Library inspection", {"raw_count": inspect["raw_count"], "valid_count": valid_count, "invalid_count": inspect["invalid_count"], "invalid_ids": inspect["invalid_ids"], "preview_count": inspect["preview_count"], "count_unit": "rows"}, "RDKit input validation"),
-        ("E02", "Morgan fingerprints", {"fingerprint_radius": fingerprint["fingerprint_radius"], "fingerprint_size_bits": fingerprint["fingerprint_size"], "packed_shape": packed_shape, "molecule_count": fingerprint["molecule_count"], "active_bits_min": fingerprint["active_bits_min"], "active_bits_median": fingerprint["active_bits_median"], "active_bits_max": fingerprint["active_bits_max"], "executor": "nvMolKit GPU", "size_unit": "bits"}, "MorganFingerprintGenerator"),
-        ("E03", "Tanimoto similarity", {"matrix_shape": matrix_shape, "q1": similarity["q1"], "median": similarity["median"], "q3": similarity["q3"], "p90": similarity["p90"], "max_off_diagonal": similarity["max"], "most_similar_pair": similarity["most_similar_nonidentical_pair"], "similarity_unit": "Tanimoto coefficient"}, "crossTanimotoSimilarity"),
-        ("E04", "Fused Butina clusters", {"cutoff": cluster["cluster_cutoff"], "cluster_count": cluster["cluster_count"], "singleton_count": cluster["singleton_count"], "singleton_fraction": cluster["singleton_fraction"], "largest_cluster_sizes": cluster["largest_cluster_sizes"], "assignment_count": cluster["assignment_count"], "cutoff_unit": "Tanimoto distance"}, "fused_butina"),
-        ("E05", "Representative embedding", {"requested_representative_count": embed["requested_representative_count"], "selected_representative_count": embed["selected_representative_count"], "selection_shortfall": embed["selection_shortfall"], "representative_policy": embed["representative_policy"], "representatives": representatives, "requested_conformers_per_representative": embed["requested_conformers_per_representative"], "generated_conformer_count": embed["generated_conformer_count"], "partial_embedding_ids": embed["partial_embedding_ids"], "zero_embedding_ids": embed["zero_embedding_ids"], "count_unit": "conformers"}, "EmbedMolecules"),
-        ("E06", "MMFF94 optimization", {"attempted_conformer_count": attempted, "converged_conformer_count": converged_count, "unconverged_conformer_count": attempted - converged_count, "per_conformer_records": public_per_records, "selected_conformer_records": public_selected_records, "energy_unit": "kcal/mol", "comparison_scope": "within molecule only"}, "MMFFOptimizeMoleculesConfs"),
+        ("E01", "Library inspection", {
+            "raw_count": molecule_count + len(state.invalid_ids),
+            "valid_count": molecule_count,
+            "invalid_count": len(state.invalid_ids),
+            "invalid_ids": list(state.invalid_ids),
+            "preview_count": min(molecule_count, 24),
+            "count_unit": "rows",
+        }, "RDKit input validation"),
+        ("E02", "Morgan fingerprints", {
+            "fingerprint_radius": radius,
+            "fingerprint_size_bits": fingerprint_size,
+            "packed_shape": fingerprint["packed_shape"],
+            "molecule_count": fingerprint["molecule_count"],
+            "active_bits_min": fingerprint["active_bits_min"],
+            "active_bits_median": fingerprint["active_bits_median"],
+            "active_bits_max": fingerprint["active_bits_max"],
+            "executor": "nvMolKit GPU",
+            "size_unit": "bits",
+        }, "MorganFingerprintGenerator"),
+        ("E03", "Tanimoto similarity", similarity, "crossTanimotoSimilarity"),
+        ("E04", "Fused Butina clusters", {
+            "cutoff": cluster["cluster_cutoff"],
+            "cluster_count": cluster["cluster_count"],
+            "singleton_count": cluster["singleton_count"],
+            "singleton_fraction": cluster["singleton_fraction"],
+            "largest_cluster_sizes": cluster["largest_cluster_sizes"],
+            "assignment_count": cluster["assignment_count"],
+            "cutoff_unit": "Tanimoto distance",
+        }, "fused_butina"),
+        ("E05", "Representative embedding", embedding, "EmbedMolecules"),
+        ("E06", "MMFF94 optimization", optimization, "MMFFOptimizeMoleculesConfs"),
     )
-    return WorkflowReport(
-        evidence=tuple(
-            EvidenceRecord(key, label, _canonical_json(payload), provenance)
-            for key, label, payload, provenance in payloads
-        )
-    )
+    return WorkflowReport(tuple(
+        EvidenceRecord(key, label, _canonical_json(payload), provenance)
+        for key, label, payload, provenance in payloads
+    ))
