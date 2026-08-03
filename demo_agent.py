@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Callable, Literal
 
 from openai import AuthenticationError, OpenAI, PermissionDeniedError
 from pydantic import (
@@ -454,6 +454,20 @@ def _executor_arguments(name: str, arguments: BaseModel) -> dict[str, Any]:
     return {}
 
 
+ProgressCallback = Callable[[str, Any], None]
+
+
+def _emit_progress(callback: ProgressCallback | None, event: str, payload: Any) -> None:
+    if callback is None:
+        return
+    try:
+        callback(event, payload)
+    except ToolCallError:
+        raise
+    except Exception:
+        raise ToolCallError("Local progress display failed.") from None
+
+
 def run_scientific_loop(
     user_goal: str,
     api_key: str,
@@ -461,6 +475,7 @@ def run_scientific_loop(
     client: Any = None,
     executors: dict[str, Any] | None = None,
     state: WorkflowState | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> ScientificLoopResult:
     """Run one plan and six phase-gated scientific tool calls in one history."""
     _validate_api_key(api_key)
@@ -482,9 +497,14 @@ def run_scientific_loop(
         state=state or WorkflowState(),
     )
     stage_results: list[StageResult] = []
-    plan = _request_call(
-        session, active_client, "submit_workflow_plan", WorkflowPlan, DEFAULT_MODEL
-    )
+    try:
+        plan = _request_call(
+            session, active_client, "submit_workflow_plan", WorkflowPlan, DEFAULT_MODEL
+        )
+    except Exception as error:
+        _emit_progress(progress_callback, "failure", str(error))
+        raise
+    _emit_progress(progress_callback, "plan", plan)
     _append_tool_result(
         session,
         {
@@ -496,64 +516,119 @@ def run_scientific_loop(
     for stage in STAGES:
         if session.eligible_tool_name() != stage:
             raise ToolCallError("The scientific workflow state is out of phase.")
-        arguments = _request_call(
-            session, active_client, stage, TOOL_ARGUMENT_MODELS[stage], DEFAULT_MODEL
-        )
+        try:
+            arguments = _request_call(
+                session, active_client, stage, TOOL_ARGUMENT_MODELS[stage], DEFAULT_MODEL
+            )
+        except Exception as error:
+            _emit_progress(progress_callback, "failure", str(error))
+            raise
         try:
             result = active_executors[stage](
                 session.state, **_executor_arguments(stage, arguments)
             )
         except Exception:
+            _emit_progress(progress_callback, "failure", "The scientific executor failed.")
             raise ToolCallError("The scientific executor failed.") from None
         if not isinstance(result, StageResult) or result.stage != stage:
+            _emit_progress(progress_callback, "failure", "The scientific executor returned an invalid stage result.")
             raise ToolCallError("The scientific executor returned an invalid stage result.")
         if session.state.phase is not POST_STAGE_PHASES[stage]:
+            _emit_progress(progress_callback, "failure", "The scientific executor left the workflow out of phase.")
             raise ToolCallError("The scientific executor left the workflow out of phase.")
         stage_results.append(result)
-        _append_tool_result(
-            session,
-            {
-                "stage": stage,
-                "decision_basis": getattr(arguments, "decision_basis", None),
-                "summary": result.summary,
-            },
-        )
+        try:
+            _append_tool_result(
+                session,
+                {
+                    "stage": stage,
+                    "decision_basis": getattr(arguments, "decision_basis", None),
+                    "summary": result.summary,
+                },
+            )
+        except Exception as error:
+            _emit_progress(progress_callback, "failure", str(error))
+            raise
+        _emit_progress(progress_callback, "stage", {"result": result, "arguments": arguments})
 
     if session.state.phase is not WorkflowPhase.OPTIMIZED or session.turn_count != 7:
         raise ToolCallError("The scientific workflow did not complete exactly once.")
     try:
         report = active_executors["build_workflow_report"](session.state)
     except Exception:
+        _emit_progress(progress_callback, "failure", "The scientific report could not be built.")
         raise ToolCallError("The scientific report could not be built.") from None
     if not isinstance(report, WorkflowReport):
+        _emit_progress(progress_callback, "failure", "The scientific report was invalid.")
         raise ToolCallError("The scientific report was invalid.")
     return ScientificLoopResult(tuple(session.messages), report, plan, tuple(stage_results), session.turn_count)
 
 
-def _report_evidence(report: WorkflowReport) -> str:
-    return "\n".join(
-        f"- **{item.key} — {item.label}** (`{item.provenance}`): `{item.payload_json}`"
-        for item in report.evidence
-    )
+_STAGE_METRICS = {
+    "inspect_library": ("raw_count", "valid_count", "invalid_count", "invalid_ids", "preview_count"),
+    "generate_morgan_fingerprints": ("molecule_count", "active_bits_min", "active_bits_median", "active_bits_max"),
+    "measure_tanimoto_similarity": ("q1", "median", "q3", "p90", "max", "most_similar_nonidentical_pair"),
+    "discover_fused_butina_clusters": ("cluster_cutoff", "cluster_count", "singleton_count", "largest_cluster_sizes"),
+    "embed_representative_conformers": ("selected_representative_count", "selection_shortfall", "generated_conformer_count", "partial_embedding_ids", "zero_embedding_ids"),
+    "optimize_conformers_mmff94": ("attempted_conformer_count", "converged_conformer_count", "unconverged_conformer_count"),
+}
 
 
-def _display_workflow(result: WorkflowResult) -> None:
+def _display_progress_event(event: str, payload: Any) -> None:
     from IPython.display import Markdown, display
 
-    plan = "\n".join(f"- `{item.stage}` — {item.rationale}" for item in result.plan.stages)
-    display(Markdown(f"## Nemotron plan\n{plan}"))
-    display(Markdown("## Continuous execution"))
-    for stage in result.stage_results:
-        display(Markdown(f"### {stage.display_label}\n```json\n{_serialize(stage.summary)}\n```"))
-        for figure in stage.figures:
-            display(figure)
-    evidence = _report_evidence(result.report)
+    if event == "plan":
+        lines = "\n".join(f"- `{item.stage}` — {item.rationale}" for item in payload.stages)
+        display(Markdown(f"## Nemotron plan\n{lines}"))
+        return
+    if event == "failure":
+        display(Markdown(f"**Workflow stopped:** {payload}"))
+        return
+    result, arguments = payload["result"], payload["arguments"]
+    chosen = arguments.model_dump(mode="json", exclude={"decision_basis"})
+    lines = [f"- `{key}`: `{value}`" for key, value in chosen.items() if value not in (None, "", [], {})]
+    if not lines:
+        lines.append("- No model-selected parameters for this fixed step.")
+    if basis := getattr(arguments, "decision_basis", None):
+        lines.append(f"- Decision summary: {basis}")
+    metrics = {key: result.summary[key] for key in _STAGE_METRICS[result.stage] if key in result.summary}
+    if metrics:
+        lines.extend(["", "Result:", *(f"- `{key}`: `{value}`" for key, value in metrics.items())])
+    display(Markdown(f"### Nemotron → {result.display_label}\n" + "\n".join(lines)))
+    for figure in result.figures:
+        display(figure)
+
+
+def _compact_evidence(report: WorkflowReport) -> str:
+    try:
+        e = {record.key: json.loads(record.payload_json) for record in report.evidence}
+    except (TypeError, json.JSONDecodeError):
+        raise ToolCallError(_SERIALIZATION_ERROR) from None
+    p1, p2, p3, p4, p5, p6 = (e.get(f"E0{i}", {}) for i in range(1, 7))
+    representatives = [item.get("molecule_id") for item in p5.get("representatives", [])]
+    lines = [
+        "## Canonical evidence",
+        f"### E01\nRaw/valid/invalid/previewed: {p1.get('raw_count', 'n/a')} / {p1.get('valid_count', 'n/a')} / {p1.get('invalid_count', 'n/a')} / {p1.get('preview_count', 'n/a')}; invalid IDs: {p1.get('invalid_ids', [])}.",
+        f"### E02\nRadius/size/molecules: {p2.get('fingerprint_radius', 'n/a')} / {p2.get('fingerprint_size_bits', 'n/a')} bits / {p2.get('molecule_count', 'n/a')}; active bits min/median/max: {p2.get('active_bits_min', 'n/a')} / {p2.get('active_bits_median', 'n/a')} / {p2.get('active_bits_max', 'n/a')}.",
+        f"### E03\nQ1/median/Q3/P90/max: {p3.get('q1', 'n/a')} / {p3.get('median', 'n/a')} / {p3.get('q3', 'n/a')} / {p3.get('p90', 'n/a')} / {p3.get('max_off_diagonal', 'n/a')}; most-similar pair: {p3.get('most_similar_pair', {})}.",
+        f"### E04\nCutoff/clusters/singletons: {p4.get('cutoff', 'n/a')} / {p4.get('cluster_count', 'n/a')} / {p4.get('singleton_count', 'n/a')}; largest sizes: {p4.get('largest_cluster_sizes', [])}.",
+        f"### E05\nRequested/selected/shortfall: {p5.get('requested_representative_count', 'n/a')} / {p5.get('selected_representative_count', 'n/a')} / {p5.get('selection_shortfall', 'n/a')}; policy: {p5.get('representative_policy', 'n/a')}; generated: {p5.get('generated_conformer_count', 'n/a')}; partial/zero: {p5.get('partial_embedding_ids', [])} / {p5.get('zero_embedding_ids', [])}; representatives: {representatives}.",
+        f"### E06\nAttempted/converged/unconverged: {p6.get('attempted_conformer_count', 'n/a')} / {p6.get('converged_conformer_count', 'n/a')} / {p6.get('unconverged_conformer_count', 'n/a')}.",
+        "| Molecule | Conformer | Energy (kcal/mol) |", "|---|---:|---:|",
+    ]
+    lines.extend(f"| {row.get('molecule_id', 'n/a')} | {row.get('conformer_index', 'n/a')} | {row.get('energy_kcal_mol', 'n/a')} |" for row in p6.get("selected_conformer_records", []))
+    return "\n".join(lines)
+
+
+def _display_conclusion(result: WorkflowResult) -> None:
+    from IPython.display import Markdown, display
+
     sections = "\n\n".join(
         f"### {section.theme.replace('_', ' ').title()}\n{section.prose} "
         f"*Evidence: {', '.join(section.evidence_keys)}*"
         for section in result.conclusion.sections
     )
-    checked = f"## Checked conclusion\n### {result.conclusion.headline}\nPython-rendered methods: 3D conformers use ETKDGv3; energies use MMFF94.\n{evidence}\n\n{sections}"
+    checked = f"## Checked conclusion\n### {result.conclusion.headline}\nPython-rendered methods: 3D conformers use ETKDGv3; energies use MMFF94.\n{_compact_evidence(result.report)}\n\n{sections}"
     display(Markdown(checked))
 
 
@@ -569,7 +644,11 @@ def run_workflow(
     """Run the scientific chain, then request and check one grounded synthesis."""
     _validate_api_key(api_key)
     active_client = client or _client(api_key)
-    scientific = run_scientific_loop(user_goal, api_key, client=active_client, executors=executors, state=state)
+    progress_callback = _display_progress_event if display_events else None
+    scientific = run_scientific_loop(
+        user_goal, api_key, client=active_client, executors=executors, state=state,
+        progress_callback=progress_callback,
+    )
     session = AgentSession(list(scientific.messages), state or WorkflowState(), 7)
     evidence = _serialize({"evidence": [item.__dict__ for item in scientific.report.evidence]})
     session.messages.append({"role": "user", "content": _SYNTHESIS_PROMPT + "\n" + evidence})
@@ -579,14 +658,17 @@ def run_workflow(
     except ConclusionValidationError:
         if display_events:
             from IPython.display import Markdown, display
-            display(Markdown(_report_evidence(scientific.report)))
+            display(Markdown(_compact_evidence(scientific.report)))
         raise
     except _HostedArgumentsValidationError:
         if display_events:
             from IPython.display import Markdown, display
-            display(Markdown(_report_evidence(scientific.report)))
+            display(Markdown(_compact_evidence(scientific.report)))
         raise ConclusionValidationError(scientific.report) from None
+    except Exception as error:
+        _emit_progress(progress_callback, "failure", str(error))
+        raise
     result = WorkflowResult(tuple(session.messages), scientific.report, scientific.plan, conclusion, scientific.stage_results, session.turn_count)
     if display_events:
-        _display_workflow(result)
+        _display_conclusion(result)
     return result

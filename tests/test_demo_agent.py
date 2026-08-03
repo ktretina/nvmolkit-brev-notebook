@@ -117,6 +117,21 @@ def full_report():
     return WorkflowReport(tuple(EvidenceRecord(f"E0{i}", f"Evidence {i}", "{}", "test") for i in range(1, 7)))
 
 
+def presentation_report():
+    payloads = (
+        {"raw_count": 26, "valid_count": 24, "invalid_count": 2, "invalid_ids": ["bad-a", "bad-b"], "preview_count": 24},
+        {"fingerprint_radius": 2, "fingerprint_size_bits": 1024, "molecule_count": 24, "active_bits_min": 7, "active_bits_median": 12.5, "active_bits_max": 21},
+        {"q1": 0.08, "median": 0.14, "q3": 0.27, "p90": 0.41, "max_off_diagonal": 0.82, "most_similar_pair": {"molecule_ids": ["mol-a", "mol-b"], "similarity": 0.82}},
+        {"cutoff": 0.5, "cluster_count": 8, "singleton_count": 3, "largest_cluster_sizes": [7, 4, 3]},
+        {"requested_representative_count": 4, "selected_representative_count": 4, "selection_shortfall": 0, "representative_policy": "include_singleton_if_available", "representatives": [{"molecule_id": "mol-a", "cluster_id": 0}, {"molecule_id": "mol-c", "cluster_id": 1}], "generated_conformer_count": 16, "partial_embedding_ids": [], "zero_embedding_ids": []},
+        {"attempted_conformer_count": 16, "converged_conformer_count": 15, "unconverged_conformer_count": 1, "per_conformer_records": [{"molecule_id": "must-not-render"}], "selected_conformer_records": [{"molecule_id": "mol-a", "conformer_index": 2, "energy_kcal_mol": 11.25}, {"molecule_id": "mol-c", "conformer_index": 0, "energy_kcal_mol": 4.5}]},
+    )
+    return WorkflowReport(tuple(
+        EvidenceRecord(f"E0{i}", f"Evidence {i}", json.dumps(payload), "test")
+        for i, payload in enumerate(payloads, 1)
+    ))
+
+
 def synthesis_arguments():
     return {
         "headline": "A coherent chemical library with bounded structural diversity",
@@ -659,19 +674,21 @@ def test_invalid_final_synthesis_displays_only_preserved_evidence_and_does_not_r
     with pytest.raises(demo_agent.ConclusionValidationError) as error:
         demo_agent.run_workflow(
             "Analyze.", VALID_API_KEY, display_events=True,
-            client=fake_client(completions), executors={**fake_executors(), "build_workflow_report": lambda state: full_report()},
+            client=fake_client(completions), executors={**fake_executors(), "build_workflow_report": lambda state: presentation_report()},
         )
 
     assert len(completions.calls) == 8
-    assert error.value.report == full_report()
+    assert error.value.report == presentation_report()
     assert error.value.rejected_prose is None
     assert "Rejected" not in str(error.value)
     rendered = "\n".join(getattr(item, "data", str(item)) for item in shown)
     assert all(key in rendered for key in ("E01", "E02", "E03", "E04", "E05", "E06"))
     assert "Rejected synthesis" not in rendered
+    assert "must-not-render" not in rendered
+    assert "per_conformer_records" not in rendered
 
 
-def test_empty_final_hosted_response_keeps_protocol_error_and_does_not_render(monkeypatch):
+def test_empty_final_hosted_response_keeps_protocol_error_and_prior_progress(monkeypatch):
     shown = []
     monkeypatch.setattr("IPython.display.display", lambda *items: shown.extend(items))
     completions = FakeCompletions(valid_responses() + [SimpleNamespace(choices=[])])
@@ -679,28 +696,87 @@ def test_empty_final_hosted_response_keeps_protocol_error_and_does_not_render(mo
     with pytest.raises(demo_agent.ToolCallError, match="strict validation") as error:
         demo_agent.run_workflow(
             "Analyze.", VALID_API_KEY, display_events=True,
-            client=fake_client(completions), executors={**fake_executors(), "build_workflow_report": lambda state: full_report()},
+            client=fake_client(completions), executors={**fake_executors(), "build_workflow_report": lambda state: presentation_report()},
         )
 
     assert not isinstance(error.value, demo_agent.ConclusionValidationError)
     assert len(completions.calls) == 8
-    assert shown == []
+    rendered = "\n".join(getattr(item, "data", str(item)) for item in shown)
+    assert "Nemotron plan" in rendered
+    assert "figure-optimize_conformers_mmff94" in rendered
+    assert "Workflow stopped" in rendered
 
 
-def test_display_workflow_shows_only_three_headings_stage_artifacts_and_checked_content(monkeypatch):
+def test_workflow_streams_plan_six_stages_then_compact_checked_conclusion(monkeypatch):
     shown = []
     monkeypatch.setattr("IPython.display.display", lambda *items: shown.extend(items))
     completions = FakeCompletions(workflow_responses())
     result = demo_agent.run_workflow(
         "Analyze.", VALID_API_KEY, display_events=True,
-        client=fake_client(completions), executors={**fake_executors(), "build_workflow_report": lambda state: full_report()},
+        client=fake_client(completions), executors={**fake_executors(), "build_workflow_report": lambda state: presentation_report()},
     )
 
     rendered = "\n".join(getattr(item, "data", str(item)) for item in shown)
     assert rendered.count("## Nemotron plan") == 1
-    assert rendered.count("## Continuous execution") == 1
     assert rendered.count("## Checked conclusion") == 1
-    assert all(stage in rendered for stage in STAGES)
+    assert all(f"Nemotron → {stage}" in rendered for stage in STAGES)
     assert all(item.rationale in rendered for item in result.plan.stages)
+    assert "radius" in rendered and "1024" in rendered
+    assert "decision_basis" not in rendered
+    assert VALID_ARGS["generate_morgan_fingerprints"]["decision_basis"] in rendered
     assert all(f"figure-{stage}" in rendered for stage in STAGES)
     assert result.conclusion.headline in rendered
+    assert rendered.index("## Nemotron plan") < rendered.index("Nemotron → inspect_library")
+    assert rendered.index("Nemotron → optimize_conformers_mmff94") < rendered.index("## Checked conclusion")
+    assert "must-not-render" not in rendered
+    assert "per_conformer_records" not in rendered
+    assert "representative_eligibility" not in rendered
+    assert '"raw_count":26' not in rendered
+
+
+def test_mid_loop_executor_failure_keeps_prior_events_and_marks_failure(monkeypatch):
+    shown = []
+    monkeypatch.setattr("IPython.display.display", lambda *items: shown.extend(items))
+    executors = fake_executors()
+    executors["measure_tanimoto_similarity"] = lambda state: (_ for _ in ()).throw(RuntimeError("secret"))
+
+    with pytest.raises(demo_agent.ToolCallError, match="executor failed"):
+        demo_agent.run_workflow(
+            "Analyze.", VALID_API_KEY, display_events=True,
+            client=fake_client(FakeCompletions(workflow_responses())), executors=executors,
+        )
+
+    rendered = "\n".join(getattr(item, "data", str(item)) for item in shown)
+    assert "Nemotron plan" in rendered
+    assert "figure-generate_morgan_fingerprints" in rendered
+    assert "figure-measure_tanimoto_similarity" not in rendered
+    assert "Workflow stopped" in rendered
+
+
+def test_display_events_false_performs_no_display_calls(monkeypatch):
+    shown = []
+    monkeypatch.setattr("IPython.display.display", lambda *items: shown.extend(items))
+
+    demo_agent.run_workflow(
+        "Analyze.", VALID_API_KEY, display_events=False,
+        client=fake_client(FakeCompletions(workflow_responses())),
+        executors={**fake_executors(), "build_workflow_report": lambda state: presentation_report()},
+    )
+
+    assert shown == []
+
+
+def test_progress_callback_failure_stops_before_the_next_hosted_turn():
+    completions = FakeCompletions(valid_responses())
+
+    def fail_on_first_stage(event, payload):
+        if event == "stage":
+            raise RuntimeError("display backend unavailable")
+
+    with pytest.raises(demo_agent.ToolCallError, match="Local progress display failed"):
+        demo_agent.run_scientific_loop(
+            "Analyze.", VALID_API_KEY, client=fake_client(completions),
+            executors=fake_executors(), progress_callback=fail_on_first_stage,
+        )
+
+    assert len(completions.calls) == 2
