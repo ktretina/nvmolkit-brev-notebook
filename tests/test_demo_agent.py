@@ -526,6 +526,28 @@ def test_nonstring_assistant_content_stops_before_executor(content):
     assert len(completions.calls) == 2
 
 
+def test_string_assistant_content_is_discarded_before_valid_tool_call_is_retained():
+    session = demo_agent.AgentSession(
+        messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+        state=WorkflowState(),
+    )
+    completions = FakeCompletions(
+        [response("inspect_library", {}, content="I will inspect the library.")]
+    )
+
+    parsed = demo_agent._request_call(
+        session,
+        fake_client(completions),
+        "inspect_library",
+        demo_agent.InspectionArgs,
+        demo_agent.DEFAULT_MODEL,
+    )
+
+    assert parsed == demo_agent.InspectionArgs()
+    assert session.messages[-1]["content"] is None
+    assert session.messages[-1]["tool_calls"][0]["function"]["name"] == "inspect_library"
+
+
 @pytest.mark.parametrize(
     ("arguments", "expected_fields"),
     [
