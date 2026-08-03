@@ -565,6 +565,55 @@ def test_fingerprint_validation_error_exposes_only_safe_signature(
     assert SECRET not in rendered
 
 
+def test_redundant_matching_stage_metadata_is_removed_before_strict_validation():
+    session = demo_agent.AgentSession(
+        messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+        state=WorkflowState(),
+    )
+    arguments = {
+        "stage": "discover_fused_butina_clusters",
+        **VALID_ARGS["discover_fused_butina_clusters"],
+    }
+    completions = FakeCompletions(
+        [response("discover_fused_butina_clusters", arguments)]
+    )
+
+    parsed = demo_agent._request_call(
+        session,
+        fake_client(completions),
+        "discover_fused_butina_clusters",
+        demo_agent.ClusterArgs,
+        demo_agent.DEFAULT_MODEL,
+    )
+
+    assert parsed == demo_agent.ClusterArgs.model_validate(
+        VALID_ARGS["discover_fused_butina_clusters"]
+    )
+
+
+def test_redundant_mismatched_stage_metadata_fails_closed():
+    session = demo_agent.AgentSession(
+        messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+        state=WorkflowState(),
+    )
+    arguments = {
+        "stage": "embed_representative_conformers",
+        **VALID_ARGS["discover_fused_butina_clusters"],
+    }
+    completions = FakeCompletions(
+        [response("discover_fused_butina_clusters", arguments)]
+    )
+
+    with pytest.raises(demo_agent.ToolCallError, match="out of phase"):
+        demo_agent._request_call(
+            session,
+            fake_client(completions),
+            "discover_fused_butina_clusters",
+            demo_agent.ClusterArgs,
+            demo_agent.DEFAULT_MODEL,
+        )
+
+
 def test_repeated_or_out_of_phase_call_stops_before_wrong_executor():
     responses = valid_responses()
     responses[2] = response("inspect_library", {})
