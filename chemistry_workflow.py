@@ -63,7 +63,13 @@ def inspect_library(
         raise RuntimeError("inspect_library requires a state in the NEW phase")
 
     raw_records = pd.read_csv(data_path)
-    if not {"id", "smiles"}.issubset(raw_records.columns):
+    if "molecule_id" in raw_records.columns:
+        identifier_column = "molecule_id"
+    elif "id" in raw_records.columns:
+        identifier_column = "id"
+    else:
+        identifier_column = None
+    if identifier_column is None or "smiles" not in raw_records.columns:
         raise ValueError("input library requires id and smiles columns")
     if len(raw_records) != expected_rows:
         raise ValueError(
@@ -74,7 +80,7 @@ def inspect_library(
     molecules: list[Any] = []
     invalid_ids: list[str] = []
     for source_row, row in raw_records.iterrows():
-        molecule_id = str(row["id"])
+        molecule_id = str(row[identifier_column])
         smiles = str(row["smiles"])
         molecule = Chem.MolFromSmiles(smiles)
         if molecule is None:

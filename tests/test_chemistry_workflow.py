@@ -14,6 +14,9 @@ from chemistry_workflow import (
 )
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
 def _write_csv(path: Path, rows: list[dict[str, str]]) -> Path:
     pd.DataFrame(rows).to_csv(path, index=False)
     return path
@@ -114,6 +117,23 @@ def test_inspection_reports_invalid_rows_and_preserves_source_indices(
     assert len(state.molecules) == 2
     assert state.summaries == {"inspect_library": result.summary}
     assert eligible_stage(state) == "generate_morgan_fingerprints"
+
+
+def test_inspection_accepts_bundled_molecule_id_and_normalizes_records():
+    data_path = PROJECT_ROOT / "data" / "sample_molecules.csv"
+    source = pd.read_csv(data_path)
+    state = WorkflowState()
+
+    result = inspect_library(state, data_path)
+
+    assert state.phase is WorkflowPhase.INSPECTED
+    assert result.summary["raw_count"] == 256
+    assert (
+        result.summary["valid_count"] + result.summary["invalid_count"]
+        == result.summary["raw_count"]
+    )
+    assert state.records[0]["id"] == source.iloc[0]["molecule_id"]
+    assert state.records[0]["source_row"] == 0
 
 
 def test_inspection_summary_is_json_safe_and_excludes_rdkit_molecules(
