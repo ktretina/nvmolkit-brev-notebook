@@ -122,7 +122,11 @@ def test_preflight_is_fixed_gpu_ready_and_credential_safe():
         for alias in node.names
     }
     assert "run_workflow" in imports
-    assert set(NVMOLKIT_ENTRY_POINTS) <= imports
+    assert "import importlib" in code
+    assert "importlib.import_module" in code and "hasattr" in code
+    for entry_point in NVMOLKIT_ENTRY_POINTS:
+        assert code.count(f'"{entry_point}"') == 1
+        assert entry_point not in imports
     assert "sys.implementation.name == \"cpython\"" in code
     assert "sys.version_info[:2] == (3, 12)" in code
     assert "torch.cuda.is_available()" in code
