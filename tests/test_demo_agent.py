@@ -518,6 +518,53 @@ def test_nonstring_assistant_content_stops_before_executor(content):
     assert len(completions.calls) == 2
 
 
+@pytest.mark.parametrize(
+    ("arguments", "expected_fields"),
+    [
+        (
+            {
+                "fingerprint_radius": 2,
+                "fingerprint_size": 1024,
+                "decision_basis": "Use a compact molecular representation.",
+            },
+            {"radius", "size", "fingerprint_radius", "fingerprint_size"},
+        ),
+        (
+            {"radius": 2, "size": 1024, "decision_basis": "short"},
+            {"decision_basis"},
+        ),
+    ],
+)
+def test_fingerprint_validation_error_exposes_only_safe_signature(
+    arguments, expected_fields
+):
+    responses = [
+        response("submit_workflow_plan", plan_arguments()),
+        response("inspect_library", {}),
+        response("generate_morgan_fingerprints", arguments),
+    ]
+    completions = FakeCompletions(responses)
+    executor_calls = []
+
+    with pytest.raises(demo_agent._HostedArgumentsValidationError) as captured:
+        demo_agent.run_scientific_loop(
+            "Analyze the library.",
+            VALID_API_KEY,
+            client=fake_client(completions),
+            executors=fake_executors(executor_calls),
+        )
+
+    error = captured.value
+    assert error.stage == "generate_morgan_fingerprints"
+    assert {field for field, _error_type in error.issues} == expected_fields
+    assert all(error_type for _field, error_type in error.issues)
+    assert executor_calls == [("inspect_library", {})]
+    rendered = str(error)
+    assert "1024" not in rendered
+    assert "compact molecular representation" not in rendered
+    assert SECRET not in rendered
+
+
 def test_repeated_or_out_of_phase_call_stops_before_wrong_executor():
     responses = valid_responses()
     responses[2] = response("inspect_library", {})

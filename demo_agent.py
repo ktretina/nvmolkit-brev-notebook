@@ -223,7 +223,13 @@ class ToolCallError(RuntimeError):
 
 
 class _HostedArgumentsValidationError(ToolCallError):
-    pass
+    def __init__(self, stage: str, issues: tuple[tuple[str, str], ...]):
+        self.stage = stage
+        self.issues = issues
+        signature = ", ".join(
+            f"{field}:{error_type}" for field, error_type in issues
+        )
+        super().__init__(f"{stage} arguments failed validation: {signature}")
 
 
 class ConclusionValidationError(ToolCallError):
@@ -404,9 +410,21 @@ def _request_call(
         arguments = argument_model.model_validate(decoded)
     except ToolCallError:
         raise
-    except ValidationError:
+    except ValidationError as error:
+        issues = tuple(
+            (
+                ".".join(str(part) for part in item["loc"]),
+                item["type"],
+            )
+            for item in error.errors(
+                include_url=False,
+                include_context=False,
+                include_input=False,
+            )
+        )
         raise _HostedArgumentsValidationError(
-            "The hosted tool arguments failed strict validation."
+            expected_name,
+            issues,
         ) from None
     except (AttributeError, IndexError, TypeError, json.JSONDecodeError):
         raise ToolCallError("The hosted tool call failed strict validation.") from None
