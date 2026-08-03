@@ -659,6 +659,10 @@ def test_final_synthesis_serializes_all_stages_and_enforces_scientific_boundarie
         "chat_template_kwargs": {"enable_thinking": False}
     }
     system_prompt = call["messages"][0]["content"]
+    assert (
+        "PhD-level scientific synthesis that remains readable in a presentation"
+        in system_prompt
+    )
     assert "450-650 words" in system_prompt
     assert all(
         theme in system_prompt.lower()

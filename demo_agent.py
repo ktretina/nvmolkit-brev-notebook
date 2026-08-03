@@ -97,8 +97,9 @@ _BRIEF_SYSTEM_PROMPT = (
 )
 
 _FINAL_SYSTEM_PROMPT = (
-    "Write a scientific synthesis of 450-650 words using all real stage summaries "
-    "supplied in the JSON payload. Address these six themes explicitly: dataset "
+    "Write a PhD-level scientific synthesis that remains readable in a presentation. "
+    "Use 450-650 words and all real stage summaries supplied in the JSON payload. "
+    "Address these six themes explicitly: dataset "
     "validity and scope; molecular representation; pairwise similarity structure; "
     "clustering and library diversity; conformational sampling and MMFF94 "
     "convergence; limitations and appropriate next analyses. Make quantitative "
