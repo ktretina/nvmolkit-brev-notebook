@@ -1069,12 +1069,32 @@ def build_workflow_report(state: WorkflowState) -> WorkflowReport:
     per_records = optimize["per_conformer_records"]
     public_per_records: list[dict[str, Any]] = []
     pair_keys: set[tuple[str, int]] = set()
+    optimization_representatives = [
+        record
+        for record in state.representative_records
+        if int(record["generated_conformer_count"]) > 0
+    ]
     for record in per_records:
         _require_exact_keys(
             record,
             {"molecule_id", "cluster_id", "conformer_index", "energy_kcal_mol", "converged", "optimization_molecule_index"},
             "per_conformer_record",
         )
+        optimization_molecule_index = int(record["optimization_molecule_index"])
+        if not 0 <= optimization_molecule_index < len(optimization_representatives):
+            raise RuntimeError("conformer provenance has an unknown molecule index.")
+        authoritative_representative = optimization_representatives[
+            optimization_molecule_index
+        ]
+        if (
+            str(record["molecule_id"])
+            != str(authoritative_representative["molecule_id"])
+            or int(record["cluster_id"])
+            != int(authoritative_representative["cluster_id"])
+        ):
+            raise RuntimeError(
+                "conformer provenance does not match its selected representative."
+            )
         pair = (str(record["molecule_id"]), int(record["conformer_index"]))
         if pair in pair_keys:
             raise RuntimeError("Conformer pairs are incomplete or duplicated.")

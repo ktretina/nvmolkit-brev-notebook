@@ -1183,3 +1183,43 @@ def test_workflow_report_rejects_deleted_required_payload_key(conformer_gpu):
     ]
     with pytest.raises(RuntimeError, match="missing or unexpected keys"):
         build_workflow_report(state)
+
+
+@pytest.mark.parametrize("field", ["molecule_id", "cluster_id"])
+def test_workflow_report_rejects_forged_unconverged_conformer_provenance(
+    conformer_gpu, field
+):
+    state = _embedded_state(conformer_gpu)
+    optimize_conformers_mmff94(state)
+    unconverged = next(
+        record
+        for record in state.summaries["optimize_conformers_mmff94"][
+            "per_conformer_records"
+        ]
+        if not record["converged"]
+    )
+    unconverged[field] = "forged" if field == "molecule_id" else 99
+    with pytest.raises(RuntimeError, match="conformer provenance"):
+        build_workflow_report(state)
+
+
+def test_workflow_report_rejects_coordinated_forgery_of_selected_labels(
+    conformer_gpu,
+):
+    state = _embedded_state(conformer_gpu)
+    optimize_conformers_mmff94(state)
+    optimization = state.summaries["optimize_conformers_mmff94"]
+    selected = optimization["selected_conformer_records"][0]
+    underlying = next(
+        record
+        for record in optimization["per_conformer_records"]
+        if record["optimization_molecule_index"]
+        == selected["optimization_molecule_index"]
+        and record["conformer_index"] == selected["conformer_index"]
+    )
+    for record in (underlying, selected):
+        record["molecule_id"] = "forged"
+        record["cluster_id"] = 99
+    selected["selected_conformer_id"] = f"forged:conf-{selected['conformer_index']}"
+    with pytest.raises(RuntimeError, match="conformer provenance"):
+        build_workflow_report(state)
