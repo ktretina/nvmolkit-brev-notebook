@@ -106,6 +106,31 @@ def valid_responses():
     ]
 
 
+THEMES = (
+    "dataset_scope", "molecular_representation", "similarity_structure",
+    "clustering", "conformational_sampling", "limitations_and_next_steps",
+)
+REQUIRED_KEYS = (("E01",), ("E02",), ("E03",), ("E04",), ("E05", "E06"), ("E01", "E06"))
+
+
+def full_report():
+    return WorkflowReport(tuple(EvidenceRecord(f"E0{i}", f"Evidence {i}", "{}", "test") for i in range(1, 7)))
+
+
+def synthesis_arguments():
+    return {
+        "headline": "A coherent chemical library with bounded structural diversity",
+        "sections": [
+            {"theme": theme, "prose": f"Qualitative interpretation for {theme.replace('_', ' ')}.", "evidence_keys": list(keys)}
+            for theme, keys in zip(THEMES, REQUIRED_KEYS)
+        ],
+    }
+
+
+def workflow_responses(synthesis=None):
+    return valid_responses() + [response("submit_synthesis", synthesis or synthesis_arguments())]
+
+
 class FakeCompletions:
     def __init__(self, responses=None, error=None):
         self.responses = list(responses or [])
@@ -134,7 +159,7 @@ def fake_executors(record=None):
             summary = {"stage": _stage, "sequence": len(calls)}
             state.summaries[_stage] = summary
             state.phase = _phase
-            return StageResult(_stage, _stage, summary)
+            return StageResult(_stage, _stage, summary, (f"figure-{_stage}",))
 
         executors[stage] = execute
     executors["build_workflow_report"] = lambda state: WorkflowReport(
@@ -528,3 +553,98 @@ def test_session_turn_limit_fails_closed():
             demo_agent.DEFAULT_MODEL,
         )
     assert completions.calls == []
+
+
+def test_valid_conclusion_is_strict_frozen_and_evidence_grounded():
+    conclusion = demo_agent.SubmitSynthesisArgs.model_validate(synthesis_arguments())
+
+    assert demo_agent.validate_conclusion(conclusion, full_report()) is conclusion
+    assert tuple(section.theme for section in conclusion.sections) == THEMES
+    assert conclusion.model_config["strict"] is True
+    with pytest.raises(ValidationError):
+        conclusion.headline = "changed"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: value["sections"].__setitem__(1, copy.deepcopy(value["sections"][0])),
+        lambda value: value["sections"].pop(),
+        lambda value: value["sections"][0].__setitem__("evidence_keys", []),
+        lambda value: value["sections"][0].__setitem__("evidence_keys", ["E09"]),
+        lambda value: value["sections"][2].__setitem__("evidence_keys", ["E04"]),
+        lambda value: value["sections"][4].__setitem__("evidence_keys", ["E05"]),
+        lambda value: value.__setitem__("headline", "A library with 2 regimes"),
+        lambda value: value["sections"][3].__setitem__("prose", "There are 3 qualitative groups."),
+    ],
+    ids=("duplicate", "missing", "empty", "unknown", "wrong-theme", "global-missing", "digit-headline", "digit-prose"),
+)
+def test_invalid_conclusion_fails_closed_without_retaining_prose(mutation):
+    arguments = synthesis_arguments()
+    mutation(arguments)
+
+    try:
+        conclusion = demo_agent.SubmitSynthesisArgs.model_validate(arguments)
+        with pytest.raises(demo_agent.ConclusionValidationError) as error:
+            demo_agent.validate_conclusion(conclusion, full_report())
+    except ValidationError:
+        return
+
+    assert error.value.report == full_report()
+    assert error.value.rejected_prose is None
+    assert arguments["headline"] not in str(error.value)
+
+
+def test_run_workflow_adds_one_checked_eighth_turn_and_retains_stage_results():
+    completions = FakeCompletions(workflow_responses())
+    result = demo_agent.run_workflow(
+        "Analyze the library.", VALID_API_KEY, display_events=False,
+        client=fake_client(completions), executors={**fake_executors(), "build_workflow_report": lambda state: full_report()},
+    )
+
+    assert result.turn_count == 8 == len(completions.calls)
+    assert len(result.stage_results) == 6
+    assert tuple(item.stage for item in result.stage_results) == STAGES
+    assert result.messages[-1]["role"] == "assistant"
+    assert result.messages[-1]["tool_calls"][0]["function"]["name"] == "submit_synthesis"
+    assert not any(message["role"] == "tool" for message in result.messages[-1:])
+    assert completions.calls[-1]["messages"] == list(result.messages[:-1])
+    assert json.loads(result.messages[-2]["content"].split("\n", 1)[1]) == {
+        "evidence": [record.__dict__ for record in full_report().evidence]
+    }
+
+
+def test_invalid_final_synthesis_preserves_report_withholds_text_and_does_not_retry():
+    invalid = synthesis_arguments()
+    invalid["headline"] = "Rejected synthesis"
+    invalid["sections"][0]["evidence_keys"] = []
+    completions = FakeCompletions(workflow_responses(invalid))
+
+    with pytest.raises(demo_agent.ConclusionValidationError) as error:
+        demo_agent.run_workflow(
+            "Analyze.", VALID_API_KEY, display_events=False,
+            client=fake_client(completions), executors={**fake_executors(), "build_workflow_report": lambda state: full_report()},
+        )
+
+    assert len(completions.calls) == 8
+    assert error.value.report == full_report()
+    assert error.value.rejected_prose is None
+    assert "Rejected" not in str(error.value)
+
+
+def test_display_workflow_shows_only_three_headings_stage_artifacts_and_checked_content(monkeypatch):
+    shown = []
+    monkeypatch.setattr("IPython.display.display", lambda *items: shown.extend(items))
+    completions = FakeCompletions(workflow_responses())
+    result = demo_agent.run_workflow(
+        "Analyze.", VALID_API_KEY, display_events=True,
+        client=fake_client(completions), executors={**fake_executors(), "build_workflow_report": lambda state: full_report()},
+    )
+
+    rendered = "\n".join(getattr(item, "data", str(item)) for item in shown)
+    assert rendered.count("## Nemotron plan") == 1
+    assert rendered.count("## Continuous execution") == 1
+    assert rendered.count("## Checked conclusion") == 1
+    assert all(stage in rendered for stage in STAGES)
+    assert all(f"figure-{stage}" in rendered for stage in STAGES)
+    assert result.conclusion.headline in rendered

@@ -46,6 +46,11 @@ _REQUEST_ERROR = (
     "The hosted Nemotron request failed. Check network access and model availability."
 )
 _SERIALIZATION_ERROR = "The scientific result could not be serialized safely."
+_SYNTHESIS_PROMPT = (
+    "Produce one detailed PhD-level but presentation-readable integrated interpretation. Cite only supplied evidence keys; use no numeric literals in authored text. "
+    "Do not infer binding, activity, ADMET, efficacy, safety, synthesizability, clinical relevance, or experimental truth. State that force-field energies compare conformers only within each molecule. "
+    "Exact quantities, three-dimensional methods, ETKDGv3, and MMFF94 are rendered separately from canonical evidence."
+)
 _SKILL_PATH = Path(__file__).resolve().parent / "skills" / "nvmolkit" / "SKILL.md"
 _DATA_PATH = Path(__file__).resolve().parent / "data" / "sample_molecules.csv"
 
@@ -141,6 +146,24 @@ class WorkflowPlan(_StrictModel):
         return self
 
 
+ConclusionTheme = Literal[
+    "dataset_scope", "molecular_representation", "similarity_structure",
+    "clustering", "conformational_sampling", "limitations_and_next_steps",
+]
+EvidenceKey = Literal["E01", "E02", "E03", "E04", "E05", "E06"]
+
+
+class ConclusionSection(_StrictModel):
+    theme: ConclusionTheme
+    prose: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1200)]
+    evidence_keys: list[EvidenceKey] = Field(min_length=1)
+
+
+class SubmitSynthesisArgs(_StrictModel):
+    headline: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)]
+    sections: list[ConclusionSection] = Field(min_length=6, max_length=6)
+
+
 TOOL_ARGUMENT_MODELS: dict[str, type[BaseModel]] = {
     "inspect_library": InspectionArgs,
     "generate_morgan_fingerprints": FingerprintArgs,
@@ -157,11 +180,19 @@ TOOL_DESCRIPTIONS = {
     "discover_fused_butina_clusters": "Choose a bounded cutoff and run nvMolKit fused Butina clustering on the GPU.",
     "embed_representative_conformers": "Choose bounded sampling parameters and run nvMolKit conformer embedding on the GPU.",
     "optimize_conformers_mmff94": "Run nvMolKit MMFF94 conformer optimization on the GPU.",
+    "submit_synthesis": "Submit one evidence-cited qualitative scientific synthesis.",
 }
 
 
 class ToolCallError(RuntimeError):
     """A secret-safe failure in the bounded hosted or scientific loop."""
+
+
+class ConclusionValidationError(ToolCallError):
+    def __init__(self, report: WorkflowReport):
+        super().__init__("Nemotron synthesis failed validation; canonical evidence is preserved.")
+        self.report = report
+        self.rejected_prose = None
 
 
 @dataclass
@@ -178,7 +209,17 @@ class AgentSession:
 class ScientificLoopResult:
     messages: tuple[dict[str, Any], ...]
     report: WorkflowReport
+    stage_results: tuple[StageResult, ...]
     turn_count: int
+
+
+@dataclass(frozen=True)
+class WorkflowResult:
+    messages: tuple[dict[str, Any], ...]
+    report: WorkflowReport
+    conclusion: SubmitSynthesisArgs
+    stage_results: tuple[StageResult, ...]
+    turn_count: int = 8
 
 
 def _client(api_key: str) -> OpenAI:
@@ -219,6 +260,31 @@ def _serialize(value: Any) -> str:
         raise ToolCallError(_SERIALIZATION_ERROR) from None
 
 
+_REQUIRED_CONCLUSION_EVIDENCE = {
+    "dataset_scope": {"E01"},
+    "molecular_representation": {"E02"},
+    "similarity_structure": {"E03"},
+    "clustering": {"E04"},
+    "conformational_sampling": {"E05", "E06"},
+    "limitations_and_next_steps": {"E01", "E06"},
+}
+
+
+def validate_conclusion(conclusion: SubmitSynthesisArgs, report: WorkflowReport) -> SubmitSynthesisArgs:
+    themes = [section.theme for section in conclusion.sections]
+    cited = {key for section in conclusion.sections for key in section.evidence_keys}
+    report_keys = tuple(record.key for record in report.evidence)
+    known = set(report_keys)
+    prose = conclusion.headline + "".join(section.prose for section in conclusion.sections)
+    valid = set(themes) == set(_REQUIRED_CONCLUSION_EVIDENCE) and len(themes) == len(set(themes))
+    valid &= report_keys == EvidenceKey.__args__ and cited == known
+    valid &= all(_REQUIRED_CONCLUSION_EVIDENCE[item.theme] <= set(item.evidence_keys) for item in conclusion.sections)
+    valid &= not any(character.isascii() and character.isdigit() for character in prose)
+    if not valid:
+        raise ConclusionValidationError(report)
+    return conclusion
+
+
 def _tool_definition(name: str, model: type[BaseModel]) -> dict[str, Any]:
     parameters = model.model_json_schema()
     parameters["additionalProperties"] = False
@@ -248,7 +314,7 @@ def _request_call(
     model: str,
 ) -> BaseModel:
     """Request, validate, and append exactly one forced hosted call."""
-    if session.turn_count >= 7:
+    if session.turn_count >= 8 or (session.turn_count == 7 and expected_name != "submit_synthesis"):
         raise ToolCallError("The bounded hosted turn limit was reached.")
     try:
         response = client.chat.completions.create(
@@ -261,7 +327,7 @@ def _request_call(
             },
             extra_body=NEMOTRON_TOOL_EXTRA_BODY,
             temperature=0.2,
-            max_tokens=900 if expected_name == "submit_workflow_plan" else 400,
+            max_tokens={"submit_synthesis": 1800, "submit_workflow_plan": 900}.get(expected_name, 400),
             stream=False,
         )
     except Exception as error:
@@ -401,6 +467,7 @@ def run_scientific_loop(
         ],
         state=state or WorkflowState(),
     )
+    stage_results: list[StageResult] = []
     plan = _request_call(
         session, active_client, "submit_workflow_plan", WorkflowPlan, DEFAULT_MODEL
     )
@@ -428,6 +495,7 @@ def run_scientific_loop(
             raise ToolCallError("The scientific executor returned an invalid stage result.")
         if session.state.phase is not POST_STAGE_PHASES[stage]:
             raise ToolCallError("The scientific executor left the workflow out of phase.")
+        stage_results.append(result)
         _append_tool_result(
             session,
             {
@@ -445,4 +513,54 @@ def run_scientific_loop(
         raise ToolCallError("The scientific report could not be built.") from None
     if not isinstance(report, WorkflowReport):
         raise ToolCallError("The scientific report was invalid.")
-    return ScientificLoopResult(tuple(session.messages), report, session.turn_count)
+    return ScientificLoopResult(tuple(session.messages), report, tuple(stage_results), session.turn_count)
+
+
+def _display_workflow(result: WorkflowResult) -> None:
+    from IPython.display import Markdown, display
+
+    plan = "Inspect, represent, compare, cluster, sample conformers, then optimize."
+    display(Markdown(f"## Nemotron plan\n{plan}"))
+    display(Markdown("## Continuous execution"))
+    for stage in result.stage_results:
+        display(Markdown(f"### {stage.display_label}\n```json\n{_serialize(stage.summary)}\n```"))
+        for figure in stage.figures:
+            display(figure)
+    evidence = "\n".join(
+        f"- **{item.key} — {item.label}** (`{item.provenance}`): `{item.payload_json}`"
+        for item in result.report.evidence
+    )
+    sections = "\n\n".join(
+        f"### {section.theme.replace('_', ' ').title()}\n{section.prose} "
+        f"*Evidence: {', '.join(section.evidence_keys)}*"
+        for section in result.conclusion.sections
+    )
+    checked = f"## Checked conclusion\n### {result.conclusion.headline}\nPython-rendered methods: 3D conformers use ETKDGv3; energies use MMFF94.\n{evidence}\n\n{sections}"
+    display(Markdown(checked))
+
+
+def run_workflow(
+    user_goal: str,
+    api_key: str,
+    display_events: bool = True,
+    *,
+    client: Any = None,
+    executors: dict[str, Any] | None = None,
+    state: WorkflowState | None = None,
+) -> WorkflowResult:
+    """Run the scientific chain, then request and check one grounded synthesis."""
+    _validate_api_key(api_key)
+    active_client = client or _client(api_key)
+    scientific = run_scientific_loop(user_goal, api_key, client=active_client, executors=executors, state=state)
+    session = AgentSession(list(scientific.messages), state or WorkflowState(), 7)
+    evidence = _serialize({"evidence": [item.__dict__ for item in scientific.report.evidence]})
+    session.messages.append({"role": "user", "content": _SYNTHESIS_PROMPT + "\n" + evidence})
+    try:
+        conclusion = _request_call(session, active_client, "submit_synthesis", SubmitSynthesisArgs, DEFAULT_MODEL)
+        conclusion = validate_conclusion(conclusion, scientific.report)
+    except ToolCallError:
+        raise ConclusionValidationError(scientific.report) from None
+    result = WorkflowResult(tuple(session.messages), scientific.report, conclusion, scientific.stage_results, session.turn_count)
+    if display_events:
+        _display_workflow(result)
+    return result
