@@ -598,6 +598,34 @@ def test_leading_json_content_is_validated_as_the_forced_tool_call():
     ]
 
 
+def test_hosted_numeric_string_cutoff_is_normalized_before_strict_validation():
+    session = demo_agent.AgentSession(
+        messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+        state=WorkflowState(),
+    )
+    hosted_arguments = {
+        **VALID_ARGS["discover_fused_butina_clusters"],
+        "cutoff": "0.5",
+    }
+    completions = FakeCompletions(
+        [response("discover_fused_butina_clusters", hosted_arguments)]
+    )
+
+    parsed = demo_agent._request_call(
+        session,
+        fake_client(completions),
+        "discover_fused_butina_clusters",
+        demo_agent.ClusterArgs,
+        demo_agent.DEFAULT_MODEL,
+    )
+
+    assert parsed.cutoff == 0.5
+    retained = json.loads(
+        session.messages[-1]["tool_calls"][0]["function"]["arguments"]
+    )
+    assert retained["cutoff"] == 0.5
+
+
 def test_text_only_response_gets_two_bounded_retries_before_any_executor():
     text_only = SimpleNamespace(
         choices=[

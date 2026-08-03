@@ -448,6 +448,18 @@ def _request_call(
                 key: decoded[key] for key in declared_fields if key in decoded
             }
             raw_arguments = _serialize(decoded)
+        cutoff = decoded.get("cutoff")
+        if expected_name == "discover_fused_butina_clusters" and isinstance(
+            cutoff, str
+        ):
+            compact_cutoff = cutoff.strip()
+            if (
+                compact_cutoff
+                and compact_cutoff.count(".") <= 1
+                and compact_cutoff.replace(".", "").isdigit()
+            ):
+                decoded = {**decoded, "cutoff": float(compact_cutoff)}
+                raw_arguments = _serialize(decoded)
         decision_basis = decoded.get("decision_basis")
         if isinstance(decision_basis, str):
             compact_basis = " ".join(decision_basis.replace("`", "").split())
