@@ -713,9 +713,10 @@ def test_representative_types_are_exact_and_evidence_is_frozen_and_canonical():
 
 def test_representatives_follow_cluster_size_then_source_row_and_member_source_row():
     state = _clustered_state()
-    selected = select_representatives(
+    selected, shortfall = select_representatives(
         state, 3, RepresentativePolicy.LARGEST_CLUSTERS_FIRST
     )
+    assert shortfall == 0
     assert selected == [
         {"molecule_id": "mol-1", "source_row": 2, "cluster_id": 0, "molecule_index": 1},
         {"molecule_id": "mol-3", "source_row": 4, "cluster_id": 1, "molecule_index": 3},
@@ -738,19 +739,21 @@ def test_singleton_policy_reserves_one_singleton_without_duplicate_cluster():
         }
         for cluster_id, cluster in enumerate(state.clusters)
     ]
-    selected = select_representatives(
+    selected, shortfall = select_representatives(
         state, 3, RepresentativePolicy.INCLUDE_SINGLETON_IF_AVAILABLE
     )
+    assert shortfall == 0
     assert [item["cluster_id"] for item in selected] == [2, 0, 3]
     assert len({item["cluster_id"] for item in selected}) == 3
 
 
 def test_representative_selection_reports_shortfall_and_rejects_fewer_than_three_clusters():
     state = _clustered_state()
-    selected = select_representatives(
+    selected, shortfall = select_representatives(
         state, 6, RepresentativePolicy.LARGEST_CLUSTERS_FIRST
     )
     assert len(selected) == 4
+    assert shortfall == 2
 
     eligibility = state.summaries["discover_fused_butina_clusters"][
         "representative_eligibility"
@@ -877,6 +880,8 @@ def test_embedding_validates_bounds_before_execution(conformer_gpu, kwargs, mess
 
 def _embedded_state(conformer_gpu) -> WorkflowState:
     state = _clustered_state()
+    state.fingerprints = _FakeGpuResult(np.zeros((7, 32), dtype=np.int32))
+    state.similarity = _FakeGpuResult(np.eye(7, dtype=float))
     embed_representative_conformers(
         state,
         representative_count=3,
@@ -1105,4 +1110,76 @@ def test_workflow_report_rejects_unexpected_keys_and_nonfinite_values(
     optimize_conformers_mmff94(state)
     mutation(state.summaries["measure_tanimoto_similarity"])
     with pytest.raises(RuntimeError, match=message):
+        build_workflow_report(state)
+
+
+@pytest.mark.parametrize("artifact_name", ["fingerprints", "similarity"])
+def test_workflow_report_requires_retained_fingerprint_and_similarity_artifacts(
+    conformer_gpu, artifact_name
+):
+    state = _embedded_state(conformer_gpu)
+    optimize_conformers_mmff94(state)
+    setattr(state, artifact_name, None)
+    with pytest.raises(RuntimeError, match=f"{artifact_name[:-1] if artifact_name.endswith('s') else artifact_name} artifact"):
+        build_workflow_report(state)
+
+
+@pytest.mark.parametrize(
+    ("artifact_field", "replacement", "message"),
+    [
+        ("energies", [99.0, 1.0, 2.0, 8.0, 7.0], "energy artifact"),
+        ("converged", [0, 1, 0, 0, 1], "convergence artifact"),
+    ],
+)
+def test_workflow_report_reconciles_optimization_artifact_values(
+    conformer_gpu, artifact_field, replacement, message
+):
+    state = _embedded_state(conformer_gpu)
+    optimize_conformers_mmff94(state)
+    setattr(state.optimization_result, artifact_field, _FakeGpuResult(replacement))
+    with pytest.raises(RuntimeError, match=message):
+        build_workflow_report(state)
+
+
+@pytest.mark.parametrize("corruption", ["missing", "duplicate", "nonminimum", "forged_id"])
+def test_workflow_report_rejects_invalid_selected_conformer_records(
+    conformer_gpu, corruption
+):
+    state = _embedded_state(conformer_gpu)
+    optimize_conformers_mmff94(state)
+    selected = state.summaries["optimize_conformers_mmff94"][
+        "selected_conformer_records"
+    ]
+    per_records = state.summaries["optimize_conformers_mmff94"][
+        "per_conformer_records"
+    ]
+    if corruption == "missing":
+        selected.pop()
+    elif corruption == "duplicate":
+        selected.append(selected[0].copy())
+    elif corruption == "nonminimum":
+        replacement = next(
+            record.copy()
+            for record in per_records
+            if record["molecule_id"] == selected[0]["molecule_id"]
+            and record["converged"]
+            and record["conformer_index"] != selected[0]["conformer_index"]
+        )
+        replacement["selected_conformer_id"] = (
+            f"{replacement['molecule_id']}:conf-{replacement['conformer_index']}"
+        )
+        selected[0] = replacement
+    else:
+        selected[0]["selected_conformer_id"] = "forged"
+    with pytest.raises(RuntimeError, match="selected conformer"):
+        build_workflow_report(state)
+
+
+def test_workflow_report_rejects_deleted_required_payload_key(conformer_gpu):
+    state = _embedded_state(conformer_gpu)
+    optimize_conformers_mmff94(state)
+    del state.summaries["embed_representative_conformers"][
+        "generated_conformer_count"
+    ]
+    with pytest.raises(RuntimeError, match="missing or unexpected keys"):
         build_workflow_report(state)
