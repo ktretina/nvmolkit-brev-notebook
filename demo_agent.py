@@ -24,6 +24,7 @@ AUTH_GUIDANCE = (
 _REQUEST_ERROR = (
     "The hosted Nemotron request failed. Check network access and model availability."
 )
+_EMPTY_NARRATIVE_ERROR = "The hosted Nemotron narrative response was empty."
 
 
 class ReadSkillArgs(BaseModel):
@@ -190,6 +191,12 @@ def _raise_request_error(exc: Exception) -> None:
     raise ToolCallError(_REQUEST_ERROR) from None
 
 
+def _validate_narrative_content(content: Any) -> str:
+    if not isinstance(content, str) or not content.strip():
+        raise ToolCallError(_EMPTY_NARRATIVE_ERROR)
+    return content
+
+
 def request_tool_call(
     api_key: str,
     *,
@@ -339,9 +346,10 @@ def request_brief_interpretation(
             max_tokens=240,
             stream=False,
         )
-        return response.choices[0].message.content or ""
+        content = response.choices[0].message.content
     except Exception as exc:
         _raise_request_error(exc)
+    return _validate_narrative_content(content)
 
 
 def request_final_synthesis(
@@ -367,6 +375,7 @@ def request_final_synthesis(
             max_tokens=1000,
             stream=False,
         )
-        return response.choices[0].message.content or ""
+        content = response.choices[0].message.content
     except Exception as exc:
         _raise_request_error(exc)
+    return _validate_narrative_content(content)

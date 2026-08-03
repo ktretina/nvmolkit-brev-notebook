@@ -67,6 +67,7 @@ AUTH_GUIDANCE = (
     "must not be substituted."
 )
 GENERIC_ERROR = "The hosted Nemotron request failed. Check network access and model availability."
+EMPTY_RESPONSE_ERROR = "The hosted Nemotron narrative response was empty."
 
 
 class FakeCompletions:
@@ -696,6 +697,57 @@ def test_final_synthesis_serializes_all_stages_and_enforces_scientific_boundarie
     assert payload == analysis_summary
     assert set(payload) == set(TOOL_NAMES)
     assert result == "A bounded 500-word synthesis."
+
+
+@pytest.mark.parametrize("request_kind", ["brief", "final"])
+@pytest.mark.parametrize("content", [None, "", " \n\t"])
+def test_empty_narrative_responses_are_rejected_without_retry(request_kind, content):
+    completions = FakeCompletions(content=content)
+
+    with pytest.raises(demo_agent.ToolCallError) as exc_info:
+        if request_kind == "brief":
+            demo_agent.request_brief_interpretation(
+                VALID_API_KEY,
+                valid_decision(),
+                {"clusters": 3},
+                {"description": "cluster bars"},
+                client=fake_client(completions),
+            )
+        else:
+            demo_agent.request_final_synthesis(
+                VALID_API_KEY,
+                {"read_nvmolkit_skill": {"loaded": True}},
+                client=fake_client(completions),
+            )
+
+    assert str(exc_info.value) == EMPTY_RESPONSE_ERROR
+    assert VALID_API_KEY not in str(exc_info.value)
+    assert repr(content) not in str(exc_info.value)
+    assert len(completions.calls) == 1
+
+
+@pytest.mark.parametrize("request_kind", ["brief", "final"])
+def test_nonempty_narrative_response_is_returned_unchanged(request_kind):
+    content = "  Bounded narrative.  \n"
+    completions = FakeCompletions(content=content)
+
+    if request_kind == "brief":
+        result = demo_agent.request_brief_interpretation(
+            VALID_API_KEY,
+            valid_decision(),
+            {"clusters": 3},
+            {"description": "cluster bars"},
+            client=fake_client(completions),
+        )
+    else:
+        result = demo_agent.request_final_synthesis(
+            VALID_API_KEY,
+            {"read_nvmolkit_skill": {"loaded": True}},
+            client=fake_client(completions),
+        )
+
+    assert result == content
+    assert len(completions.calls) == 1
 
 
 @pytest.mark.parametrize(
