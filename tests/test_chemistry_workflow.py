@@ -343,7 +343,16 @@ def test_similarity_chain_records_gpu_calls_summaries_figures_and_eligibility(
         "active_bits_max": 4,
         "cuda_device": "cuda:fake",
     }
-    assert fingerprint.figures and inspected_state.fingerprints is fingerprint_result
+    assert fingerprint.display_label == "nvMolKit MorganFingerprintGenerator"
+    assert len(fingerprint.figures) == 1
+    fingerprint_axes = fingerprint.figures[0].axes
+    assert len(fingerprint_axes) == 1
+    assert fingerprint_axes[0].get_title() == "Morgan fingerprint density"
+    assert fingerprint_axes[0].get_xlabel() == (
+        "Active Morgan fingerprint bits per molecule"
+    )
+    assert sum(patch.get_height() for patch in fingerprint_axes[0].patches) == 3
+    assert inspected_state.fingerprints is fingerprint_result
     assert calls["generator"] == [(3, 2048)]
     assert calls["fingerprints"] == [inspected_state.molecules]
     assert inspected_state.phase is WorkflowPhase.FINGERPRINTED
@@ -363,7 +372,15 @@ def test_similarity_chain_records_gpu_calls_summaries_figures_and_eligibility(
             "similarity": 0.8,
         },
     }
-    assert similarity.figures and inspected_state.similarity is similarity_result
+    assert similarity.display_label == "nvMolKit crossTanimotoSimilarity"
+    assert len(similarity.figures) == 1
+    similarity_axes = similarity.figures[0].axes
+    assert len(similarity_axes) == 2
+    assert similarity_axes[0].get_title() == "All-pairs Tanimoto similarity"
+    assert len(similarity_axes[0].images) == 1
+    assert similarity_axes[0].images[0].get_array().shape == (3, 3)
+    assert similarity_axes[0].images[0].get_clim() == (0.0, 1.0)
+    assert inspected_state.similarity is similarity_result
     assert calls["similarity"] == [fingerprint_result]
     assert inspected_state.phase is WorkflowPhase.COMPARED
 
@@ -394,7 +411,14 @@ def test_similarity_chain_records_gpu_calls_summaries_figures_and_eligibility(
             },
         ],
     }
-    assert clusters.figures
+    assert (
+        clusters.display_label == "nvMolKit fused_butina with RDKit MMFF94 eligibility"
+    )
+    assert len(clusters.figures) == 1
+    cluster_axes = clusters.figures[0].axes
+    assert len(cluster_axes) == 1
+    assert cluster_axes[0].get_title() == "Largest fused Butina clusters"
+    assert [patch.get_height() for patch in cluster_axes[0].patches] == [2, 1]
     assert inspected_state.clusters == [[0, 2], [1]]
     assert calls["cluster"] == [(fingerprint_result.tensor, 0.47)]
     assert calls["sync"] == 3
@@ -497,6 +521,22 @@ def test_cluster_cutoff_is_bounded_before_gpu_execution(
         discover_fused_butina_clusters(inspected_state, cluster_cutoff=cutoff)
     assert calls["cluster"] == []
     assert _state_snapshot(inspected_state) == before
+
+
+@pytest.mark.parametrize("cutoff", [0.40, 0.60])
+def test_cluster_cutoff_inclusive_boundaries_execute_and_are_forwarded_unchanged(
+    inspected_state, fake_gpu, cutoff
+):
+    calls, fingerprint_result, similarity_result = fake_gpu
+    inspected_state.phase = WorkflowPhase.COMPARED
+    inspected_state.fingerprints = fingerprint_result
+    inspected_state.similarity = similarity_result
+
+    result = discover_fused_butina_clusters(inspected_state, cluster_cutoff=cutoff)
+
+    assert calls["cluster"] == [(fingerprint_result.tensor, cutoff)]
+    assert result.summary["cluster_cutoff"] == cutoff
+    assert inspected_state.phase is WorkflowPhase.CLUSTERED
 
 
 @pytest.mark.parametrize(
