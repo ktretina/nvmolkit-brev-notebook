@@ -1,4 +1,4 @@
-"""One bounded nvMolKit workflow with an evidence-linked, schema-checked Nemotron conclusion."""
+"""One bounded nvMolKit workflow with a grounded, schema-checked Nemotron conclusion."""
 
 from __future__ import annotations
 
@@ -47,9 +47,9 @@ _REQUEST_ERROR = (
 )
 _SERIALIZATION_ERROR = "The scientific result could not be serialized safely."
 _SYNTHESIS_PROMPT = (
-    "Produce one detailed PhD-level but presentation-readable integrated interpretation. Cite only supplied evidence keys and collectively cite every supplied key. "
+    "Produce one detailed PhD-level but presentation-readable integrated interpretation. Collectively cite every supplied evidence key in the structured evidence_keys fields, but do not mention evidence IDs or add evidence-citation labels in the headline or prose. "
     "Do not infer binding, activity, ADMET, efficacy, safety, synthesizability, clinical relevance, or experimental truth. State that force-field energies compare conformers only within each molecule. "
-    "Canonical quantities, three-dimensional methods, ETKDGv3, and MMFF94 are rendered separately from the supplied evidence."
+    "Three-dimensional methods use ETKDGv3 and MMFF94."
 )
 _SKILL_PATH = Path(__file__).resolve().parent / "skills" / "nvmolkit" / "SKILL.md"
 _DATA_PATH = Path(__file__).resolve().parent / "data" / "sample_molecules.csv"
@@ -214,7 +214,7 @@ TOOL_DESCRIPTIONS = {
     "discover_fused_butina_clusters": "Choose a bounded cutoff and run nvMolKit fused Butina clustering on the GPU.",
     "embed_representative_conformers": "Choose bounded sampling parameters and run nvMolKit conformer embedding on the GPU.",
     "optimize_conformers_mmff94": "Run nvMolKit MMFF94 conformer optimization on the GPU.",
-    "submit_synthesis": "Submit one evidence-cited qualitative scientific synthesis.",
+    "submit_synthesis": "Submit one grounded qualitative synthesis; keep evidence IDs only in evidence_keys fields.",
 }
 
 
@@ -234,7 +234,7 @@ class _HostedArgumentsValidationError(ToolCallError):
 
 class ConclusionValidationError(ToolCallError):
     def __init__(self, report: WorkflowReport):
-        super().__init__("Nemotron synthesis failed validation; canonical evidence is preserved.")
+        super().__init__("Nemotron synthesis failed validation; structured results are preserved.")
         self.report = report
         self.rejected_prose = None
 
@@ -324,6 +324,11 @@ def validate_conclusion(conclusion: SubmitSynthesisArgs, report: WorkflowReport)
     known = set(report_keys)
     valid = set(themes) == set(_REQUIRED_CONCLUSION_EVIDENCE) and len(themes) == len(set(themes))
     valid &= report_keys == EvidenceKey.__args__ and cited == known
+    presented_text = (conclusion.headline, *(section.prose for section in conclusion.sections))
+    valid &= not any(
+        any(key in text for key in EvidenceKey.__args__)
+        for text in presented_text
+    )
     if not valid:
         raise ConclusionValidationError(report)
     return conclusion
@@ -504,8 +509,12 @@ def _append_tool_result(session: AgentSession, content: Any) -> None:
     )
 
 
-def _system_grounding() -> str:
-    skill = _SKILL_PATH.read_text(encoding="utf-8")
+def _system_grounding(skill: str | None = None) -> str:
+    bundled_skill = _SKILL_PATH.read_text(encoding="utf-8")
+    if skill is None:
+        skill = bundled_skill
+    if skill != bundled_skill:
+        raise ValueError("The agent requires the exact bundled nvMolKit skill.")
     return f"""You are a bounded chemistry workflow agent. The exact vendored
 BioNeMo Agent Toolkit skill snapshot below is grounding, not a callable tool.
 Grounding provenance: skills/nvmolkit/SKILL.md
@@ -573,6 +582,7 @@ def run_scientific_loop(
     executors: dict[str, Any] | None = None,
     state: WorkflowState | None = None,
     progress_callback: ProgressCallback | None = None,
+    skill: str | None = None,
 ) -> ScientificLoopResult:
     """Run one plan and six phase-gated scientific tool calls in one history."""
     _validate_api_key(api_key)
@@ -588,7 +598,7 @@ def run_scientific_loop(
 
     session = AgentSession(
         messages=[
-            {"role": "system", "content": _system_grounding()},
+            {"role": "system", "content": _system_grounding(skill)},
             {"role": "user", "content": user_goal.strip()},
         ],
         state=state or WorkflowState(),
@@ -710,36 +720,14 @@ def _display_progress_event(event: str, payload: Any) -> None:
         _display_figure(figure)
 
 
-def _compact_evidence(report: WorkflowReport) -> str:
-    try:
-        e = {record.key: json.loads(record.payload_json) for record in report.evidence}
-    except (TypeError, json.JSONDecodeError):
-        raise ToolCallError(_SERIALIZATION_ERROR) from None
-    p1, p2, p3, p4, p5, p6 = (e.get(f"E0{i}", {}) for i in range(1, 7))
-    representatives = [item.get("molecule_id") for item in p5.get("representatives", [])]
-    lines = [
-        "## Canonical evidence",
-        f"### E01\nRaw/valid/invalid/previewed: {p1.get('raw_count', 'n/a')} / {p1.get('valid_count', 'n/a')} / {p1.get('invalid_count', 'n/a')} / {p1.get('preview_count', 'n/a')}; invalid IDs: {p1.get('invalid_ids', [])}.",
-        f"### E02\nRadius/size/molecules: {p2.get('fingerprint_radius', 'n/a')} / {p2.get('fingerprint_size_bits', 'n/a')} bits / {p2.get('molecule_count', 'n/a')}; active bits min/median/max: {p2.get('active_bits_min', 'n/a')} / {p2.get('active_bits_median', 'n/a')} / {p2.get('active_bits_max', 'n/a')}.",
-        f"### E03\nQ1/median/Q3/P90/max: {p3.get('q1', 'n/a')} / {p3.get('median', 'n/a')} / {p3.get('q3', 'n/a')} / {p3.get('p90', 'n/a')} / {p3.get('max_off_diagonal', 'n/a')}; most-similar pair: {p3.get('most_similar_pair', {})}.",
-        f"### E04\nCutoff/clusters/singletons: {p4.get('cutoff', 'n/a')} / {p4.get('cluster_count', 'n/a')} / {p4.get('singleton_count', 'n/a')}; largest sizes: {p4.get('largest_cluster_sizes', [])}.",
-        f"### E05\nRequested/selected/shortfall: {p5.get('requested_representative_count', 'n/a')} / {p5.get('selected_representative_count', 'n/a')} / {p5.get('selection_shortfall', 'n/a')}; policy: {p5.get('representative_policy', 'n/a')}; generated: {p5.get('generated_conformer_count', 'n/a')}; partial/zero: {p5.get('partial_embedding_ids', [])} / {p5.get('zero_embedding_ids', [])}; representatives: {representatives}.",
-        f"### E06\nAttempted/converged/unconverged: {p6.get('attempted_conformer_count', 'n/a')} / {p6.get('converged_conformer_count', 'n/a')} / {p6.get('unconverged_conformer_count', 'n/a')}.",
-        "| Molecule | Conformer | Energy (kcal/mol) |", "|---|---:|---:|",
-    ]
-    lines.extend(f"| {row.get('molecule_id', 'n/a')} | {row.get('conformer_index', 'n/a')} | {row.get('energy_kcal_mol', 'n/a')} |" for row in p6.get("selected_conformer_records", []))
-    return "\n".join(lines)
-
-
 def _display_conclusion(result: WorkflowResult) -> None:
     from IPython.display import Markdown, display
 
     sections = "\n\n".join(
-        f"### {section.theme.replace('_', ' ').title()}\n{section.prose} "
-        f"*Evidence: {', '.join(section.evidence_keys)}*"
+        f"### {section.theme.replace('_', ' ').title()}\n{section.prose}"
         for section in result.conclusion.sections
     )
-    rendered = f"## Evidence-linked, schema-checked conclusion\n### {result.conclusion.headline}\nPython verifies its schema, evidence references, and exact rendered metrics; Nemotron's qualitative interpretation is not automatically fact-verified.\nPython-rendered methods: 3D conformers use ETKDGv3; energies use MMFF94.\n{_compact_evidence(result.report)}\n\n{sections}"
+    rendered = f"## Schema-checked scientific conclusion\n### {result.conclusion.headline}\nPython checks the response structure before rendering; Nemotron's qualitative interpretation is not automatically fact-verified.\nPython-rendered methods: 3D conformers use ETKDGv3; energies use MMFF94.\n\n{sections}"
     display(Markdown(rendered))
 
 
@@ -748,6 +736,7 @@ def run_workflow(
     api_key: str,
     display_events: bool = True,
     *,
+    skill: str | None = None,
     client: Any = None,
     executors: dict[str, Any] | None = None,
     state: WorkflowState | None = None,
@@ -758,7 +747,7 @@ def run_workflow(
     progress_callback = _display_progress_event if display_events else None
     scientific = run_scientific_loop(
         user_goal, api_key, client=active_client, executors=executors, state=state,
-        progress_callback=progress_callback,
+        progress_callback=progress_callback, skill=skill,
     )
     session = AgentSession(list(scientific.messages), state or WorkflowState(), 7)
     evidence = _serialize({"evidence": [item.__dict__ for item in scientific.report.evidence]})
@@ -767,14 +756,10 @@ def run_workflow(
         conclusion = _request_call(session, active_client, "submit_synthesis", SubmitSynthesisArgs, DEFAULT_MODEL)
         conclusion = validate_conclusion(conclusion, scientific.report)
     except ConclusionValidationError:
-        if display_events:
-            from IPython.display import Markdown, display
-            display(Markdown(_compact_evidence(scientific.report)))
+        _emit_progress(progress_callback, "failure", "Nemotron synthesis failed validation.")
         raise
     except _HostedArgumentsValidationError:
-        if display_events:
-            from IPython.display import Markdown, display
-            display(Markdown(_compact_evidence(scientific.report)))
+        _emit_progress(progress_callback, "failure", "Nemotron synthesis failed validation.")
         raise ConclusionValidationError(scientific.report) from None
     except Exception as error:
         _emit_progress(progress_callback, "failure", str(error))

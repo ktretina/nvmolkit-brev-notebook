@@ -558,6 +558,23 @@ def test_similarity_chain_records_gpu_calls_summaries_figures_and_eligibility(
     )
 
 
+def test_embedding_count_figure_keeps_long_molecule_ids_readable():
+    records = [
+        {"molecule_id": molecule_id, "generated_conformer_count": 5}
+        for molecule_id in (
+            "CHEMBL266886", "CHEMBL414196", "CHEMBL6329",
+            "CHEMBL6312", "CHEMBL6291", "CHEMBL267678",
+        )
+    ]
+
+    figure = chemistry_workflow._embedding_count_figure(records, requested=5)
+    labels = figure.axes[0].get_xticklabels()
+
+    assert tuple(figure.get_size_inches()) == pytest.approx((6.5, 3.25))
+    assert all(label.get_rotation() == 25 for label in labels)
+    assert all(label.get_horizontalalignment() == "right" for label in labels)
+
+
 @pytest.mark.parametrize("radius", [1, 4, True])
 def test_fingerprint_radius_is_bounded_before_gpu_execution(
     inspected_state, fake_gpu, radius

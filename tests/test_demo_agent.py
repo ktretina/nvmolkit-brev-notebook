@@ -344,6 +344,14 @@ def test_skill_is_exact_initial_grounding_not_an_artificial_tool():
     assert "read_nvmolkit_skill" not in exposed_names
 
 
+def test_explicit_bundled_skill_is_supplied_as_initial_grounding():
+    skill = Path("skills/nvmolkit/SKILL.md").read_text(encoding="utf-8")
+
+    result, _ = run(skill=skill)
+
+    assert skill in result.messages[0]["content"]
+
+
 def test_each_turn_exposes_and_forces_only_the_phase_eligible_schema():
     _, completions = run()
 
@@ -963,6 +971,15 @@ def test_conclusion_accepts_numeric_prose_and_global_evidence_coverage():
     assert demo_agent.validate_conclusion(conclusion, full_report()) is conclusion
 
 
+def test_conclusion_keeps_evidence_ids_out_of_presented_prose():
+    arguments = synthesis_arguments()
+    arguments["sections"][0]["prose"] = "The dataset is described by E01."
+    conclusion = demo_agent.SubmitSynthesisArgs.model_validate(arguments)
+
+    with pytest.raises(demo_agent.ConclusionValidationError):
+        demo_agent.validate_conclusion(conclusion, full_report())
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -1015,7 +1032,7 @@ def test_run_workflow_adds_one_schema_checked_eighth_turn_and_retains_stage_resu
     }
 
 
-def test_invalid_final_synthesis_displays_only_preserved_evidence_and_does_not_retry(monkeypatch):
+def test_invalid_final_synthesis_stops_without_rendering_evidence_dump_or_rejected_prose(monkeypatch):
     shown = []
     monkeypatch.setattr("IPython.display.display", lambda *items: shown.extend(items))
     invalid = synthesis_arguments()
@@ -1034,7 +1051,9 @@ def test_invalid_final_synthesis_displays_only_preserved_evidence_and_does_not_r
     assert error.value.rejected_prose is None
     assert "Rejected" not in str(error.value)
     rendered = "\n".join(getattr(item, "data", str(item)) for item in shown)
-    assert all(key in rendered for key in ("E01", "E02", "E03", "E04", "E05", "E06"))
+    assert "Workflow stopped" in rendered
+    assert "Canonical evidence" not in rendered
+    assert all(key not in rendered for key in ("E01", "E02", "E03", "E04", "E05", "E06"))
     assert "Rejected synthesis" not in rendered
     assert "must-not-render" not in rendered
     assert "per_conformer_records" not in rendered
@@ -1070,10 +1089,10 @@ def test_workflow_streams_plan_six_stages_then_compact_schema_checked_conclusion
 
     rendered = "\n".join(getattr(item, "data", str(item)) for item in shown)
     assert rendered.count("## Nemotron plan") == 1
-    heading = "## Evidence-linked, schema-checked conclusion"
+    heading = "## Schema-checked scientific conclusion"
     assert rendered.count(heading) == 1
     assert "Nemotron's qualitative interpretation is not automatically fact-verified" in rendered
-    assert "Python verifies its schema, evidence references, and exact rendered metrics" in rendered
+    assert "Python checks the response structure before rendering" in rendered
     assert all(f"Nemotron → {stage}" in rendered for stage in STAGES)
     assert all(item.rationale in rendered for item in result.plan.stages)
     assert "radius" in rendered and "1024" in rendered
@@ -1087,6 +1106,9 @@ def test_workflow_streams_plan_six_stages_then_compact_schema_checked_conclusion
     assert "per_conformer_records" not in rendered
     assert "representative_eligibility" not in rendered
     assert '"raw_count":26' not in rendered
+    assert "Canonical evidence" not in rendered
+    assert "*Evidence:" not in rendered
+    assert all(key not in rendered for key in ("E01", "E02", "E03", "E04", "E05", "E06"))
 
 
 def test_progress_display_serializes_matplotlib_figure_as_png(monkeypatch):

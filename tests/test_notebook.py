@@ -85,8 +85,12 @@ def test_notebook_exposes_one_goal_and_one_public_agent_call():
     calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and dotted_name(node.func) == "run_workflow"]
     assert len(assignments) == 1
     assert len(calls) == 1
-    assert ast.unparse(calls[0]) == "run_workflow(USER_GOAL, api_key, display_events=True)"
-    assert "result = run_workflow(USER_GOAL, api_key, display_events=True)" in notebook.cells[6].source
+    assert ast.unparse(calls[0]) == (
+        "run_workflow(USER_GOAL, api_key, "
+        "skill=(PROJECT_ROOT / 'skills' / 'nvmolkit' / 'SKILL.md').read_text(encoding='utf-8'), "
+        "display_events=True)"
+    )
+    assert "skill=(PROJECT_ROOT / \"skills\" / \"nvmolkit\" / \"SKILL.md\").read_text(encoding=\"utf-8\")" in notebook.cells[6].source
     assert all(forbidden not in code for forbidden in (
         "read_nvmolkit_skill", "prepare_molecular_sample", "compute_morgan_fingerprints",
         "compute_tanimoto_similarity", "cluster_with_fused_butina",
@@ -104,11 +108,11 @@ def test_intro_and_run_text_make_attribution_and_grounding_explicit():
     assert "one persistent Nemotron conversation" in intro
     assert "fixed dependency chain" in intro
     assert "RDKit" in combined and "input" in combined
-    assert "Python" in combined and "canonical evidence" in combined
+    assert "Python" in combined and "structured results" in combined
     for entry_point in NVMOLKIT_ENTRY_POINTS:
         assert entry_point in combined
     assert "six sequential validated executions" in run_text
-    assert "evidence-linked, schema-checked synthesis" in run_text
+    assert "schema-checked scientific synthesis" in run_text
     assert "qualitative interpretation is not automatically fact-verified" in run_text
 
 
@@ -134,7 +138,7 @@ def test_boundary_is_scientifically_bounded_and_claim_safe():
     for phrase in (
         "bounded fixed workflow", "binding", "activity", "admet", "safety",
         "within-molecule", "not global", "experimental", "no performance claims",
-        "schema, evidence references, and exact rendered metrics",
+        "checks the synthesis structure before rendering",
         "qualitative interpretation is not automatically fact-verified",
     ):
         assert phrase in boundary

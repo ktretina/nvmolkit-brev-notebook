@@ -567,7 +567,7 @@ def select_representatives(
 def _embedding_count_figure(records: list[dict[str, Any]], requested: int):
     from matplotlib.figure import Figure
 
-    figure = Figure(figsize=(5.5, 3.25), layout="constrained")
+    figure = Figure(figsize=(6.5, 3.25), layout="constrained")
     axes = figure.subplots()
     axes.bar(
         [record["molecule_id"] for record in records],
@@ -576,6 +576,9 @@ def _embedding_count_figure(records: list[dict[str, Any]], requested: int):
     axes.axhline(requested, color="black", linestyle="--", linewidth=1)
     axes.set_ylabel("Generated conformers")
     axes.set_title("nvMolKit conformer embedding")
+    axes.tick_params(axis="x", labelrotation=25, labelsize=8)
+    for label in axes.get_xticklabels():
+        label.set_horizontalalignment("right")
     return figure
 
 
