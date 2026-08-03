@@ -492,7 +492,7 @@ def test_invalid_scientific_calls_fail_before_any_executor(bad_tool_calls):
         )
 
     assert executor_calls == []
-    assert len(completions.calls) == 2
+    assert len(completions.calls) == (3 if bad_tool_calls == [] else 2)
 
 
 @pytest.mark.parametrize(
@@ -546,6 +546,60 @@ def test_string_assistant_content_is_discarded_before_valid_tool_call_is_retaine
     assert parsed == demo_agent.InspectionArgs()
     assert session.messages[-1]["content"] is None
     assert session.messages[-1]["tool_calls"][0]["function"]["name"] == "inspect_library"
+
+
+def test_text_only_response_gets_one_bounded_retry_before_any_executor():
+    text_only = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="I will call the tool.", tool_calls=[])
+            )
+        ]
+    )
+    session = demo_agent.AgentSession(
+        messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+        state=WorkflowState(),
+    )
+    completions = FakeCompletions([text_only, response("inspect_library", {})])
+
+    parsed = demo_agent._request_call(
+        session,
+        fake_client(completions),
+        "inspect_library",
+        demo_agent.InspectionArgs,
+        demo_agent.DEFAULT_MODEL,
+    )
+
+    assert parsed == demo_agent.InspectionArgs()
+    assert len(completions.calls) == 2
+    assert session.turn_count == 1
+
+
+def test_text_only_response_retry_is_limited_to_one():
+    text_only = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="I will call the tool.", tool_calls=[])
+            )
+        ]
+    )
+    session = demo_agent.AgentSession(
+        messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+        state=WorkflowState(),
+    )
+    completions = FakeCompletions([text_only, text_only])
+
+    with pytest.raises(demo_agent.ToolCallError, match="exactly one"):
+        demo_agent._request_call(
+            session,
+            fake_client(completions),
+            "inspect_library",
+            demo_agent.InspectionArgs,
+            demo_agent.DEFAULT_MODEL,
+        )
+
+    assert len(completions.calls) == 2
+    assert session.turn_count == 0
 
 
 @pytest.mark.parametrize(

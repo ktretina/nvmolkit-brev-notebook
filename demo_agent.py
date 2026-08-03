@@ -356,6 +356,8 @@ def _request_call(
     expected_name: str,
     argument_model: type[BaseModel],
     model: str,
+    *,
+    _retry_text_only: bool = True,
 ) -> BaseModel:
     """Request, validate, and append exactly one forced hosted call."""
     if session.turn_count >= 8 or (session.turn_count == 7 and expected_name != "submit_synthesis"):
@@ -386,6 +388,15 @@ def _request_call(
                 "Hosted assistant content was returned before the required tool call."
             )
         content = None
+        if isinstance(calls, (list, tuple)) and not calls and _retry_text_only:
+            return _request_call(
+                session,
+                client,
+                expected_name,
+                argument_model,
+                model,
+                _retry_text_only=False,
+            )
         if not isinstance(calls, (list, tuple)) or len(calls) != 1:
             raise ToolCallError("Expected exactly one hosted tool call.")
         call = calls[0]
