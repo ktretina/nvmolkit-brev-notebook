@@ -53,8 +53,10 @@ class WorkflowState:
     records: list[dict[str, Any]] = field(default_factory=list)
     molecules: list[Any] = field(default_factory=list)
     fingerprints: Any = None
+    fingerprint_parameters: tuple[int, int] | None = None
     similarity: Any = None
     clusters: list[list[int]] = field(default_factory=list)
+    cluster_cutoff: float | None = None
     representative_records: list[dict[str, Any]] = field(default_factory=list)
     conformer_molecules: list[Any] = field(default_factory=list)
     optimization_result: Any = None
@@ -191,6 +193,77 @@ def _host_array(tensor: Any) -> np.ndarray:
     return np.asarray(host_value)
 
 
+def _fingerprint_artifact_metrics(fingerprints: Any) -> dict[str, Any]:
+    fingerprint_tensor = fingerprints.torch()
+    packed = _host_array(fingerprint_tensor)
+    if packed.ndim != 2:
+        raise RuntimeError("The packed Morgan fingerprint shape was unexpected.")
+    packed_unsigned = (
+        packed.astype(np.int64, copy=False) & np.int64(0xFFFFFFFF)
+    ).astype(np.uint32)
+    active_bits = np.unpackbits(packed_unsigned.view(np.uint8), axis=1).sum(
+        axis=1, dtype=np.int64
+    )
+    return {
+        "packed_shape": [int(value) for value in packed.shape],
+        "molecule_count": int(packed.shape[0]),
+        "active_bits_min": int(active_bits.min()),
+        "active_bits_median": float(np.median(active_bits)),
+        "active_bits_max": int(active_bits.max()),
+        "cuda_device": str(fingerprint_tensor.device),
+        "active_bits": active_bits,
+    }
+
+
+def _similarity_artifact_metrics(
+    similarity_matrix: np.ndarray, records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    molecule_count = len(records)
+    upper_rows, upper_columns = np.triu_indices(molecule_count, k=1)
+    off_diagonal = similarity_matrix[upper_rows, upper_columns]
+    pair_position = int(np.argmax(off_diagonal))
+    first_index = int(upper_rows[pair_position])
+    second_index = int(upper_columns[pair_position])
+    pair_similarity = float(off_diagonal[pair_position])
+    return {
+        "matrix_shape": [int(value) for value in similarity_matrix.shape],
+        "q1": float(np.quantile(off_diagonal, 0.25)),
+        "median": float(np.median(off_diagonal)),
+        "q3": float(np.quantile(off_diagonal, 0.75)),
+        "p90": float(np.quantile(off_diagonal, 0.90)),
+        "max": pair_similarity,
+        "most_similar_nonidentical_pair": {
+            "molecule_ids": [
+                str(records[first_index]["id"]),
+                str(records[second_index]["id"]),
+            ],
+            "source_rows": [
+                int(records[first_index]["source_row"]),
+                int(records[second_index]["source_row"]),
+            ],
+            "similarity": pair_similarity,
+        },
+    }
+
+
+def _cluster_artifact_metrics(
+    clusters: list[list[int]], molecule_count: int, cutoff: float
+) -> dict[str, Any]:
+    cluster_sizes = [len(cluster) for cluster in clusters]
+    singleton_count = sum(size == 1 for size in cluster_sizes)
+    return {
+        "cluster_cutoff": float(cutoff),
+        "molecule_count": int(molecule_count),
+        "cluster_count": int(len(clusters)),
+        "singleton_count": int(singleton_count),
+        "singleton_fraction": float(singleton_count / molecule_count),
+        "largest_cluster_sizes": [
+            int(size) for size in sorted(cluster_sizes, reverse=True)[:15]
+        ],
+        "assignment_count": int(sum(cluster_sizes)),
+    }
+
+
 def _fingerprint_density_figure(active_bits: np.ndarray):
     from matplotlib.figure import Figure
 
@@ -249,42 +322,38 @@ def generate_morgan_fingerprints(
         radius=fingerprint_radius, fpSize=fingerprint_size
     )
     fingerprints = generator.GetFingerprints(state.molecules)
-    fingerprint_tensor = fingerprints.torch()
     expected_shape = (len(state.molecules), fingerprint_size // 32)
-    if tuple(fingerprint_tensor.shape) != expected_shape:
+    if tuple(fingerprints.torch().shape) != expected_shape:
         raise RuntimeError(
             "The packed Morgan fingerprint shape did not match the molecule count and size."
         )
 
     _synchronize_cuda()
-    packed = _host_array(fingerprint_tensor)
-    if packed.shape != expected_shape:
+    metrics = _fingerprint_artifact_metrics(fingerprints)
+    if tuple(metrics["packed_shape"]) != expected_shape:
         raise RuntimeError(
             "The packed Morgan fingerprint shape changed during host transfer."
         )
-    packed_unsigned = (
-        packed.astype(np.int64, copy=False) & np.int64(0xFFFFFFFF)
-    ).astype(np.uint32)
-    active_bits = np.unpackbits(packed_unsigned.view(np.uint8), axis=1).sum(
-        axis=1, dtype=np.int64
-    )
 
     summary: dict[str, Any] = {
         "entry_point": "MorganFingerprintGenerator",
         "fingerprint_radius": int(fingerprint_radius),
         "fingerprint_size": int(fingerprint_size),
-        "molecule_count": int(len(state.molecules)),
-        "packed_shape": [int(value) for value in expected_shape],
-        "active_bits_min": int(active_bits.min()),
-        "active_bits_median": float(np.median(active_bits)),
-        "active_bits_max": int(active_bits.max()),
-        "cuda_device": str(fingerprint_tensor.device),
+        **{key: metrics[key] for key in (
+            "molecule_count",
+            "packed_shape",
+            "active_bits_min",
+            "active_bits_median",
+            "active_bits_max",
+            "cuda_device",
+        )},
     }
-    figure = _fingerprint_density_figure(active_bits)
+    figure = _fingerprint_density_figure(metrics["active_bits"])
     summaries = dict(state.summaries)
     summaries["generate_morgan_fingerprints"] = summary
 
     state.fingerprints = fingerprints
+    state.fingerprint_parameters = (int(fingerprint_radius), int(fingerprint_size))
     state.summaries = summaries
     state.phase = WorkflowPhase.FINGERPRINTED
     return StageResult(
@@ -322,31 +391,9 @@ def measure_tanimoto_similarity(state: WorkflowState) -> StageResult:
     ):
         raise RuntimeError("The Tanimoto matrix diagonal must be approximately 1.")
 
-    upper_rows, upper_columns = np.triu_indices(molecule_count, k=1)
-    off_diagonal = similarity_matrix[upper_rows, upper_columns]
-    pair_position = int(np.argmax(off_diagonal))
-    first_index = int(upper_rows[pair_position])
-    second_index = int(upper_columns[pair_position])
-    pair_similarity = float(off_diagonal[pair_position])
     summary: dict[str, Any] = {
         "entry_point": "crossTanimotoSimilarity",
-        "matrix_shape": [int(value) for value in similarity_matrix.shape],
-        "q1": float(np.quantile(off_diagonal, 0.25)),
-        "median": float(np.median(off_diagonal)),
-        "q3": float(np.quantile(off_diagonal, 0.75)),
-        "p90": float(np.quantile(off_diagonal, 0.90)),
-        "max": pair_similarity,
-        "most_similar_nonidentical_pair": {
-            "molecule_ids": [
-                str(state.records[first_index]["id"]),
-                str(state.records[second_index]["id"]),
-            ],
-            "source_rows": [
-                int(state.records[first_index]["source_row"]),
-                int(state.records[second_index]["source_row"]),
-            ],
-            "similarity": pair_similarity,
-        },
+        **_similarity_artifact_metrics(similarity_matrix, state.records),
     }
     figure = _similarity_heatmap_figure(similarity_matrix)
     summaries = dict(state.summaries)
@@ -426,20 +473,11 @@ def discover_fused_butina_clusters(
             }
         )
 
-    cluster_sizes = [len(cluster) for cluster in clusters]
-    singleton_count = sum(size == 1 for size in cluster_sizes)
+    cluster_metrics = _cluster_artifact_metrics(clusters, molecule_count, cutoff)
     eligible_cluster_count = len(candidates_by_cluster)
     summary: dict[str, Any] = {
         "entry_point": "fused_butina",
-        "cluster_cutoff": cutoff,
-        "molecule_count": int(molecule_count),
-        "cluster_count": int(len(clusters)),
-        "singleton_count": int(singleton_count),
-        "singleton_fraction": float(singleton_count / molecule_count),
-        "largest_cluster_sizes": [
-            int(size) for size in sorted(cluster_sizes, reverse=True)[:15]
-        ],
-        "assignment_count": int(len(assigned_indices)),
+        **cluster_metrics,
         "representative_eligibility": {
             "eligible_cluster_count": int(eligible_cluster_count),
             "eligible_singleton_count": int(eligible_singleton_count),
@@ -447,11 +485,12 @@ def discover_fused_butina_clusters(
             "candidates_by_cluster": candidates_by_cluster,
         },
     }
-    figure = _cluster_size_figure(cluster_sizes)
+    figure = _cluster_size_figure([len(cluster) for cluster in clusters])
     summaries = dict(state.summaries)
     summaries["discover_fused_butina_clusters"] = summary
 
     state.clusters = clusters
+    state.cluster_cutoff = cutoff
     state.summaries = summaries
     state.phase = WorkflowPhase.CLUSTERED
     return StageResult(
@@ -979,6 +1018,18 @@ def build_workflow_report(state: WorkflowState) -> WorkflowReport:
         raise RuntimeError("Validated molecule rows are unreconciled.")
     if state.fingerprints is None:
         raise RuntimeError("fingerprint artifact is missing.")
+    if state.fingerprint_parameters is None:
+        raise RuntimeError("fingerprint run parameters are missing.")
+    artifact_fingerprint_metrics = _fingerprint_artifact_metrics(state.fingerprints)
+    artifact_fingerprint_metrics.pop("active_bits")
+    expected_fingerprint_summary = {
+        "entry_point": "MorganFingerprintGenerator",
+        "fingerprint_radius": int(state.fingerprint_parameters[0]),
+        "fingerprint_size": int(state.fingerprint_parameters[1]),
+        **artifact_fingerprint_metrics,
+    }
+    if fingerprint != expected_fingerprint_summary:
+        raise RuntimeError("fingerprint summary drifted from the retained artifact.")
     packed_shape = [int(value) for value in fingerprint["packed_shape"]]
     if packed_shape != [valid_count, int(fingerprint["fingerprint_size"]) // 32]:
         raise RuntimeError("Fingerprint dimensions are unreconciled.")
@@ -1002,6 +1053,12 @@ def build_workflow_report(state: WorkflowState) -> WorkflowReport:
         or not np.allclose(np.diag(similarity_matrix), 1, rtol=0, atol=1e-7)
     ):
         raise RuntimeError("Similarity artifact invariants are invalid.")
+    expected_similarity_summary = {
+        "entry_point": "crossTanimotoSimilarity",
+        **_similarity_artifact_metrics(similarity_matrix, state.records),
+    }
+    if similarity != expected_similarity_summary:
+        raise RuntimeError("similarity summary drifted from the retained artifact.")
     assigned = [index for members in state.clusters for index in members]
     if (
         int(cluster["assignment_count"]) != valid_count
@@ -1009,6 +1066,17 @@ def build_workflow_report(state: WorkflowState) -> WorkflowReport:
         or sorted(assigned) != list(range(valid_count))
     ):
         raise RuntimeError("Cluster assignment is incomplete or duplicated.")
+    if state.cluster_cutoff is None:
+        raise RuntimeError("cluster cutoff artifact is missing.")
+    expected_cluster_summary = {
+        "entry_point": "fused_butina",
+        **_cluster_artifact_metrics(
+            state.clusters, valid_count, state.cluster_cutoff
+        ),
+        "representative_eligibility": cluster["representative_eligibility"],
+    }
+    if cluster != expected_cluster_summary:
+        raise RuntimeError("cluster summary drifted from the retained artifact.")
     _validated_eligibility(state)
 
     known_representatives = {

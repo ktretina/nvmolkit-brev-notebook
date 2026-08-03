@@ -41,8 +41,10 @@ def _state_snapshot(state: WorkflowState) -> dict[str, object]:
         "records": list(state.records),
         "molecules": list(state.molecules),
         "fingerprints": state.fingerprints,
+        "fingerprint_parameters": state.fingerprint_parameters,
         "similarity": state.similarity,
         "clusters": list(state.clusters),
+        "cluster_cutoff": state.cluster_cutoff,
         "representative_records": list(state.representative_records),
         "conformer_molecules": list(state.conformer_molecules),
         "optimization_result": state.optimization_result,
@@ -134,8 +136,10 @@ def test_new_state_exposes_only_input_inspection():
     assert state.records == []
     assert state.molecules == []
     assert state.fingerprints is None
+    assert state.fingerprint_parameters is None
     assert state.similarity is None
     assert state.clusters == []
+    assert state.cluster_cutoff is None
     assert state.representative_records == []
     assert state.conformer_molecules == []
     assert state.optimization_result is None
@@ -436,6 +440,7 @@ def test_similarity_chain_records_gpu_calls_summaries_figures_and_eligibility(
     )
     assert sum(patch.get_height() for patch in fingerprint_axes[0].patches) == 3
     assert inspected_state.fingerprints is fingerprint_result
+    assert inspected_state.fingerprint_parameters == (3, 2048)
     assert calls["generator"] == [(3, 2048)]
     assert calls["fingerprints"] == [inspected_state.molecules]
     assert inspected_state.phase is WorkflowPhase.FINGERPRINTED
@@ -503,6 +508,7 @@ def test_similarity_chain_records_gpu_calls_summaries_figures_and_eligibility(
     assert cluster_axes[0].get_title() == "Largest fused Butina clusters"
     assert [patch.get_height() for patch in cluster_axes[0].patches] == [2, 1]
     assert inspected_state.clusters == [[0, 2], [1]]
+    assert inspected_state.cluster_cutoff == 0.47
     assert calls["cluster"] == [(fingerprint_result.tensor, 0.47)]
     assert calls["sync"] == 3
     assert inspected_state.phase is WorkflowPhase.CLUSTERED
@@ -880,8 +886,27 @@ def test_embedding_validates_bounds_before_execution(conformer_gpu, kwargs, mess
 
 def _embedded_state(conformer_gpu) -> WorkflowState:
     state = _clustered_state()
-    state.fingerprints = _FakeGpuResult(np.zeros((7, 32), dtype=np.int32))
+    state.fingerprints = _FakeGpuResult(
+        np.zeros((7, 32), dtype=np.int32), device="cuda:0"
+    )
     state.similarity = _FakeGpuResult(np.eye(7, dtype=float))
+    state.fingerprint_parameters = (2, 1024)
+    state.cluster_cutoff = 0.5
+    state.summaries["generate_morgan_fingerprints"].update(
+        active_bits_min=0, active_bits_median=0.0, active_bits_max=0
+    )
+    state.summaries["measure_tanimoto_similarity"].update(
+        q1=0.0,
+        median=0.0,
+        q3=0.0,
+        p90=0.0,
+        max=0.0,
+        most_similar_nonidentical_pair={
+            "molecule_ids": ["mol-0", "mol-1"],
+            "source_rows": [10, 2],
+            "similarity": 0.0,
+        },
+    )
     embed_representative_conformers(
         state,
         representative_count=3,
@@ -1222,4 +1247,55 @@ def test_workflow_report_rejects_coordinated_forgery_of_selected_labels(
         record["cluster_id"] = 99
     selected["selected_conformer_id"] = f"forged:conf-{selected['conformer_index']}"
     with pytest.raises(RuntimeError, match="conformer provenance"):
+        build_workflow_report(state)
+
+
+@pytest.mark.parametrize(
+    ("stage", "drift", "message"),
+    [
+        (
+            "generate_morgan_fingerprints",
+            {
+                "fingerprint_radius": 3,
+                "active_bits_min": 10,
+                "active_bits_median": 11.0,
+                "active_bits_max": 12,
+            },
+            "fingerprint summary",
+        ),
+        (
+            "measure_tanimoto_similarity",
+            {
+                "q1": 0.4,
+                "median": 0.4,
+                "q3": 0.4,
+                "p90": 0.4,
+                "max": 0.4,
+                "most_similar_nonidentical_pair": {
+                    "molecule_ids": ["mol-5", "mol-6"],
+                    "source_rows": [1, 12],
+                    "similarity": 0.4,
+                },
+            },
+            "similarity summary",
+        ),
+        (
+            "discover_fused_butina_clusters",
+            {
+                "cluster_cutoff": 0.6,
+                "singleton_count": 0,
+                "singleton_fraction": 0.0,
+                "largest_cluster_sizes": [4, 3],
+            },
+            "cluster summary",
+        ),
+    ],
+)
+def test_workflow_report_rejects_coordinated_summary_drift_from_artifacts(
+    conformer_gpu, stage, drift, message
+):
+    state = _embedded_state(conformer_gpu)
+    optimize_conformers_mmff94(state)
+    state.summaries[stage].update(drift)
+    with pytest.raises(RuntimeError, match=message):
         build_workflow_report(state)
