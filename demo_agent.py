@@ -343,8 +343,12 @@ def _request_call(
         message = response.choices[0].message
         content = getattr(message, "content", None)
         calls = getattr(message, "tool_calls", None)
-        if isinstance(content, str) and content.strip():
-            raise ToolCallError("Hosted text was returned before the required tool call.")
+        if content is not None and (
+            not isinstance(content, str) or content.strip()
+        ):
+            raise ToolCallError(
+                "Hosted assistant content was returned before the required tool call."
+            )
         if not isinstance(calls, (list, tuple)) or len(calls) != 1:
             raise ToolCallError("Expected exactly one hosted tool call.")
         call = calls[0]

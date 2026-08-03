@@ -379,6 +379,37 @@ def test_invalid_scientific_calls_fail_before_any_executor(bad_tool_calls):
     assert len(completions.calls) == 2
 
 
+@pytest.mark.parametrize(
+    "content",
+    [[{"type": "text", "text": "unexpected"}], {"text": "unexpected"}, 1],
+)
+def test_nonstring_assistant_content_stops_before_executor(content):
+    plan = response("submit_workflow_plan", plan_arguments())
+    invalid = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=content,
+                    tool_calls=[call("inspect_library", "{}")],
+                )
+            )
+        ]
+    )
+    completions = FakeCompletions([plan, invalid])
+    executor_calls = []
+
+    with pytest.raises(demo_agent.ToolCallError, match="content"):
+        demo_agent.run_scientific_loop(
+            "Analyze the library.",
+            VALID_API_KEY,
+            client=fake_client(completions),
+            executors=fake_executors(executor_calls),
+        )
+
+    assert executor_calls == []
+    assert len(completions.calls) == 2
+
+
 def test_repeated_or_out_of_phase_call_stops_before_wrong_executor():
     responses = valid_responses()
     responses[2] = response("inspect_library", {})
