@@ -15,12 +15,17 @@ import nbformat
 REPO_ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK_PATH = REPO_ROOT / "notebooks" / "nvmolkit_nemotron_demo.ipynb"
 HEADINGS = (
-    "# Can an AI chemistry agent use nvMolKit?",
+    "# AI Agents for Chemistry",
     "## Preflight",
     "## User request",
     "## Agent run",
     "## Boundary",
 )
+APPROVED_INTRO = """# AI Agents for Chemistry
+
+AI agents can extend language models from passive generators into systems that plan analyses, select validated operations, call scientific software, and interpret structured results. In chemistry, this creates a practical interface between high-level scientific questions and specialized computational tools while preserving explicit constraints, provenance, and reproducibility.
+
+This notebook demonstrates that pattern through a bounded molecular-library analysis. A Nemotron agent is grounded with the BioNeMo Agent Toolkit skill for nvMolKit, then uses nvMolKit GPU operations to generate Morgan fingerprints, calculate all-pairs Tanimoto similarity, discover fused Butina clusters, embed representative conformers, and optimize them with MMFF94. Python validates the workflow, executes the approved tool calls, and renders the results. The demonstration illustrates agent-guided cheminformatics—not unrestricted autonomy—and its outputs are computational descriptors and sampled force-field geometries rather than evidence of biological activity, safety, or experimental structure."""
 NVMOLKIT_ENTRY_POINTS = (
     "MorganFingerprintGenerator",
     "crossTanimotoSimilarity",
@@ -103,10 +108,11 @@ def test_intro_and_run_text_make_attribution_and_grounding_explicit():
     intro = notebook.cells[0].source
     run_text = notebook.cells[5].source
     combined = f"{intro}\n{run_text}"
-    assert "pinned BioNeMo Agent Toolkit nvMolKit skill" in intro
-    assert "initial context" in intro
-    assert "one persistent Nemotron conversation" in intro
-    assert "fixed dependency chain" in intro
+    assert intro == APPROVED_INTRO
+    assert "AI agents" in intro
+    assert "BioNeMo Agent Toolkit skill for nvMolKit" in intro
+    assert "bounded molecular-library analysis" in intro
+    assert "not unrestricted autonomy" in intro
     assert "RDKit" in combined and "input" in combined
     assert "Python" in combined and "structured results" in combined
     for entry_point in NVMOLKIT_ENTRY_POINTS:
