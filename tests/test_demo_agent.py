@@ -492,7 +492,9 @@ def test_invalid_scientific_calls_fail_before_any_executor(bad_tool_calls):
         )
 
     assert executor_calls == []
-    assert len(completions.calls) == (3 if bad_tool_calls == [] else 2)
+    assert len(completions.calls) == (
+        3 if bad_tool_calls is None or bad_tool_calls == [] else 2
+    )
 
 
 @pytest.mark.parametrize(
@@ -546,6 +548,46 @@ def test_string_assistant_content_is_discarded_before_valid_tool_call_is_retaine
     assert parsed == demo_agent.InspectionArgs()
     assert session.messages[-1]["content"] is None
     assert session.messages[-1]["tool_calls"][0]["function"]["name"] == "inspect_library"
+
+
+def test_leading_json_content_is_validated_as_the_forced_tool_call():
+    session = demo_agent.AgentSession(
+        messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+        state=WorkflowState(),
+    )
+    arguments = {
+        "stage": "discover_fused_butina_clusters",
+        **VALID_ARGS["discover_fused_butina_clusters"],
+    }
+    content_only = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=json.dumps(arguments) + "\nI selected this bounded cutoff.",
+                    tool_calls=None,
+                )
+            )
+        ]
+    )
+    completions = FakeCompletions([content_only])
+
+    parsed = demo_agent._request_call(
+        session,
+        fake_client(completions),
+        "discover_fused_butina_clusters",
+        demo_agent.ClusterArgs,
+        demo_agent.DEFAULT_MODEL,
+    )
+
+    assert parsed == demo_agent.ClusterArgs.model_validate(
+        VALID_ARGS["discover_fused_butina_clusters"]
+    )
+    retained = session.messages[-1]["tool_calls"][0]
+    assert retained["id"].startswith("compat-")
+    assert retained["function"]["name"] == "discover_fused_butina_clusters"
+    assert json.loads(retained["function"]["arguments"]) == VALID_ARGS[
+        "discover_fused_butina_clusters"
+    ]
 
 
 def test_text_only_response_gets_two_bounded_retries_before_any_executor():

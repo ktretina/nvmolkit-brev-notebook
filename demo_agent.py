@@ -387,10 +387,21 @@ def _request_call(
             raise ToolCallError(
                 "Hosted assistant content was returned before the required tool call."
             )
+        no_calls = calls is None or (
+            isinstance(calls, (list, tuple)) and not calls
+        )
+        content_arguments = None
+        if no_calls and isinstance(content, str):
+            try:
+                candidate, _end = json.JSONDecoder().raw_decode(content.lstrip())
+            except json.JSONDecodeError:
+                candidate = None
+            if isinstance(candidate, dict):
+                content_arguments = candidate
         content = None
         if (
-            isinstance(calls, (list, tuple))
-            and not calls
+            no_calls
+            and content_arguments is None
             and _text_only_retries_remaining
         ):
             return _request_call(
@@ -401,21 +412,26 @@ def _request_call(
                 model,
                 _text_only_retries_remaining=_text_only_retries_remaining - 1,
             )
-        if not isinstance(calls, (list, tuple)) or len(calls) != 1:
-            raise ToolCallError("Expected exactly one hosted tool call.")
-        call = calls[0]
-        function = getattr(call, "function", None)
-        call_id = getattr(call, "id", None)
-        if getattr(call, "type", None) != "function" or function is None:
-            raise ToolCallError("The hosted tool call was malformed.")
-        if getattr(function, "name", None) != expected_name:
-            raise ToolCallError("The hosted tool call was out of phase.")
-        if not isinstance(call_id, str) or not call_id.strip():
-            raise ToolCallError("The hosted tool call ID was missing.")
-        raw_arguments = getattr(function, "arguments", None)
-        if not isinstance(raw_arguments, str) or not raw_arguments.strip():
-            raise ToolCallError("The hosted tool arguments were missing.")
-        decoded = json.loads(raw_arguments)
+        if content_arguments is not None:
+            call_id = f"compat-{session.turn_count + 1}-{expected_name}"
+            decoded = content_arguments
+            raw_arguments = _serialize(decoded)
+        else:
+            if not isinstance(calls, (list, tuple)) or len(calls) != 1:
+                raise ToolCallError("Expected exactly one hosted tool call.")
+            call = calls[0]
+            function = getattr(call, "function", None)
+            call_id = getattr(call, "id", None)
+            if getattr(call, "type", None) != "function" or function is None:
+                raise ToolCallError("The hosted tool call was malformed.")
+            if getattr(function, "name", None) != expected_name:
+                raise ToolCallError("The hosted tool call was out of phase.")
+            if not isinstance(call_id, str) or not call_id.strip():
+                raise ToolCallError("The hosted tool call ID was missing.")
+            raw_arguments = getattr(function, "arguments", None)
+            if not isinstance(raw_arguments, str) or not raw_arguments.strip():
+                raise ToolCallError("The hosted tool arguments were missing.")
+            decoded = json.loads(raw_arguments)
         if not isinstance(decoded, dict):
             raise ToolCallError("The hosted tool arguments must be a JSON object.")
         declared_fields = argument_model.model_fields
