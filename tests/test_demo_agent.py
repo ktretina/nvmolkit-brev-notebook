@@ -373,13 +373,21 @@ def test_plan_requires_exact_dependency_order_and_nonempty_rationales():
 
 @pytest.mark.parametrize(
     "value",
-    ["", "short", "valid rationale\ncontinued", "use `code` here", "x" * 241],
+    ["", "valid rationale\ncontinued", "use `code` here", "x" * 241],
 )
 def test_decision_basis_rejects_unpresentable_or_unbounded_text(value):
     with pytest.raises(ValidationError):
         demo_agent.FingerprintArgs.model_validate(
             {"radius": 2, "size": 1024, "decision_basis": value}
         )
+
+
+def test_decision_basis_accepts_brief_nonempty_text():
+    parsed = demo_agent.FingerprintArgs.model_validate(
+        {"radius": 2, "size": 1024, "decision_basis": "brief"}
+    )
+
+    assert parsed.decision_basis == "brief"
 
 
 @pytest.mark.parametrize(
@@ -530,7 +538,7 @@ def test_nonstring_assistant_content_stops_before_executor(content):
             {"radius", "size", "fingerprint_radius", "fingerprint_size"},
         ),
         (
-            {"radius": 2, "size": 1024, "decision_basis": "short"},
+            {"radius": 2, "size": 1024, "decision_basis": "x" * 241},
             {"decision_basis"},
         ),
     ],

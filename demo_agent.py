@@ -122,7 +122,7 @@ DecisionBasis = Annotated[
     str,
     StringConstraints(
         strip_whitespace=True,
-        min_length=12,
+        min_length=1,
         max_length=240,
         pattern=r"^[^\r\n`]+$",
     ),
