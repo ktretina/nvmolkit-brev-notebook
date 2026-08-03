@@ -10,14 +10,21 @@ from rdkit import Chem
 import chemistry_workflow
 
 from chemistry_workflow import (
+    EvidenceRecord,
+    RepresentativePolicy,
     StageResult,
+    WorkflowReport,
     WorkflowPhase,
     WorkflowState,
+    build_workflow_report,
     discover_fused_butina_clusters,
+    embed_representative_conformers,
     eligible_stage,
     generate_morgan_fingerprints,
     inspect_library,
     measure_tanimoto_similarity,
+    optimize_conformers_mmff94,
+    select_representatives,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +48,82 @@ def _state_snapshot(state: WorkflowState) -> dict[str, object]:
         "optimization_result": state.optimization_result,
         "summaries": dict(state.summaries),
     }
+
+
+def _clustered_state() -> WorkflowState:
+    smiles = ["CCO", "CCN", "CCC", "CCCl", "CCBr", "CCF", "C1CC1"]
+    source_rows = [10, 2, 7, 4, 8, 1, 12]
+    clusters = [[0, 1, 2], [3, 4], [5], [6]]
+    candidates = []
+    for cluster_id, cluster in enumerate(clusters):
+        candidates.append(
+            {
+                "cluster_id": cluster_id,
+                "candidate_ids": [f"mol-{index}" for index in cluster],
+                "source_rows": [source_rows[index] for index in cluster],
+                "is_singleton": len(cluster) == 1,
+            }
+        )
+    return WorkflowState(
+        phase=WorkflowPhase.CLUSTERED,
+        records=[
+            {"id": f"mol-{index}", "smiles": value, "source_row": source_rows[index]}
+            for index, value in enumerate(smiles)
+        ],
+        molecules=[Chem.MolFromSmiles(value) for value in smiles],
+        clusters=clusters,
+        summaries={
+            "inspect_library": {
+                "raw_count": 8,
+                "valid_count": 7,
+                "invalid_count": 1,
+                "invalid_ids": ["invalid"],
+                "preview_count": 7,
+                "executor": "RDKit input validation",
+            },
+            "generate_morgan_fingerprints": {
+                "entry_point": "MorganFingerprintGenerator",
+                "fingerprint_radius": 2,
+                "fingerprint_size": 1024,
+                "molecule_count": 7,
+                "packed_shape": [7, 32],
+                "active_bits_min": 3,
+                "active_bits_median": 4.0,
+                "active_bits_max": 6,
+                "cuda_device": "cuda:0",
+            },
+            "measure_tanimoto_similarity": {
+                "entry_point": "crossTanimotoSimilarity",
+                "matrix_shape": [7, 7],
+                "q1": 0.1,
+                "median": 0.2,
+                "q3": 0.3,
+                "p90": 0.6,
+                "max": 0.9,
+                "most_similar_nonidentical_pair": {
+                    "molecule_ids": ["mol-0", "mol-1"],
+                    "source_rows": [10, 2],
+                    "similarity": 0.9,
+                },
+            },
+            "discover_fused_butina_clusters": {
+                "entry_point": "fused_butina",
+                "cluster_cutoff": 0.5,
+                "molecule_count": 7,
+                "cluster_count": 4,
+                "singleton_count": 2,
+                "singleton_fraction": 2 / 7,
+                "largest_cluster_sizes": [3, 2, 1, 1],
+                "assignment_count": 7,
+                "representative_eligibility": {
+                    "eligible_cluster_count": 4,
+                    "eligible_singleton_count": 2,
+                    "maximum_representative_count": 4,
+                    "candidates_by_cluster": candidates,
+                },
+            },
+        },
+    )
 
 
 def test_new_state_exposes_only_input_inspection():
@@ -611,3 +694,415 @@ def test_similarity_chain_rejects_out_of_phase_and_repeat_before_science(
     assert calls["similarity"] == []
     assert calls["cluster"] == []
     assert _state_snapshot(inspected_state) == before
+
+
+def test_representative_types_are_exact_and_evidence_is_frozen_and_canonical():
+    assert [policy.value for policy in RepresentativePolicy] == [
+        "largest_clusters_first",
+        "include_singleton_if_available",
+    ]
+    record = EvidenceRecord("E01", "Input", '{"a":1,"b":2}', "source")
+    report = WorkflowReport(evidence=(record,))
+    assert tuple(report.__dataclass_fields__) == ("evidence",)
+    assert json.loads(record.payload_json) == {"a": 1, "b": 2}
+    with pytest.raises(FrozenInstanceError):
+        record.key = "E02"  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        report.evidence = ()  # type: ignore[misc]
+
+
+def test_representatives_follow_cluster_size_then_source_row_and_member_source_row():
+    state = _clustered_state()
+    selected = select_representatives(
+        state, 3, RepresentativePolicy.LARGEST_CLUSTERS_FIRST
+    )
+    assert selected == [
+        {"molecule_id": "mol-1", "source_row": 2, "cluster_id": 0, "molecule_index": 1},
+        {"molecule_id": "mol-3", "source_row": 4, "cluster_id": 1, "molecule_index": 3},
+        {"molecule_id": "mol-5", "source_row": 1, "cluster_id": 2, "molecule_index": 5},
+    ]
+
+
+def test_singleton_policy_reserves_one_singleton_without_duplicate_cluster():
+    state = _clustered_state()
+    state.clusters = [[0, 1], [2, 3], [4, 5], [6]]
+    eligibility = state.summaries["discover_fused_butina_clusters"][
+        "representative_eligibility"
+    ]
+    eligibility["candidates_by_cluster"] = [
+        {
+            "cluster_id": cluster_id,
+            "candidate_ids": [f"mol-{index}" for index in cluster],
+            "source_rows": [state.records[index]["source_row"] for index in cluster],
+            "is_singleton": len(cluster) == 1,
+        }
+        for cluster_id, cluster in enumerate(state.clusters)
+    ]
+    selected = select_representatives(
+        state, 3, RepresentativePolicy.INCLUDE_SINGLETON_IF_AVAILABLE
+    )
+    assert [item["cluster_id"] for item in selected] == [2, 0, 3]
+    assert len({item["cluster_id"] for item in selected}) == 3
+
+
+def test_representative_selection_reports_shortfall_and_rejects_fewer_than_three_clusters():
+    state = _clustered_state()
+    selected = select_representatives(
+        state, 6, RepresentativePolicy.LARGEST_CLUSTERS_FIRST
+    )
+    assert len(selected) == 4
+
+    eligibility = state.summaries["discover_fused_butina_clusters"][
+        "representative_eligibility"
+    ]
+    eligibility["candidates_by_cluster"] = eligibility["candidates_by_cluster"][:2]
+    with pytest.raises(RuntimeError, match="at least 3 eligible distinct clusters"):
+        select_representatives(
+            state, 3, RepresentativePolicy.LARGEST_CLUSTERS_FIRST
+        )
+
+
+class _FakeOptimizationResult:
+    def __init__(self, molecules, *, pairs=None, energies=None, converged=None, coordinates=None):
+        expected_pairs = [
+            (mol_index, conf_index)
+            for mol_index, molecule in enumerate(molecules)
+            for conf_index in range(molecule.GetNumConformers())
+        ]
+        pairs = expected_pairs if pairs is None else pairs
+        self.mol_indices = _FakeGpuResult([pair[0] for pair in pairs])
+        self.conf_indices = _FakeGpuResult([pair[1] for pair in pairs])
+        self.energies = _FakeGpuResult(
+            list(range(1, len(pairs) + 1)) if energies is None else energies
+        )
+        self.converged = _FakeGpuResult(
+            [1] * len(pairs) if converged is None else converged
+        )
+        if coordinates is None:
+            coordinates = [
+                [
+                    np.full((molecule.GetNumAtoms(), 3), conf_index + mol_index, dtype=float)
+                    for conf_index in range(molecule.GetNumConformers())
+                ]
+                for mol_index, molecule in enumerate(molecules)
+            ]
+        self._coordinates = coordinates
+
+    def per_molecule(self):
+        return self._coordinates
+
+
+@pytest.fixture
+def conformer_gpu(monkeypatch):
+    calls = {"embed": [], "optimize": [], "sync": 0}
+    generated_counts = [3, 2, 0]
+
+    def embed(molecules, parameters, *, confsPerMolecule, maxIterations):
+        calls["embed"].append(
+            (molecules, parameters.randomSeed, parameters.useRandomCoords, confsPerMolecule, maxIterations)
+        )
+        for molecule, count in zip(molecules, generated_counts):
+            molecule.RemoveAllConformers()
+            for conformer_id in range(min(count, confsPerMolecule)):
+                conformer = Chem.Conformer(molecule.GetNumAtoms())
+                conformer.SetId(conformer_id)
+                molecule.AddConformer(conformer, assignId=True)
+
+    def optimize(molecules, *, maxIters, output):
+        calls["optimize"].append((molecules, maxIters, output))
+        return _FakeOptimizationResult(
+            molecules,
+            energies=[3.0, 1.0, 2.0, 8.0, 7.0],
+            converged=[1, 1, 0, 0, 1],
+        )
+
+    monkeypatch.setattr(chemistry_workflow, "_embed_molecules", embed)
+    monkeypatch.setattr(chemistry_workflow, "_optimize_mmff94", optimize)
+    monkeypatch.setattr(
+        chemistry_workflow, "_coordinate_output_device", lambda: "DEVICE"
+    )
+    monkeypatch.setattr(
+        chemistry_workflow,
+        "_synchronize_cuda",
+        lambda: calls.__setitem__("sync", calls["sync"] + 1),
+    )
+    return calls
+
+
+def test_embedding_accounts_for_partial_and_zero_results_atomically(conformer_gpu):
+    state = _clustered_state()
+    result = embed_representative_conformers(
+        state,
+        representative_count=3,
+        representative_policy=RepresentativePolicy.LARGEST_CLUSTERS_FIRST,
+        conformers_per_representative=3,
+    )
+    assert result.summary["entry_point"] == "EmbedMolecules"
+    assert result.summary["selection_executor"] == "Python/RDKit"
+    assert result.summary["selected_representative_count"] == 3
+    assert result.summary["selection_shortfall"] == 0
+    assert result.summary["generated_conformer_count"] == 5
+    assert result.summary["partial_embedding_ids"] == ["mol-3"]
+    assert result.summary["zero_embedding_ids"] == ["mol-5"]
+    assert state.phase is WorkflowPhase.EMBEDDED
+    assert len(state.representative_records) == 3
+    assert len(state.conformer_molecules) == 2
+    calls = conformer_gpu
+    assert calls["embed"][0][1:] == (7, True, 3, -1)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"representative_count": 2}, "representative count"),
+        ({"representative_count": 7}, "representative count"),
+        ({"conformers_per_representative": 2}, "conformers per representative"),
+        ({"conformers_per_representative": 9}, "conformers per representative"),
+    ],
+)
+def test_embedding_validates_bounds_before_execution(conformer_gpu, kwargs, message):
+    state = _clustered_state()
+    before = _state_snapshot(state)
+    arguments = {
+        "representative_count": 3,
+        "representative_policy": RepresentativePolicy.LARGEST_CLUSTERS_FIRST,
+        "conformers_per_representative": 3,
+        **kwargs,
+    }
+    with pytest.raises(ValueError, match=message):
+        embed_representative_conformers(state, **arguments)
+    assert conformer_gpu["embed"] == []
+    assert _state_snapshot(state) == before
+
+
+def _embedded_state(conformer_gpu) -> WorkflowState:
+    state = _clustered_state()
+    embed_representative_conformers(
+        state,
+        representative_count=3,
+        representative_policy=RepresentativePolicy.LARGEST_CLUSTERS_FIRST,
+        conformers_per_representative=3,
+    )
+    return state
+
+
+def test_optimization_reconciles_pairs_selects_within_molecule_and_builds_figures(conformer_gpu):
+    state = _embedded_state(conformer_gpu)
+    result = optimize_conformers_mmff94(state)
+    assert result.summary["entry_point"] == "MMFFOptimizeMoleculesConfs"
+    assert result.summary["attempted_conformer_count"] == 5
+    assert result.summary["converged_conformer_count"] == 3
+    assert result.summary["unconverged_conformer_count"] == 2
+    assert [record["selected_conformer_id"] for record in result.summary["selected_conformer_records"]] == [
+        "mol-1:conf-1",
+        "mol-3:conf-1",
+    ]
+    assert len(result.figures) == 2
+    assert result.figures[0].axes[0].get_ylabel() == "MMFF94 energy (kcal/mol)"
+    assert state.phase is WorkflowPhase.OPTIMIZED
+    assert conformer_gpu["optimize"][0][1:] == (500, "DEVICE")
+
+
+@pytest.mark.parametrize(
+    ("pairs", "energies", "converged", "message"),
+    [
+        ([(0, 0)] * 5, None, None, "incomplete or duplicated"),
+        (None, [1.0, 2.0, float("nan"), 4.0, 5.0], None, "non-finite"),
+        (None, None, [1, 1, 1, 1], "same length"),
+    ],
+)
+def test_optimization_rejects_bad_results_atomically(
+    conformer_gpu, monkeypatch, pairs, energies, converged, message
+):
+    state = _embedded_state(conformer_gpu)
+    before = _state_snapshot(state)
+
+    def bad_optimize(molecules, *, maxIters, output):
+        return _FakeOptimizationResult(
+            molecules, pairs=pairs, energies=energies, converged=converged
+        )
+
+    monkeypatch.setattr(chemistry_workflow, "_optimize_mmff94", bad_optimize)
+    with pytest.raises(RuntimeError, match=message):
+        optimize_conformers_mmff94(state)
+    assert _state_snapshot(state) == before
+
+
+def test_workflow_report_has_exact_frozen_e01_e06_schemas(conformer_gpu):
+    state = _embedded_state(conformer_gpu)
+    optimize_conformers_mmff94(state)
+    report = build_workflow_report(state)
+    assert [record.key for record in report.evidence] == [
+        "E01", "E02", "E03", "E04", "E05", "E06"
+    ]
+    assert [record.provenance for record in report.evidence] == [
+        "RDKit input validation",
+        "MorganFingerprintGenerator",
+        "crossTanimotoSimilarity",
+        "fused_butina",
+        "EmbedMolecules",
+        "MMFFOptimizeMoleculesConfs",
+    ]
+    expected_keys = [
+        {"raw_count", "valid_count", "invalid_count", "invalid_ids", "preview_count", "count_unit"},
+        {"fingerprint_radius", "fingerprint_size_bits", "packed_shape", "molecule_count", "active_bits_min", "active_bits_median", "active_bits_max", "executor", "size_unit"},
+        {"matrix_shape", "q1", "median", "q3", "p90", "max_off_diagonal", "most_similar_pair", "similarity_unit"},
+        {"cutoff", "cluster_count", "singleton_count", "singleton_fraction", "largest_cluster_sizes", "assignment_count", "cutoff_unit"},
+        {"requested_representative_count", "selected_representative_count", "selection_shortfall", "representative_policy", "representatives", "requested_conformers_per_representative", "generated_conformer_count", "partial_embedding_ids", "zero_embedding_ids", "count_unit"},
+        {"attempted_conformer_count", "converged_conformer_count", "unconverged_conformer_count", "per_conformer_records", "selected_conformer_records", "energy_unit", "comparison_scope"},
+    ]
+    for record, keys in zip(report.evidence, expected_keys):
+        payload = json.loads(record.payload_json)
+        assert set(payload) == keys
+        assert record.payload_json == json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+    assert json.loads(report.evidence[0].payload_json)["count_unit"] == "rows"
+    assert json.loads(report.evidence[1].payload_json)["size_unit"] == "bits"
+    assert json.loads(report.evidence[2].payload_json)["similarity_unit"] == "Tanimoto coefficient"
+    assert json.loads(report.evidence[3].payload_json)["cutoff_unit"] == "Tanimoto distance"
+    assert json.loads(report.evidence[4].payload_json)["count_unit"] == "conformers"
+    e06 = json.loads(report.evidence[5].payload_json)
+    assert e06["energy_unit"] == "kcal/mol"
+    assert e06["comparison_scope"] == "within molecule only"
+
+
+@pytest.mark.parametrize(
+    ("stage", "mutation", "message"),
+    [
+        ("generate_morgan_fingerprints", lambda summary: summary.__setitem__("entry_point", "wrong"), "provenance"),
+        ("discover_fused_butina_clusters", lambda summary: summary.__setitem__("assignment_count", 6), "assignment"),
+        ("embed_representative_conformers", lambda summary: summary["representatives"][0].__setitem__("cluster_id", 99), "representative provenance"),
+        ("optimize_conformers_mmff94", lambda summary: summary.__setitem__("converged_conformer_count", 99), "convergence totals"),
+    ],
+)
+def test_workflow_report_rejects_unreconciled_or_unknown_provenance(
+    conformer_gpu, stage, mutation, message
+):
+    state = _embedded_state(conformer_gpu)
+    optimize_conformers_mmff94(state)
+    mutation(state.summaries[stage])
+    with pytest.raises(RuntimeError, match=message):
+        build_workflow_report(state)
+
+
+@pytest.mark.parametrize("bad_count", [3.5, "3", None])
+def test_embedding_rejects_non_integer_representative_counts_atomically(
+    conformer_gpu, bad_count
+):
+    state = _clustered_state()
+    before = _state_snapshot(state)
+    with pytest.raises(ValueError, match="representative count"):
+        embed_representative_conformers(
+            state,
+            representative_count=bad_count,
+            representative_policy=RepresentativePolicy.LARGEST_CLUSTERS_FIRST,
+            conformers_per_representative=3,
+        )
+    assert _state_snapshot(state) == before
+
+
+@pytest.mark.parametrize("corruption", ["duplicate_cluster", "unknown_molecule"])
+def test_selection_rejects_duplicate_or_unknown_eligibility_provenance_atomically(
+    corruption
+):
+    state = _clustered_state()
+    candidates = state.summaries["discover_fused_butina_clusters"][
+        "representative_eligibility"
+    ]["candidates_by_cluster"]
+    if corruption == "duplicate_cluster":
+        candidates[1]["cluster_id"] = candidates[0]["cluster_id"]
+    else:
+        candidates[0]["candidate_ids"][0] = "unknown"
+    before = _state_snapshot(state)
+    with pytest.raises(RuntimeError, match="duplicate or unknown|unknown representative"):
+        select_representatives(
+            state, 3, RepresentativePolicy.LARGEST_CLUSTERS_FIRST
+        )
+    assert _state_snapshot(state) == before
+
+
+def test_embedding_rejects_all_zero_results_atomically(conformer_gpu, monkeypatch):
+    state = _clustered_state()
+    before = _state_snapshot(state)
+
+    def zero_embed(molecules, parameters, *, confsPerMolecule, maxIterations):
+        for molecule in molecules:
+            molecule.RemoveAllConformers()
+
+    monkeypatch.setattr(chemistry_workflow, "_embed_molecules", zero_embed)
+    with pytest.raises(RuntimeError, match="zero conformers"):
+        embed_representative_conformers(
+            state,
+            representative_count=3,
+            representative_policy=RepresentativePolicy.LARGEST_CLUSTERS_FIRST,
+            conformers_per_representative=3,
+        )
+    assert _state_snapshot(state) == before
+
+
+def test_optimization_uses_returned_pairs_as_authoritative_coordinate_mapping(
+    conformer_gpu, monkeypatch
+):
+    state = _embedded_state(conformer_gpu)
+    pairs = [(1, 1), (0, 2), (0, 0), (1, 0), (0, 1)]
+    coordinates = [
+        [
+            np.full((state.conformer_molecules[0].GetNumAtoms(), 3), value)
+            for value in (2.0, 0.0, 1.0)
+        ],
+        [
+            np.full((state.conformer_molecules[1].GetNumAtoms(), 3), value)
+            for value in (11.0, 10.0)
+        ],
+    ]
+
+    def shuffled_optimize(molecules, *, maxIters, output):
+        return _FakeOptimizationResult(
+            molecules,
+            pairs=pairs,
+            energies=[5.0, 4.0, 3.0, 2.0, 1.0],
+            converged=[1] * 5,
+            coordinates=coordinates,
+        )
+
+    monkeypatch.setattr(chemistry_workflow, "_optimize_mmff94", shuffled_optimize)
+    optimize_conformers_mmff94(state)
+    for molecule_index, molecule in enumerate(state.conformer_molecules):
+        for conformer_index in range(molecule.GetNumConformers()):
+            point = molecule.GetConformer(conformer_index).GetAtomPosition(0)
+            assert point.x == pytest.approx(10 * molecule_index + conformer_index)
+
+
+def test_optimization_rejects_unreconciled_coordinate_totals_atomically(
+    conformer_gpu, monkeypatch
+):
+    state = _embedded_state(conformer_gpu)
+    before = _state_snapshot(state)
+
+    def bad_coordinates(molecules, *, maxIters, output):
+        result = _FakeOptimizationResult(molecules)
+        result._coordinates[0] = result._coordinates[0][:-1]
+        return result
+
+    monkeypatch.setattr(chemistry_workflow, "_optimize_mmff94", bad_coordinates)
+    with pytest.raises(RuntimeError, match="coordinate conformer totals"):
+        optimize_conformers_mmff94(state)
+    assert _state_snapshot(state) == before
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda summary: summary.__setitem__("unexpected", 1), "unexpected keys"),
+        (lambda summary: summary.__setitem__("median", float("inf")), "non-finite"),
+    ],
+)
+def test_workflow_report_rejects_unexpected_keys_and_nonfinite_values(
+    conformer_gpu, mutation, message
+):
+    state = _embedded_state(conformer_gpu)
+    optimize_conformers_mmff94(state)
+    mutation(state.summaries["measure_tanimoto_similarity"])
+    with pytest.raises(RuntimeError, match=message):
+        build_workflow_report(state)
