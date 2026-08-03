@@ -548,7 +548,7 @@ def test_string_assistant_content_is_discarded_before_valid_tool_call_is_retaine
     assert session.messages[-1]["tool_calls"][0]["function"]["name"] == "inspect_library"
 
 
-def test_text_only_response_gets_one_bounded_retry_before_any_executor():
+def test_text_only_response_gets_two_bounded_retries_before_any_executor():
     text_only = SimpleNamespace(
         choices=[
             SimpleNamespace(
@@ -560,7 +560,9 @@ def test_text_only_response_gets_one_bounded_retry_before_any_executor():
         messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
         state=WorkflowState(),
     )
-    completions = FakeCompletions([text_only, response("inspect_library", {})])
+    completions = FakeCompletions(
+        [text_only, text_only, response("inspect_library", {})]
+    )
 
     parsed = demo_agent._request_call(
         session,
@@ -571,11 +573,11 @@ def test_text_only_response_gets_one_bounded_retry_before_any_executor():
     )
 
     assert parsed == demo_agent.InspectionArgs()
-    assert len(completions.calls) == 2
+    assert len(completions.calls) == 3
     assert session.turn_count == 1
 
 
-def test_text_only_response_retry_is_limited_to_one():
+def test_text_only_response_retries_are_limited_to_two():
     text_only = SimpleNamespace(
         choices=[
             SimpleNamespace(
@@ -587,7 +589,7 @@ def test_text_only_response_retry_is_limited_to_one():
         messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
         state=WorkflowState(),
     )
-    completions = FakeCompletions([text_only, text_only])
+    completions = FakeCompletions([text_only, text_only, text_only])
 
     with pytest.raises(demo_agent.ToolCallError, match="exactly one"):
         demo_agent._request_call(
@@ -598,7 +600,7 @@ def test_text_only_response_retry_is_limited_to_one():
             demo_agent.DEFAULT_MODEL,
         )
 
-    assert len(completions.calls) == 2
+    assert len(completions.calls) == 3
     assert session.turn_count == 0
 
 
@@ -775,7 +777,7 @@ def test_hosted_configuration_disables_retries_and_thinking(monkeypatch):
     _, completions = run()
     for call_record in completions.calls:
         assert call_record["model"] == demo_agent.DEFAULT_MODEL
-        assert call_record["temperature"] == 0.2
+        assert call_record["temperature"] == 0.0
         assert call_record["stream"] is False
         assert call_record["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
 

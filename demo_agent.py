@@ -357,7 +357,7 @@ def _request_call(
     argument_model: type[BaseModel],
     model: str,
     *,
-    _retry_text_only: bool = True,
+    _text_only_retries_remaining: int = 2,
 ) -> BaseModel:
     """Request, validate, and append exactly one forced hosted call."""
     if session.turn_count >= 8 or (session.turn_count == 7 and expected_name != "submit_synthesis"):
@@ -372,7 +372,7 @@ def _request_call(
                 "function": {"name": expected_name},
             },
             extra_body=NEMOTRON_TOOL_EXTRA_BODY,
-            temperature=0.2,
+            temperature=0.0,
             max_tokens={"submit_synthesis": 1800, "submit_workflow_plan": 900}.get(expected_name, 400),
             stream=False,
         )
@@ -388,14 +388,18 @@ def _request_call(
                 "Hosted assistant content was returned before the required tool call."
             )
         content = None
-        if isinstance(calls, (list, tuple)) and not calls and _retry_text_only:
+        if (
+            isinstance(calls, (list, tuple))
+            and not calls
+            and _text_only_retries_remaining
+        ):
             return _request_call(
                 session,
                 client,
                 expected_name,
                 argument_model,
                 model,
-                _retry_text_only=False,
+                _text_only_retries_remaining=_text_only_retries_remaining - 1,
             )
         if not isinstance(calls, (list, tuple)) or len(calls) != 1:
             raise ToolCallError("Expected exactly one hosted tool call.")
