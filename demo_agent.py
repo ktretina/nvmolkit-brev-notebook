@@ -443,6 +443,14 @@ def _request_call(
                 key: decoded[key] for key in declared_fields if key in decoded
             }
             raw_arguments = _serialize(decoded)
+        decision_basis = decoded.get("decision_basis")
+        if isinstance(decision_basis, str):
+            compact_basis = " ".join(decision_basis.replace("`", "").split())
+            if len(compact_basis) > 240:
+                compact_basis = compact_basis[:237].rstrip() + "..."
+            if compact_basis != decision_basis:
+                decoded = {**decoded, "decision_basis": compact_basis}
+                raw_arguments = _serialize(decoded)
         arguments = argument_model.model_validate(decoded)
     except ToolCallError:
         raise

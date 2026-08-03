@@ -646,6 +646,33 @@ def test_text_only_response_retries_are_limited_to_two():
     assert session.turn_count == 0
 
 
+def test_decision_basis_is_compacted_before_strict_validation():
+    session = demo_agent.AgentSession(
+        messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+        state=WorkflowState(),
+    )
+    arguments = {
+        "cutoff": 0.5,
+        "decision_basis": "Use the observed spread.\n" + ("detail " * 80) + "`note`",
+    }
+    completions = FakeCompletions(
+        [response("discover_fused_butina_clusters", arguments)]
+    )
+
+    parsed = demo_agent._request_call(
+        session,
+        fake_client(completions),
+        "discover_fused_butina_clusters",
+        demo_agent.ClusterArgs,
+        demo_agent.DEFAULT_MODEL,
+    )
+
+    assert 1 <= len(parsed.decision_basis) <= 240
+    assert "\n" not in parsed.decision_basis
+    assert "`" not in parsed.decision_basis
+    assert parsed.decision_basis.endswith("...")
+
+
 @pytest.mark.parametrize(
     ("arguments", "expected_fields"),
     [
@@ -656,10 +683,6 @@ def test_text_only_response_retries_are_limited_to_two():
                 "decision_basis": "Use a compact molecular representation.",
             },
             {"radius", "size"},
-        ),
-        (
-            {"radius": 2, "size": 1024, "decision_basis": "x" * 241},
-            {"decision_basis"},
         ),
     ],
 )
