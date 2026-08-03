@@ -188,6 +188,10 @@ class ToolCallError(RuntimeError):
     """A secret-safe failure in the bounded hosted or scientific loop."""
 
 
+class _HostedArgumentsValidationError(ToolCallError):
+    pass
+
+
 class ConclusionValidationError(ToolCallError):
     def __init__(self, report: WorkflowReport):
         super().__init__("Nemotron synthesis failed validation; canonical evidence is preserved.")
@@ -361,7 +365,11 @@ def _request_call(
         arguments = argument_model.model_validate(decoded)
     except ToolCallError:
         raise
-    except (AttributeError, IndexError, TypeError, json.JSONDecodeError, ValidationError):
+    except ValidationError:
+        raise _HostedArgumentsValidationError(
+            "The hosted tool arguments failed strict validation."
+        ) from None
+    except (AttributeError, IndexError, TypeError, json.JSONDecodeError):
         raise ToolCallError("The hosted tool call failed strict validation.") from None
 
     session.messages.append(
@@ -564,7 +572,12 @@ def run_workflow(
     try:
         conclusion = _request_call(session, active_client, "submit_synthesis", SubmitSynthesisArgs, DEFAULT_MODEL)
         conclusion = validate_conclusion(conclusion, scientific.report)
-    except ToolCallError:
+    except ConclusionValidationError:
+        if display_events:
+            from IPython.display import Markdown, display
+            display(Markdown(_report_evidence(scientific.report)))
+        raise
+    except _HostedArgumentsValidationError:
         if display_events:
             from IPython.display import Markdown, display
             display(Markdown(_report_evidence(scientific.report)))

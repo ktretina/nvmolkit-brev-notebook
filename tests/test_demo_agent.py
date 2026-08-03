@@ -640,6 +640,22 @@ def test_invalid_final_synthesis_displays_only_preserved_evidence_and_does_not_r
     assert "Rejected synthesis" not in rendered
 
 
+def test_empty_final_hosted_response_keeps_protocol_error_and_does_not_render(monkeypatch):
+    shown = []
+    monkeypatch.setattr("IPython.display.display", lambda *items: shown.extend(items))
+    completions = FakeCompletions(valid_responses() + [SimpleNamespace(choices=[])])
+
+    with pytest.raises(demo_agent.ToolCallError, match="strict validation") as error:
+        demo_agent.run_workflow(
+            "Analyze.", VALID_API_KEY, display_events=True,
+            client=fake_client(completions), executors={**fake_executors(), "build_workflow_report": lambda state: full_report()},
+        )
+
+    assert not isinstance(error.value, demo_agent.ConclusionValidationError)
+    assert len(completions.calls) == 8
+    assert shown == []
+
+
 def test_display_workflow_shows_only_three_headings_stage_artifacts_and_checked_content(monkeypatch):
     shown = []
     monkeypatch.setattr("IPython.display.display", lambda *items: shown.extend(items))
