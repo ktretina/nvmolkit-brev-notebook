@@ -406,10 +406,14 @@ def _request_call(
         decoded = json.loads(raw_arguments)
         if not isinstance(decoded, dict):
             raise ToolCallError("The hosted tool arguments must be a JSON object.")
-        if "stage" in decoded and "stage" not in argument_model.model_fields:
+        declared_fields = argument_model.model_fields
+        if "stage" in decoded and "stage" not in declared_fields:
             if decoded["stage"] != expected_name:
                 raise ToolCallError("The hosted tool call was out of phase.")
-            decoded = {key: value for key, value in decoded.items() if key != "stage"}
+        if declared_fields and any(key not in declared_fields for key in decoded):
+            decoded = {
+                key: decoded[key] for key in declared_fields if key in decoded
+            }
             raw_arguments = _serialize(decoded)
         arguments = argument_model.model_validate(decoded)
     except ToolCallError:

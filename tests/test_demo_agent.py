@@ -557,7 +557,7 @@ def test_string_assistant_content_is_discarded_before_valid_tool_call_is_retaine
                 "fingerprint_size": 1024,
                 "decision_basis": "Use a compact molecular representation.",
             },
-            {"radius", "size", "fingerprint_radius", "fingerprint_size"},
+            {"radius", "size"},
         ),
         (
             {"radius": 2, "size": 1024, "decision_basis": "x" * 241},
@@ -602,6 +602,7 @@ def test_redundant_matching_stage_metadata_is_removed_before_strict_validation()
     )
     arguments = {
         "stage": "discover_fused_butina_clusters",
+        "summary": "Cluster at the selected bounded cutoff.",
         **VALID_ARGS["discover_fused_butina_clusters"],
     }
     completions = FakeCompletions(
