@@ -671,6 +671,20 @@ _STAGE_METRICS = {
 }
 
 
+def _display_figure(figure: Any) -> None:
+    from io import BytesIO
+
+    from IPython.display import Image, display
+    from matplotlib.figure import Figure
+
+    if isinstance(figure, Figure):
+        png = BytesIO()
+        figure.savefig(png, format="png", dpi=120, bbox_inches="tight")
+        display(Image(data=png.getvalue(), format="png"))
+        return
+    display(figure)
+
+
 def _display_progress_event(event: str, payload: Any) -> None:
     from IPython.display import Markdown, display
 
@@ -693,7 +707,7 @@ def _display_progress_event(event: str, payload: Any) -> None:
         lines.extend(["", "Result:", *(f"- `{key}`: `{value}`" for key, value in metrics.items())])
     display(Markdown(f"### Nemotron → {result.display_label}\n" + "\n".join(lines)))
     for figure in result.figures:
-        display(figure)
+        _display_figure(figure)
 
 
 def _compact_evidence(report: WorkflowReport) -> str:

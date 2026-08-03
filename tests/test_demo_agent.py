@@ -1089,6 +1089,28 @@ def test_workflow_streams_plan_six_stages_then_compact_schema_checked_conclusion
     assert '"raw_count":26' not in rendered
 
 
+def test_progress_display_serializes_matplotlib_figure_as_png(monkeypatch):
+    from IPython.display import Image
+    from matplotlib.figure import Figure
+
+    shown = []
+    monkeypatch.setattr("IPython.display.display", lambda *items: shown.extend(items))
+    figure = Figure(figsize=(2, 1))
+    figure.subplots().plot([0, 1], [0, 1])
+    result = StageResult(
+        "generate_morgan_fingerprints",
+        "nvMolKit MorganFingerprintGenerator",
+        {"molecule_count": 2},
+        (figure,),
+    )
+    arguments = demo_agent.FingerprintArgs(radius=2, size=1024, decision_basis="compact")
+
+    demo_agent._display_progress_event("stage", {"result": result, "arguments": arguments})
+
+    assert isinstance(shown[-1], Image)
+    assert shown[-1].data.startswith(b"\x89PNG\r\n\x1a\n")
+
+
 def test_mid_loop_executor_failure_keeps_prior_events_and_marks_failure(monkeypatch):
     shown = []
     monkeypatch.setattr("IPython.display.display", lambda *items: shown.extend(items))
