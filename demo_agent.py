@@ -47,9 +47,9 @@ _REQUEST_ERROR = (
 )
 _SERIALIZATION_ERROR = "The scientific result could not be serialized safely."
 _SYNTHESIS_PROMPT = (
-    "Produce one detailed PhD-level but presentation-readable integrated interpretation. Cite only supplied evidence keys; use no numeric literals in authored text. "
+    "Produce one detailed PhD-level but presentation-readable integrated interpretation. Cite only supplied evidence keys and collectively cite every supplied key. "
     "Do not infer binding, activity, ADMET, efficacy, safety, synthesizability, clinical relevance, or experimental truth. State that force-field energies compare conformers only within each molecule. "
-    "Exact quantities, three-dimensional methods, ETKDGv3, and MMFF94 are rendered separately from canonical evidence."
+    "Canonical quantities, three-dimensional methods, ETKDGv3, and MMFF94 are rendered separately from the supplied evidence."
 )
 _SKILL_PATH = Path(__file__).resolve().parent / "skills" / "nvmolkit" / "SKILL.md"
 _DATA_PATH = Path(__file__).resolve().parent / "data" / "sample_molecules.csv"
@@ -322,11 +322,8 @@ def validate_conclusion(conclusion: SubmitSynthesisArgs, report: WorkflowReport)
     cited = {key for section in conclusion.sections for key in section.evidence_keys}
     report_keys = tuple(record.key for record in report.evidence)
     known = set(report_keys)
-    prose = conclusion.headline + "".join(section.prose for section in conclusion.sections)
     valid = set(themes) == set(_REQUIRED_CONCLUSION_EVIDENCE) and len(themes) == len(set(themes))
     valid &= report_keys == EvidenceKey.__args__ and cited == known
-    valid &= all(_REQUIRED_CONCLUSION_EVIDENCE[item.theme] <= set(item.evidence_keys) for item in conclusion.sections)
-    valid &= not any(character.isdigit() for character in prose)
     if not valid:
         raise ConclusionValidationError(report)
     return conclusion

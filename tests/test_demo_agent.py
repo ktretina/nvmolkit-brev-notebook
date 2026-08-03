@@ -831,6 +831,17 @@ def test_valid_conclusion_is_strict_frozen_and_evidence_grounded():
         conclusion.headline = "changed"
 
 
+def test_conclusion_accepts_numeric_prose_and_global_evidence_coverage():
+    arguments = synthesis_arguments()
+    arguments["headline"] = "Two numerical regimes in one bounded library"
+    arguments["sections"][4]["prose"] = "The sampled conformers include 2 regimes."
+    arguments["sections"][4]["evidence_keys"] = ["E05"]
+    arguments["sections"][5]["evidence_keys"] = ["E06"]
+    conclusion = demo_agent.SubmitSynthesisArgs.model_validate(arguments)
+
+    assert demo_agent.validate_conclusion(conclusion, full_report()) is conclusion
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -839,12 +850,12 @@ def test_valid_conclusion_is_strict_frozen_and_evidence_grounded():
         lambda value: value["sections"][0].__setitem__("evidence_keys", []),
         lambda value: value["sections"][0].__setitem__("evidence_keys", ["E09"]),
         lambda value: value["sections"][2].__setitem__("evidence_keys", ["E04"]),
-        lambda value: value["sections"][4].__setitem__("evidence_keys", ["E05"]),
-        lambda value: value.__setitem__("headline", "A library with 2 regimes"),
-        lambda value: value["sections"][3].__setitem__("prose", "There are 3 qualitative groups."),
-        lambda value: value["sections"][3].__setitem__("prose", "There are ٣ qualitative groups."),
+        lambda value: (
+            value["sections"][4].__setitem__("evidence_keys", ["E05"]),
+            value["sections"][5].__setitem__("evidence_keys", ["E01"]),
+        ),
     ],
-    ids=("duplicate", "missing", "empty", "unknown", "wrong-theme", "global-missing", "digit-headline", "digit-prose", "unicode-digit"),
+    ids=("duplicate", "missing", "empty", "unknown", "global-missing", "all-global-missing"),
 )
 def test_invalid_conclusion_fails_closed_without_retaining_prose(mutation):
     arguments = synthesis_arguments()
