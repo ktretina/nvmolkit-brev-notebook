@@ -32,7 +32,7 @@ These are separate evidence gates; one does not prove the others:
 - **Local deterministic acceptance:** run `pytest` to validate notebook structure, scientific state transitions, serialization boundaries, and agent wiring without claiming GPU or hosted execution.
 - **GPU acceptance:** on a compatible NVIDIA GPU, run `RUN_GPU_TESTS=1 pytest tests/test_gpu_acceptance.py -v` and retain the result before calling the nvMolKit runtime GPU-accepted.
 - **Hosted inference acceptance:** in a fresh Brev kernel, verify one plan, six validated executions, and one checked synthesis using a valid hosted Developer API key.
-- **Rendered deployment acceptance:** inspect the invalid-input report, fingerprint histogram, similarity heatmap, cluster chart, conformer-energy chart, and static conformer views through the organization-only Secure Link.
+- **Rendered deployment acceptance:** inspect the 24-molecule RDKit preview and invalid-input report, fingerprint histogram, similarity heatmap, cluster chart, conformer-energy chart, and static conformer views through the organization-only Secure Link.
 
 ## Boundaries
 

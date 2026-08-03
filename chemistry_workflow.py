@@ -80,6 +80,17 @@ def eligible_stage(state: WorkflowState) -> str:
     return _NEXT_STAGE[state.phase]
 
 
+def _build_molecule_preview(molecules: list[Any], records: list[dict[str, Any]]):
+    from rdkit.Chem import Draw
+
+    return Draw.MolsToGridImage(
+        molecules,
+        legends=[record["id"] for record in records],
+        molsPerRow=6,
+        subImgSize=(160, 120),
+    )
+
+
 def inspect_library(
     state: WorkflowState, data_path: Path, expected_rows: int = 256
 ) -> StageResult:
@@ -118,12 +129,16 @@ def inspect_library(
     if not molecules:
         raise ValueError("input library produced zero valid molecules")
 
+    preview_count = min(len(molecules), 24)
+    preview = _build_molecule_preview(
+        molecules[:preview_count], records[:preview_count]
+    )
     summary: dict[str, Any] = {
         "raw_count": int(len(raw_records)),
         "valid_count": int(len(molecules)),
         "invalid_count": int(len(invalid_ids)),
         "invalid_ids": invalid_ids,
-        "preview_count": int(min(len(molecules), 24)),
+        "preview_count": int(preview_count),
         "executor": "RDKit input validation",
     }
     summaries = dict(state.summaries)
@@ -139,6 +154,7 @@ def inspect_library(
         stage="inspect_library",
         display_label="RDKit input validation",
         summary=summary,
+        figures=(preview,),
     )
 
 

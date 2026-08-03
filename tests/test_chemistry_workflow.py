@@ -214,6 +214,8 @@ def test_inspection_reports_invalid_rows_and_preserves_source_indices(
     assert state.invalid_ids == ("invalid-1",)
     assert state.summaries == {"inspect_library": result.summary}
     assert eligible_stage(state) == "generate_morgan_fingerprints"
+    assert len(result.figures) == 1
+    assert all(dimension > 0 for dimension in result.figures[0].size)
 
 
 def test_inspection_accepts_bundled_molecule_id_and_normalizes_records():
@@ -321,15 +323,47 @@ def test_inspection_rejects_all_invalid_rows_without_mutating_state(
     assert _state_snapshot(state) == before
 
 
-def test_inspection_caps_preview_at_24(tmp_path: Path):
+def test_inspection_caps_preview_at_first_24_valid_records(tmp_path: Path, monkeypatch):
     sample = _write_csv(
         tmp_path / "sample.csv",
-        [{"id": f"valid-{index}", "smiles": "CCO"} for index in range(30)],
+        [{"id": "invalid-first", "smiles": "not-smiles"}]
+        + [{"id": f"valid-{index}", "smiles": "CCO"} for index in range(30)],
     )
+    captured = {}
+    preview = object()
 
-    result = inspect_library(WorkflowState(), sample, expected_rows=30)
+    def capture_preview(molecules, records):
+        captured["molecule_count"] = len(molecules)
+        captured["ids"] = [record["id"] for record in records]
+        return preview
+
+    monkeypatch.setattr(chemistry_workflow, "_build_molecule_preview", capture_preview)
+
+    result = inspect_library(WorkflowState(), sample, expected_rows=31)
 
     assert result.summary["preview_count"] == 24
+    assert result.summary["invalid_ids"] == ["invalid-first"]
+    assert captured == {
+        "molecule_count": 24,
+        "ids": [f"valid-{index}" for index in range(24)],
+    }
+    assert result.figures == (preview,)
+
+
+def test_inspection_preview_failure_preserves_new_state(tmp_path: Path, monkeypatch):
+    sample = _write_csv(tmp_path / "sample.csv", [{"id": "one", "smiles": "CCO"}])
+    state = WorkflowState(summaries={"sentinel": {"kept": True}})
+    before = _state_snapshot(state)
+
+    def fail_preview(molecules, records):
+        raise RuntimeError("preview failed")
+
+    monkeypatch.setattr(chemistry_workflow, "_build_molecule_preview", fail_preview)
+
+    with pytest.raises(RuntimeError, match="preview failed"):
+        inspect_library(state, sample, expected_rows=1)
+
+    assert _state_snapshot(state) == before
 
 
 class _FakeTensor:
