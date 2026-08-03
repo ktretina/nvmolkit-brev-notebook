@@ -1,20 +1,41 @@
-"""Strict hosted-Nemotron helpers for the guided nvMolKit notebook."""
+"""One bounded Nemotron conversation over the nvMolKit chemistry workflow."""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Literal
+from pathlib import Path
+from typing import Annotated, Any, Literal
 
 from openai import AuthenticationError, OpenAI, PermissionDeniedError
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
+
+from chemistry_workflow import (
+    StageResult,
+    WorkflowPhase,
+    WorkflowReport,
+    WorkflowState,
+    build_workflow_report,
+    discover_fused_butina_clusters,
+    eligible_stage,
+    embed_representative_conformers,
+    generate_morgan_fingerprints,
+    inspect_library,
+    measure_tanimoto_similarity,
+    optimize_conformers_mmff94,
+)
 
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 DEFAULT_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
-NEMOTRON_TOOL_EXTRA_BODY = {
-    "chat_template_kwargs": {"enable_thinking": False}
-}
+NEMOTRON_TOOL_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
 AUTH_GUIDANCE = (
     "NVIDIA_API_KEY must be a hosted Developer API key. Generate it from the "
     "Nemotron build.nvidia.com model page, then paste only the bare key; it "
@@ -24,106 +45,126 @@ AUTH_GUIDANCE = (
 _REQUEST_ERROR = (
     "The hosted Nemotron request failed. Check network access and model availability."
 )
-_EMPTY_NARRATIVE_ERROR = "The hosted Nemotron narrative response was empty."
+_SERIALIZATION_ERROR = "The scientific result could not be serialized safely."
+_SKILL_PATH = Path(__file__).resolve().parent / "skills" / "nvmolkit" / "SKILL.md"
+_DATA_PATH = Path(__file__).resolve().parent / "data" / "sample_molecules.csv"
+
+STAGES = (
+    "inspect_library",
+    "generate_morgan_fingerprints",
+    "measure_tanimoto_similarity",
+    "discover_fused_butina_clusters",
+    "embed_representative_conformers",
+    "optimize_conformers_mmff94",
+)
+StageName = Literal[
+    "inspect_library",
+    "generate_morgan_fingerprints",
+    "measure_tanimoto_similarity",
+    "discover_fused_butina_clusters",
+    "embed_representative_conformers",
+    "optimize_conformers_mmff94",
+]
+DecisionBasis = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=12,
+        max_length=240,
+        pattern=r"^[^\r\n`]+$",
+    ),
+]
 
 
-class ReadSkillArgs(BaseModel):
+class _StrictModel(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
 
-class PrepareSampleArgs(BaseModel):
-    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
-
-    preview_count: Literal[24]
+class InspectionArgs(_StrictModel):
+    pass
 
 
-class FingerprintArgs(BaseModel):
-    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
-
-    fingerprint_radius: Literal[2, 3]
-    fingerprint_size: Literal[1024, 2048]
-
-
-class SimilarityArgs(BaseModel):
-    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+class FingerprintArgs(_StrictModel):
+    radius: Literal[2, 3]
+    size: Literal[1024, 2048]
+    decision_basis: DecisionBasis
 
 
-class ClusterArgs(BaseModel):
-    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
-
-    cluster_cutoff: float = Field(ge=0.40, le=0.60)
+class SimilarityArgs(_StrictModel):
+    pass
 
 
-class ConformerArgs(BaseModel):
-    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+class ClusterArgs(_StrictModel):
+    cutoff: float = Field(ge=0.40, le=0.60)
+    decision_basis: DecisionBasis
 
+
+class EmbedArgs(_StrictModel):
     representative_count: int = Field(ge=3, le=6)
+    policy: Literal[
+        "largest_clusters_first", "include_singleton_if_available"
+    ]
     conformers_per_representative: int = Field(ge=3, le=8)
+    decision_basis: DecisionBasis
+
+
+class OptimizationArgs(_StrictModel):
+    pass
+
+
+class PlanStage(_StrictModel):
+    stage: StageName
+    rationale: DecisionBasis
+
+
+class WorkflowPlan(_StrictModel):
+    stages: list[PlanStage] = Field(min_length=6, max_length=6)
+
+    @model_validator(mode="after")
+    def dependency_order_is_exact(self) -> "WorkflowPlan":
+        if tuple(item.stage for item in self.stages) != STAGES:
+            raise ValueError("The workflow plan must use the exact dependency order.")
+        return self
 
 
 TOOL_ARGUMENT_MODELS: dict[str, type[BaseModel]] = {
-    "read_nvmolkit_skill": ReadSkillArgs,
-    "prepare_molecular_sample": PrepareSampleArgs,
-    "compute_morgan_fingerprints": FingerprintArgs,
-    "compute_tanimoto_similarity": SimilarityArgs,
-    "cluster_with_fused_butina": ClusterArgs,
-    "generate_and_optimize_conformers": ConformerArgs,
+    "inspect_library": InspectionArgs,
+    "generate_morgan_fingerprints": FingerprintArgs,
+    "measure_tanimoto_similarity": SimilarityArgs,
+    "discover_fused_butina_clusters": ClusterArgs,
+    "embed_representative_conformers": EmbedArgs,
+    "optimize_conformers_mmff94": OptimizationArgs,
 }
-
 TOOL_DESCRIPTIONS = {
-    "read_nvmolkit_skill": "Read the pinned nvMolKit skill before scientific execution.",
-    "prepare_molecular_sample": "Load and preview the bundled molecular sample.",
-    "compute_morgan_fingerprints": "Compute bounded Morgan fingerprints for the prepared sample.",
-    "compute_tanimoto_similarity": "Compute pairwise Tanimoto similarity from validated fingerprints.",
-    "cluster_with_fused_butina": "Cluster the molecular library with fused Butina.",
-    "generate_and_optimize_conformers": "Generate ETKDG conformers and optimize them with MMFF94.",
+    "submit_workflow_plan": "Submit the six-stage scientific plan in dependency order.",
+    "inspect_library": "Validate the fixed molecular library with RDKit and report invalid SMILES.",
+    "generate_morgan_fingerprints": "Choose bounded parameters and run nvMolKit Morgan fingerprints on the GPU.",
+    "measure_tanimoto_similarity": "Run nvMolKit all-pairs Tanimoto similarity on the GPU.",
+    "discover_fused_butina_clusters": "Choose a bounded cutoff and run nvMolKit fused Butina clustering on the GPU.",
+    "embed_representative_conformers": "Choose bounded sampling parameters and run nvMolKit conformer embedding on the GPU.",
+    "optimize_conformers_mmff94": "Run nvMolKit MMFF94 conformer optimization on the GPU.",
 }
-
-_TOOL_SYSTEM_PROMPT = """You select arguments for exactly one named, allow-listed
-scientific function in a guided nvMolKit notebook. Call only the supplied tool and
-call it exactly once. Use only the supplied task and JSON context. Do not request
-code execution, dynamic imports, arbitrary tools, or additional functions. These
-computational outputs do not establish binding, biological activity, ADMET,
-efficacy, safety, synthesizability, clinical relevance, or experimentally
-validated conformations."""
-
-_BRIEF_SYSTEM_PROMPT = (
-    "Give only 2-4 sentences interpreting the supplied scientific tool result "
-    "conservatively. You are text-only: you do not receive figure pixels. You "
-    "receive a figure_context description, axes, scale, and salient values; refer "
-    "only to that supplied evidence. Do not claim binding, biological activity, "
-    "ADMET, efficacy, safety, synthesizability, clinical relevance, or experimentally "
-    "validated conformations. Distinguish computational descriptors and sampled "
-    "force-field geometries from biological or experimental evidence."
-)
-
-_FINAL_SYSTEM_PROMPT = (
-    "Write a PhD-level scientific synthesis that remains readable in a presentation. "
-    "Use 450-650 words and all real stage summaries supplied in the JSON payload. "
-    "Address these six themes explicitly: dataset "
-    "validity and scope; molecular representation; pairwise similarity structure; "
-    "clustering and library diversity; conformational sampling and MMFF94 "
-    "convergence; limitations and appropriate next analyses. Make quantitative "
-    "references only to supplied results and figure_context evidence. Do not claim "
-    "binding, biological activity, ADMET, efficacy, safety, synthesizability, "
-    "clinical relevance, or experimentally validated conformations. Distinguish "
-    "within-molecule sampled force-field minima from global or experimental "
-    "conformations."
-)
 
 
 class ToolCallError(RuntimeError):
-    """A secret-safe failure to obtain or validate a hosted tool call."""
+    """A secret-safe failure in the bounded hosted or scientific loop."""
+
+
+@dataclass
+class AgentSession:
+    messages: list[dict[str, Any]]
+    state: WorkflowState
+    turn_count: int = 0
+
+    def eligible_tool_name(self) -> str:
+        return eligible_stage(self.state)
 
 
 @dataclass(frozen=True)
-class ToolDecision:
-    arguments: BaseModel
-    source: Literal["nemotron"]
-    error: None
-    tool_name: str
-    tool_call_id: str
-    raw_arguments: str
+class ScientificLoopResult:
+    messages: tuple[dict[str, Any], ...]
+    report: WorkflowReport
+    turn_count: int
 
 
 def _client(api_key: str) -> OpenAI:
@@ -139,22 +180,6 @@ def _validate_api_key(api_key: str) -> None:
         raise ValueError(AUTH_GUIDANCE)
 
 
-def _tool_definition(tool_name: str) -> dict[str, Any]:
-    model = TOOL_ARGUMENT_MODELS[tool_name]
-    parameters = model.model_json_schema()
-    parameters["additionalProperties"] = False
-    parameters["required"] = list(model.model_fields)
-    return {
-        "type": "function",
-        "function": {
-            "name": tool_name,
-            "description": TOOL_DESCRIPTIONS[tool_name],
-            "strict": True,
-            "parameters": parameters,
-        },
-    }
-
-
 def _json_safe(value: Any) -> Any:
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
@@ -168,214 +193,240 @@ def _json_safe(value: Any) -> Any:
         return _json_safe(value.tolist())
     if hasattr(value, "item"):
         return _json_safe(value.item())
-    raise ToolCallError("The scientific result could not be serialized safely.")
+    raise ToolCallError(_SERIALIZATION_ERROR)
 
 
 def _serialize(value: Any) -> str:
     try:
         return json.dumps(
-            _json_safe(value),
-            separators=(",", ":"),
-            sort_keys=True,
-            allow_nan=False,
+            _json_safe(value), sort_keys=True, separators=(",", ":"), allow_nan=False
         )
     except Exception:
-        raise ToolCallError(
-            "The scientific result could not be serialized safely."
-        ) from None
+        raise ToolCallError(_SERIALIZATION_ERROR) from None
 
 
-def _raise_request_error(exc: Exception) -> None:
-    if isinstance(exc, (AuthenticationError, PermissionDeniedError)):
+def _tool_definition(name: str, model: type[BaseModel]) -> dict[str, Any]:
+    parameters = model.model_json_schema()
+    parameters["additionalProperties"] = False
+    parameters["required"] = list(model.model_fields)
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": TOOL_DESCRIPTIONS[name],
+            "strict": True,
+            "parameters": parameters,
+        },
+    }
+
+
+def _raise_request_error(error: Exception) -> None:
+    if isinstance(error, (AuthenticationError, PermissionDeniedError)):
         raise ValueError(AUTH_GUIDANCE) from None
     raise ToolCallError(_REQUEST_ERROR) from None
 
 
-def _validate_narrative_content(content: Any) -> str:
-    if not isinstance(content, str) or not content.strip():
-        raise ToolCallError(_EMPTY_NARRATIVE_ERROR)
-    return content
-
-
-def request_tool_call(
-    api_key: str,
-    *,
-    tool_name: str,
-    task_prompt: str,
-    context: Any,
-    model: str = DEFAULT_MODEL,
-    client=None,
-) -> ToolDecision:
-    """Request and strictly validate one forced, allow-listed function call."""
-
-    _validate_api_key(api_key)
-    if tool_name not in TOOL_ARGUMENT_MODELS:
-        raise ToolCallError("The requested tool is not allow-listed.")
-
-    serialized_context = _serialize(context)
+def _request_call(
+    session: AgentSession,
+    client: Any,
+    expected_name: str,
+    argument_model: type[BaseModel],
+    model: str,
+) -> BaseModel:
+    """Request, validate, and append exactly one forced hosted call."""
+    if session.turn_count >= 7:
+        raise ToolCallError("The bounded hosted turn limit was reached.")
     try:
-        active_client = client or _client(api_key)
-        response = active_client.chat.completions.create(
+        response = client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": _TOOL_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": f"Task: {task_prompt}\nContext JSON: {serialized_context}",
-                },
-            ],
-            tools=[_tool_definition(tool_name)],
-            tool_choice={"type": "function", "function": {"name": tool_name}},
+            messages=session.messages,
+            tools=[_tool_definition(expected_name, argument_model)],
+            tool_choice={
+                "type": "function",
+                "function": {"name": expected_name},
+            },
             extra_body=NEMOTRON_TOOL_EXTRA_BODY,
             temperature=0.2,
-            max_tokens=400,
+            max_tokens=900 if expected_name == "submit_workflow_plan" else 400,
             stream=False,
         )
-    except Exception as exc:
-        _raise_request_error(exc)
+    except Exception as error:
+        _raise_request_error(error)
 
     try:
-        tool_calls = response.choices[0].message.tool_calls
-        if not isinstance(tool_calls, (list, tuple)):
-            raise ToolCallError("The hosted tool call collection was malformed.")
-        if len(tool_calls) != 1:
+        message = response.choices[0].message
+        content = getattr(message, "content", None)
+        calls = getattr(message, "tool_calls", None)
+        if isinstance(content, str) and content.strip():
+            raise ToolCallError("Hosted text was returned before the required tool call.")
+        if not isinstance(calls, (list, tuple)) or len(calls) != 1:
             raise ToolCallError("Expected exactly one hosted tool call.")
-        tool_call = tool_calls[0]
-        if getattr(tool_call, "type", None) != "function":
-            raise ToolCallError("The hosted tool call type was invalid.")
-        function = getattr(tool_call, "function", None)
-        if function is None:
-            raise ToolCallError("The hosted function call was malformed.")
-        returned_name = getattr(function, "name", None)
-        if returned_name != tool_name:
-            raise ToolCallError("The hosted tool call named an unexpected function.")
-        tool_call_id = getattr(tool_call, "id", None)
-        if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+        call = calls[0]
+        function = getattr(call, "function", None)
+        call_id = getattr(call, "id", None)
+        if getattr(call, "type", None) != "function" or function is None:
+            raise ToolCallError("The hosted tool call was malformed.")
+        if getattr(function, "name", None) != expected_name:
+            raise ToolCallError("The hosted tool call was out of phase.")
+        if not isinstance(call_id, str) or not call_id.strip():
             raise ToolCallError("The hosted tool call ID was missing.")
         raw_arguments = getattr(function, "arguments", None)
         if not isinstance(raw_arguments, str) or not raw_arguments.strip():
             raise ToolCallError("The hosted tool arguments were missing.")
-        try:
-            decoded = json.loads(raw_arguments)
-        except (json.JSONDecodeError, TypeError):
-            raise ToolCallError("The hosted tool arguments were not valid JSON.") from None
+        decoded = json.loads(raw_arguments)
         if not isinstance(decoded, dict):
             raise ToolCallError("The hosted tool arguments must be a JSON object.")
-        arguments = TOOL_ARGUMENT_MODELS[tool_name].model_validate(decoded)
+        arguments = argument_model.model_validate(decoded)
     except ToolCallError:
         raise
-    except (AttributeError, IndexError, TypeError, ValidationError):
-        raise ToolCallError("The hosted tool arguments failed strict validation.") from None
+    except (AttributeError, IndexError, TypeError, json.JSONDecodeError, ValidationError):
+        raise ToolCallError("The hosted tool call failed strict validation.") from None
 
-    return ToolDecision(
-        arguments=arguments,
-        source="nemotron",
-        error=None,
-        tool_name=tool_name,
-        tool_call_id=tool_call_id,
-        raw_arguments=raw_arguments,
+    session.messages.append(
+        {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": expected_name,
+                        "arguments": raw_arguments,
+                    },
+                }
+            ],
+        }
+    )
+    session.turn_count += 1
+    return arguments
+
+
+def _append_tool_result(session: AgentSession, content: Any) -> None:
+    assistant = session.messages[-1]
+    session.messages.append(
+        {
+            "role": "tool",
+            "tool_call_id": assistant["tool_calls"][0]["id"],
+            "content": _serialize(content),
+        }
     )
 
 
-def request_and_execute_step(
+def _system_grounding() -> str:
+    skill = _SKILL_PATH.read_text(encoding="utf-8")
+    return f"""You are a bounded chemistry workflow agent. The exact vendored
+BioNeMo Agent Toolkit skill snapshot below is grounding, not a callable tool.
+Grounding provenance: skills/nvmolkit/SKILL.md
+
+Follow this dependency order: inspect, fingerprint, compare, cluster, embed,
+then optimize. RDKit input validation, MMFF94 eligibility, and
+representative selection; each named nvMolKit GPU operation executes the batched
+science. Choose only parameters in the supplied schema. Provide concise decision summaries,
+not hidden chain-of-thought. These computational descriptors
+and sampled force-field geometries do not establish binding, activity, ADMET,
+efficacy, safety, synthesizability, clinical relevance, or experimental truth.
+
+--- exact skills/nvmolkit/SKILL.md content ---
+{skill}"""
+
+
+def _default_executors() -> dict[str, Any]:
+    return {
+        "inspect_library": lambda state: inspect_library(state, _DATA_PATH),
+        "generate_morgan_fingerprints": lambda state, **args: generate_morgan_fingerprints(state, **args),
+        "measure_tanimoto_similarity": lambda state: measure_tanimoto_similarity(state),
+        "discover_fused_butina_clusters": lambda state, **args: discover_fused_butina_clusters(state, **args),
+        "embed_representative_conformers": lambda state, **args: embed_representative_conformers(state, **args),
+        "optimize_conformers_mmff94": lambda state: optimize_conformers_mmff94(state),
+        "build_workflow_report": build_workflow_report,
+    }
+
+
+def _executor_arguments(name: str, arguments: BaseModel) -> dict[str, Any]:
+    if name == "generate_morgan_fingerprints":
+        return {
+            "fingerprint_radius": arguments.radius,
+            "fingerprint_size": arguments.size,
+        }
+    if name == "discover_fused_butina_clusters":
+        return {"cluster_cutoff": arguments.cutoff}
+    if name == "embed_representative_conformers":
+        return {
+            "representative_count": arguments.representative_count,
+            "representative_policy": arguments.policy,
+            "conformers_per_representative": arguments.conformers_per_representative,
+        }
+    return {}
+
+
+def run_scientific_loop(
+    user_goal: str,
     api_key: str,
     *,
-    tool_name: str,
-    task_prompt: str,
-    context: Any,
-    executor,
-    model: str = DEFAULT_MODEL,
-    client=None,
-) -> tuple[ToolDecision, Any]:
-    """Execute once, and only after the hosted call passes strict validation."""
-
-    decision = request_tool_call(
-        api_key,
-        tool_name=tool_name,
-        task_prompt=task_prompt,
-        context=context,
-        model=model,
-        client=client,
-    )
-    result = executor(decision.arguments)
-    return decision, result
-
-
-def request_brief_interpretation(
-    api_key: str,
-    decision: ToolDecision,
-    tool_result: Any,
-    figure_context: Any,
-    model: str = DEFAULT_MODEL,
-    client=None,
-) -> str:
-    """Continue the tool-call exchange for a bounded section interpretation."""
-
+    client: Any = None,
+    executors: dict[str, Any] | None = None,
+    state: WorkflowState | None = None,
+) -> ScientificLoopResult:
+    """Run one plan and six phase-gated scientific tool calls in one history."""
     _validate_api_key(api_key)
-    serialized_result = _serialize(
-        {"tool_result": tool_result, "figure_context": figure_context}
+    if not isinstance(user_goal, str) or not user_goal.strip():
+        raise ValueError("A non-empty scientific goal is required.")
+    active_client = client or _client(api_key)
+    active_executors = executors or _default_executors()
+    allowed_executor_keys = set(STAGES) | {"build_workflow_report"}
+    if set(active_executors) != allowed_executor_keys or not all(
+        callable(active_executors[key]) for key in allowed_executor_keys
+    ):
+        raise ValueError("Executors must match the fixed scientific workflow.")
+
+    session = AgentSession(
+        messages=[
+            {"role": "system", "content": _system_grounding()},
+            {"role": "user", "content": user_goal.strip()},
+        ],
+        state=state or WorkflowState(),
     )
-    try:
-        active_client = client or _client(api_key)
-        response = active_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": _BRIEF_SYSTEM_PROMPT},
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": decision.tool_call_id,
-                            "type": "function",
-                            "function": {
-                                "name": decision.tool_name,
-                                "arguments": decision.raw_arguments,
-                            },
-                        }
-                    ],
-                },
-                {
-                    "role": "tool",
-                    "tool_call_id": decision.tool_call_id,
-                    "content": serialized_result,
-                },
-            ],
-            extra_body=NEMOTRON_TOOL_EXTRA_BODY,
-            temperature=0.2,
-            max_tokens=240,
-            stream=False,
+    plan = _request_call(
+        session, active_client, "submit_workflow_plan", WorkflowPlan, DEFAULT_MODEL
+    )
+    _append_tool_result(
+        session,
+        {
+            "accepted": True,
+            "stages": [item.model_dump(mode="json") for item in plan.stages],
+        },
+    )
+
+    for stage in STAGES:
+        if session.eligible_tool_name() != stage:
+            raise ToolCallError("The scientific workflow state is out of phase.")
+        arguments = _request_call(
+            session, active_client, stage, TOOL_ARGUMENT_MODELS[stage], DEFAULT_MODEL
         )
-        content = response.choices[0].message.content
-    except Exception as exc:
-        _raise_request_error(exc)
-    return _validate_narrative_content(content)
-
-
-def request_final_synthesis(
-    api_key: str,
-    analysis_summary: Any,
-    model: str = DEFAULT_MODEL,
-    client=None,
-) -> str:
-    """Request a detailed synthesis from JSON-safe summaries of completed stages."""
-
-    _validate_api_key(api_key)
-    serialized_summary = _serialize(analysis_summary)
-    try:
-        active_client = client or _client(api_key)
-        response = active_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": _FINAL_SYSTEM_PROMPT},
-                {"role": "user", "content": serialized_summary},
-            ],
-            extra_body=NEMOTRON_TOOL_EXTRA_BODY,
-            temperature=0.2,
-            max_tokens=1000,
-            stream=False,
+        try:
+            result = active_executors[stage](
+                session.state, **_executor_arguments(stage, arguments)
+            )
+        except Exception:
+            raise ToolCallError("The scientific executor failed.") from None
+        if not isinstance(result, StageResult) or result.stage != stage:
+            raise ToolCallError("The scientific executor returned an invalid stage result.")
+        _append_tool_result(
+            session,
+            {
+                "stage": stage,
+                "decision_basis": getattr(arguments, "decision_basis", None),
+                "summary": result.summary,
+            },
         )
-        content = response.choices[0].message.content
-    except Exception as exc:
-        _raise_request_error(exc)
-    return _validate_narrative_content(content)
+
+    if session.state.phase is not WorkflowPhase.OPTIMIZED or session.turn_count != 7:
+        raise ToolCallError("The scientific workflow did not complete exactly once.")
+    try:
+        report = active_executors["build_workflow_report"](session.state)
+    except Exception:
+        raise ToolCallError("The scientific report could not be built.") from None
+    if not isinstance(report, WorkflowReport):
+        raise ToolCallError("The scientific report was invalid.")
+    return ScientificLoopResult(tuple(session.messages), report, session.turn_count)
