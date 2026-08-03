@@ -2,14 +2,14 @@
 
 This standalone project asks one presentation-sized question: **can an AI chemistry agent use nvMolKit to autonomously execute a real cheminformatics workflow?** One stateful, bounded Nemotron conversation follows a fixed dependency chain:
 
-`plan → RDKit inspect → MorganFingerprintGenerator → crossTanimotoSimilarity → fused_butina → EmbedMolecules → MMFFOptimizeMoleculesConfs → checked synthesis`
+`plan → RDKit inspect → MorganFingerprintGenerator → crossTanimotoSimilarity → fused_butina → EmbedMolecules → MMFFOptimizeMoleculesConfs → evidence-linked, schema-checked synthesis`
 
-The pinned BioNeMo Agent Toolkit nvMolKit skill grounds the conversation's initial context. Reading it is not an agent tool call and does not permanently teach or modify the model. Nemotron selects only bounded fingerprint, clustering, and conformer parameters and requests each eligible tool in sequence. Python validates and executes those calls, renders results, and preserves exact artifact-grounded evidence records E01–E06; credentials, RDKit molecules, tensors, matrices, and coordinates remain local.
+The pinned BioNeMo Agent Toolkit nvMolKit skill grounds the conversation's initial context. Reading it is not an agent tool call and does not permanently teach or modify the model. Nemotron selects only bounded fingerprint, clustering, and conformer parameters and requests each eligible tool in sequence. Python validates and executes those calls, renders results, and preserves exact artifact-grounded evidence records E01–E06; credentials, RDKit molecules, tensors, matrices, and coordinates remain local. Python verifies the synthesis schema, evidence references, and exact rendered metrics; Nemotron's qualitative interpretation is not automatically fact-verified.
 
 ## What runs where
 
 - **Brev** provides the GPU VM and organization-only Secure Link to JupyterLab.
-- **Hosted Nemotron** creates one plan, makes six validated tool calls using prior evidence, and drafts one evidence-cited synthesis. It does not execute Python.
+- **Hosted Nemotron** creates one plan, makes six validated tool calls using prior evidence, and drafts one evidence-linked, schema-checked synthesis. It does not execute Python.
 - **Python** owns the tool contract, dependency order, validation, execution, exact evidence, and presentation.
 - **RDKit** parses inputs, screens MMFF94 eligibility, and supports rendering.
 - **nvMolKit on the GPU** generates Morgan fingerprints, computes all-pairs Tanimoto similarity, runs fused Butina clustering, embeds conformers, and performs MMFF94 optimization.
@@ -31,7 +31,7 @@ These are separate evidence gates; one does not prove the others:
 
 - **Local deterministic acceptance:** run `pytest` to validate notebook structure, scientific state transitions, serialization boundaries, and agent wiring without claiming GPU or hosted execution.
 - **GPU acceptance:** on a compatible NVIDIA GPU, run `RUN_GPU_TESTS=1 pytest tests/test_gpu_acceptance.py -v` and retain the result before calling the nvMolKit runtime GPU-accepted.
-- **Hosted inference acceptance:** in a fresh Brev kernel, verify one plan, six validated executions, and one checked synthesis using a valid hosted Developer API key.
+- **Hosted inference acceptance:** in a fresh Brev kernel, verify one plan, six validated executions, and one evidence-linked, schema-checked synthesis using a valid hosted Developer API key; this does not fact-verify Nemotron's qualitative interpretation.
 - **Rendered deployment acceptance:** inspect the 24-molecule RDKit preview and invalid-input report, fingerprint histogram, similarity heatmap, cluster chart, conformer-energy chart, and static conformer views through the organization-only Secure Link.
 
 ## Boundaries

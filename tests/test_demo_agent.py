@@ -735,7 +735,7 @@ def test_invalid_conclusion_fails_closed_without_retaining_prose(mutation):
     assert arguments["headline"] not in str(error.value)
 
 
-def test_run_workflow_adds_one_checked_eighth_turn_and_retains_stage_results():
+def test_run_workflow_adds_one_schema_checked_eighth_turn_and_retains_stage_results():
     completions = FakeCompletions(workflow_responses())
     result = demo_agent.run_workflow(
         "Analyze the library.", VALID_API_KEY, display_events=False,
@@ -800,7 +800,7 @@ def test_empty_final_hosted_response_keeps_protocol_error_and_prior_progress(mon
     assert "Workflow stopped" in rendered
 
 
-def test_workflow_streams_plan_six_stages_then_compact_checked_conclusion(monkeypatch):
+def test_workflow_streams_plan_six_stages_then_compact_schema_checked_conclusion(monkeypatch):
     shown = []
     monkeypatch.setattr("IPython.display.display", lambda *items: shown.extend(items))
     completions = FakeCompletions(workflow_responses())
@@ -811,7 +811,10 @@ def test_workflow_streams_plan_six_stages_then_compact_checked_conclusion(monkey
 
     rendered = "\n".join(getattr(item, "data", str(item)) for item in shown)
     assert rendered.count("## Nemotron plan") == 1
-    assert rendered.count("## Checked conclusion") == 1
+    heading = "## Evidence-linked, schema-checked conclusion"
+    assert rendered.count(heading) == 1
+    assert "Nemotron's qualitative interpretation is not automatically fact-verified" in rendered
+    assert "Python verifies its schema, evidence references, and exact rendered metrics" in rendered
     assert all(f"Nemotron → {stage}" in rendered for stage in STAGES)
     assert all(item.rationale in rendered for item in result.plan.stages)
     assert "radius" in rendered and "1024" in rendered
@@ -820,7 +823,7 @@ def test_workflow_streams_plan_six_stages_then_compact_checked_conclusion(monkey
     assert all(f"figure-{stage}" in rendered for stage in STAGES)
     assert result.conclusion.headline in rendered
     assert rendered.index("## Nemotron plan") < rendered.index("Nemotron → inspect_library")
-    assert rendered.index("Nemotron → optimize_conformers_mmff94") < rendered.index("## Checked conclusion")
+    assert rendered.index("Nemotron → optimize_conformers_mmff94") < rendered.index(heading)
     assert "must-not-render" not in rendered
     assert "per_conformer_records" not in rendered
     assert "representative_eligibility" not in rendered

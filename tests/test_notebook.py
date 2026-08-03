@@ -108,7 +108,8 @@ def test_intro_and_run_text_make_attribution_and_grounding_explicit():
     for entry_point in NVMOLKIT_ENTRY_POINTS:
         assert entry_point in combined
     assert "six sequential validated executions" in run_text
-    assert "checked synthesis" in run_text
+    assert "evidence-linked, schema-checked synthesis" in run_text
+    assert "qualitative interpretation is not automatically fact-verified" in run_text
 
 
 def test_preflight_is_fixed_gpu_ready_and_credential_safe():
@@ -133,6 +134,8 @@ def test_boundary_is_scientifically_bounded_and_claim_safe():
     for phrase in (
         "bounded fixed workflow", "binding", "activity", "admet", "safety",
         "within-molecule", "not global", "experimental", "no performance claims",
+        "schema, evidence references, and exact rendered metrics",
+        "qualitative interpretation is not automatically fact-verified",
     ):
         assert phrase in boundary
 
@@ -167,7 +170,9 @@ def test_readme_preserves_launch_and_separate_acceptance_gates():
     lowered = readme.lower()
     for gate in ("local deterministic acceptance", "gpu acceptance", "hosted inference acceptance", "rendered deployment acceptance"):
         assert gate in lowered
-    assert "one plan" in lowered and "six validated executions" in lowered and "one checked synthesis" in lowered
+    assert "one plan" in lowered and "six validated executions" in lowered
+    assert "one evidence-linked, schema-checked synthesis" in lowered
+    assert "qualitative interpretation is not automatically fact-verified" in lowered
     assert "not yet live-qualified" in lowered
 
 

@@ -1,4 +1,4 @@
-"""One bounded Nemotron conversation over the nvMolKit chemistry workflow."""
+"""One bounded nvMolKit workflow with an evidence-linked, schema-checked Nemotron conclusion."""
 
 from __future__ import annotations
 
@@ -311,6 +311,7 @@ _REQUIRED_CONCLUSION_EVIDENCE = {
 
 
 def validate_conclusion(conclusion: SubmitSynthesisArgs, report: WorkflowReport) -> SubmitSynthesisArgs:
+    """Check the synthesis schema and evidence links, not the truth of qualitative prose."""
     themes = [section.theme for section in conclusion.sections]
     cited = {key for section in conclusion.sections for key in section.evidence_keys}
     report_keys = tuple(record.key for record in report.evidence)
@@ -662,8 +663,8 @@ def _display_conclusion(result: WorkflowResult) -> None:
         f"*Evidence: {', '.join(section.evidence_keys)}*"
         for section in result.conclusion.sections
     )
-    checked = f"## Checked conclusion\n### {result.conclusion.headline}\nPython-rendered methods: 3D conformers use ETKDGv3; energies use MMFF94.\n{_compact_evidence(result.report)}\n\n{sections}"
-    display(Markdown(checked))
+    rendered = f"## Evidence-linked, schema-checked conclusion\n### {result.conclusion.headline}\nPython verifies its schema, evidence references, and exact rendered metrics; Nemotron's qualitative interpretation is not automatically fact-verified.\nPython-rendered methods: 3D conformers use ETKDGv3; energies use MMFF94.\n{_compact_evidence(result.report)}\n\n{sections}"
+    display(Markdown(rendered))
 
 
 def run_workflow(
@@ -675,7 +676,7 @@ def run_workflow(
     executors: dict[str, Any] | None = None,
     state: WorkflowState | None = None,
 ) -> WorkflowResult:
-    """Run the scientific chain, then request and check one grounded synthesis."""
+    """Run the chain, then schema-check one evidence-linked synthesis without fact-verifying its prose."""
     _validate_api_key(api_key)
     active_client = client or _client(api_key)
     progress_callback = _display_progress_event if display_events else None

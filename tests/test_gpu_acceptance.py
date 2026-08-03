@@ -4,7 +4,7 @@ import json
 import pytest
 
 
-# Allow at most two deterministic MMFF non-convergences in the eight-conformer batch.
+# Request up to 12 conformers (4 representatives × 3); require at least half to converge.
 MIN_CONVERGED = 6
 
 
