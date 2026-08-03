@@ -954,8 +954,39 @@ def test_optimization_reconciles_pairs_selects_within_molecule_and_builds_figure
     ]
     assert len(result.figures) == 2
     assert result.figures[0].axes[0].get_ylabel() == "MMFF94 energy (kcal/mol)"
+    structure_figure = result.figures[1]
+    assert tuple(structure_figure.get_size_inches()) == pytest.approx((10.4, 3.8))
+    assert len(structure_figure.axes) == 2
+    assert all(axes.name == "3d" for axes in structure_figure.axes)
+    assert [axes.get_title() for axes in structure_figure.axes] == [
+        "mol-1:conf-1",
+        "mol-3:conf-1",
+    ]
     assert state.phase is WorkflowPhase.OPTIMIZED
     assert conformer_gpu["optimize"][0][1:] == (500, "DEVICE")
+
+
+def test_optimized_structure_figure_caps_grid_at_two_columns_and_three_rows(
+    conformer_gpu,
+):
+    state = _embedded_state(conformer_gpu)
+    result = optimize_conformers_mmff94(state)
+    records = []
+    for index in range(5):
+        record = dict(result.summary["selected_conformer_records"][index % 2])
+        record["selected_conformer_id"] = f"selected-{index}"
+        records.append(record)
+
+    figure = chemistry_workflow._optimized_structure_figure(
+        state.conformer_molecules, records
+    )
+
+    assert tuple(figure.get_size_inches()) == pytest.approx((10.4, 11.4))
+    assert len(figure.axes) == 6
+    assert [axes.get_title() for axes in figure.axes[:5]] == [
+        f"selected-{index}" for index in range(5)
+    ]
+    assert not figure.axes[5].axison
 
 
 @pytest.mark.parametrize(

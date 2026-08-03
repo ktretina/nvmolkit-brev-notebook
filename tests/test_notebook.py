@@ -65,7 +65,7 @@ def test_notebook_is_one_clean_eight_cell_story():
         if line.startswith("#")
     ) == HEADINGS
     code_cells = [cell for cell in notebook.cells if cell.cell_type == "code"]
-    assert sum(len(cell.source.splitlines()) for cell in code_cells) <= 150
+    assert sum(len(cell.source.splitlines()) for cell in code_cells) <= 25
     for cell in code_cells:
         ast.parse(cell.source)
         assert cell.execution_count is None
@@ -121,22 +121,11 @@ def test_preflight_is_fixed_gpu_ready_and_credential_safe():
         if isinstance(node, ast.ImportFrom)
         for alias in node.names
     }
-    assert "run_workflow" in imports
-    assert "import importlib" in code
-    assert "importlib.import_module" in code and "hasattr" in code
-    for entry_point in NVMOLKIT_ENTRY_POINTS:
-        assert code.count(f'"{entry_point}"') == 1
-        assert entry_point not in imports
-    assert "sys.implementation.name == \"cpython\"" in code
-    assert "sys.version_info[:2] == (3, 12)" in code
-    assert "torch.cuda.is_available()" in code
+    assert imports == {"Path", "notebook_preflight", "run_workflow"}
     assert "PROJECT_ROOT / \"demo_agent.py\"" in code
-    assert 'os.environ.get("NVIDIA_API_KEY", "")' in code
-    assert 'os.environ["NVIDIA_API_KEY"]' not in code
-    getpass_calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and dotted_name(node.func) == "getpass"]
-    assert len(getpass_calls) == 1
-    assert "hidden" in getpass_calls[0].args[0].value.lower()
-    assert any(isinstance(node, ast.Raise) for node in ast.walk(tree))
+    assert "api_key = notebook_preflight()" in code
+    assert len(code.splitlines()) <= 10
+    assert all(token not in code for token in ("torch", "getpass", "NVIDIA_API_KEY", "nvmolkit"))
 
 
 def test_boundary_is_scientifically_bounded_and_claim_safe():

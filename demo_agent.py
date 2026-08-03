@@ -54,6 +54,40 @@ _SYNTHESIS_PROMPT = (
 _SKILL_PATH = Path(__file__).resolve().parent / "skills" / "nvmolkit" / "SKILL.md"
 _DATA_PATH = Path(__file__).resolve().parent / "data" / "sample_molecules.csv"
 
+_NVMOLKIT_CAPABILITIES = (
+    ("nvmolkit.fingerprints", "MorganFingerprintGenerator"),
+    ("nvmolkit.similarity", "crossTanimotoSimilarity"),
+    ("nvmolkit.clustering", "fused_butina"),
+    ("nvmolkit.embedMolecules", "EmbedMolecules"),
+    ("nvmolkit.mmffOptimization", "MMFFOptimizeMoleculesConfs"),
+)
+
+
+def notebook_preflight() -> str:
+    """Validate the supported GPU runtime and return a hidden hosted API key."""
+    import getpass
+    import os
+    import sys
+
+    assert sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 12), (
+        "This notebook requires CPython 3.12."
+    )
+    import torch
+
+    assert torch.cuda.is_available(), "This notebook requires an NVIDIA CUDA GPU."
+    for module_name, entry_point in _NVMOLKIT_CAPABILITIES:
+        module = __import__(module_name, fromlist=(entry_point,))
+        assert hasattr(module, entry_point), f"Missing nvMolKit capability: {entry_point}"
+
+    api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
+    if not api_key:
+        api_key = getpass.getpass(
+            "Hosted NVIDIA Developer API key (nvapi-; input hidden): "
+        ).strip()
+    if not api_key:
+        raise ValueError("NVIDIA_API_KEY is required.")
+    return api_key
+
 STAGES = (
     "inspect_library",
     "generate_morgan_fingerprints",

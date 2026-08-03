@@ -715,9 +715,16 @@ def _optimized_structure_figure(
     from matplotlib.figure import Figure
 
     panel_count = max(1, min(6, len(selected_records)))
-    figure = Figure(figsize=(5.2 * panel_count, 4.2), layout="constrained")
+    column_count = min(2, panel_count)
+    row_count = (panel_count + column_count - 1) // column_count
+    figure = Figure(
+        figsize=(5.2 * column_count, 3.8 * row_count), layout="constrained"
+    )
     axes_value = figure.subplots(
-        1, panel_count, subplot_kw={"projection": "3d"}, squeeze=False
+        row_count,
+        column_count,
+        subplot_kw={"projection": "3d"},
+        squeeze=False,
     )
     axes_list = list(axes_value.flat)
     if not selected_records:
@@ -741,6 +748,8 @@ def _optimized_structure_figure(
             indices = [bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()]
             axes.plot(*[coordinates[indices, dimension] for dimension in range(3)], color="#777777")
         axes.set_title(record["selected_conformer_id"])
+        axes.set_axis_off()
+    for axes in axes_list[len(selected_records[:6]) :]:
         axes.set_axis_off()
     figure.suptitle("Lowest-energy converged sampled conformers")
     return figure

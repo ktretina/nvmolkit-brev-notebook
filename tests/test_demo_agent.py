@@ -1,5 +1,7 @@
 import copy
+import builtins
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -111,6 +113,97 @@ THEMES = (
     "clustering", "conformational_sampling", "limitations_and_next_steps",
 )
 REQUIRED_KEYS = (("E01",), ("E02",), ("E03",), ("E04",), ("E05", "E06"), ("E01", "E06"))
+
+
+def test_notebook_preflight_checks_cuda_and_exact_nvmolkit_capabilities(monkeypatch):
+    imported = []
+    capabilities = {
+        "nvmolkit.fingerprints": "MorganFingerprintGenerator",
+        "nvmolkit.similarity": "crossTanimotoSimilarity",
+        "nvmolkit.clustering": "fused_butina",
+        "nvmolkit.embedMolecules": "EmbedMolecules",
+        "nvmolkit.mmffOptimization": "MMFFOptimizeMoleculesConfs",
+    }
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "torch":
+            return SimpleNamespace(cuda=FakeCuda())
+        if name in capabilities:
+            imported.append(name)
+            return SimpleNamespace(**{capabilities[name]: object()})
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setenv("NVIDIA_API_KEY", VALID_API_KEY)
+
+    assert demo_agent.notebook_preflight() == VALID_API_KEY
+    assert imported == list(capabilities)
+
+
+def test_notebook_preflight_uses_hidden_prompt_without_leaking_secret(monkeypatch, capsys):
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "torch":
+            return SimpleNamespace(cuda=FakeCuda())
+        if name.startswith("nvmolkit."):
+            entry_point = {
+                "nvmolkit.fingerprints": "MorganFingerprintGenerator",
+                "nvmolkit.similarity": "crossTanimotoSimilarity",
+                "nvmolkit.clustering": "fused_butina",
+                "nvmolkit.embedMolecules": "EmbedMolecules",
+                "nvmolkit.mmffOptimization": "MMFFOptimizeMoleculesConfs",
+            }[name]
+            return SimpleNamespace(**{entry_point: object()})
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.setattr("getpass.getpass", lambda prompt: SECRET)
+
+    assert demo_agent.notebook_preflight() == SECRET
+    captured = capsys.readouterr()
+    assert SECRET not in captured.out + captured.err
+
+
+def test_notebook_preflight_rejects_non_cpython_312(monkeypatch):
+    monkeypatch.setattr(
+        sys, "implementation", SimpleNamespace(name="pypy")
+    )
+    with pytest.raises(AssertionError, match="CPython 3.12"):
+        demo_agent.notebook_preflight()
+
+
+def test_notebook_preflight_rejects_non_cuda_runtime(monkeypatch):
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return False
+
+    real_import = builtins.__import__
+    monkeypatch.setattr(
+        builtins,
+        "__import__",
+        lambda name, *args, **kwargs: (
+            SimpleNamespace(cuda=FakeCuda())
+            if name == "torch"
+            else real_import(name, *args, **kwargs)
+        ),
+    )
+    with pytest.raises(AssertionError, match="CUDA"):
+        demo_agent.notebook_preflight()
 
 
 def full_report():
