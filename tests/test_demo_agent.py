@@ -382,6 +382,30 @@ def test_executor_failure_is_secret_safe_and_stops_later_calls():
     assert len(completions.calls) == 2
 
 
+def test_executor_cannot_report_success_without_exact_phase_advance():
+    class SerializationProbe:
+        calls = 0
+
+        def tolist(self):
+            self.calls += 1
+            return ["serialized"]
+
+    probe = SerializationProbe()
+    executors = fake_executors()
+    executors["inspect_library"] = lambda state: StageResult(
+        "inspect_library", "inspect", {"probe": probe}
+    )
+    completions = FakeCompletions(valid_responses())
+
+    with pytest.raises(demo_agent.ToolCallError, match="phase"):
+        demo_agent.run_scientific_loop(
+            "Analyze.", VALID_API_KEY, client=fake_client(completions), executors=executors
+        )
+
+    assert probe.calls == 0
+    assert len(completions.calls) == 2
+
+
 def test_nonfinite_tool_summary_is_rejected_before_next_hosted_turn():
     executors = fake_executors()
     def nonfinite(state):
@@ -468,6 +492,24 @@ def test_default_dispatcher_calls_only_fixed_chemistry_facade(monkeypatch):
 
     assert result.report is report
     assert [name for name, _ in calls] == list(STAGES)
+
+
+def test_empty_executor_registry_is_rejected_without_using_production_tools(monkeypatch):
+    default_calls = []
+    monkeypatch.setattr(
+        demo_agent,
+        "_default_executors",
+        lambda: default_calls.append("called") or fake_executors(),
+    )
+    completions = FakeCompletions(valid_responses())
+
+    with pytest.raises(ValueError, match="fixed scientific workflow"):
+        demo_agent.run_scientific_loop(
+            "Analyze.", VALID_API_KEY, client=fake_client(completions), executors={}
+        )
+
+    assert default_calls == []
+    assert completions.calls == []
 
 
 def test_session_turn_limit_fails_closed():

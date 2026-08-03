@@ -57,6 +57,20 @@ STAGES = (
     "embed_representative_conformers",
     "optimize_conformers_mmff94",
 )
+POST_STAGE_PHASES = dict(
+    zip(
+        STAGES,
+        (
+            WorkflowPhase.INSPECTED,
+            WorkflowPhase.FINGERPRINTED,
+            WorkflowPhase.COMPARED,
+            WorkflowPhase.CLUSTERED,
+            WorkflowPhase.EMBEDDED,
+            WorkflowPhase.OPTIMIZED,
+        ),
+        strict=True,
+    )
+)
 StageName = Literal[
     "inspect_library",
     "generate_morgan_fingerprints",
@@ -373,7 +387,7 @@ def run_scientific_loop(
     if not isinstance(user_goal, str) or not user_goal.strip():
         raise ValueError("A non-empty scientific goal is required.")
     active_client = client or _client(api_key)
-    active_executors = executors or _default_executors()
+    active_executors = _default_executors() if executors is None else executors
     allowed_executor_keys = set(STAGES) | {"build_workflow_report"}
     if set(active_executors) != allowed_executor_keys or not all(
         callable(active_executors[key]) for key in allowed_executor_keys
@@ -412,6 +426,8 @@ def run_scientific_loop(
             raise ToolCallError("The scientific executor failed.") from None
         if not isinstance(result, StageResult) or result.stage != stage:
             raise ToolCallError("The scientific executor returned an invalid stage result.")
+        if session.state.phase is not POST_STAGE_PHASES[stage]:
+            raise ToolCallError("The scientific executor left the workflow out of phase.")
         _append_tool_result(
             session,
             {
