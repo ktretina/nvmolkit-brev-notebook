@@ -999,13 +999,24 @@ def test_conclusion_accepts_numeric_prose_and_global_evidence_coverage():
     assert demo_agent.validate_conclusion(conclusion, full_report()) is conclusion
 
 
-def test_conclusion_keeps_evidence_ids_out_of_presented_prose():
+def test_conclusion_validation_keeps_structured_grounding_when_model_prose_cites_it():
     arguments = synthesis_arguments()
     arguments["sections"][0]["prose"] = "The dataset is described by E01."
     conclusion = demo_agent.SubmitSynthesisArgs.model_validate(arguments)
 
-    with pytest.raises(demo_agent.ConclusionValidationError):
-        demo_agent.validate_conclusion(conclusion, full_report())
+    assert demo_agent.validate_conclusion(conclusion, full_report()) is conclusion
+
+
+def test_presentation_text_removes_model_generated_evidence_citations():
+    prose = (
+        "The dataset contains 256 molecules (E01). Similarity is broad (E02-E03). "
+        "Evidence: E01, E02, E03."
+    )
+
+    rendered = demo_agent._presentation_text(prose)
+
+    assert rendered == "The dataset contains 256 molecules. Similarity is broad."
+    assert all(key not in rendered for key in ("E01", "E02", "E03"))
 
 
 @pytest.mark.parametrize(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
@@ -324,11 +325,6 @@ def validate_conclusion(conclusion: SubmitSynthesisArgs, report: WorkflowReport)
     known = set(report_keys)
     valid = set(themes) == set(_REQUIRED_CONCLUSION_EVIDENCE) and len(themes) == len(set(themes))
     valid &= report_keys == EvidenceKey.__args__ and cited == known
-    presented_text = (conclusion.headline, *(section.prose for section in conclusion.sections))
-    valid &= not any(
-        any(key in text for key in EvidenceKey.__args__)
-        for text in presented_text
-    )
     if not valid:
         raise ConclusionValidationError(report)
     return conclusion
@@ -732,14 +728,32 @@ def _display_progress_event(event: str, payload: Any) -> None:
         _display_figure(figure)
 
 
+_EVIDENCE_CITATION_GROUP = (
+    r"E0[1-6](?:\s*(?:,|and|[-–—])\s*E0[1-6])*"
+)
+
+
+def _presentation_text(text: str) -> str:
+    text = re.sub(rf"\s*\({_EVIDENCE_CITATION_GROUP}\)", "", text)
+    text = re.sub(
+        rf"\s*Evidence:\s*{_EVIDENCE_CITATION_GROUP}\.?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\bE0[1-6]\b", "", text)
+    text = re.sub(r"\s+([.,;:])", r"\1", text)
+    return " ".join(text.split())
+
+
 def _display_conclusion(result: WorkflowResult) -> None:
     from IPython.display import Markdown, display
 
     sections = "\n\n".join(
-        f"### {section.theme.replace('_', ' ').title()}\n{section.prose}"
+        f"### {section.theme.replace('_', ' ').title()}\n{_presentation_text(section.prose)}"
         for section in result.conclusion.sections
     )
-    rendered = f"## Schema-checked scientific conclusion\n### {result.conclusion.headline}\nPython checks the response structure before rendering; Nemotron's qualitative interpretation is not automatically fact-verified.\nPython-rendered methods: 3D conformers use ETKDGv3; energies use MMFF94.\n\n{sections}"
+    rendered = f"## Schema-checked scientific conclusion\n### {_presentation_text(result.conclusion.headline)}\nPython checks the response structure before rendering; Nemotron's qualitative interpretation is not automatically fact-verified.\nPython-rendered methods: 3D conformers use ETKDGv3; energies use MMFF94.\n\n{sections}"
     display(Markdown(rendered))
 
 
