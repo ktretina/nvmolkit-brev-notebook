@@ -21,25 +21,86 @@ REPO_ROOT = NOTEBOOK_PATH.parents[1]
 STORY_HEADINGS = [
     "# nvMolKit + Nemotron",
     "## 1. Preflight",
-    "## 2. Molecular sample",
-    "## 3. Nemotron tool call",
-    "## 4. Fingerprints, similarity, and clusters",
+    "## 2. Nemotron learns the nvMolKit skill",
+    "## 3. Molecular sample",
+    "## 4. Mapping molecular similarity",
+    "### 4.1 Morgan fingerprints",
+    "### 4.2 All-pairs Tanimoto similarity",
+    "### 4.3 Fused Butina clusters",
     "## 5. Conformers and MMFF94",
     "## 6. What the results mean",
 ]
 
-REQUIRED_CALLS = {
-    "MorganFingerprintGenerator",
-    "crossTanimotoSimilarity",
-    "fused_butina",
-    "EmbedMolecules",
-    "MMFFOptimizeMoleculesConfs",
-    "Point3D",
-    "torch.cuda.synchronize",
-    "Draw.MolsToGridImage",
-    "sns.heatmap",
-    "py3Dmol.view",
-}
+INTRODUCTION = """# nvMolKit + Nemotron
+
+This notebook demonstrates a guided chemistry agent using NVIDIA Nemotron to call a small set of allow-listed scientific tools backed by nvMolKit on an NVIDIA GPU. Nemotron first reads the BioNeMo Agent Toolkit skill for nvMolKit, learning the library's supported operations, API boundaries, and GPU requirements. It then works through a molecular library one analysis at a time: validating the sample, generating Morgan fingerprints, measuring all-pairs Tanimoto similarity, identifying structural clusters, and generating and minimizing representative conformers.
+
+Each stage follows the same transparent pattern. The notebook defines a bounded scientific function; Nemotron requests that function through a structured tool call; the notebook validates and executes it; the result is visualized immediately; and Nemotron provides a short interpretation. A final synthesis combines the numerical results from every stage into a detailed scientific discussion.
+
+Brev supplies the GPU environment, nvMolKit performs the batched GPU chemistry operations, RDKit handles molecule parsing and display preparation, and the notebook enforces the execution and scientific-safety boundaries. Nemotron chooses validated tool parameters and explains results, but it does not execute arbitrary Python.
+
+This is a cheminformatics demonstration, not a benchmark or validated scientific study. Fingerprints, similarities, clusters, force-field energies, and candidate geometries are computational outputs. They do not establish binding, biological activity, ADMET properties, efficacy, safety, synthesizability, or clinical relevance."""
+
+TOOL_STAGES = (
+    (
+        "## 2. Nemotron learns the nvMolKit skill",
+        "read_nvmolkit_skill",
+        "ReadSkillArgs",
+        "skill_artifact",
+    ),
+    (
+        "## 3. Molecular sample",
+        "prepare_molecular_sample",
+        "PrepareSampleArgs",
+        "sample_artifact",
+    ),
+    (
+        "### 4.1 Morgan fingerprints",
+        "compute_morgan_fingerprints",
+        "FingerprintArgs",
+        "fingerprint_artifact",
+    ),
+    (
+        "### 4.2 All-pairs Tanimoto similarity",
+        "compute_tanimoto_similarity",
+        "SimilarityArgs",
+        "similarity_artifact",
+    ),
+    (
+        "### 4.3 Fused Butina clusters",
+        "cluster_with_fused_butina",
+        "ClusterArgs",
+        "cluster_artifact",
+    ),
+)
+
+EXPECTED_CAPABILITY_ROWS = [
+    {
+        "Capability": "Morgan fingerprints",
+        "Entry point": "MorganFingerprintGenerator",
+        "Role": "Molecular representation",
+    },
+    {
+        "Capability": "Tanimoto similarity",
+        "Entry point": "crossTanimotoSimilarity",
+        "Role": "Pairwise structural similarity",
+    },
+    {
+        "Capability": "Butina clustering",
+        "Entry point": "fused_butina",
+        "Role": "Structural grouping",
+    },
+    {
+        "Capability": "ETKDG embedding",
+        "Entry point": "EmbedMolecules",
+        "Role": "Candidate 3D conformers",
+    },
+    {
+        "Capability": "MMFF94 optimization",
+        "Entry point": "MMFFOptimizeMoleculesConfs",
+        "Role": "Force-field minimization",
+    },
+]
 
 
 def read_notebook():
@@ -60,7 +121,51 @@ def dotted_name(node):
     return None
 
 
-def test_notebook_has_exact_v4_story_structure_and_is_only_source_notebook():
+def artifact_subscript_path(node):
+    if not isinstance(node, ast.Subscript):
+        return None
+    keys = []
+    current = node
+    while isinstance(current, ast.Subscript):
+        if not isinstance(current.slice, ast.Constant) or not isinstance(
+            current.slice.value, str
+        ):
+            return None
+        keys.append(current.slice.value)
+        current = current.value
+    if not isinstance(current, ast.Name) or not current.id.endswith("_artifact"):
+        return None
+    return current.id, tuple(reversed(keys))
+
+
+def artifact_accesses(node):
+    access = artifact_subscript_path(node)
+    if access is not None:
+        yield access
+        return
+    if isinstance(node, ast.Name) and node.id.endswith("_artifact"):
+        yield node.id, ()
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from artifact_accesses(child)
+
+
+def notebook_code(notebook):
+    return "\n".join(
+        cell.source for cell in notebook.cells if cell.cell_type == "code"
+    )
+
+
+def heading_cell_index(notebook, heading):
+    return next(
+        index
+        for index, cell in enumerate(notebook.cells)
+        if cell.cell_type == "markdown"
+        and heading in cell.source.splitlines()
+    )
+
+
+def test_notebook_has_exact_v4_story_intro_and_is_only_source_notebook():
     notebook = read_notebook()
     headings = [
         line
@@ -81,19 +186,18 @@ def test_notebook_has_exact_v4_story_structure_and_is_only_source_notebook():
         for path in (REPO_ROOT / "notebooks").rglob("*.ipynb")
         if ".ipynb_checkpoints" not in path.parts and "executed" not in path.parts
     )
-    intro = notebook.cells[0].source
     setup = (REPO_ROOT / "launchable" / "setup.sh").read_text(encoding="utf-8")
     fields = (REPO_ROOT / "launchable" / "fields.md").read_text(encoding="utf-8")
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
 
     assert headings == STORY_HEADINGS
+    assert notebook.cells[0].source == INTRODUCTION
     assert tracked_notebooks == ["notebooks/nvmolkit_nemotron_demo.ipynb"]
     assert source_notebooks == ["notebooks/nvmolkit_nemotron_demo.ipynb"]
-    assert all(
-        phrase in intro
-        for phrase in ("API entry-point map", "runtime requirements", "recipes", "boundaries")
-    )
+    for cell in notebook.cells:
+        if cell.cell_type == "code":
+            ast.parse(cell.source)
     assert all(
         requirement in setup
         for requirement in (
@@ -116,228 +220,402 @@ def test_notebook_has_exact_v4_story_structure_and_is_only_source_notebook():
     assert ".jupyter.pid" in gitignore
 
 
-def test_notebook_code_calls_required_workflow_and_visuals():
+def test_preflight_uses_fixed_local_artifacts_gpu_probe_and_strict_agent_contracts():
     notebook = read_notebook()
-    code = "\n".join(
-        cell.source for cell in notebook.cells if cell.cell_type == "code"
-    )
+    code = notebook_code(notebook)
     tree = ast.parse(code)
-    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
-    called_names = {dotted_name(node.func) for node in calls}
-    fused_butina_call = next(
-        call for call in calls if dotted_name(call.func) == "fused_butina"
-    )
-    mmff_call = next(
-        call for call in calls if dotted_name(call.func) == "MMFFOptimizeMoleculesConfs"
-    )
-    mmff_keywords = {keyword.arg: keyword.value for keyword in mmff_call.keywords}
-    referenced_names = {
-        dotted_name(node)
+    imports = {
+        alias.name
         for node in ast.walk(tree)
-        if isinstance(node, (ast.Name, ast.Attribute))
-    }
-    string_literals = {
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        if isinstance(node, ast.ImportFrom) and node.module == "demo_agent"
+        for alias in node.names
     }
 
-    assert REQUIRED_CALLS <= called_names
-    assert len(fused_butina_call.args) == 1
-    assert isinstance(fused_butina_call.args[0], ast.Call)
-    assert dotted_name(fused_butina_call.args[0].func) == "fingerprints.torch"
-    assert dotted_name(mmff_keywords["output"]) == "CoordinateOutput.DEVICE"
     assert {
-        "optimization_result.energies.numpy",
-        "optimization_result.converged.numpy",
-        "optimization_result.mol_indices.numpy",
-        "optimization_result.conf_indices.numpy",
-        "optimization_result.per_molecule",
-    } <= called_names
-    assert {
-        "optimization_result.energies",
-        "optimization_result.converged",
-        "optimization_result.mol_indices",
-        "optimization_result.conf_indices",
-        "optimization_result.per_molecule",
-    } <= referenced_names
-    assert "converged_conformers" in string_literals
-    assert {
-        "requested_conformers",
-        "generated_conformers",
-        "mmff_attempted_conformers",
-    } <= string_literals
-    assert "optimized_conformers" not in string_literals
+        "ReadSkillArgs",
+        "PrepareSampleArgs",
+        "FingerprintArgs",
+        "SimilarityArgs",
+        "ClusterArgs",
+        "request_and_execute_step",
+        "request_brief_interpretation",
+    } <= imports
+    assert 'DATA_PATH = PROJECT_ROOT / "data" / "sample_molecules.csv"' in code
+    assert 'SKILL_PATH = PROJECT_ROOT / "skills" / "nvmolkit" / "SKILL.md"' in code
+    assert "Path.cwd().parents" in code
+    assert "torch.cuda.is_available()" in code
+    assert "torch.cuda.get_device_capability(0)" in code
+    assert "nvmolkit.__version__" in code
+    preflight_tree = ast.parse(notebook.cells[2].source)
+    probe_call = next(
+        node
+        for node in ast.walk(preflight_tree)
+        if isinstance(node, ast.Call)
+        and dotted_name(node.func) == "MorganFingerprintGenerator"
+    )
+    probe_keywords = {keyword.arg: keyword.value for keyword in probe_call.keywords}
+    assert probe_keywords["radius"].value == 2
+    assert probe_keywords["fpSize"].value == 1024
+    assert "GetFingerprints(probe_molecules)" in notebook.cells[2].source
+    assert "torch.cuda.synchronize()" in code
+    assert 'model = "nvidia/nemotron-3-nano-30b-a3b"' in code
+    assert "from nvmolkit.embedMolecules import EmbedMolecules" in code
+    assert "from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs" in code
 
-    requested_assignment = next(
+
+def test_each_guided_tool_has_task_function_forced_call_result_and_brief_in_order():
+    notebook = read_notebook()
+    code = notebook_code(notebook)
+    tree = ast.parse(code)
+    request_calls = [
         node
         for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and dotted_name(node.func) == "request_and_execute_step"
+    ]
+    brief_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and dotted_name(node.func) == "request_brief_interpretation"
+    ]
+
+    assert len(request_calls) == len(brief_calls) == 5
+    for heading, function_name, annotation_name, artifact_name in TOOL_STAGES:
+        heading_index = heading_cell_index(notebook, heading)
+        task_cell, function_cell, request_cell, result_cell, brief_cell = notebook.cells[
+            heading_index + 1 : heading_index + 6
+        ]
+        assert [
+            task_cell.cell_type,
+            function_cell.cell_type,
+            request_cell.cell_type,
+            result_cell.cell_type,
+            brief_cell.cell_type,
+        ] == ["markdown", "code", "code", "code", "code"]
+        assert task_cell.source.startswith("**Task.**")
+
+        function_tree = ast.parse(function_cell.source)
+        function = next(
+            node for node in function_tree.body if isinstance(node, ast.FunctionDef)
+        )
+        assert function.name == function_name
+        assert [argument.arg for argument in function.args.args] == ["args"]
+        assert dotted_name(function.args.args[0].annotation) == annotation_name
+
+        assert "# Validation completes before the executor runs." in request_cell.source
+        request_tree = ast.parse(request_cell.source)
+        stage_request = next(
+            node
+            for node in ast.walk(request_tree)
+            if isinstance(node, ast.Call)
+            and dotted_name(node.func) == "request_and_execute_step"
+        )
+        keywords = {keyword.arg: keyword.value for keyword in stage_request.keywords}
+        assert keywords["tool_name"].value == function_name
+        assert dotted_name(keywords["executor"]) == function_name
+        assert f'**Requested tool:**' in request_cell.source
+        assert f'**Validated arguments:**' in request_cell.source
+        assert artifact_name in request_cell.source
+
+        assert "json.dumps" in result_cell.source
+        assert artifact_name in result_cell.source
+        assert "request_brief_interpretation" in brief_cell.source
+        assert '"Interpretation unavailable"' in brief_cell.source
+        assert "except Exception" in brief_cell.source
+
+    tool_name_literals = [
+        keyword.value.value
+        for call in request_calls
+        for keyword in call.keywords
+        if keyword.arg == "tool_name"
+    ]
+    assert tool_name_literals == [stage[1] for stage in TOOL_STAGES]
+    assert "analyze_molecule_library" not in code
+    assert "request_explanation" not in code
+    assert "request_tool_call" not in code
+    assert "default" not in code.lower()
+    assert "eval(" not in code
+    assert "exec(" not in code
+    assert "importlib" not in code
+
+
+def test_skill_stage_reads_pinned_text_once_and_bounds_later_grounding():
+    notebook = read_notebook()
+    code = notebook_code(notebook)
+    skill_function_cell = notebook.cells[
+        heading_cell_index(notebook, "## 2. Nemotron learns the nvMolKit skill") + 2
+    ].source
+    skill_result_cell = notebook.cells[
+        heading_cell_index(notebook, "## 2. Nemotron learns the nvMolKit skill") + 4
+    ].source
+    later_request_cells = [
+        notebook.cells[heading_cell_index(notebook, heading) + 3].source
+        for heading, *_ in TOOL_STAGES[1:]
+    ]
+    skill_function_tree = ast.parse(skill_function_cell)
+    capabilities_assignment = next(
+        node
+        for node in skill_function_tree.body[0].body
         if isinstance(node, ast.Assign)
         and any(
-            isinstance(target, ast.Name) and target.id == "requested_conformers"
+            isinstance(target, ast.Name) and target.id == "capabilities"
             for target in node.targets
         )
     )
-    embed_call = next(call for call in calls if dotted_name(call.func) == "EmbedMolecules")
-    assert requested_assignment.lineno < embed_call.lineno
-
-    explanation_call = next(
-        call for call in calls if dotted_name(call.func) == "request_explanation"
-    )
-    explanation_line = explanation_call.lineno
-    lines = code.splitlines()
-    before_explanation = "\n".join(lines[: explanation_line - 1])
-    after_explanation = "\n".join(lines[explanation_line:])
-    boundary_terms = (
-        "binding",
-        "activity",
-        "ADMET",
-        "efficacy",
-        "safety",
-        "synthesizability",
-        "clinical relevance",
-        "experimentally validated conformations",
-    )
-    assert all(term in before_explanation for term in boundary_terms)
-    assert "Agent-generated interpretation; verify independently" in before_explanation
-    assert all(term in after_explanation for term in boundary_terms)
-
-
-def test_notebook_validates_one_tool_call_before_allow_listed_executor():
-    notebook = read_notebook()
-    code = "\n".join(
-        cell.source for cell in notebook.cells if cell.cell_type == "code"
-    )
-    tree = ast.parse(code)
-    executors = [
+    summary_assignment = next(
         node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "analyze_molecule_library"
-    ]
-
-    assert len(executors) == 1
-    executor = executors[0]
-    assert [argument.arg for argument in executor.args.args] == ["mols", "plan"]
-    executor_calls = {
-        dotted_name(node.func)
-        for node in ast.walk(executor)
-        if isinstance(node, ast.Call)
+        for node in skill_function_tree.body[0].body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "summary"
+            for target in node.targets
+        )
+    )
+    summary_items = {
+        key.value: value
+        for key, value in zip(
+            summary_assignment.value.keys, summary_assignment.value.values
+        )
     }
+    figure_context = ast.literal_eval(summary_items["figure_context"])
+    skill_result_tree = ast.parse(skill_result_cell)
+    capability_table_call = next(
+        node
+        for node in ast.walk(skill_result_tree)
+        if isinstance(node, ast.Call) and dotted_name(node.func) == "pd.DataFrame"
+    )
+
+    assert skill_function_cell.count("SKILL_PATH.read_text") == 1
+    assert "ce151c15470991c8cb9a0efdd531a124c346ca5b" in skill_function_cell
+    assert "https://github.com/NVIDIA-BioNeMo/bionemo-agent-toolkit/blob/" in skill_function_cell
+    assert "There is no CPU fallback" in skill_function_cell
+    assert ast.literal_eval(capabilities_assignment.value) == EXPECTED_CAPABILITY_ROWS
+    assert dotted_name(summary_items["capabilities"]) == "capabilities"
+    assert figure_context == {
+        "visual": "capability table",
+        "rows": 5,
+        "columns": ["Capability", "Entry point", "Role"],
+    }
+    assert ast.literal_eval(capability_table_call.args[0]) == EXPECTED_CAPABILITY_ROWS
+    assert all(
+        list(row) == ["Capability", "Entry point", "Role"]
+        for row in ast.literal_eval(capability_table_call.args[0])
+    )
+    assert code.count('skill_artifact["skill_text"]') == 1
+    assert all('"skill_grounding": skill_grounding' in cell for cell in later_request_cells)
+    assert all("skill_text" not in cell for cell in later_request_cells)
+
+
+def test_hosted_payloads_contain_only_json_safe_summaries_and_one_skill_text():
+    notebook = read_notebook()
+    hosted_calls = []
+    for cell in notebook.cells:
+        if cell.cell_type != "code":
+            continue
+        for node in ast.walk(ast.parse(cell.source)):
+            if not isinstance(node, ast.Call):
+                continue
+            call_name = dotted_name(node.func)
+            if call_name == "request_and_execute_step":
+                keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+                hosted_calls.append((call_name, keywords["context"], node))
+            elif call_name == "request_brief_interpretation":
+                hosted_calls.append((call_name, node.args[2], node))
+                hosted_calls.append((call_name, node.args[3], node))
+
+    assert len(hosted_calls) == 15
+    forbidden_local_keys = {
+        "molecules",
+        "frame",
+        "fingerprints",
+        "tensor",
+        "active_bits",
+        "result",
+        "matrix",
+        "assignments",
+        "clusters",
+        "reported_cluster_sizes",
+    }
+    skill_text_accesses = []
+    for call_name, payload, call in hosted_calls:
+        for artifact_name, path in artifact_accesses(payload):
+            assert path, f"Whole local artifact exposed: {artifact_name}"
+            assert path[0] not in forbidden_local_keys
+            if path[0] == "summary":
+                continue
+            assert (
+                call_name == "request_brief_interpretation"
+                and dotted_name(call.args[1]) == "skill_decision"
+                and artifact_name == "skill_artifact"
+                and path == ("skill_text",)
+            )
+            skill_text_accesses.append((artifact_name, path))
+
+    assert skill_text_accesses == [("skill_artifact", ("skill_text",))]
+
+
+def test_brief_contexts_state_each_stage_specific_scientific_boundary():
+    notebook = read_notebook()
+    expected_boundaries = {
+        "## 2. Nemotron learns the nvMolKit skill": (
+            "Explain the documented capabilities and GPU/API limitations."
+        ),
+        "## 3. Molecular sample": (
+            "The 24-molecule preview cannot establish whole-library chemistry."
+        ),
+        "### 4.1 Morgan fingerprints": (
+            "Interpret representation and density only; do not infer biological activity."
+        ),
+        "### 4.2 All-pairs Tanimoto similarity": (
+            "Explain the off-diagonal distribution and most-similar pair without "
+            "inferring shared biological activity."
+        ),
+        "### 4.3 Fused Butina clusters": (
+            "Discuss fragmentation, diversity, singletons, and cutoff sensitivity "
+            "without biological claims."
+        ),
+    }
+
+    for heading, boundary in expected_boundaries.items():
+        brief_cell = notebook.cells[heading_cell_index(notebook, heading) + 5]
+        string_literals = {
+            node.value
+            for node in ast.walk(ast.parse(brief_cell.source))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        assert boundary in string_literals
+
+
+def test_sample_stage_keeps_fixed_raw_shape_filters_invalid_smiles_and_previews_24():
+    notebook = read_notebook()
+    heading_index = heading_cell_index(notebook, "## 3. Molecular sample")
+    function_cell = notebook.cells[heading_index + 2].source
+    result_cell = notebook.cells[heading_index + 4].source
+
+    assert "pd.read_csv(DATA_PATH)" in function_cell
+    assert "len(raw_sample) != 256" in function_cell
+    assert '["molecule_id", "smiles"]' in function_cell
+    assert "Chem.MolFromSmiles" in function_cell
+    assert "molecule is not None" in function_cell
+    assert "excluded_identifiers" in function_cell
+    assert "zero valid molecules" in function_cell.lower()
+    assert "Expected 256 valid" not in function_cell
+    assert "raw_rows" in function_cell
+    assert "valid_molecules" in function_cell
+    assert "invalid_molecules" in function_cell
+    assert "preview_count" in function_cell
+    assert "figure_context" in function_cell
+    assert "Invalid SMILES" in result_cell
+    assert "excluded identifiers" in result_cell
+    assert 'else "none"' in result_cell
+    assert 'sample_artifact["molecules"][:24]' in result_cell
+    assert "molsPerRow=6" in result_cell
+    assert "Draw.MolsToGridImage" in result_cell
+
+
+def test_similarity_chain_uses_gpu_artifacts_bounded_statistics_and_static_visuals():
+    notebook = read_notebook()
+    code = notebook_code(notebook)
+    tree = ast.parse(code)
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    called_names = {dotted_name(node.func) for node in calls}
+    fingerprint_function = notebook.cells[
+        heading_cell_index(notebook, "### 4.1 Morgan fingerprints") + 2
+    ].source
+    fingerprint_result = notebook.cells[
+        heading_cell_index(notebook, "### 4.1 Morgan fingerprints") + 4
+    ].source
+    similarity_function = notebook.cells[
+        heading_cell_index(notebook, "### 4.2 All-pairs Tanimoto similarity") + 2
+    ].source
+    similarity_result = notebook.cells[
+        heading_cell_index(notebook, "### 4.2 All-pairs Tanimoto similarity") + 4
+    ].source
+    cluster_function = notebook.cells[
+        heading_cell_index(notebook, "### 4.3 Fused Butina clusters") + 2
+    ].source
+    cluster_result = notebook.cells[
+        heading_cell_index(notebook, "### 4.3 Fused Butina clusters") + 4
+    ].source
+
     assert {
         "MorganFingerprintGenerator",
         "crossTanimotoSimilarity",
         "fused_butina",
-        "EmbedMolecules",
-        "MMFFOptimizeMoleculesConfs",
-    } <= executor_calls
-
-    executor_invocations = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and dotted_name(node.func) == "analyze_molecule_library"
-    ]
-    assert len(executor_invocations) == 1
-    invocation = executor_invocations[0]
-    assert [dotted_name(argument) for argument in invocation.args] == ["mols", "plan"]
-
-    tool_request = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and dotted_name(node.func) == "request_tool_call"
-    )
-    plan_assignment = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "plan" for target in node.targets)
-        and dotted_name(node.value) == "decision.plan"
-    )
-    allow_list_guard = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.If)
-        and "decision.tool_name" in {
-            dotted_name(child)
-            for child in ast.walk(node.test)
-            if isinstance(child, (ast.Name, ast.Attribute))
-        }
-        and any(isinstance(child, ast.Raise) for child in ast.walk(node))
-    )
-    fallback_guard = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.If)
-        and "decision.source" in {
-            dotted_name(child)
-            for child in ast.walk(node.test)
-            if isinstance(child, (ast.Name, ast.Attribute))
-        }
-        and any(isinstance(child, ast.Raise) for child in ast.walk(node))
-    )
-    fallback_strings = {
-        node.value
-        for node in ast.walk(fallback_guard)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
-    }
-    assert any("Scientific tool was not executed" in value for value in fallback_strings)
-    assert (
-        tool_request.lineno
-        < plan_assignment.lineno
-        < fallback_guard.lineno
-        < allow_list_guard.lineno
-        < invocation.lineno
-    )
-
-    summary_assignment = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "summary" for target in node.targets)
-        and node.value is invocation
-    )
-    explanation = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and dotted_name(node.func) == "request_explanation"
-    )
-    assert summary_assignment.lineno < explanation.lineno
-    assert [dotted_name(argument) for argument in explanation.args[:3]] == [
-        "api_key",
-        "decision",
-        "summary",
-    ]
-    assert "**Requested tool:**" in code
-    assert "**Validated arguments:**" in code
-
-
-def test_notebook_executor_returns_compact_json_safe_summary():
-    notebook = read_notebook()
-    code = "\n".join(
-        cell.source for cell in notebook.cells if cell.cell_type == "code"
-    )
-    tree = ast.parse(code)
-    executor = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "analyze_molecule_library"
-    )
-    returns = [node for node in ast.walk(executor) if isinstance(node, ast.Return)]
-    assert len(returns) == 1
-    assert dotted_name(returns[0].value) == "summary"
-    summary_assignment = next(
-        node
-        for node in ast.walk(executor)
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "summary" for target in node.targets)
-    )
-    assert isinstance(summary_assignment.value, ast.Dict)
+        "torch.cuda.synchronize",
+        "Draw.MolsToGridImage",
+        "sns.heatmap",
+        "plt.hist",
+        "plt.bar",
+    } <= called_names
+    assert "fingerprint_radius" in fingerprint_function
+    assert "fingerprint_size" in fingerprint_function
+    assert "GetFingerprints" in fingerprint_function
+    assert "GPU-resident" in fingerprint_function
+    assert "packed" in fingerprint_function
+    assert "active hashed bits" in fingerprint_function
+    assert "torch.cuda.synchronize()" in fingerprint_function
     assert all(
-        isinstance(key, ast.Constant) and isinstance(key.value, str)
-        for key in summary_assignment.value.keys
+        statistic in fingerprint_function
+        for statistic in ("min_active_bits", "median_active_bits", "mean_active_bits", "max_active_bits")
     )
+    assert "plt.hist" in fingerprint_result
+    assert "Active Morgan fingerprint bits per molecule" in fingerprint_result
+
+    similarity_tree = ast.parse(similarity_function)
+    tanimoto_call = next(
+        node
+        for node in ast.walk(similarity_tree)
+        if isinstance(node, ast.Call)
+        and dotted_name(node.func) == "crossTanimotoSimilarity"
+    )
+    assert len(tanimoto_call.args) == 1
+    assert isinstance(tanimoto_call.args[0], ast.Subscript)
+    assert dotted_name(tanimoto_call.args[0].value) == "fingerprint_artifact"
+    assert tanimoto_call.args[0].slice.value == "fingerprints"
+    assert "np.isfinite" in similarity_function
+    assert "np.allclose" in similarity_function
+    assert "Self-similarity on the diagonal" in similarity_function
+    assert "np.triu_indices" in similarity_function
+    assert all(
+        key in similarity_function
+        for key in ("q1", "median", "q3", "p90", "max_off_diagonal", "most_similar_nonidentical_pair_ids")
+    )
+    assert "sns.heatmap" in similarity_result
+    assert "vmin=0" in similarity_result and "vmax=1" in similarity_result
+    assert "Unordered" in similarity_result and "input order" in similarity_result
+    assert "cluster_order" not in similarity_result
+
+    fused_call = next(call for call in calls if dotted_name(call.func) == "fused_butina")
+    assert isinstance(fused_call.args[0], ast.Call)
+    assert dotted_name(fused_call.args[0].func) == "fingerprints.torch"
+    cluster_task = notebook.cells[
+        heading_cell_index(notebook, "### 4.3 Fused Butina clusters") + 1
+    ].source
+    assert "0.50 Tanimoto-distance cutoff" in cluster_task
+    assert "Tanimoto-distance threshold" in cluster_function
+    assert "similarity > 1 - cutoff" in cluster_function
+    assert "Lowering it" in cluster_function
+    cutoff_comment_index = cluster_function.splitlines().index(
+        "    # The cutoff is a Tanimoto-distance threshold: similarity > 1 - cutoff."
+    )
+    assert cluster_function.splitlines()[cutoff_comment_index + 1] == (
+        "    # Lowering it requires greater similarity and can create more singletons."
+    )
+    assert "\\n" not in cluster_function
+    assert "singletons" in cluster_function.lower()
+    assert "sorted(assigned_indices) != list(range(molecule_count))" in cluster_function
+    assert "assignments" in cluster_function and '"clusters"' in cluster_function
+    assert all(
+        key in cluster_function
+        for key in ("cluster_count", "singleton_count", "singleton_fraction", "largest_cluster_sizes")
+    )
+    assert "[:15]" in cluster_result
+    assert "plt.bar" in cluster_result
+    assert "singletons" in cluster_result.lower()
+    assert "sns.heatmap" not in cluster_result
+    assert code.count("json.dumps") >= 5
 
 
 def test_notebook_contains_no_api_key_and_no_saved_execution_state():
@@ -349,6 +627,21 @@ def test_notebook_contains_no_api_key_and_no_saved_execution_state():
         if cell.cell_type == "code":
             assert cell.outputs == []
             assert cell.execution_count is None
+
+
+def test_sections_five_and_six_are_markdown_only_transitions_for_task_three():
+    notebook = read_notebook()
+    section_five_index = heading_cell_index(
+        notebook, "## 5. Conformers and MMFF94"
+    )
+    task_three_tail = notebook.cells[section_five_index:]
+
+    assert all(cell.cell_type == "markdown" for cell in task_three_tail)
+    assert [cell.source.splitlines()[0] for cell in task_three_tail] == [
+        "## 5. Conformers and MMFF94",
+        "## 6. What the results mean",
+    ]
+    assert all(len(cell.source.split("\n\n", 1)) == 2 for cell in task_three_tail)
 
 
 def test_setup_uses_brev_managed_python_and_leaves_jupyter_to_brev():
@@ -603,9 +896,11 @@ def test_docs_assign_tool_contract_and_execution_to_the_correct_components():
     intro = read_notebook().cells[0].source.lower()
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8").lower()
 
+    assert "agent toolkit skill" in intro
+    assert "structured tool call" in intro
+    assert "notebook validates and executes it" in intro
+    assert "tool contract" in readme
+    assert "notebook" in readme and "executes" in readme
     for documentation in (intro, readme):
-        assert "agent toolkit skill" in documentation
-        assert "tool contract" in documentation
-        assert "notebook" in documentation and "executes" in documentation
         assert "model executes python" not in documentation
         assert "dynamically loaded" not in documentation
