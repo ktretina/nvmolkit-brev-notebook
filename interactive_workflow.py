@@ -78,18 +78,19 @@ class InteractiveWorkflow:
 
     def __init__(self, controller: demo_agent.BoundedWorkflowController):
         self.controller = controller
-        self.status = "ready"
+        self.status = "idle"
         self.controls: dict[str, widgets.Widget] = {}
         self.approve_button: widgets.Button | None = None
         self.retry_button: widgets.Button | None = None
         self.transcript_text = ""
+        self.plan_cards: tuple[widgets.VBox, ...] = ()
         self.completed_cards: tuple[widgets.VBox, ...] = ()
         self.active_card: widgets.VBox | None = None
         self._active_proposal: demo_agent.StageProposal | None = None
         self._approved: BaseModel | None = None
         self._busy = False
         self.start_button = widgets.Button(description="Start Agent", button_style="primary")
-        self.start_button.on_click(lambda _button: self.start())
+        self.start_button.on_click(self.start)
         self._body = widgets.VBox()
         self.root = widgets.VBox((self.start_button, self._body))
 
@@ -101,27 +102,44 @@ class InteractiveWorkflow:
         self.transcript_text += text + "\n"
 
     def _set_body(self) -> None:
-        children = list(self.completed_cards)
+        children = [*self.plan_cards, *self.completed_cards]
         if self.active_card is not None:
             children.append(self.active_card)
         self._body.children = tuple(children)
 
-    def _error_card(self, title: str, error: Exception, retry_label: str | None, callback=None) -> None:
-        self.status = "error" if retry_label else "stopped"
+    @staticmethod
+    def _known_failure(error: Exception) -> bool:
+        return isinstance(error, demo_agent.ToolCallError) or str(error) == demo_agent.AUTH_GUIDANCE
+
+    def _retry_card(self, title: str, error: Exception, status: str, label: str, callback) -> None:
         message = _safe_message(error)
+        self.status = status
         self._line(f"{title}: {message}")
-        children: list[widgets.Widget] = [widgets.HTML(f"<b>{escape(title)}</b><p>{message}</p>")]
-        self.retry_button = None
-        if retry_label and callback is not None:
-            button = widgets.Button(description=retry_label)
-            button.on_click(lambda _button: callback())
-            children.append(button)
-            self.retry_button = button
-        self.active_card = widgets.VBox(tuple(children))
+        button = widgets.Button(description=label)
+        button.on_click(callback)
+        self.retry_button = button
+        error_widget = widgets.HTML(f"<b>{escape(title)}</b><p>{message}</p>")
+        if self.active_card is None or status in {"plan_failed", "proposal_failed"}:
+            self.active_card = widgets.VBox((error_widget, button))
+        else:
+            self.active_card.children = (*self.active_card.children, error_widget, button)
         self._set_body()
 
-    def start(self) -> None:
-        if self._busy or self.status != "ready":
+    def _stop(self) -> None:
+        self.status = "stopped"
+        self.retry_button = None
+        self.approve_button = None
+        message = "A local workflow error occurred. The workflow was stopped safely."
+        self._line(f"Workflow stopped: {message}")
+        error_widget = widgets.HTML(f"<b>Workflow stopped</b><p>{message}</p>")
+        if self.active_card is None:
+            self.active_card = widgets.VBox((error_widget,))
+        else:
+            self.active_card.children = (*self.active_card.children, error_widget)
+        self._set_body()
+
+    def start(self, button: widgets.Button | None = None) -> None:
+        if (button is not None and button is not self.start_button) or self._busy or self.status != "idle" or self.start_button.disabled:
             return
         self._busy = True
         self.start_button.disabled = True
@@ -133,39 +151,78 @@ class InteractiveWorkflow:
                 for item in plan.stages
             )
             self._line("Plan: " + ", ".join(item.stage for item in plan.stages))
-            self.active_card = widgets.VBox((widgets.HTML(f"<h3>Fixed workflow plan</h3><ol>{lines}</ol>"),))
+            plan_card = widgets.VBox((widgets.HTML(f"<h3>Fixed workflow plan</h3><ol>{lines}</ol>"),))
+            self.plan_cards = (*self.plan_cards, plan_card)
+            self.active_card = None
             self._set_body()
             self._request_proposal()
         except Exception as error:
-            self._error_card("Plan request failed", error, "Retry Plan", self._retry_plan)
+            if self._known_failure(error) and getattr(self.controller, "pending", None) is None and getattr(self.controller, "plan", None) is None:
+                self._retry_card("Plan request failed", error, "plan_failed", "Retry Plan", self._retry_plan)
+            else:
+                self._stop()
         finally:
             self._busy = False
 
-    def _retry_plan(self) -> None:
-        if self._busy:
+    def _retry_plan(self, button: widgets.Button) -> None:
+        if self._busy or self.status != "plan_failed" or button is not self.retry_button or button.disabled:
             return
-        self.status = "ready"
-        self.retry_button.disabled = True
+        button.disabled = True
+        self.retry_button = None
+        self.status = "idle"
         self.start_button.disabled = False
-        self.start()
+        self.start(self.start_button)
 
     def _evidence_summary(self) -> str:
         results = getattr(self.controller, "stage_results", ())
         if not results:
             return "No prior scientific results; fixed input and plan only."
-        return "; ".join(f"{result.stage}: {len(result.summary)} metrics" for result in results)
+        result = results[-1]
+        allowed = demo_agent._STAGE_METRICS.get(result.stage, ())
+        metrics = [f"{key}={result.summary[key]}" for key in allowed if key in result.summary]
+        return f"{result.stage}: " + (", ".join(metrics) if metrics else "completed")
 
     def _request_proposal(self) -> None:
-        self.status = "requesting_proposal"
+        self.status = "proposing"
         try:
             proposal = self.controller.request_next_stage()
             self._show_proposal(proposal)
         except Exception as error:
-            self._error_card("Stage proposal failed", error, "Retry Proposal", self._request_proposal)
+            expected = demo_agent.STAGES[len(self.completed_cards)] if len(self.completed_cards) < len(demo_agent.STAGES) else None
+            retryable = False
+            try:
+                retryable = getattr(self.controller, "pending", None) is None and self.controller.session.eligible_tool_name() == expected
+            except Exception:
+                pass
+            if self._known_failure(error) and retryable:
+                self._retry_card("Stage proposal failed", error, "proposal_failed", "Retry Proposal", self._retry_proposal)
+            else:
+                self._stop()
+
+    def _retry_proposal(self, button: widgets.Button) -> None:
+        if self._busy or self.status != "proposal_failed" or button is not self.retry_button or button.disabled:
+            return
+        expected = demo_agent.STAGES[len(self.completed_cards)]
+        try:
+            safe = getattr(self.controller, "pending", None) is None and self.controller.session.eligible_tool_name() == expected
+        except Exception:
+            safe = False
+        if not safe:
+            button.disabled = True
+            self._stop()
+            return
+        self._busy = True
+        button.disabled = True
+        self.retry_button = None
+        try:
+            self._request_proposal()
+        finally:
+            self._busy = False
 
     def _show_proposal(self, proposal: demo_agent.StageProposal) -> None:
         self._active_proposal = proposal
         self._approved = None
+        self.retry_button = None
         self.controls = controls_for(proposal)
         proposed_receipt = command_receipt(proposal.stage, proposal.arguments)
         preview = widgets.HTML()
@@ -183,7 +240,7 @@ class InteractiveWorkflow:
             control.observe(update_preview, names="value")
         update_preview()
         button = widgets.Button(description="Approve & Run", button_style="success")
-        button.on_click(lambda _button: self._approve(button))
+        button.on_click(self._approve)
         self.approve_button = button
         basis = getattr(proposal.arguments, "decision_basis", "Fixed parameter-free stage.")
         header = widgets.HTML(
@@ -204,9 +261,10 @@ class InteractiveWorkflow:
             control.disabled = True
 
     def _approve(self, original_button: widgets.Button) -> None:
-        if self._busy or original_button.disabled or self.status != "awaiting_approval":
+        if self._busy or original_button is not self.approve_button or original_button.disabled or self.status != "awaiting_approval":
             return
         self._busy = True
+        self.status = "executing"
         self._disable_active()
         proposal = self._active_proposal
         try:
@@ -221,10 +279,10 @@ class InteractiveWorkflow:
             else:
                 self._request_proposal()
         except Exception as error:
-            if self._execution_is_retryable(proposal):
-                self._error_card("Scientific execution failed", error, "Retry Execution", self._retry_execution)
+            if self._known_failure(error) and self._execution_is_retryable(proposal):
+                self._retry_card("Scientific execution failed", error, "execution_failed", "Retry Execution", self._retry_execution)
             else:
-                self._error_card("Workflow stopped", error, None)
+                self._stop()
         finally:
             self._busy = False
 
@@ -236,13 +294,21 @@ class InteractiveWorkflow:
         except Exception:
             return False
 
-    def _retry_execution(self) -> None:
-        if self._busy or self._approved is None or self._active_proposal is None:
+    def _retry_execution(self, button: widgets.Button) -> None:
+        if self._busy or self.status != "execution_failed" or button is not self.retry_button or button.disabled:
+            return
+        proposal = self._active_proposal
+        if not self._execution_is_retryable(proposal):
+            button.disabled = True
+            self._stop()
             return
         self._busy = True
-        self.retry_button.disabled = True
-        proposal, approved = self._active_proposal, self._approved
+        self.status = "executing"
+        button.disabled = True
+        self.retry_button = None
+        approved = self._approved
         try:
+            assert proposal is not None and approved is not None
             receipt = command_receipt(proposal.stage, approved)
             result = self.controller.execute_pending(approved)
             self._complete_card(proposal, approved, receipt, result)
@@ -251,10 +317,10 @@ class InteractiveWorkflow:
             else:
                 self._request_proposal()
         except Exception as error:
-            if self._execution_is_retryable(proposal):
-                self._error_card("Scientific execution failed", error, "Retry Execution", self._retry_execution)
+            if self._known_failure(error) and self._execution_is_retryable(proposal):
+                self._retry_card("Scientific execution failed", error, "execution_failed", "Retry Execution", self._retry_execution)
             else:
-                self._error_card("Workflow stopped", error, None)
+                self._stop()
         finally:
             self._busy = False
 
@@ -267,16 +333,24 @@ class InteractiveWorkflow:
         with output:
             for figure in result.figures:
                 demo_agent._display_figure(figure)
-        card = widgets.VBox((widgets.HTML(
+        completion = widgets.HTML(
             f"<h3>Completed: {escape(result.stage)}</h3>{comparison}"
             f"<b>Approved tool call</b><pre>{escape(receipt.approved_tool_call)}</pre>"
             f"<b>{escape(receipt.scientific_label)}</b><pre>{escape(receipt.scientific_invocation)}</pre>"
             f"<p><b>Result metrics:</b> {escape(str(metrics))}</p>"
-        ), output))
+        )
+        card = self.active_card
+        if card is None:
+            raise RuntimeError("Active proposal card was missing.")
+        card.children = (*card.children, completion, output)
         self.completed_cards = (*self.completed_cards, card)
         self.active_card = None
-        self.status = "stage_complete"
+        self.status = "proposing"
         self._line(f"Completed {result.stage}: {receipt.approved_tool_call}; {receipt.scientific_label}: {receipt.scientific_invocation}; metrics={metrics}")
+        self._approved = None
+        self._active_proposal = None
+        self.retry_button = None
+        self.approve_button = None
         self._set_body()
 
     def _request_synthesis(self) -> None:
@@ -287,11 +361,29 @@ class InteractiveWorkflow:
             with output:
                 demo_agent._display_conclusion(result)
             self.active_card = widgets.VBox((widgets.HTML("<h3>Final synthesis</h3>"), output))
-            self.status = "complete"
+            self.status = "completed"
             self._line("Final synthesis complete")
             self._set_body()
         except Exception as error:
-            self._error_card("Synthesis failed", error, "Retry Synthesis", self._request_synthesis)
+            if self._known_failure(error) and len(self.completed_cards) == len(demo_agent.STAGES):
+                self._retry_card("Synthesis failed", error, "synthesis_failed", "Retry Synthesis", self._retry_synthesis)
+            else:
+                self._stop()
+
+    def _retry_synthesis(self, button: widgets.Button) -> None:
+        if self._busy or self.status != "synthesis_failed" or button is not self.retry_button or button.disabled:
+            return
+        if len(self.completed_cards) != len(demo_agent.STAGES):
+            button.disabled = True
+            self._stop()
+            return
+        self._busy = True
+        button.disabled = True
+        self.retry_button = None
+        try:
+            self._request_synthesis()
+        finally:
+            self._busy = False
 
 
 def launch_interactive_workflow(user_goal: str, api_key: str, skill: str | None = None,
