@@ -268,12 +268,125 @@ def _one_receipt_call(receipt, name):
     return matches[0]
 
 
+def _approved_call(receipt):
+    statement = ast.parse(receipt.approved_tool_call).body[0]
+    assert isinstance(statement, ast.Expr)
+    assert isinstance(statement.value, ast.Call)
+    return statement.value
+
+
 def _keyword_sources(call):
     return {keyword.arg: ast.unparse(keyword.value) for keyword in call.keywords}
 
 
 def _literal_keywords(call):
     return {keyword.arg: ast.literal_eval(keyword.value) for keyword in call.keywords}
+
+
+def _import_contract(function):
+    imports = [
+        node for node in ast.walk(_source_tree(function))
+        if isinstance(node, ast.ImportFrom)
+    ]
+    assert len(imports) == 1
+    return imports[0].module, [alias.name for alias in imports[0].names]
+
+
+def _return_expression(function):
+    returns = [
+        node.value for node in ast.walk(_source_tree(function))
+        if isinstance(node, ast.Return)
+    ]
+    assert len(returns) == 1
+    return returns[0]
+
+
+def _assigned_expression(function, target_name):
+    matches = [
+        node.value
+        for node in ast.walk(_source_tree(function))
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == target_name
+            for target in node.targets
+        )
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _controller_mapping(stage):
+    tree = _source_tree(demo_agent._executor_arguments)
+    for branch in (node for node in ast.walk(tree) if isinstance(node, ast.If)):
+        comparison = branch.test
+        if (
+            isinstance(comparison, ast.Compare)
+            and len(comparison.comparators) == 1
+            and isinstance(comparison.comparators[0], ast.Constant)
+            and comparison.comparators[0].value == stage
+        ):
+            returned = next(
+                node.value for node in branch.body if isinstance(node, ast.Return)
+            )
+            assert isinstance(returned, ast.Dict)
+            return {
+                ast.literal_eval(key): ast.unparse(value)
+                for key, value in zip(returned.keys, returned.values)
+            }
+    raise AssertionError(f"No controller mapping found for {stage}")
+
+
+@pytest.mark.parametrize(
+    ("stage", "arguments", "field_to_workflow_keyword"),
+    [
+        (
+            "generate_morgan_fingerprints",
+            FingerprintArgs(radius=3, size=2048, decision_basis="contract"),
+            {"radius": "fingerprint_radius", "size": "fingerprint_size"},
+        ),
+        (
+            "discover_fused_butina_clusters",
+            ClusterArgs(cutoff=0.6, decision_basis="contract"),
+            {"cutoff": "cluster_cutoff"},
+        ),
+        (
+            "embed_representative_conformers",
+            EmbedArgs(
+                representative_count=6,
+                policy="include_singleton_if_available",
+                conformers_per_representative=8,
+                decision_basis="contract",
+            ),
+            {
+                "representative_count": "representative_count",
+                "policy": "representative_policy",
+                "conformers_per_representative": (
+                    "conformers_per_representative"
+                ),
+            },
+        ),
+    ],
+)
+def test_approved_receipt_fields_track_controller_workflow_keywords(
+    stage, arguments, field_to_workflow_keyword
+):
+    receipt = command_receipt(stage, arguments)
+    approved = _approved_call(receipt)
+    controller = _controller_mapping(stage)
+    inspected_mapping = {
+        source.removeprefix("arguments."): workflow_keyword
+        for workflow_keyword, source in controller.items()
+    }
+
+    assert inspected_mapping == field_to_workflow_keyword
+    assert list(_literal_keywords(approved)) == list(field_to_workflow_keyword)
+    assert _literal_keywords(approved) == {
+        field: getattr(arguments, field) for field in field_to_workflow_keyword
+    }
+    assert demo_agent._executor_arguments(stage, arguments) == {
+        workflow_keyword: getattr(arguments, field)
+        for field, workflow_keyword in field_to_workflow_keyword.items()
+    }
 
 
 def test_inspection_receipt_tracks_the_default_executor_call_site():
@@ -304,7 +417,13 @@ def test_fingerprint_receipt_tracks_the_real_generator_and_batch_call_sites():
     )
     displayed_generator = _one_receipt_call(receipt, "MorganFingerprintGenerator")
     displayed_batch = _one_receipt_call(receipt, "GetFingerprints")
+    wrapper_return = _return_expression(chemistry_workflow._morgan_generator_class)
 
+    assert _import_contract(chemistry_workflow._morgan_generator_class) == (
+        "nvmolkit.fingerprints",
+        ["MorganFingerprintGenerator"],
+    )
+    assert ast.unparse(wrapper_return) == _call_name(displayed_generator)
     assert isinstance(actual_generator.func, ast.Call)
     assert _keyword_sources(actual_generator) == {
         "radius": "fingerprint_radius",
@@ -325,8 +444,18 @@ def test_similarity_receipt_tracks_the_real_batch_call_site():
         "_cross_tanimoto_similarity",
     )
     displayed = _one_receipt_call(receipt, "crossTanimotoSimilarity")
+    public = _one_source_call(
+        chemistry_workflow._cross_tanimoto_similarity,
+        "crossTanimotoSimilarity",
+    )
 
+    assert _import_contract(chemistry_workflow._cross_tanimoto_similarity) == (
+        "nvmolkit.similarity",
+        ["crossTanimotoSimilarity"],
+    )
     assert [ast.unparse(value) for value in actual.args] == ["state.fingerprints"]
+    assert _call_name(public) == _call_name(displayed)
+    assert [ast.unparse(value) for value in public.args] == ["fingerprints"]
     assert [ast.unparse(value) for value in displayed.args] == ["fingerprints"]
 
 
@@ -337,11 +466,23 @@ def test_cluster_receipt_tracks_the_real_fused_butina_call_site():
         chemistry_workflow.discover_fused_butina_clusters, "_fused_butina"
     )
     displayed = _one_receipt_call(receipt, "fused_butina")
+    public = _one_source_call(chemistry_workflow._fused_butina, "fused_butina")
+    cutoff_assignment = _assigned_expression(
+        chemistry_workflow.discover_fused_butina_clusters, "cutoff"
+    )
 
+    assert _import_contract(chemistry_workflow._fused_butina) == (
+        "nvmolkit.clustering",
+        ["fused_butina"],
+    )
     assert [ast.unparse(value) for value in actual.args] == [
         "state.fingerprints.torch()"
     ]
+    assert ast.unparse(cutoff_assignment) == "float(cluster_cutoff)"
     assert _keyword_sources(actual) == {"cutoff": "cutoff"}
+    assert _call_name(public) == _call_name(displayed)
+    assert [ast.unparse(value) for value in public.args] == ["fingerprints"]
+    assert _keyword_sources(public) == {"cutoff": "cutoff"}
     assert [ast.unparse(value) for value in displayed.args] == [
         "fingerprints.torch()"
     ]
@@ -360,14 +501,43 @@ def test_embedding_receipt_tracks_the_real_embed_call_site():
         chemistry_workflow.embed_representative_conformers, "_embed_molecules"
     )
     displayed = _one_receipt_call(receipt, "EmbedMolecules")
+    public = _one_source_call(chemistry_workflow._embed_molecules, "EmbedMolecules")
+    policy_assignment = _assigned_expression(
+        chemistry_workflow.embed_representative_conformers, "policy"
+    )
+    selection = _one_source_call(
+        chemistry_workflow.embed_representative_conformers,
+        "select_representatives",
+    )
 
+    assert _import_contract(chemistry_workflow._embed_molecules) == (
+        "nvmolkit.embedMolecules",
+        ["EmbedMolecules"],
+    )
     assert [ast.unparse(value) for value in actual.args] == [
         "molecules",
         "parameters",
     ]
+    assert ast.unparse(policy_assignment) == (
+        "RepresentativePolicy(representative_policy)"
+    )
+    assert [ast.unparse(value) for value in selection.args] == [
+        "state",
+        "representative_count",
+        "policy",
+    ]
     assert _keyword_sources(actual) == {
         "confsPerMolecule": "conformers_per_representative",
         "maxIterations": "-1",
+    }
+    assert _call_name(public) == _call_name(displayed)
+    assert [ast.unparse(value) for value in public.args] == [
+        "molecules",
+        "parameters",
+    ]
+    assert _keyword_sources(public) == {
+        "confsPerMolecule": "confsPerMolecule",
+        "maxIterations": "maxIterations",
     }
     assert [ast.unparse(value) for value in displayed.args] == [
         "molecules",
@@ -385,11 +555,32 @@ def test_optimization_receipt_tracks_the_real_mmff94_call_site():
         chemistry_workflow.optimize_conformers_mmff94, "_optimize_mmff94"
     )
     displayed = _one_receipt_call(receipt, "MMFFOptimizeMoleculesConfs")
+    public = _one_source_call(
+        chemistry_workflow._optimize_mmff94, "MMFFOptimizeMoleculesConfs"
+    )
+    coordinate_return = _return_expression(
+        chemistry_workflow._coordinate_output_device
+    )
 
+    assert _import_contract(chemistry_workflow._optimize_mmff94) == (
+        "nvmolkit.mmffOptimization",
+        ["MMFFOptimizeMoleculesConfs"],
+    )
+    assert _import_contract(chemistry_workflow._coordinate_output_device) == (
+        "nvmolkit.types",
+        ["CoordinateOutput"],
+    )
+    assert ast.unparse(coordinate_return) == "CoordinateOutput.DEVICE"
     assert [ast.unparse(value) for value in actual.args] == ["molecules"]
     assert _keyword_sources(actual) == {
         "maxIters": "500",
         "output": "_coordinate_output_device()",
+    }
+    assert _call_name(public) == _call_name(displayed)
+    assert [ast.unparse(value) for value in public.args] == ["molecules"]
+    assert _keyword_sources(public) == {
+        "maxIters": "maxIters",
+        "output": "output",
     }
     assert [ast.unparse(value) for value in displayed.args] == ["molecules"]
     assert _keyword_sources(displayed) == {
