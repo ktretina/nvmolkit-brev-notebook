@@ -1,7 +1,12 @@
+import ast
 from dataclasses import FrozenInstanceError
+import inspect
+import textwrap
 
 import pytest
 
+import chemistry_workflow
+import demo_agent
 from command_receipts import CommandReceipt, command_receipt
 from demo_agent import (
     ClusterArgs,
@@ -128,6 +133,14 @@ def test_command_receipt_rejects_the_wrong_model_for_each_stage(
         command_receipt(stage, wrong_arguments)
 
 
+def test_command_receipt_rejects_a_subclass_of_the_allowed_model():
+    class InspectionArgsSubclass(InspectionArgs):
+        pass
+
+    with pytest.raises(ValueError, match="Arguments do not match workflow stage"):
+        command_receipt("inspect_library", InspectionArgsSubclass())
+
+
 def test_command_receipt_rejects_unknown_stage_before_reading_arguments():
     class ExplosiveArguments:
         def __repr__(self):
@@ -147,3 +160,239 @@ def test_command_receipt_is_frozen():
 
     with pytest.raises(FrozenInstanceError):
         receipt.approved_tool_call = "changed"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "approved", "invocation"),
+    [
+        (
+            FingerprintArgs(radius=3, size=2048, decision_basis="alternate"),
+            "generate_morgan_fingerprints(radius=3, size=2048)",
+            "generator = MorganFingerprintGenerator(radius=3, fpSize=2048)\n"
+            "fingerprints = generator.GetFingerprints(molecules)",
+        ),
+    ],
+)
+def test_fingerprint_receipt_formats_alternate_allowed_values(
+    arguments, approved, invocation
+):
+    receipt = command_receipt("generate_morgan_fingerprints", arguments)
+
+    assert receipt.approved_tool_call == approved
+    assert receipt.scientific_invocation == invocation
+    assert receipt == command_receipt("generate_morgan_fingerprints", arguments)
+
+
+@pytest.mark.parametrize("cutoff", [0.4, 0.6])
+def test_cluster_receipt_formats_both_allowed_boundaries(cutoff):
+    arguments = ClusterArgs(cutoff=cutoff, decision_basis="boundary")
+    receipt = command_receipt("discover_fused_butina_clusters", arguments)
+
+    assert receipt.approved_tool_call == (
+        f"discover_fused_butina_clusters(cutoff={cutoff!r})"
+    )
+    assert receipt.scientific_invocation == (
+        f"clusters = fused_butina(fingerprints.torch(), cutoff={cutoff!r})[0]"
+    )
+    assert receipt == command_receipt("discover_fused_butina_clusters", arguments)
+
+
+@pytest.mark.parametrize(
+    ("count", "policy", "conformers"),
+    [
+        (3, "largest_clusters_first", 3),
+        (6, "include_singleton_if_available", 8),
+    ],
+)
+def test_embed_receipt_formats_boundaries_and_both_policies(
+    count, policy, conformers
+):
+    arguments = EmbedArgs(
+        representative_count=count,
+        policy=policy,
+        conformers_per_representative=conformers,
+        decision_basis="boundary",
+    )
+    receipt = command_receipt("embed_representative_conformers", arguments)
+
+    assert receipt.approved_tool_call == (
+        "embed_representative_conformers("
+        f"representative_count={count!r}, policy={policy!r}, "
+        f"conformers_per_representative={conformers!r})"
+    )
+    assert receipt.scientific_invocation == (
+        "# Python/RDKit representative selection: "
+        f"count={count!r}, policy={policy!r}\n"
+        "EmbedMolecules(molecules, parameters, "
+        f"confsPerMolecule={conformers!r}, maxIterations=-1)"
+    )
+    assert receipt == command_receipt("embed_representative_conformers", arguments)
+
+
+def _source_tree(function):
+    return ast.parse(textwrap.dedent(inspect.getsource(function)))
+
+
+def _call_name(call):
+    target = call.func
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    if isinstance(target, ast.Call):
+        return _call_name(target)
+    raise AssertionError(f"Unsupported call target: {ast.dump(target)}")
+
+
+def _one_source_call(function, name, *, keyword_names=None):
+    matches = [
+        node
+        for node in ast.walk(_source_tree(function))
+        if isinstance(node, ast.Call) and _call_name(node) == name
+        and (
+            keyword_names is None
+            or {keyword.arg for keyword in node.keywords} == keyword_names
+        )
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _one_receipt_call(receipt, name):
+    matches = [
+        node
+        for node in ast.walk(ast.parse(receipt.scientific_invocation))
+        if isinstance(node, ast.Call) and _call_name(node) == name
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _keyword_sources(call):
+    return {keyword.arg: ast.unparse(keyword.value) for keyword in call.keywords}
+
+
+def _literal_keywords(call):
+    return {keyword.arg: ast.literal_eval(keyword.value) for keyword in call.keywords}
+
+
+def test_inspection_receipt_tracks_the_default_executor_call_site():
+    tree = _source_tree(demo_agent._default_executors)
+    executors = next(node for node in ast.walk(tree) if isinstance(node, ast.Dict))
+    entries = {
+        ast.literal_eval(key): value for key, value in zip(executors.keys, executors.values)
+    }
+    actual = entries["inspect_library"].body
+    receipt = command_receipt("inspect_library", InspectionArgs())
+    displayed = _one_receipt_call(receipt, "inspect_library")
+
+    assert _call_name(actual) == _call_name(displayed) == "inspect_library"
+    assert [ast.unparse(value) for value in actual.args] == ["state", "_DATA_PATH"]
+    assert [ast.unparse(value) for value in displayed.args] == ["state", "DATA_PATH"]
+
+
+def test_fingerprint_receipt_tracks_the_real_generator_and_batch_call_sites():
+    arguments = FingerprintArgs(radius=3, size=2048, decision_basis="contract")
+    receipt = command_receipt("generate_morgan_fingerprints", arguments)
+    actual_generator = _one_source_call(
+        chemistry_workflow.generate_morgan_fingerprints,
+        "_morgan_generator_class",
+        keyword_names={"radius", "fpSize"},
+    )
+    actual_batch = _one_source_call(
+        chemistry_workflow.generate_morgan_fingerprints, "GetFingerprints"
+    )
+    displayed_generator = _one_receipt_call(receipt, "MorganFingerprintGenerator")
+    displayed_batch = _one_receipt_call(receipt, "GetFingerprints")
+
+    assert isinstance(actual_generator.func, ast.Call)
+    assert _keyword_sources(actual_generator) == {
+        "radius": "fingerprint_radius",
+        "fpSize": "fingerprint_size",
+    }
+    assert _literal_keywords(displayed_generator) == {
+        "radius": arguments.radius,
+        "fpSize": arguments.size,
+    }
+    assert [ast.unparse(value) for value in actual_batch.args] == ["state.molecules"]
+    assert [ast.unparse(value) for value in displayed_batch.args] == ["molecules"]
+
+
+def test_similarity_receipt_tracks_the_real_batch_call_site():
+    receipt = command_receipt("measure_tanimoto_similarity", SimilarityArgs())
+    actual = _one_source_call(
+        chemistry_workflow.measure_tanimoto_similarity,
+        "_cross_tanimoto_similarity",
+    )
+    displayed = _one_receipt_call(receipt, "crossTanimotoSimilarity")
+
+    assert [ast.unparse(value) for value in actual.args] == ["state.fingerprints"]
+    assert [ast.unparse(value) for value in displayed.args] == ["fingerprints"]
+
+
+def test_cluster_receipt_tracks_the_real_fused_butina_call_site():
+    arguments = ClusterArgs(cutoff=0.6, decision_basis="contract")
+    receipt = command_receipt("discover_fused_butina_clusters", arguments)
+    actual = _one_source_call(
+        chemistry_workflow.discover_fused_butina_clusters, "_fused_butina"
+    )
+    displayed = _one_receipt_call(receipt, "fused_butina")
+
+    assert [ast.unparse(value) for value in actual.args] == [
+        "state.fingerprints.torch()"
+    ]
+    assert _keyword_sources(actual) == {"cutoff": "cutoff"}
+    assert [ast.unparse(value) for value in displayed.args] == [
+        "fingerprints.torch()"
+    ]
+    assert _literal_keywords(displayed) == {"cutoff": arguments.cutoff}
+
+
+def test_embedding_receipt_tracks_the_real_embed_call_site():
+    arguments = EmbedArgs(
+        representative_count=6,
+        policy="include_singleton_if_available",
+        conformers_per_representative=8,
+        decision_basis="contract",
+    )
+    receipt = command_receipt("embed_representative_conformers", arguments)
+    actual = _one_source_call(
+        chemistry_workflow.embed_representative_conformers, "_embed_molecules"
+    )
+    displayed = _one_receipt_call(receipt, "EmbedMolecules")
+
+    assert [ast.unparse(value) for value in actual.args] == [
+        "molecules",
+        "parameters",
+    ]
+    assert _keyword_sources(actual) == {
+        "confsPerMolecule": "conformers_per_representative",
+        "maxIterations": "-1",
+    }
+    assert [ast.unparse(value) for value in displayed.args] == [
+        "molecules",
+        "parameters",
+    ]
+    assert _literal_keywords(displayed) == {
+        "confsPerMolecule": arguments.conformers_per_representative,
+        "maxIterations": -1,
+    }
+
+
+def test_optimization_receipt_tracks_the_real_mmff94_call_site():
+    receipt = command_receipt("optimize_conformers_mmff94", OptimizationArgs())
+    actual = _one_source_call(
+        chemistry_workflow.optimize_conformers_mmff94, "_optimize_mmff94"
+    )
+    displayed = _one_receipt_call(receipt, "MMFFOptimizeMoleculesConfs")
+
+    assert [ast.unparse(value) for value in actual.args] == ["molecules"]
+    assert _keyword_sources(actual) == {
+        "maxIters": "500",
+        "output": "_coordinate_output_device()",
+    }
+    assert [ast.unparse(value) for value in displayed.args] == ["molecules"]
+    assert _keyword_sources(displayed) == {
+        "maxIters": "500",
+        "output": "CoordinateOutput.DEVICE",
+    }
