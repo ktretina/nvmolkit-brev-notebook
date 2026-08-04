@@ -151,6 +151,9 @@ class InteractiveWorkflow:
                 and self.controller.pending is None
                 and self.controller.session.turn_count == 0
                 and self.controller.session.state.phase is demo_agent.WorkflowPhase.NEW
+                and self.controller.stage_results == []
+                and self.controller.report is None
+                and self.controller.synthesis_prompt_appended is False
             )
         except Exception:
             return False
@@ -159,9 +162,13 @@ class InteractiveWorkflow:
         try:
             return (
                 len(self.completed_cards) == len(demo_agent.STAGES)
+                and self.controller.plan is not None
                 and self.controller.pending is None
                 and self.controller.session.turn_count == 7
                 and self.controller.session.state.phase is demo_agent.WorkflowPhase.OPTIMIZED
+                and tuple(result.stage for result in self.controller.stage_results) == demo_agent.STAGES
+                and self.controller.report is not None
+                and self.controller.synthesis_prompt_appended is True
             )
         except Exception:
             return False

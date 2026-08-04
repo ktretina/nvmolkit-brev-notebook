@@ -42,6 +42,8 @@ class Controller:
         self.index = 0
         self.pending = None
         self.plan = None
+        self.report = None
+        self.synthesis_prompt_appended = False
         self.stage_results = []
         self.session = Session(self)
 
@@ -78,6 +80,8 @@ class Controller:
 
     def request_synthesis(self):
         self.calls.append("synthesis")
+        self.report = SimpleNamespace(evidence=())
+        self.synthesis_prompt_appended = True
         if self.synthesis_failures: raise self.synthesis_failures.pop(0)
         return SimpleNamespace(conclusion=SimpleNamespace())
 
@@ -172,6 +176,19 @@ def test_retry_plan_rechecks_turn_phase_and_pending():
     assert workflow.status == "stopped" and controller.calls == before
 
 
+@pytest.mark.parametrize("mutation", ["stage_results", "report", "prompt"])
+def test_retry_plan_rejects_noncanonical_fresh_state(mutation):
+    controller = Controller(); controller.plan_failures.append(ToolCallError("safe hosted failure"))
+    workflow = InteractiveWorkflow(controller); workflow.start_button.click()
+    if mutation == "stage_results": controller.stage_results.append(StageResult("inspect_library", "label", {}))
+    elif mutation == "report": controller.report = SimpleNamespace()
+    else: controller.synthesis_prompt_appended = True
+    before = list(controller.calls)
+    workflow.retry_button.click()
+    assert workflow.status == "stopped" and workflow.retry_button is None
+    assert controller.calls == before
+
+
 def test_safe_execution_retry_uses_same_model_and_stale_retry_is_inert():
     controller = Controller(); controller.execution_failures.append(ToolCallError("executor failed"))
     workflow, _ = started(controller)
@@ -242,6 +259,38 @@ def test_retry_synthesis_rechecks_turn_phase_and_pending(monkeypatch):
     workflow.retry_button.click()
     assert workflow.status == "stopped"
     assert controller.calls.count("synthesis") == before
+
+
+@pytest.mark.parametrize("mutation", ["pending", "plan", "missing_stage", "wrong_order", "report", "prompt"])
+def test_retry_synthesis_rejects_noncanonical_state(monkeypatch, mutation):
+    monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
+    controller = Controller(); controller.synthesis_failures.append(ToolCallError("hosted synthesis failed"))
+    workflow, _ = started(controller)
+    for _ in range(6): workflow.approve_button.click()
+    if mutation == "pending": controller.pending = proposals()[5]
+    elif mutation == "plan": controller.plan = None
+    elif mutation == "missing_stage": controller.stage_results.pop()
+    elif mutation == "wrong_order": controller.stage_results[0], controller.stage_results[1] = controller.stage_results[1], controller.stage_results[0]
+    elif mutation == "report": controller.report = None
+    else: controller.synthesis_prompt_appended = False
+    before = controller.calls.count("synthesis")
+    workflow.retry_button.click()
+    assert workflow.status == "stopped" and workflow.retry_button is None
+    assert controller.calls.count("synthesis") == before
+
+
+def test_known_synthesis_error_that_mutates_state_never_offers_retry(monkeypatch):
+    monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
+    controller = Controller()
+    def unsafe_synthesis():
+        controller.calls.append("synthesis")
+        controller.report = None
+        controller.synthesis_prompt_appended = True
+        raise ToolCallError("known but state-mutating failure")
+    controller.request_synthesis = unsafe_synthesis
+    workflow, _ = started(controller)
+    for _ in range(6): workflow.approve_button.click()
+    assert workflow.status == "stopped" and workflow.retry_button is None
 
 
 def test_control_observer_unexpected_error_is_secret_safe_fatal(monkeypatch):
