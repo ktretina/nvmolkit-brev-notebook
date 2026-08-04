@@ -44,6 +44,7 @@ class Controller:
         self.plan = None
         self.report = None
         self.synthesis_prompt_appended = False
+        self.figures = ()
         self.stage_results = []
         self.session = Session(self)
 
@@ -71,7 +72,7 @@ class Controller:
             "q1": 0.12, "median": 0.22, "cluster_count": 17,
             "selected_representative_count": 4, "converged_conformer_count": 20,
         }
-        result = StageResult(stage, f"label {stage}", summary)
+        result = StageResult(stage, f"label {stage}", summary, self.figures)
         self.stage_results.append(result)
         self.pending = None
         self.index += 1
@@ -316,3 +317,38 @@ def test_launch_signature_create_display_and_no_hosted_call(monkeypatch):
     assert displayed == [workflow] and controller.calls == []
     assert str(inspect.signature(launch_interactive_workflow)).startswith("(user_goal: 'str', api_key: 'str', *")
     with pytest.raises(TypeError): launch_interactive_workflow("goal", "nvapi-test", "positional")
+
+
+def test_figure_render_failure_keeps_completed_result_and_advances(monkeypatch):
+    controller = Controller(); controller.figures = (object(),)
+    monkeypatch.setattr(demo_agent, "_display_figure", lambda figure: (_ for _ in ()).throw(RuntimeError("FIGURE-SECRET")))
+    workflow, _ = started(controller)
+    workflow.approve_button.click()
+    assert len(workflow.completed_cards) == 1 and len(workflow.completed_results) == 1
+    assert workflow.status == "awaiting_approval"
+    assert controller.calls.count("proposal") == 2
+    assert len([call for call in controller.calls if isinstance(call, tuple)]) == 1
+    assert "Figure unavailable in this notebook frontend." in html_text(workflow.completed_cards[0])
+    assert "FIGURE-SECRET" not in workflow.transcript_text
+
+
+def test_conclusion_render_failure_retains_result_and_completion(monkeypatch):
+    controller = Controller()
+    monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: (_ for _ in ()).throw(RuntimeError("CONCLUSION-SECRET")))
+    workflow, _ = started(controller)
+    for _ in range(6): workflow.approve_button.click()
+    assert workflow.status == "completed" and workflow.workflow_result is not None
+    assert workflow.retry_button is None and controller.calls.count("synthesis") == 1
+    assert "Conclusion rendering unavailable in this notebook frontend." in html_text(workflow.active_card)
+    assert "CONCLUSION-SECRET" not in workflow.transcript_text
+
+
+def test_completed_control_observers_are_detached():
+    workflow, _ = started()
+    workflow.approve_button.click()
+    old_controls = dict(workflow.controls)
+    workflow.approve_button.click()
+    old_card = workflow.completed_cards[1]
+    before = (html_text(old_card), html_text(workflow.active_card), workflow.transcript_text)
+    old_controls["radius"].value = 3
+    assert (html_text(old_card), html_text(workflow.active_card), workflow.transcript_text) == before
