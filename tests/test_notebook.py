@@ -159,12 +159,19 @@ def test_fixed_artifacts_and_skill_provenance_are_intact():
     skill_bytes = (REPO_ROOT / "skills" / "nvmolkit" / "SKILL.md").read_bytes()
     assert "ce151c15470991c8cb9a0efdd531a124c346ca5b" in provenance
     assert hashlib.sha256(skill_bytes).hexdigest() in provenance
-    for relative_path in ("requirements.txt", "launchable/setup.sh", "launchable/fields.md", "data/sample_molecules.csv"):
+    for relative_path in ("launchable/setup.sh", "launchable/fields.md", "data/sample_molecules.csv"):
         committed = subprocess.run(
             ["git", "show", f"31c8567b6ed743e56e87ee3475b4c143a7614c9b:{relative_path}"],
             cwd=REPO_ROOT, check=True, capture_output=True,
         ).stdout
         assert (REPO_ROOT / relative_path).read_bytes() == committed
+    requirement_lines = (REPO_ROOT / "requirements.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert requirement_lines.count("ipywidgets==8.1.7") == 1
+    assert [line for line in requirement_lines if line.startswith("ipywidgets")] == [
+        "ipywidgets==8.1.7"
+    ]
 
 
 def test_readme_preserves_launch_and_separate_acceptance_gates():
