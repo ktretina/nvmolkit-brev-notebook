@@ -426,6 +426,46 @@ def test_controller_executor_failure_retains_pending_and_blocks_unsafe_retry():
     assert calls == [("inspect_library", {})]
 
 
+def test_controller_retries_retained_pending_after_nonmutating_executor_failure():
+    calls = []
+    executors = fake_executors(calls)
+
+    def fail_once_then_advance(state):
+        calls.append(("inspect_library", {}))
+        if len(calls) == 1:
+            raise RuntimeError(SECRET)
+        state.phase = WorkflowPhase.INSPECTED
+        return StageResult(
+            "inspect_library",
+            "inspect_library",
+            {"stage": "inspect_library", "sequence": len(calls)},
+        )
+
+    executors["inspect_library"] = fail_once_then_advance
+    instance, _ = controller(executors=executors)
+    instance.request_plan()
+    proposal = instance.request_next_stage()
+    messages_before_execution = len(instance.session.messages)
+
+    with pytest.raises(demo_agent.ToolCallError, match="executor failed"):
+        instance.execute_pending(proposal.arguments)
+
+    assert instance.session.state.phase is WorkflowPhase.NEW
+    assert instance.pending is proposal
+    assert len(instance.session.messages) == messages_before_execution
+    assert instance.stage_results == []
+
+    result = instance.execute_pending(proposal.arguments)
+
+    assert result.stage == "inspect_library"
+    assert calls == [("inspect_library", {}), ("inspect_library", {})]
+    assert instance.pending is None
+    assert instance.session.state.phase is WorkflowPhase.INSPECTED
+    assert instance.stage_results == [result]
+    assert len(instance.session.messages) == messages_before_execution + 1
+    assert instance.session.messages[-1]["role"] == "tool"
+
+
 def test_controller_scientific_and_synthesis_paths_use_seven_then_eight_turns():
     completions = FakeCompletions(workflow_responses())
     instance = demo_agent.BoundedWorkflowController.create(
