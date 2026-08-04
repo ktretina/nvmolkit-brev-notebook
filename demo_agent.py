@@ -599,6 +599,7 @@ class BoundedWorkflowController:
     pending: StageProposal | None = None
     stage_results: list[StageResult] = field(default_factory=list)
     report: WorkflowReport | None = None
+    synthesis_prompt_appended: bool = False
 
     @classmethod
     def create(
@@ -690,6 +691,11 @@ class BoundedWorkflowController:
             executed = argument_model.model_validate(approved.model_dump())
         except ValidationError:
             raise ToolCallError("Approved stage arguments failed strict validation.") from None
+        if (
+            "decision_basis" in argument_model.model_fields
+            and executed.decision_basis != proposal.arguments.decision_basis
+        ):
+            raise ToolCallError("The Nemotron decision summary cannot be changed.")
         proposed_arguments = proposal.arguments.model_dump(mode="json")
         executed_arguments = executed.model_dump(mode="json")
         proposed_executor_args = _executor_arguments(stage, proposal.arguments)
@@ -748,12 +754,14 @@ class BoundedWorkflowController:
 
     def request_synthesis(self) -> WorkflowResult:
         scientific = self.scientific_result()
-        evidence = _serialize(
-            {"evidence": [item.__dict__ for item in scientific.report.evidence]}
-        )
-        self.session.messages.append(
-            {"role": "user", "content": _SYNTHESIS_PROMPT + "\n" + evidence}
-        )
+        if not self.synthesis_prompt_appended:
+            evidence = _serialize(
+                {"evidence": [item.__dict__ for item in scientific.report.evidence]}
+            )
+            self.session.messages.append(
+                {"role": "user", "content": _SYNTHESIS_PROMPT + "\n" + evidence}
+            )
+            self.synthesis_prompt_appended = True
         try:
             conclusion = _request_call(
                 self.session,

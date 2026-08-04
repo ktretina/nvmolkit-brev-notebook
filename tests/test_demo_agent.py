@@ -382,6 +382,27 @@ def test_controller_rejects_wrong_approval_model_before_execution():
     assert instance.pending is not None
 
 
+def test_controller_rejects_decision_basis_edit_before_execution():
+    calls = []
+    instance, _ = controller(executors=fake_executors(calls))
+    instance.request_plan()
+    inspection = instance.request_next_stage()
+    instance.execute_pending(inspection.arguments)
+    proposal = instance.request_next_stage()
+    edited = demo_agent.FingerprintArgs(
+        radius=proposal.arguments.radius,
+        size=proposal.arguments.size,
+        decision_basis="Human-authored replacement rationale.",
+    )
+
+    with pytest.raises(demo_agent.ToolCallError, match="decision summary") as error:
+        instance.execute_pending(edited)
+
+    assert SECRET not in str(error.value)
+    assert calls == [("inspect_library", {})]
+    assert instance.pending is proposal
+
+
 def test_controller_plan_can_be_requested_exactly_once():
     instance, completions = controller()
 
@@ -488,6 +509,46 @@ def test_controller_scientific_and_synthesis_paths_use_seven_then_eight_turns():
     result = instance.request_synthesis()
     assert result.turn_count == 8 == len(completions.calls)
     assert result.stage_results == scientific.stage_results
+
+
+def test_controller_synthesis_retry_reuses_one_evidence_prompt():
+    empty = SimpleNamespace(choices=[])
+    completions = FakeCompletions(
+        valid_responses()
+        + [empty, response("submit_synthesis", synthesis_arguments())]
+    )
+    instance = demo_agent.BoundedWorkflowController.create(
+        "Analyze the library.",
+        VALID_API_KEY,
+        client=fake_client(completions),
+        executors={
+            **fake_executors(),
+            "build_workflow_report": lambda state: full_report(),
+        },
+    )
+    instance.request_plan()
+    for _stage in STAGES:
+        proposal = instance.request_next_stage()
+        instance.execute_pending(proposal.arguments)
+
+    with pytest.raises(demo_agent.ToolCallError, match="strict validation"):
+        instance.request_synthesis()
+
+    assert instance.session.turn_count == 7
+    assert sum(
+        message["role"] == "user"
+        and message["content"].startswith(demo_agent._SYNTHESIS_PROMPT)
+        for message in instance.session.messages
+    ) == 1
+
+    result = instance.request_synthesis()
+
+    assert result.turn_count == 8
+    assert sum(
+        message["role"] == "user"
+        and message["content"].startswith(demo_agent._SYNTHESIS_PROMPT)
+        for message in result.messages
+    ) == 1
 
 
 def test_every_assistant_call_has_a_matching_canonical_tool_result():
