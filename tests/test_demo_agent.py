@@ -288,6 +288,18 @@ def run(responses=None, **kwargs):
     return result, completions
 
 
+def controller(responses=None, *, executors=None, state=None):
+    completions = FakeCompletions(responses or valid_responses())
+    instance = demo_agent.BoundedWorkflowController.create(
+        "Analyze the bundled molecular library.",
+        VALID_API_KEY,
+        client=fake_client(completions),
+        executors=executors or fake_executors(),
+        state=state,
+    )
+    return instance, completions
+
+
 def request_error(status, error_type):
     http_response = httpx.Response(
         status,
@@ -307,6 +319,135 @@ def test_stateful_loop_uses_one_history_and_exactly_seven_hosted_turns():
     assert roles.count("tool") == 7
     for index, hosted_call in enumerate(completions.calls):
         assert hosted_call["messages"] == list(result.messages[: 2 + 2 * index])
+
+
+def test_controller_waits_for_approval_before_executing_stage():
+    calls = []
+    instance, completions = controller(executors=fake_executors(calls))
+
+    instance.request_plan()
+    proposal = instance.request_next_stage()
+
+    assert proposal == demo_agent.StageProposal(
+        "inspect_library", demo_agent.InspectionArgs()
+    )
+    assert calls == []
+    assert instance.session.state.phase is WorkflowPhase.NEW
+    assert len(completions.calls) == 2
+
+    result = instance.execute_pending(proposal.arguments)
+
+    assert result.stage == "inspect_library"
+    assert calls == [("inspect_library", {})]
+    assert instance.pending is None
+
+
+def test_controller_records_user_override_and_executed_arguments():
+    calls = []
+    instance, _ = controller(executors=fake_executors(calls))
+    instance.request_plan()
+    instance.request_next_stage()
+    instance.execute_pending(demo_agent.InspectionArgs())
+    proposed = instance.request_next_stage()
+    approved = demo_agent.FingerprintArgs(
+        radius=3,
+        size=2048,
+        decision_basis=proposed.arguments.decision_basis,
+    )
+
+    instance.execute_pending(approved)
+
+    history = json.loads(instance.session.messages[-1]["content"])
+    assert history["proposed_arguments"]["radius"] == 2
+    assert history["proposed_arguments"]["size"] == 1024
+    assert history["executed_arguments"]["radius"] == 3
+    assert history["executed_arguments"]["size"] == 2048
+    assert history["user_override"] is True
+    assert calls[-1] == (
+        "generate_morgan_fingerprints",
+        {"fingerprint_radius": 3, "fingerprint_size": 2048},
+    )
+
+
+def test_controller_rejects_wrong_approval_model_before_execution():
+    calls = []
+    instance, _ = controller(executors=fake_executors(calls))
+    instance.request_plan()
+    instance.request_next_stage()
+
+    with pytest.raises(demo_agent.ToolCallError, match="approved arguments"):
+        instance.execute_pending(demo_agent.SimilarityArgs())
+
+    assert calls == []
+    assert instance.pending is not None
+
+
+def test_controller_plan_can_be_requested_exactly_once():
+    instance, completions = controller()
+
+    instance.request_plan()
+    with pytest.raises(demo_agent.ToolCallError, match="exactly once"):
+        instance.request_plan()
+
+    assert len(completions.calls) == 1
+
+
+def test_controller_pending_proposal_prevents_another_hosted_call():
+    instance, completions = controller()
+    instance.request_plan()
+    instance.request_next_stage()
+
+    with pytest.raises(demo_agent.ToolCallError, match="pending"):
+        instance.request_next_stage()
+
+    assert len(completions.calls) == 2
+
+
+def test_controller_executor_failure_retains_pending_and_blocks_unsafe_retry():
+    calls = []
+    executors = fake_executors(calls)
+
+    def fail_after_advancing(state):
+        calls.append(("inspect_library", {}))
+        state.phase = WorkflowPhase.INSPECTED
+        raise RuntimeError(SECRET)
+
+    executors["inspect_library"] = fail_after_advancing
+    instance, _ = controller(executors=executors)
+    instance.request_plan()
+    proposal = instance.request_next_stage()
+
+    with pytest.raises(demo_agent.ToolCallError, match="executor failed"):
+        instance.execute_pending(proposal.arguments)
+
+    assert instance.pending is proposal
+    with pytest.raises(demo_agent.ToolCallError, match="out of phase"):
+        instance.execute_pending(proposal.arguments)
+    assert calls == [("inspect_library", {})]
+
+
+def test_controller_scientific_and_synthesis_paths_use_seven_then_eight_turns():
+    completions = FakeCompletions(workflow_responses())
+    instance = demo_agent.BoundedWorkflowController.create(
+        "Analyze the library.",
+        VALID_API_KEY,
+        client=fake_client(completions),
+        executors={
+            **fake_executors(),
+            "build_workflow_report": lambda state: full_report(),
+        },
+    )
+    instance.request_plan()
+    for _stage in STAGES:
+        proposal = instance.request_next_stage()
+        instance.execute_pending(proposal.arguments)
+
+    scientific = instance.scientific_result()
+    assert scientific.turn_count == 7
+
+    result = instance.request_synthesis()
+    assert result.turn_count == 8 == len(completions.calls)
+    assert result.stage_results == scientific.stage_results
 
 
 def test_every_assistant_call_has_a_matching_canonical_tool_result():

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
 
@@ -267,6 +267,12 @@ class WorkflowResult:
     conclusion: SubmitSynthesisArgs
     stage_results: tuple[StageResult, ...]
     turn_count: int = 8
+
+
+@dataclass(frozen=True)
+class StageProposal:
+    stage: StageName
+    arguments: BaseModel
 
 
 def _client(api_key: str) -> OpenAI:
@@ -582,6 +588,231 @@ def _emit_progress(callback: ProgressCallback | None, event: str, payload: Any) 
         raise ToolCallError("Local progress display failed.") from None
 
 
+@dataclass
+class BoundedWorkflowController:
+    """Expose one bounded hosted proposal and deterministic execution at a time."""
+
+    session: AgentSession
+    client: Any
+    executors: dict[str, Any]
+    plan: WorkflowPlan | None = None
+    pending: StageProposal | None = None
+    stage_results: list[StageResult] = field(default_factory=list)
+    report: WorkflowReport | None = None
+
+    @classmethod
+    def create(
+        cls,
+        user_goal: str,
+        api_key: str,
+        *,
+        client: Any = None,
+        executors: dict[str, Any] | None = None,
+        state: WorkflowState | None = None,
+        skill: str | None = None,
+    ) -> "BoundedWorkflowController":
+        """Validate and initialize the fixed workflow without making a hosted request."""
+        _validate_api_key(api_key)
+        if not isinstance(user_goal, str) or not user_goal.strip():
+            raise ValueError("A non-empty scientific goal is required.")
+        active_client = client or _client(api_key)
+        active_executors = _default_executors() if executors is None else executors
+        allowed_executor_keys = set(STAGES) | {"build_workflow_report"}
+        if set(active_executors) != allowed_executor_keys or not all(
+            callable(active_executors[key]) for key in allowed_executor_keys
+        ):
+            raise ValueError("Executors must match the fixed scientific workflow.")
+        session = AgentSession(
+            messages=[
+                {"role": "system", "content": _system_grounding(skill)},
+                {"role": "user", "content": user_goal.strip()},
+            ],
+            state=state or WorkflowState(),
+        )
+        return cls(session=session, client=active_client, executors=active_executors)
+
+    def request_plan(self) -> WorkflowPlan:
+        if self.plan is not None or self.session.turn_count != 0:
+            raise ToolCallError("The workflow plan can be requested exactly once.")
+        plan = _request_call(
+            self.session,
+            self.client,
+            "submit_workflow_plan",
+            WorkflowPlan,
+            DEFAULT_MODEL,
+        )
+        self.plan = WorkflowPlan.model_validate(plan.model_dump())
+        _append_tool_result(
+            self.session,
+            {
+                "accepted": True,
+                "stages": [
+                    item.model_dump(mode="json") for item in self.plan.stages
+                ],
+            },
+        )
+        return self.plan
+
+    def request_next_stage(self) -> StageProposal:
+        if self.plan is None:
+            raise ToolCallError("A workflow plan is required before requesting a stage.")
+        if self.pending is not None:
+            raise ToolCallError("A stage proposal is already pending approval.")
+        if self.session.state.phase is WorkflowPhase.OPTIMIZED:
+            raise ToolCallError("The scientific stages are already complete.")
+        stage = self.session.eligible_tool_name()
+        if stage not in TOOL_ARGUMENT_MODELS:
+            raise ToolCallError("The scientific workflow state is out of phase.")
+        arguments = _request_call(
+            self.session,
+            self.client,
+            stage,
+            TOOL_ARGUMENT_MODELS[stage],
+            DEFAULT_MODEL,
+        )
+        proposal = StageProposal(stage, arguments)
+        self.pending = proposal
+        return proposal
+
+    def execute_pending(self, approved: BaseModel) -> StageResult:
+        proposal = self.pending
+        if proposal is None:
+            raise ToolCallError("No stage proposal is pending approval.")
+        stage = proposal.stage
+        argument_model = TOOL_ARGUMENT_MODELS[stage]
+        if type(approved) is not argument_model:
+            raise ToolCallError(
+                "The approved arguments must use the exact model for the pending stage."
+            )
+        if self.session.eligible_tool_name() != stage:
+            raise ToolCallError("The scientific workflow state is out of phase.")
+        try:
+            executed = argument_model.model_validate(approved.model_dump())
+        except ValidationError:
+            raise ToolCallError("Approved stage arguments failed strict validation.") from None
+        proposed_arguments = proposal.arguments.model_dump(mode="json")
+        executed_arguments = executed.model_dump(mode="json")
+        proposed_executor_args = _executor_arguments(stage, proposal.arguments)
+        executed_executor_args = _executor_arguments(stage, executed)
+        try:
+            result = self.executors[stage](
+                self.session.state, **executed_executor_args
+            )
+        except Exception:
+            raise ToolCallError("The scientific executor failed.") from None
+        if not isinstance(result, StageResult) or result.stage != stage:
+            raise ToolCallError("The scientific executor returned an invalid stage result.")
+        if self.session.state.phase is not POST_STAGE_PHASES[stage]:
+            raise ToolCallError("The scientific executor left the workflow out of phase.")
+        _append_tool_result(
+            self.session,
+            {
+                "stage": stage,
+                "decision_basis": getattr(executed, "decision_basis", None),
+                "proposed_arguments": proposed_arguments,
+                "executed_arguments": executed_arguments,
+                "user_override": proposed_executor_args != executed_executor_args,
+                "summary": result.summary,
+            },
+        )
+        self.stage_results.append(result)
+        self.pending = None
+        return result
+
+    def scientific_result(self) -> ScientificLoopResult:
+        if self.plan is None:
+            raise ToolCallError("The scientific workflow did not complete exactly once.")
+        if self.pending is not None:
+            raise ToolCallError("A stage proposal is still pending approval.")
+        if (
+            tuple(result.stage for result in self.stage_results) != STAGES
+            or self.session.turn_count != 7
+            or self.session.state.phase is not WorkflowPhase.OPTIMIZED
+        ):
+            raise ToolCallError("The scientific workflow did not complete exactly once.")
+        if self.report is None:
+            try:
+                report = self.executors["build_workflow_report"](self.session.state)
+            except Exception:
+                raise ToolCallError("The scientific report could not be built.") from None
+            if not isinstance(report, WorkflowReport):
+                raise ToolCallError("The scientific report was invalid.")
+            self.report = report
+        return ScientificLoopResult(
+            tuple(self.session.messages),
+            self.report,
+            self.plan,
+            tuple(self.stage_results),
+            self.session.turn_count,
+        )
+
+    def request_synthesis(self) -> WorkflowResult:
+        scientific = self.scientific_result()
+        evidence = _serialize(
+            {"evidence": [item.__dict__ for item in scientific.report.evidence]}
+        )
+        self.session.messages.append(
+            {"role": "user", "content": _SYNTHESIS_PROMPT + "\n" + evidence}
+        )
+        try:
+            conclusion = _request_call(
+                self.session,
+                self.client,
+                "submit_synthesis",
+                SubmitSynthesisArgs,
+                DEFAULT_MODEL,
+            )
+            conclusion = validate_conclusion(conclusion, scientific.report)
+        except _HostedArgumentsValidationError:
+            raise ConclusionValidationError(scientific.report) from None
+        return WorkflowResult(
+            tuple(self.session.messages),
+            scientific.report,
+            scientific.plan,
+            conclusion,
+            scientific.stage_results,
+            self.session.turn_count,
+        )
+
+
+def _complete_scientific_loop(
+    controller: BoundedWorkflowController,
+    progress_callback: ProgressCallback | None,
+) -> ScientificLoopResult:
+    try:
+        plan = controller.request_plan()
+    except Exception as error:
+        _emit_progress(progress_callback, "failure", str(error))
+        raise
+    _emit_progress(progress_callback, "plan", plan)
+
+    for stage in STAGES:
+        if controller.session.eligible_tool_name() != stage:
+            raise ToolCallError("The scientific workflow state is out of phase.")
+        try:
+            proposal = controller.request_next_stage()
+        except Exception as error:
+            _emit_progress(progress_callback, "failure", str(error))
+            raise
+        try:
+            result = controller.execute_pending(proposal.arguments)
+        except Exception as error:
+            _emit_progress(progress_callback, "failure", str(error))
+            raise
+        _emit_progress(
+            progress_callback,
+            "stage",
+            {"result": result, "arguments": proposal.arguments},
+        )
+
+    try:
+        return controller.scientific_result()
+    except Exception as error:
+        if "scientific report" in str(error):
+            _emit_progress(progress_callback, "failure", str(error))
+        raise
+
+
 def run_scientific_loop(
     user_goal: str,
     api_key: str,
@@ -593,90 +824,15 @@ def run_scientific_loop(
     skill: str | None = None,
 ) -> ScientificLoopResult:
     """Run one plan and six phase-gated scientific tool calls in one history."""
-    _validate_api_key(api_key)
-    if not isinstance(user_goal, str) or not user_goal.strip():
-        raise ValueError("A non-empty scientific goal is required.")
-    active_client = client or _client(api_key)
-    active_executors = _default_executors() if executors is None else executors
-    allowed_executor_keys = set(STAGES) | {"build_workflow_report"}
-    if set(active_executors) != allowed_executor_keys or not all(
-        callable(active_executors[key]) for key in allowed_executor_keys
-    ):
-        raise ValueError("Executors must match the fixed scientific workflow.")
-
-    session = AgentSession(
-        messages=[
-            {"role": "system", "content": _system_grounding(skill)},
-            {"role": "user", "content": user_goal.strip()},
-        ],
-        state=state or WorkflowState(),
+    controller = BoundedWorkflowController.create(
+        user_goal,
+        api_key,
+        client=client,
+        executors=executors,
+        state=state,
+        skill=skill,
     )
-    stage_results: list[StageResult] = []
-    try:
-        plan = _request_call(
-            session, active_client, "submit_workflow_plan", WorkflowPlan, DEFAULT_MODEL
-        )
-    except Exception as error:
-        _emit_progress(progress_callback, "failure", str(error))
-        raise
-    _emit_progress(progress_callback, "plan", plan)
-    _append_tool_result(
-        session,
-        {
-            "accepted": True,
-            "stages": [item.model_dump(mode="json") for item in plan.stages],
-        },
-    )
-
-    for stage in STAGES:
-        if session.eligible_tool_name() != stage:
-            raise ToolCallError("The scientific workflow state is out of phase.")
-        try:
-            arguments = _request_call(
-                session, active_client, stage, TOOL_ARGUMENT_MODELS[stage], DEFAULT_MODEL
-            )
-        except Exception as error:
-            _emit_progress(progress_callback, "failure", str(error))
-            raise
-        try:
-            result = active_executors[stage](
-                session.state, **_executor_arguments(stage, arguments)
-            )
-        except Exception:
-            _emit_progress(progress_callback, "failure", "The scientific executor failed.")
-            raise ToolCallError("The scientific executor failed.") from None
-        if not isinstance(result, StageResult) or result.stage != stage:
-            _emit_progress(progress_callback, "failure", "The scientific executor returned an invalid stage result.")
-            raise ToolCallError("The scientific executor returned an invalid stage result.")
-        if session.state.phase is not POST_STAGE_PHASES[stage]:
-            _emit_progress(progress_callback, "failure", "The scientific executor left the workflow out of phase.")
-            raise ToolCallError("The scientific executor left the workflow out of phase.")
-        stage_results.append(result)
-        try:
-            _append_tool_result(
-                session,
-                {
-                    "stage": stage,
-                    "decision_basis": getattr(arguments, "decision_basis", None),
-                    "summary": result.summary,
-                },
-            )
-        except Exception as error:
-            _emit_progress(progress_callback, "failure", str(error))
-            raise
-        _emit_progress(progress_callback, "stage", {"result": result, "arguments": arguments})
-
-    if session.state.phase is not WorkflowPhase.OPTIMIZED or session.turn_count != 7:
-        raise ToolCallError("The scientific workflow did not complete exactly once.")
-    try:
-        report = active_executors["build_workflow_report"](session.state)
-    except Exception:
-        _emit_progress(progress_callback, "failure", "The scientific report could not be built.")
-        raise ToolCallError("The scientific report could not be built.") from None
-    if not isinstance(report, WorkflowReport):
-        _emit_progress(progress_callback, "failure", "The scientific report was invalid.")
-        raise ToolCallError("The scientific report was invalid.")
-    return ScientificLoopResult(tuple(session.messages), report, plan, tuple(stage_results), session.turn_count)
+    return _complete_scientific_loop(controller, progress_callback)
 
 
 _STAGE_METRICS = {
@@ -768,29 +924,24 @@ def run_workflow(
     state: WorkflowState | None = None,
 ) -> WorkflowResult:
     """Run the chain, then schema-check one evidence-linked synthesis without fact-verifying its prose."""
-    _validate_api_key(api_key)
-    active_client = client or _client(api_key)
     progress_callback = _display_progress_event if display_events else None
-    scientific = run_scientific_loop(
-        user_goal, api_key, client=active_client, executors=executors, state=state,
-        progress_callback=progress_callback, skill=skill,
+    controller = BoundedWorkflowController.create(
+        user_goal,
+        api_key,
+        client=client,
+        executors=executors,
+        state=state,
+        skill=skill,
     )
-    session = AgentSession(list(scientific.messages), state or WorkflowState(), 7)
-    evidence = _serialize({"evidence": [item.__dict__ for item in scientific.report.evidence]})
-    session.messages.append({"role": "user", "content": _SYNTHESIS_PROMPT + "\n" + evidence})
+    _complete_scientific_loop(controller, progress_callback)
     try:
-        conclusion = _request_call(session, active_client, "submit_synthesis", SubmitSynthesisArgs, DEFAULT_MODEL)
-        conclusion = validate_conclusion(conclusion, scientific.report)
+        result = controller.request_synthesis()
     except ConclusionValidationError:
         _emit_progress(progress_callback, "failure", "Nemotron synthesis failed validation.")
         raise
-    except _HostedArgumentsValidationError:
-        _emit_progress(progress_callback, "failure", "Nemotron synthesis failed validation.")
-        raise ConclusionValidationError(scientific.report) from None
     except Exception as error:
         _emit_progress(progress_callback, "failure", str(error))
         raise
-    result = WorkflowResult(tuple(session.messages), scientific.report, scientific.plan, conclusion, scientific.stage_results, session.turn_count)
     if display_events:
         _display_conclusion(result)
     return result
