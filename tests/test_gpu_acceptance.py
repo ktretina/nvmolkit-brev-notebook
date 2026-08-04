@@ -158,7 +158,13 @@ def test_nvmolkit_gpu_workflow(tmp_path):
         message["tool_calls"][0]["id"] for message in assistant_messages
     ]
 
+    fingerprints = state.fingerprints.torch()
+    assert fingerprints.is_cuda
+    assert fingerprints.device.type == "cuda"
+
     similarity = state.similarity.torch()
+    assert similarity.is_cuda
+    assert similarity.device.type == "cuda"
     assert tuple(similarity.shape) == (192, 192)
     assert torch.isfinite(similarity).all().item()
     assert ((similarity >= 0) & (similarity <= 1)).all().item()
@@ -212,6 +218,10 @@ def test_nvmolkit_gpu_workflow(tmp_path):
     converged = optimization_result.converged.torch()
     mol_indices = optimization_result.mol_indices.torch()
     conf_indices = optimization_result.conf_indices.torch()
+    assert energies.is_cuda
+    assert converged.is_cuda
+    assert mol_indices.is_cuda
+    assert conf_indices.is_cuda
     attempted = evidence["E06"]["attempted_conformer_count"]
     assert len(energies) == len(converged) == len(mol_indices) == len(conf_indices) == attempted
     assert torch.isfinite(energies).all().item()
@@ -244,5 +254,6 @@ def test_nvmolkit_gpu_workflow(tmp_path):
     ):
         assert len(conformer_coordinates) == molecule.GetNumConformers()
         for coordinates in conformer_coordinates:
+            assert coordinates.is_cuda
             assert tuple(coordinates.shape) == (molecule.GetNumAtoms(), 3)
             assert torch.isfinite(coordinates).all().item()
