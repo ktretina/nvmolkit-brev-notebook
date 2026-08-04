@@ -1,5 +1,6 @@
 import os
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,7 +19,6 @@ def test_nvmolkit_gpu_workflow(tmp_path):
     import torch
 
     from chemistry_workflow import (
-        RepresentativePolicy,
         WorkflowPhase,
         WorkflowState,
         build_workflow_report,
@@ -29,6 +29,7 @@ def test_nvmolkit_gpu_workflow(tmp_path):
         measure_tanimoto_similarity,
         optimize_conformers_mmff94,
     )
+    from demo_agent import BoundedWorkflowController, STAGES
 
     assert torch.cuda.is_available(), "A CUDA-capable NVIDIA GPU is required."
     assert "L4" in torch.cuda.get_device_name(0), (
@@ -48,12 +49,114 @@ def test_nvmolkit_gpu_workflow(tmp_path):
         ]
     ).to_csv(data_path, index=False)
     state = WorkflowState()
-    inspect_library(state, data_path, expected_rows=192)
-    generate_morgan_fingerprints(
-        state, fingerprint_radius=2, fingerprint_size=1024
+
+    stage_arguments = {
+        "inspect_library": {},
+        "generate_morgan_fingerprints": {
+            "radius": 2,
+            "size": 1024,
+            "decision_basis": "Use the qualification fingerprint parameters.",
+        },
+        "measure_tanimoto_similarity": {},
+        "discover_fused_butina_clusters": {
+            "cutoff": 0.5,
+            "decision_basis": "Use the qualification clustering cutoff.",
+        },
+        "embed_representative_conformers": {
+            "representative_count": 4,
+            "policy": "include_singleton_if_available",
+            "conformers_per_representative": 3,
+            "decision_basis": "Use the qualification conformer sample size.",
+        },
+        "optimize_conformers_mmff94": {},
+    }
+    plan_arguments = {
+        "stages": [
+            {
+                "stage": stage,
+                "rationale": f"Run {stage.replace('_', ' ')} after its prerequisite.",
+            }
+            for stage in STAGES
+        ]
+    }
+
+    class ScriptedCompletions:
+        def __init__(self):
+            self.expected_names = ("submit_workflow_plan", *STAGES)
+            self.arguments = (
+                plan_arguments,
+                *(stage_arguments[stage] for stage in STAGES),
+            )
+            self.calls = []
+
+        def create(self, **kwargs):
+            call_index = len(self.calls)
+            assert call_index < len(self.expected_names)
+            expected_name = self.expected_names[call_index]
+            assert kwargs["tool_choice"] == {
+                "type": "function",
+                "function": {"name": expected_name},
+            }
+            assert [tool["function"]["name"] for tool in kwargs["tools"]] == [
+                expected_name
+            ]
+            self.calls.append(kwargs)
+            tool_call = SimpleNamespace(
+                id=f"gpu-acceptance-{call_index}",
+                type="function",
+                function=SimpleNamespace(
+                    name=expected_name,
+                    arguments=json.dumps(self.arguments[call_index]),
+                ),
+            )
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=None, tool_calls=[tool_call])
+                    )
+                ]
+            )
+
+    completions = ScriptedCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    controller = BoundedWorkflowController.create(
+        "Qualify the fixed nvMolKit workflow on the task-owned L4 GPU.",
+        "nvapi-gpu-acceptance-placeholder",
+        client=client,
+        state=state,
+        executors={
+            "inspect_library": lambda active_state: inspect_library(
+                active_state, data_path, expected_rows=192
+            ),
+            "generate_morgan_fingerprints": generate_morgan_fingerprints,
+            "measure_tanimoto_similarity": measure_tanimoto_similarity,
+            "discover_fused_butina_clusters": discover_fused_butina_clusters,
+            "embed_representative_conformers": embed_representative_conformers,
+            "optimize_conformers_mmff94": optimize_conformers_mmff94,
+            "build_workflow_report": build_workflow_report,
+        },
     )
-    measure_tanimoto_similarity(state)
-    discover_fused_butina_clusters(state, cluster_cutoff=0.5)
+    plan = controller.request_plan()
+    assert tuple(item.stage for item in plan.stages) == STAGES
+    for stage in STAGES:
+        proposal = controller.request_next_stage()
+        assert proposal.stage == stage
+        result = controller.execute_pending(proposal.arguments)
+        assert result.stage == stage
+
+    scientific = controller.scientific_result()
+    assert scientific.turn_count == 7 == len(completions.calls)
+    assert tuple(result.stage for result in scientific.stage_results) == STAGES
+    assistant_messages = [
+        message for message in scientific.messages if message["role"] == "assistant"
+    ]
+    tool_messages = [
+        message for message in scientific.messages if message["role"] == "tool"
+    ]
+    assert len(assistant_messages) == len(tool_messages) == 7
+    assert [message["tool_call_id"] for message in tool_messages] == [
+        message["tool_calls"][0]["id"] for message in assistant_messages
+    ]
 
     similarity = state.similarity.torch()
     assert tuple(similarity.shape) == (192, 192)
@@ -85,14 +188,7 @@ def test_nvmolkit_gpu_workflow(tmp_path):
         }
         assert len(repeated_cluster_ids) == 1
 
-    embed_representative_conformers(
-        state,
-        representative_count=4,
-        representative_policy=RepresentativePolicy.INCLUDE_SINGLETON_IF_AVAILABLE,
-        conformers_per_representative=3,
-    )
-    optimize_conformers_mmff94(state)
-    report = build_workflow_report(state)
+    report = scientific.report
 
     assert state.phase is WorkflowPhase.OPTIMIZED
     assert [record.key for record in report.evidence] == [
