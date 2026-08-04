@@ -87,15 +87,26 @@ def test_notebook_exposes_one_goal_and_one_public_agent_call():
         if isinstance(node, ast.Assign)
         and any(isinstance(target, ast.Name) and target.id == "USER_GOAL" for target in node.targets)
     ]
-    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and dotted_name(node.func) == "run_workflow"]
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and dotted_name(node.func) == "launch_interactive_workflow"
+    ]
+    workflow_assignments = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "workflow" for target in node.targets)
+    ]
     assert len(assignments) == 1
     assert len(calls) == 1
+    assert len(workflow_assignments) == 1
+    assert workflow_assignments[0].value is calls[0]
     assert ast.unparse(calls[0]) == (
-        "run_workflow(USER_GOAL, api_key, "
-        "skill=(PROJECT_ROOT / 'skills' / 'nvmolkit' / 'SKILL.md').read_text(encoding='utf-8'), "
-        "display_events=True)"
+        "launch_interactive_workflow(USER_GOAL, api_key, "
+        "skill=(PROJECT_ROOT / 'skills' / 'nvmolkit' / 'SKILL.md').read_text(encoding='utf-8'))"
     )
     assert "skill=(PROJECT_ROOT / \"skills\" / \"nvmolkit\" / \"SKILL.md\").read_text(encoding=\"utf-8\")" in notebook.cells[6].source
+    assert "run_workflow" not in code
     assert all(forbidden not in code for forbidden in (
         "read_nvmolkit_skill", "prepare_molecular_sample", "compute_morgan_fingerprints",
         "compute_tanimoto_similarity", "cluster_with_fused_butina",
@@ -117,8 +128,18 @@ def test_intro_and_run_text_make_attribution_and_grounding_explicit():
     assert "Python" in combined and "structured results" in combined
     for entry_point in NVMOLKIT_ENTRY_POINTS:
         assert entry_point in combined
-    assert "six sequential validated executions" in run_text
-    assert "schema-checked scientific synthesis" in run_text
+    for phrase in (
+        "click **Start Agent**",
+        "review the Nemotron proposal and concise decision",
+        "bounded dropdowns and sliders",
+        "click **Approve & Run** for each of the six stages",
+        "validated, approved agent tool call",
+        "corresponding RDKit inspection or nvMolKit invocation",
+        "final synthesis appears only after MMFF94",
+        "Button callback failures remain in the active card",
+        "do not mark the notebook cell failed",
+    ):
+        assert phrase in run_text
     assert "qualitative interpretation is not automatically fact-verified" in run_text
 
 
@@ -132,7 +153,9 @@ def test_preflight_is_fixed_gpu_ready_and_credential_safe():
         if isinstance(node, ast.ImportFrom)
         for alias in node.names
     }
-    assert imports == {"Path", "notebook_preflight", "run_workflow"}
+    assert imports == {"Path", "notebook_preflight", "launch_interactive_workflow"}
+    assert "from interactive_workflow import launch_interactive_workflow" in code
+    assert "run_workflow" not in code
     assert "PROJECT_ROOT / \"demo_agent.py\"" in code
     assert "api_key = notebook_preflight()" in code
     assert len(code.splitlines()) <= 10
@@ -187,8 +210,14 @@ def test_readme_preserves_launch_and_separate_acceptance_gates():
     lowered = readme.lower()
     for gate in ("local deterministic acceptance", "gpu acceptance", "hosted inference acceptance", "rendered deployment acceptance"):
         assert gate in lowered
-    assert "one plan" in lowered and "six validated executions" in lowered
-    assert "one evidence-linked, schema-checked synthesis" in lowered
+    assert "one plan" in lowered
+    assert "six approvals" in lowered
+    assert "six completed command receipts/result cards" in lowered
+    assert "one synthesis" in lowered
+    assert "bounded scientific parameters" in lowered
+    assert "returns after the interface is displayed" in lowered
+    assert "guarded button failures stay inside the active card" in lowered
+    assert "start agent" in lowered and "approve & run" in lowered
     assert "qualitative interpretation is not automatically fact-verified" in lowered
     assert "not yet live-qualified" in lowered
 
