@@ -127,6 +127,12 @@ class InteractiveWorkflow:
 
     def _stop(self) -> None:
         self.status = "stopped"
+        if self.retry_button is not None:
+            self.retry_button.disabled = True
+        if self.approve_button is not None:
+            self.approve_button.disabled = True
+        for control in self.controls.values():
+            control.disabled = True
         self.retry_button = None
         self.approve_button = None
         message = "A local workflow error occurred. The workflow was stopped safely."
@@ -137,6 +143,28 @@ class InteractiveWorkflow:
         else:
             self.active_card.children = (*self.active_card.children, error_widget)
         self._set_body()
+
+    def _plan_retryable(self) -> bool:
+        try:
+            return (
+                self.controller.plan is None
+                and self.controller.pending is None
+                and self.controller.session.turn_count == 0
+                and self.controller.session.state.phase is demo_agent.WorkflowPhase.NEW
+            )
+        except Exception:
+            return False
+
+    def _synthesis_retryable(self) -> bool:
+        try:
+            return (
+                len(self.completed_cards) == len(demo_agent.STAGES)
+                and self.controller.pending is None
+                and self.controller.session.turn_count == 7
+                and self.controller.session.state.phase is demo_agent.WorkflowPhase.OPTIMIZED
+            )
+        except Exception:
+            return False
 
     def start(self, button: widgets.Button | None = None) -> None:
         if (button is not None and button is not self.start_button) or self._busy or self.status != "idle" or self.start_button.disabled:
@@ -157,7 +185,7 @@ class InteractiveWorkflow:
             self._set_body()
             self._request_proposal()
         except Exception as error:
-            if self._known_failure(error) and getattr(self.controller, "pending", None) is None and getattr(self.controller, "plan", None) is None:
+            if self._known_failure(error) and self._plan_retryable():
                 self._retry_card("Plan request failed", error, "plan_failed", "Retry Plan", self._retry_plan)
             else:
                 self._stop()
@@ -166,6 +194,10 @@ class InteractiveWorkflow:
 
     def _retry_plan(self, button: widgets.Button) -> None:
         if self._busy or self.status != "plan_failed" or button is not self.retry_button or button.disabled:
+            return
+        if not self._plan_retryable():
+            button.disabled = True
+            self._stop()
             return
         button.disabled = True
         self.retry_button = None
@@ -235,10 +267,14 @@ class InteractiveWorkflow:
                 ) + "</pre>"
             except (ValidationError, ValueError):
                 preview.value = "<b>Approved-call preview unavailable</b>"
+            except Exception:
+                self._stop()
 
         for control in self.controls.values():
             control.observe(update_preview, names="value")
         update_preview()
+        if self.status == "stopped":
+            return
         button = widgets.Button(description="Approve & Run", button_style="success")
         button.on_click(self._approve)
         self.approve_button = button
@@ -365,7 +401,7 @@ class InteractiveWorkflow:
             self._line("Final synthesis complete")
             self._set_body()
         except Exception as error:
-            if self._known_failure(error) and len(self.completed_cards) == len(demo_agent.STAGES):
+            if self._known_failure(error) and self._synthesis_retryable():
                 self._retry_card("Synthesis failed", error, "synthesis_failed", "Retry Synthesis", self._retry_synthesis)
             else:
                 self._stop()
@@ -373,7 +409,7 @@ class InteractiveWorkflow:
     def _retry_synthesis(self, button: widgets.Button) -> None:
         if self._busy or self.status != "synthesis_failed" or button is not self.retry_button or button.disabled:
             return
-        if len(self.completed_cards) != len(demo_agent.STAGES):
+        if not self._synthesis_retryable():
             button.disabled = True
             self._stop()
             return
@@ -386,8 +422,14 @@ class InteractiveWorkflow:
             self._busy = False
 
 
-def launch_interactive_workflow(user_goal: str, api_key: str, skill: str | None = None,
-                                client: Any = None, executors: dict[str, Any] | None = None) -> InteractiveWorkflow:
+def launch_interactive_workflow(
+    user_goal: str,
+    api_key: str,
+    *,
+    skill: str | None = None,
+    client: Any = None,
+    executors: dict[str, Any] | None = None,
+) -> InteractiveWorkflow:
     controller = demo_agent.BoundedWorkflowController.create(
         user_goal, api_key, skill=skill, client=client, executors=executors
     )

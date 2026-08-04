@@ -1,3 +1,4 @@
+import inspect
 from types import SimpleNamespace
 
 import ipywidgets as widgets
@@ -24,7 +25,10 @@ def proposals():
 
 
 class Session:
-    def __init__(self, controller): self.controller = controller
+    def __init__(self, controller):
+        self.controller = controller
+        self.turn_count = 0
+        self.state = SimpleNamespace(phase=demo_agent.WorkflowPhase.NEW)
     def eligible_tool_name(self): return demo_agent.STAGES[self.controller.index] if self.controller.index < 6 else "submit_synthesis"
 
 
@@ -37,18 +41,22 @@ class Controller:
         self.synthesis_failures = []
         self.index = 0
         self.pending = None
+        self.plan = None
         self.stage_results = []
         self.session = Session(self)
 
     def request_plan(self):
         self.calls.append("plan")
         if self.plan_failures: raise self.plan_failures.pop(0)
-        return demo_agent.WorkflowPlan(stages=[{"stage": stage, "rationale": f"Plan {stage}."} for stage in demo_agent.STAGES])
+        self.plan = demo_agent.WorkflowPlan(stages=[{"stage": stage, "rationale": f"Plan {stage}."} for stage in demo_agent.STAGES])
+        self.session.turn_count += 1
+        return self.plan
 
     def request_next_stage(self):
         self.calls.append("proposal")
         if self.proposal_failures: raise self.proposal_failures.pop(0)
         self.pending = proposals()[self.index]
+        self.session.turn_count += 1
         return self.pending
 
     def execute_pending(self, approved):
@@ -65,6 +73,7 @@ class Controller:
         self.stage_results.append(result)
         self.pending = None
         self.index += 1
+        self.session.state.phase = tuple(demo_agent.POST_STAGE_PHASES.values())[self.index - 1]
         return result
 
     def request_synthesis(self):
@@ -154,6 +163,15 @@ def test_known_hosted_failure_has_one_guarded_retry(where):
     assert controller.calls == expected
 
 
+def test_retry_plan_rechecks_turn_phase_and_pending():
+    controller = Controller(); controller.plan_failures.append(ToolCallError("safe hosted failure"))
+    workflow = InteractiveWorkflow(controller); workflow.start_button.click()
+    before = list(controller.calls)
+    controller.session.turn_count = 1
+    workflow.retry_button.click()
+    assert workflow.status == "stopped" and controller.calls == before
+
+
 def test_safe_execution_retry_uses_same_model_and_stale_retry_is_inert():
     controller = Controller(); controller.execution_failures.append(ToolCallError("executor failed"))
     workflow, _ = started(controller)
@@ -212,3 +230,40 @@ def test_known_synthesis_failure_has_guarded_retry(monkeypatch):
     retry = workflow.retry_button; retry.click(); retry.click()
     assert workflow.status == "completed" and retry.disabled
     assert controller.calls.count("synthesis") == 2
+
+
+def test_retry_synthesis_rechecks_turn_phase_and_pending(monkeypatch):
+    monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
+    controller = Controller(); controller.synthesis_failures.append(ToolCallError("hosted synthesis failed"))
+    workflow, _ = started(controller)
+    for _ in range(6): workflow.approve_button.click()
+    before = controller.calls.count("synthesis")
+    controller.session.state.phase = demo_agent.WorkflowPhase.EMBEDDED
+    workflow.retry_button.click()
+    assert workflow.status == "stopped"
+    assert controller.calls.count("synthesis") == before
+
+
+def test_control_observer_unexpected_error_is_secret_safe_fatal(monkeypatch):
+    workflow, _ = started()
+    workflow.approve_button.click()
+    monkeypatch.setattr("interactive_workflow._approved_model", lambda *_: (_ for _ in ()).throw(RuntimeError("OBSERVER-SECRET")))
+    workflow.controls["radius"].value = 3
+    assert workflow.status == "stopped" and workflow.retry_button is None
+    assert "OBSERVER-SECRET" not in workflow.transcript_text
+    assert "local workflow error" in workflow.transcript_text.lower()
+
+
+def test_launch_signature_create_display_and_no_hosted_call(monkeypatch):
+    from interactive_workflow import launch_interactive_workflow
+
+    controller = Controller(); created = []; displayed = []
+    def create(*args, **kwargs):
+        created.append((args, kwargs)); return controller
+    monkeypatch.setattr(demo_agent.BoundedWorkflowController, "create", create)
+    monkeypatch.setattr(InteractiveWorkflow, "display", lambda self: displayed.append(self))
+    workflow = launch_interactive_workflow("goal", "nvapi-test", skill="s", client="c", executors={})
+    assert created == [(("goal", "nvapi-test"), {"skill": "s", "client": "c", "executors": {}})]
+    assert displayed == [workflow] and controller.calls == []
+    assert str(inspect.signature(launch_interactive_workflow)).startswith("(user_goal: 'str', api_key: 'str', *")
+    with pytest.raises(TypeError): launch_interactive_workflow("goal", "nvapi-test", "positional")
