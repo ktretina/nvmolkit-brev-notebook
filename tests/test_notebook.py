@@ -208,12 +208,17 @@ def test_readme_preserves_launch_and_separate_acceptance_gates():
         assert "hidden" in instructions.lower()
         assert "not rely on setup-variable persistence" in instructions
     lowered = readme.lower()
+    hosted_gate = next(
+        line.lower()
+        for line in readme.splitlines()
+        if line.startswith("- **Hosted inference acceptance:**")
+    )
     for gate in ("local deterministic acceptance", "gpu acceptance", "hosted inference acceptance", "rendered deployment acceptance"):
         assert gate in lowered
     assert "one plan" in lowered
     assert "six approvals" in lowered
     assert "six completed command receipts/result cards" in lowered
-    assert "one synthesis" in lowered
+    assert "one evidence-linked, schema-checked synthesis" in hosted_gate
     assert "bounded scientific parameters" in lowered
     assert "returns after the interface is displayed" in lowered
     assert "guarded button failures stay inside the active card" in lowered
