@@ -182,7 +182,7 @@ def test_fixed_artifacts_and_skill_provenance_are_intact():
     skill_bytes = (REPO_ROOT / "skills" / "nvmolkit" / "SKILL.md").read_bytes()
     assert "ce151c15470991c8cb9a0efdd531a124c346ca5b" in provenance
     assert hashlib.sha256(skill_bytes).hexdigest() in provenance
-    for relative_path in ("launchable/setup.sh", "launchable/fields.md", "data/sample_molecules.csv"):
+    for relative_path in ("launchable/fields.md", "data/sample_molecules.csv"):
         committed = subprocess.run(
             ["git", "show", f"31c8567b6ed743e56e87ee3475b4c143a7614c9b:{relative_path}"],
             cwd=REPO_ROOT, check=True, capture_output=True,
@@ -244,6 +244,8 @@ def test_setup_uses_brev_managed_python_and_leaves_jupyter_to_brev():
 
 def test_setup_runs_only_managed_runtime_and_probes_existing_jupyter(tmp_path):
     fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    (fake_home / "nvmolkit-brev-notebook").symlink_to(REPO_ROOT, target_is_directory=True)
     managed_bin = fake_home / ".venv" / "bin"
     fake_bin = tmp_path / "bin"
     managed_bin.mkdir(parents=True)
@@ -254,7 +256,7 @@ def test_setup_runs_only_managed_runtime_and_probes_existing_jupyter(tmp_path):
 case "${1:-}" in
   -c) printf 'VERSION_CHECK %s\n' "${2:-}" >>"${INVOCATION_LOG}" ;;
   --version) printf 'Python 3.12.13\n' ;;
-  -m) printf 'MODULE %s %s %s\n' "${2:-}" "${3:-}" "${4:-}" >>"${INVOCATION_LOG}"; [[ "${2:-} ${3:-}" == "pip --version" ]] && exit 1 || true ;;
+  -m) printf 'MODULE %s %s %s\n' "${2:-}" "${3:-}" "${4:-}" >>"${INVOCATION_LOG}"; [[ "${2:-} ${3:-}" == "pip --version" ]] && exit 1; [[ "${4:-}" == "-r" && ! -f "${5:-}" ]] && exit 93; true ;;
   -) payload="$(</dev/stdin)"; [[ "$payload" == *"torch.cuda.is_available"* ]] && printf 'SMOKE\n' >>"${INVOCATION_LOG}" || printf 'HEALTH\n' >>"${INVOCATION_LOG}" ;;
   *) exit 92 ;;
 esac
@@ -265,7 +267,11 @@ esac
 """, encoding="utf-8")
     (fake_bin / "uname").chmod(0o755)
     env = os.environ | {"HOME": str(fake_home), "INVOCATION_LOG": str(log), "PATH": f"{fake_bin}:/usr/bin:/bin"}
-    result = subprocess.run(["bash", str(REPO_ROOT / "launchable" / "setup.sh")], cwd=REPO_ROOT, env=env, capture_output=True, text=True)
+    copied_setup = tmp_path / "brev-generated-setup.sh"
+    copied_setup.write_bytes((REPO_ROOT / "launchable" / "setup.sh").read_bytes())
+    execution_dir = tmp_path / "execution"
+    execution_dir.mkdir()
+    result = subprocess.run(["bash", str(copied_setup)], cwd=execution_dir, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     invocations = log.read_text(encoding="utf-8").splitlines()
     assert any("sys.implementation.name" in line for line in invocations)

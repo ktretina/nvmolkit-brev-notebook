@@ -1,8 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+if [[ -f "${PWD}/requirements.txt" && -f "${PWD}/demo_agent.py" ]]; then
+  PROJECT_DIR="${PWD}"
+elif [[ -f "${HOME}/nvmolkit-brev-notebook/requirements.txt" ]]; then
+  PROJECT_DIR="${HOME}/nvmolkit-brev-notebook"
+else
+  echo "Error: could not find the cloned nvmolkit-brev-notebook project." >&2
+  exit 1
+fi
 
 cd "${PROJECT_DIR}"
 
