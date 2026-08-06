@@ -240,8 +240,9 @@ def test_nvmolkit_gpu_workflow():
     for cluster_id, cluster in enumerate(state.clusters):
         for molecule_index in cluster:
             cluster_by_index[molecule_index] = cluster_id
-    assert len(state.clusters) > 1
-    assert cluster_by_index[0] != cluster_by_index[3]
+    assert len(state.clusters) >= 8
+    assert len(set(cluster_by_index)) == len(state.clusters)
+    assert len({candidate.cluster_id for candidate in context.candidates}) == 8
 
     report = scientific.report
 
