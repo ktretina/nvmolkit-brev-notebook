@@ -13,6 +13,8 @@ from objective_challenge import (
     MAX_ATTEMPTS,
     PANEL_SIZE,
     ObjectiveAttempt,
+    ObjectiveCandidate,
+    ObjectiveContext,
     ObjectiveRun,
     build_objective_context,
     build_objective_evidence,
@@ -56,6 +58,31 @@ def optimized_state() -> WorkflowState:
         molecules=[Chem.MolFromSmiles(value) for value in smiles],
         similarity=FakeGpuResult(1.0 - distance),
         clusters=[[index] for index in range(CANDIDATE_COUNT)],
+    )
+
+
+def two_revision_context() -> ObjectiveContext:
+    candidates = tuple(
+        ObjectiveCandidate(
+            molecule_id=f"candidate-{index}",
+            molecule_index=index,
+            source_row=index,
+            cluster_id=index,
+        )
+        for index in range(CANDIDATE_COUNT)
+    )
+    distance = np.full((CANDIDATE_COUNT, CANDIDATE_COUNT), 0.90, dtype=float)
+    np.fill_diagonal(distance, 0.0)
+    distance[0, 1] = distance[1, 0] = 0.30
+    distance[2, 3] = distance[3, 2] = 0.40
+    distance.setflags(write=False)
+    return ObjectiveContext(
+        candidates=candidates,
+        baseline_ids=("candidate-0", "candidate-1", "candidate-2", "candidate-3"),
+        baseline_score=0.30,
+        benchmark_score=0.90,
+        target_score=0.75,
+        distance_matrix=distance,
     )
 
 
@@ -273,6 +300,67 @@ def test_rank_legal_swaps_returns_none_after_success_and_stays_fixture_agnostic(
     assert rank_legal_swaps(context, out_of_pool_achieved) == ()
     assert all(f"mol-{index}" not in source for index in range(CANDIDATE_COUNT))
     assert "CHEMBL" not in source
+
+
+@pytest.mark.parametrize("forged_score", (-1.0, float("nan")))
+def test_rank_legal_swaps_rejects_forged_nonachieved_attempt_scores(forged_score):
+    context = build_objective_context(optimized_state())
+    forged = ObjectiveAttempt(
+        attempt_number=1,
+        selected_ids=("mol-0", "mol-2", "mol-4", "mol-6"),
+        decision_basis="This forged record pretends a solved panel is pending.",
+        score=forged_score,
+        limiting_pair=("mol-0", "mol-2"),
+        constraints_passed=True,
+        achieved=False,
+    )
+
+    with pytest.raises(ValueError):
+        rank_legal_swaps(context, forged)
+
+
+def test_rank_legal_swaps_supports_two_revisions_and_preserves_panel_order():
+    context = two_revision_context()
+    current = evaluate_diverse_panel(
+        context,
+        ("candidate-1", "candidate-0", "candidate-2", "candidate-3"),
+        attempt_number=1,
+        decision_basis="Start in a deliberately noncanonical panel order.",
+    )
+
+    first_ranker = rank_legal_swaps(context, current)
+
+    assert current.achieved is False
+    assert first_ranker
+    first_swap = first_ranker[0]
+    assert first_swap.replace_id == "candidate-0"
+    assert first_swap.replacement_id == "candidate-4"
+    assert first_swap.resulting_ids == (
+        "candidate-1",
+        "candidate-4",
+        "candidate-2",
+        "candidate-3",
+    )
+    assert current.score < first_swap.predicted_score < context.target_score
+
+    second = evaluate_diverse_panel(
+        context,
+        first_swap.resulting_ids,
+        attempt_number=2,
+        decision_basis="Resolve the first independent limiting pair.",
+    )
+    second_ranker = rank_legal_swaps(context, second)
+
+    assert second.achieved is False
+    assert second_ranker
+    third = evaluate_diverse_panel(
+        context,
+        second_ranker[0].resulting_ids,
+        attempt_number=3,
+        decision_basis="Resolve the remaining independent limiting pair.",
+    )
+    assert second_ranker[0].predicted_score >= context.target_score
+    assert third.achieved is True
 
 
 def test_rank_legal_swaps_can_reach_target_within_two_attempts_for_every_miss():

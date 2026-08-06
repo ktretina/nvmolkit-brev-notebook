@@ -23,6 +23,7 @@ CANDIDATE_COUNT = 8
 MAX_ATTEMPTS = 3
 TARGET_FRACTION = 0.8
 SUGGESTION_LIMIT = 3
+SCORE_TOLERANCE = 1e-12
 
 
 @dataclass(frozen=True)
@@ -178,7 +179,7 @@ def evaluate_diverse_panel(
         score=float(score),
         limiting_pair=limiting_pair,
         constraints_passed=True,
-        achieved=bool(score + 1e-12 >= context.target_score),
+        achieved=bool(score + SCORE_TOLERANCE >= context.target_score),
     )
 
 
@@ -193,6 +194,23 @@ def rank_legal_swaps(
     candidates = {candidate.molecule_id: candidate for candidate in context.candidates}
     if any(molecule_id not in candidates for molecule_id in current.selected_ids):
         raise ValueError("Objective attempt contains an out-of-pool molecule ID.")
+    recomputed_score, recomputed_limiting_pair = _score_panel(
+        context, current.selected_ids
+    )
+    if not isinstance(current.score, (int, float, np.floating)) or not np.isfinite(
+        current.score
+    ):
+        raise ValueError("Objective attempt score must be finite.")
+    if not np.isclose(
+        current.score, recomputed_score, rtol=0.0, atol=SCORE_TOLERANCE
+    ):
+        raise ValueError("Objective attempt score does not match its panel.")
+    if current.limiting_pair != recomputed_limiting_pair:
+        raise ValueError("Objective attempt limiting pair does not match its panel.")
+    if current.constraints_passed is not True:
+        raise ValueError("Objective attempt constraints must be passed.")
+    if recomputed_score + SCORE_TOLERANCE >= context.target_score:
+        raise ValueError("Objective attempt below-target state is inconsistent.")
 
     suggestions = []
     current_ids = set(current.selected_ids)
@@ -210,8 +228,8 @@ def rank_legal_swaps(
             if len({candidates[molecule_id].cluster_id for molecule_id in resulting_ids}) != PANEL_SIZE:
                 continue
             predicted_score, limiting_pair = _score_panel(context, resulting_ids)
-            score_delta = predicted_score - current.score
-            if score_delta <= 1e-12:
+            score_delta = predicted_score - recomputed_score
+            if score_delta <= SCORE_TOLERANCE:
                 continue
             suggestions.append(
                 ObjectiveSwap(
@@ -235,7 +253,7 @@ def rank_legal_swaps(
     target_reaching = [
         suggestion
         for suggestion in suggestions
-        if suggestion.predicted_score + 1e-12 >= context.target_score
+        if suggestion.predicted_score + SCORE_TOLERANCE >= context.target_score
     ]
     return tuple((target_reaching or suggestions)[:SUGGESTION_LIMIT])
 
@@ -269,7 +287,12 @@ def finalize_objective_run(
 
 def no_improvement_run(context: ObjectiveContext) -> ObjectiveRun:
     """Represent the explicit case where the current policy is already optimal."""
-    if not np.isclose(context.baseline_score, context.benchmark_score, rtol=0.0, atol=1e-12):
+    if not np.isclose(
+        context.baseline_score,
+        context.benchmark_score,
+        rtol=0.0,
+        atol=SCORE_TOLERANCE,
+    ):
         raise ValueError("A no-improvement run requires an optimal baseline.")
     return ObjectiveRun(
         context=context,
