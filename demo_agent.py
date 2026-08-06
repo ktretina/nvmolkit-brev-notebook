@@ -1161,8 +1161,10 @@ def _display_progress_event(event: str, payload: Any) -> None:
         _display_figure(figure)
 
 
+_EVIDENCE_CITATION_KEY = r"(?:E0[1-6]|O01)"
 _EVIDENCE_CITATION_GROUP = (
-    r"E0[1-6](?:\s*(?:,|and|[-–—])\s*E0[1-6])*"
+    rf"{_EVIDENCE_CITATION_KEY}"
+    rf"(?:\s*(?:,|and|[-–—])\s*{_EVIDENCE_CITATION_KEY})*"
 )
 
 
@@ -1174,7 +1176,7 @@ def _presentation_text(text: str) -> str:
         text,
         flags=re.IGNORECASE,
     )
-    text = re.sub(r"\bE0[1-6]\b", "", text)
+    text = re.sub(r"\b(?:E0[1-6]|O01)\b", "", text)
     text = re.sub(r"\s+([.,;:])", r"\1", text)
     return " ".join(text.split())
 

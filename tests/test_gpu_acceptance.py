@@ -1,5 +1,8 @@
 import os
 import json
+import inspect
+import itertools
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,13 +12,26 @@ import pytest
 MIN_CONVERGED = 6
 
 
+def test_gpu_acceptance_source_gates_default_objective_challenge():
+    source = inspect.getsource(test_nvmolkit_gpu_workflow)
+
+    for required in (
+        "sample_molecules.csv",
+        "objective_required=True",
+        "begin_objective_challenge",
+        "benchmark_score > context.baseline_score",
+        'objective_evidence.key == "O01"',
+        'termination_reason == "target_achieved"',
+    ):
+        assert required in source
+
+
 @pytest.mark.skipif(
     os.environ.get("RUN_GPU_TESTS") != "1",
     reason="set RUN_GPU_TESTS=1 on the task-owned Brev GPU",
 )
-def test_nvmolkit_gpu_workflow(tmp_path):
+def test_nvmolkit_gpu_workflow():
     import nvmolkit
-    import pandas as pd
     import torch
 
     from chemistry_workflow import (
@@ -30,6 +46,7 @@ def test_nvmolkit_gpu_workflow(tmp_path):
         optimize_conformers_mmff94,
     )
     from demo_agent import BoundedWorkflowController, STAGES
+    from objective_challenge import evaluate_diverse_panel
 
     assert torch.cuda.is_available(), "A CUDA-capable NVIDIA GPU is required."
     assert "L4" in torch.cuda.get_device_name(0), (
@@ -40,14 +57,7 @@ def test_nvmolkit_gpu_workflow(tmp_path):
         f"GPU acceptance requires nvMolKit 0.5.0; found {nvmolkit.__version__}"
     )
 
-    smiles = ("CCO", "CCN", "CCC", "c1ccccc1", "CC(=O)O", "CCOC")
-    data_path = tmp_path / "gpu_acceptance_molecules.csv"
-    pd.DataFrame(
-        [
-            {"molecule_id": f"mol-{index}", "smiles": smile}
-            for index, smile in enumerate(smiles * 32)
-        ]
-    ).to_csv(data_path, index=False)
+    data_path = Path(__file__).resolve().parents[1] / "data" / "sample_molecules.csv"
     state = WorkflowState()
 
     stage_arguments = {
@@ -82,11 +92,11 @@ def test_nvmolkit_gpu_workflow(tmp_path):
 
     class ScriptedCompletions:
         def __init__(self):
-            self.expected_names = ("submit_workflow_plan", *STAGES)
-            self.arguments = (
+            self.expected_names = ["submit_workflow_plan", *STAGES]
+            self.arguments = [
                 plan_arguments,
                 *(stage_arguments[stage] for stage in STAGES),
-            )
+            ]
             self.calls = []
 
         def create(self, **kwargs):
@@ -124,9 +134,10 @@ def test_nvmolkit_gpu_workflow(tmp_path):
         "nvapi-gpu-acceptance-placeholder",
         client=client,
         state=state,
+        objective_required=True,
         executors={
             "inspect_library": lambda active_state: inspect_library(
-                active_state, data_path, expected_rows=192
+                active_state, data_path, expected_rows=256
             ),
             "generate_morgan_fingerprints": generate_morgan_fingerprints,
             "measure_tanimoto_similarity": measure_tanimoto_similarity,
@@ -158,6 +169,52 @@ def test_nvmolkit_gpu_workflow(tmp_path):
         message["tool_calls"][0]["id"] for message in assistant_messages
     ]
 
+    context = controller.begin_objective_challenge()
+    assert len(context.candidates) == 8
+    assert context.benchmark_score > context.baseline_score
+    candidate_ids = tuple(candidate.molecule_id for candidate in context.candidates)
+    best_panel = max(
+        itertools.combinations(candidate_ids, 4),
+        key=lambda panel: evaluate_diverse_panel(
+            context,
+            panel,
+            attempt_number=2,
+            decision_basis="Evaluate one bounded candidate panel.",
+        ).score,
+    )
+    completions.expected_names.extend(["select_diverse_panel", "select_diverse_panel"])
+    completions.arguments.extend(
+        [
+            {
+                "selected_ids": list(context.baseline_ids),
+                "decision_basis": "Measure the defined baseline before revising it.",
+            },
+            {
+                "selected_ids": list(best_panel),
+                "decision_basis": "Replace the measured limiting analogue pair.",
+            },
+        ]
+    )
+    for _ in range(2):
+        proposal = controller.request_objective_attempt()
+        controller.execute_objective_attempt(proposal)
+    assert controller.objective_run is not None
+    assert 1 <= len(controller.objective_run.attempts) <= 3
+    assert controller.objective_run.termination_reason == "target_achieved"
+    assert controller.objective_run.final_score >= context.target_score
+    assert controller.objective_evidence.key == "O01"
+    assert controller.session.turn_count == 9 == len(completions.calls)
+    assistant_messages = [
+        message for message in controller.session.messages if message["role"] == "assistant"
+    ]
+    tool_messages = [
+        message for message in controller.session.messages if message["role"] == "tool"
+    ]
+    assert len(assistant_messages) == len(tool_messages) == 9
+    assert [message["tool_call_id"] for message in tool_messages] == [
+        message["tool_calls"][0]["id"] for message in assistant_messages
+    ]
+
     fingerprints = state.fingerprints.torch()
     assert fingerprints.is_cuda
     assert fingerprints.device.type == "cuda"
@@ -165,10 +222,9 @@ def test_nvmolkit_gpu_workflow(tmp_path):
     similarity = state.similarity.torch()
     assert similarity.is_cuda
     assert similarity.device.type == "cuda"
-    assert tuple(similarity.shape) == (192, 192)
+    assert tuple(similarity.shape) == (256, 256)
     assert torch.isfinite(similarity).all().item()
     assert ((similarity >= 0) & (similarity <= 1)).all().item()
-    expected_one = torch.tensor(1.0, dtype=similarity.dtype, device=similarity.device)
     assert torch.allclose(
         similarity.diagonal(),
         torch.ones_like(similarity.diagonal()),
@@ -176,23 +232,16 @@ def test_nvmolkit_gpu_workflow(tmp_path):
         atol=1e-7,
     )
     assert torch.allclose(similarity, similarity.T, rtol=0, atol=1e-7)
-    assert torch.isclose(similarity[0, 6], expected_one, rtol=0, atol=1e-7).item()
 
     clustered_indices = [index for cluster in state.clusters for index in cluster]
-    assert len(clustered_indices) == 192
-    assert sorted(clustered_indices) == list(range(192))
-    cluster_by_index = [-1] * 192
+    assert len(clustered_indices) == 256
+    assert sorted(clustered_indices) == list(range(256))
+    cluster_by_index = [-1] * 256
     for cluster_id, cluster in enumerate(state.clusters):
         for molecule_index in cluster:
             cluster_by_index[molecule_index] = cluster_id
     assert len(state.clusters) > 1
     assert cluster_by_index[0] != cluster_by_index[3]
-    for smiles_index in range(len(smiles)):
-        repeated_cluster_ids = {
-            cluster_by_index[smiles_index + repeat_index * len(smiles)]
-            for repeat_index in range(32)
-        }
-        assert len(repeated_cluster_ids) == 1
 
     report = scientific.report
 
@@ -208,10 +257,10 @@ def test_nvmolkit_gpu_workflow(tmp_path):
         "MMFFOptimizeMoleculesConfs",
     ]
     evidence = {record.key: json.loads(record.payload_json) for record in report.evidence}
-    assert evidence["E01"]["valid_count"] == 192
-    assert evidence["E02"]["packed_shape"] == [192, 32]
-    assert evidence["E03"]["matrix_shape"] == [192, 192]
-    assert evidence["E04"]["assignment_count"] == 192
+    assert evidence["E01"]["valid_count"] == 256
+    assert evidence["E02"]["packed_shape"] == [256, 32]
+    assert evidence["E03"]["matrix_shape"] == [256, 256]
+    assert evidence["E04"]["assignment_count"] == 256
 
     optimization_result = state.optimization_result
     energies = optimization_result.energies.torch()

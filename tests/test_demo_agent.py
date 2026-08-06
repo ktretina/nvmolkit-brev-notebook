@@ -1252,13 +1252,16 @@ def test_conclusion_validation_keeps_structured_grounding_when_model_prose_cites
 def test_presentation_text_removes_model_generated_evidence_citations():
     prose = (
         "The dataset contains 256 molecules (E01). Similarity is broad (E02-E03). "
-        "Evidence: E01, E02, E03."
+        "The optimized panel improves diversity (O01). Evidence: E01, E02, E03, O01."
     )
 
     rendered = demo_agent._presentation_text(prose)
 
-    assert rendered == "The dataset contains 256 molecules. Similarity is broad."
-    assert all(key not in rendered for key in ("E01", "E02", "E03"))
+    assert rendered == (
+        "The dataset contains 256 molecules. Similarity is broad. "
+        "The optimized panel improves diversity."
+    )
+    assert all(key not in rendered for key in ("E01", "E02", "E03", "O01"))
 
 
 @pytest.mark.parametrize(
