@@ -63,6 +63,7 @@ class ObjectiveAttempt:
     limiting_pair: tuple[str, str]
     constraints_passed: bool
     achieved: bool
+    selected_swap: ObjectiveSwap | None = None
 
 
 @dataclass(frozen=True)
@@ -173,6 +174,7 @@ def evaluate_diverse_panel(
     *,
     attempt_number: int,
     decision_basis: str,
+    selected_swap: ObjectiveSwap | None = None,
 ) -> ObjectiveAttempt:
     """Validate and score one proposed panel without mutating workflow state."""
     panel, _ = _validated_panel(context, selected_ids)
@@ -182,6 +184,24 @@ def evaluate_diverse_panel(
     if not basis or len(basis) > 240 or any(character in basis for character in "\r\n`"):
         raise ValueError("Objective decision basis is invalid.")
     score, limiting_pair = _score_panel(context, panel)
+    if selected_swap is not None:
+        if type(selected_swap) is not ObjectiveSwap:
+            raise ValueError("Objective selected swap must use the exact swap type.")
+        if set(panel) != set(selected_swap.resulting_ids):
+            raise ValueError("Objective selected swap does not match the selected panel.")
+        if isinstance(selected_swap.predicted_score, bool) or not isinstance(
+            selected_swap.predicted_score, (int, float, np.floating)
+        ) or not np.isfinite(selected_swap.predicted_score):
+            raise ValueError("Objective selected swap predicted score is invalid.")
+        if not np.isclose(
+            score,
+            selected_swap.predicted_score,
+            rtol=0.0,
+            atol=SCORE_TOLERANCE,
+        ):
+            raise ValueError("Objective selected swap predicted score does not match the panel.")
+        if limiting_pair != selected_swap.limiting_pair:
+            raise ValueError("Objective selected swap limiting pair does not match the panel.")
     return ObjectiveAttempt(
         attempt_number=attempt_number,
         selected_ids=panel,
@@ -190,6 +210,7 @@ def evaluate_diverse_panel(
         limiting_pair=limiting_pair,
         constraints_passed=True,
         achieved=bool(score + SCORE_TOLERANCE >= context.target_score),
+        selected_swap=selected_swap,
     )
 
 
@@ -341,6 +362,18 @@ def build_objective_evidence(run: ObjectiveRun) -> EvidenceRecord:
                 "limiting_pair": list(attempt.limiting_pair),
                 "constraints_passed": attempt.constraints_passed,
                 "achieved": attempt.achieved,
+                "selected_swap": (
+                    None
+                    if attempt.selected_swap is None
+                    else {
+                        "replace_id": attempt.selected_swap.replace_id,
+                        "replacement_id": attempt.selected_swap.replacement_id,
+                        "resulting_ids": list(attempt.selected_swap.resulting_ids),
+                        "predicted_score": attempt.selected_swap.predicted_score,
+                        "score_delta": attempt.selected_swap.score_delta,
+                        "limiting_pair": list(attempt.selected_swap.limiting_pair),
+                    }
+                ),
             }
             for attempt in run.attempts
         ],

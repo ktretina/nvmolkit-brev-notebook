@@ -233,6 +233,68 @@ def test_o01_is_canonical_and_does_not_expose_the_hidden_benchmark_panel():
     assert json.dumps(payload, sort_keys=True, separators=(",", ":")) == record.payload_json
 
 
+def test_evaluate_panel_records_only_an_exact_selected_swap():
+    context = build_objective_context(optimized_state())
+    first = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Measure the current policy baseline.",
+    )
+    selected = rank_legal_swaps(context, first)[0]
+
+    second = evaluate_diverse_panel(
+        context,
+        selected.resulting_ids,
+        attempt_number=2,
+        decision_basis="Apply the selected legal swap.",
+        selected_swap=selected,
+    )
+
+    assert second.selected_swap is selected
+    with pytest.raises(ValueError, match="selected swap"):
+        evaluate_diverse_panel(
+            context,
+            context.baseline_ids,
+            attempt_number=2,
+            decision_basis="Reject a mismatched selected legal swap.",
+            selected_swap=selected,
+        )
+
+
+def test_o01_serializes_the_selected_intervention_without_hidden_answers():
+    context = build_objective_context(optimized_state())
+    first = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Measure the current policy baseline.",
+    )
+    selected = rank_legal_swaps(context, first)[0]
+    second = evaluate_diverse_panel(
+        context,
+        selected.resulting_ids,
+        attempt_number=2,
+        decision_basis="Apply the selected legal swap.",
+        selected_swap=selected,
+    )
+
+    payload = json.loads(
+        build_objective_evidence(finalize_objective_run(context, (first, second))).payload_json
+    )
+
+    assert payload["attempts"][0]["selected_swap"] is None
+    assert payload["attempts"][1]["selected_swap"] == {
+        "replace_id": selected.replace_id,
+        "replacement_id": selected.replacement_id,
+        "resulting_ids": list(selected.resulting_ids),
+        "predicted_score": selected.predicted_score,
+        "score_delta": selected.score_delta,
+        "limiting_pair": list(selected.limiting_pair),
+    }
+    assert "benchmark_panel" not in payload
+
+
 def test_objective_figures_show_trajectory_final_structures_and_heatmap():
     state, run = successful_run()
     trajectory, structures, heatmap = objective_figures(run, state)
