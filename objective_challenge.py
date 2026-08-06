@@ -187,7 +187,8 @@ def evaluate_diverse_panel(
     if selected_swap is not None:
         if type(selected_swap) is not ObjectiveSwap:
             raise ValueError("Objective selected swap must use the exact swap type.")
-        if set(panel) != set(selected_swap.resulting_ids):
+        selected_swap_panel, _ = _validated_panel(context, selected_swap.resulting_ids)
+        if set(panel) != set(selected_swap_panel):
             raise ValueError("Objective selected swap does not match the selected panel.")
         if isinstance(selected_swap.predicted_score, bool) or not isinstance(
             selected_swap.predicted_score, (int, float, np.floating)

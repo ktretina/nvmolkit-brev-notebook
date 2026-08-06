@@ -16,6 +16,7 @@ from objective_challenge import (
     ObjectiveCandidate,
     ObjectiveContext,
     ObjectiveRun,
+    ObjectiveSwap,
     build_objective_context,
     build_objective_evidence,
     evaluate_diverse_panel,
@@ -259,6 +260,34 @@ def test_evaluate_panel_records_only_an_exact_selected_swap():
             attempt_number=2,
             decision_basis="Reject a mismatched selected legal swap.",
             selected_swap=selected,
+        )
+
+
+def test_evaluate_panel_rejects_a_selected_swap_with_a_malformed_panel():
+    context = build_objective_context(optimized_state())
+    first = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Measure the current policy baseline.",
+    )
+    selected = rank_legal_swaps(context, first)[0]
+    malformed = ObjectiveSwap(
+        replace_id=selected.replace_id,
+        replacement_id=selected.replacement_id,
+        resulting_ids=selected.resulting_ids + (selected.resulting_ids[0],),
+        predicted_score=selected.predicted_score,
+        score_delta=selected.score_delta,
+        limiting_pair=selected.limiting_pair,
+    )
+
+    with pytest.raises(ValueError, match="selected swap|Objective proposal"):
+        evaluate_diverse_panel(
+            context,
+            selected.resulting_ids,
+            attempt_number=2,
+            decision_basis="Reject the malformed selected legal swap.",
+            selected_swap=malformed,
         )
 
 
