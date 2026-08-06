@@ -355,6 +355,40 @@ def _eligibility_groups(
     return groups
 
 
+def validated_similarity_matrix(state: WorkflowState) -> np.ndarray:
+    """Return a defensive host copy after rechecking similarity invariants."""
+    if state.similarity is None:
+        raise RuntimeError("similarity artifact is missing.")
+    matrix = np.array(_host_array(state.similarity.torch()), dtype=float, copy=True)
+    molecule_count = len(state.records)
+    if (
+        matrix.shape != (molecule_count, molecule_count)
+        or not np.isfinite(matrix).all()
+        or np.any((matrix < 0.0) | (matrix > 1.0))
+        or not np.allclose(matrix, matrix.T, rtol=0.0, atol=1e-7)
+        or not np.allclose(
+            np.diag(matrix), np.ones(molecule_count), rtol=0.0, atol=1e-7
+        )
+    ):
+        raise RuntimeError("Similarity artifact invariants are invalid.")
+    return matrix
+
+
+def eligible_representative_groups(
+    state: WorkflowState,
+) -> tuple[dict[str, Any], ...]:
+    """Return defensive MMFF94-eligible cluster groups for downstream decisions."""
+    if not state.records or len(state.records) != len(state.molecules) or not state.clusters:
+        raise RuntimeError("Representative eligibility artifacts are incomplete.")
+    return tuple(
+        {
+            **{key: value for key, value in group.items() if key != "members"},
+            "members": [dict(member) for member in group["members"]],
+        }
+        for group in _eligibility_groups(state.records, state.molecules, state.clusters)
+    )
+
+
 def generate_morgan_fingerprints(
     state: WorkflowState,
     *,

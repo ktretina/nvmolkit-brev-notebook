@@ -1,0 +1,191 @@
+import json
+
+import numpy as np
+import pytest
+from rdkit import Chem
+
+from chemistry_workflow import WorkflowPhase, WorkflowState
+from objective_challenge import (
+    CANDIDATE_COUNT,
+    MAX_ATTEMPTS,
+    PANEL_SIZE,
+    ObjectiveRun,
+    build_objective_context,
+    build_objective_evidence,
+    evaluate_diverse_panel,
+    finalize_objective_run,
+    objective_figures,
+)
+
+
+class FakeTensor:
+    def __init__(self, values):
+        self.values = np.asarray(values, dtype=float)
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return self.values.copy()
+
+
+class FakeGpuResult:
+    def __init__(self, values):
+        self.tensor = FakeTensor(values)
+
+    def torch(self):
+        return self.tensor
+
+
+def optimized_state() -> WorkflowState:
+    smiles = ("CC", "CCC", "CCCC", "CCO", "CCN", "CCCl", "CCF", "C1CC1")
+    distance = np.full((CANDIDATE_COUNT, CANDIDATE_COUNT), 0.80, dtype=float)
+    np.fill_diagonal(distance, 0.0)
+    distance[0, 1] = distance[1, 0] = 0.35
+    return WorkflowState(
+        phase=WorkflowPhase.OPTIMIZED,
+        records=[
+            {"id": f"mol-{index}", "smiles": value, "source_row": index}
+            for index, value in enumerate(smiles)
+        ],
+        molecules=[Chem.MolFromSmiles(value) for value in smiles],
+        similarity=FakeGpuResult(1.0 - distance),
+        clusters=[[index] for index in range(CANDIDATE_COUNT)],
+    )
+
+
+def successful_run() -> tuple[WorkflowState, ObjectiveRun]:
+    state = optimized_state()
+    context = build_objective_context(state)
+    first = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Measure the current policy baseline.",
+    )
+    second = evaluate_diverse_panel(
+        context,
+        ("mol-0", "mol-2", "mol-4", "mol-6"),
+        attempt_number=2,
+        decision_basis="Remove the closest baseline analogue.",
+    )
+    return state, finalize_objective_run(context, (first, second))
+
+
+def test_constants_keep_the_challenge_visually_bounded():
+    assert (CANDIDATE_COUNT, PANEL_SIZE, MAX_ATTEMPTS) == (8, 4, 3)
+
+
+def test_build_context_uses_eight_distinct_mmff_eligible_clusters():
+    context = build_objective_context(optimized_state())
+
+    assert len(context.candidates) == 8
+    assert len({candidate.cluster_id for candidate in context.candidates}) == 8
+    assert context.baseline_ids == ("mol-0", "mol-1", "mol-2", "mol-3")
+    assert context.baseline_score == pytest.approx(0.35)
+    assert context.benchmark_score == pytest.approx(0.80)
+    assert context.target_score == pytest.approx(0.71)
+    assert context.distance_matrix.flags.writeable is False
+
+
+def test_build_context_requires_optimized_state_and_eight_eligible_clusters():
+    state = optimized_state()
+    state.phase = WorkflowPhase.CLUSTERED
+    with pytest.raises(RuntimeError, match="OPTIMIZED"):
+        build_objective_context(state)
+
+    state = optimized_state()
+    state.clusters.pop()
+    with pytest.raises(RuntimeError, match="eight eligible distinct clusters"):
+        build_objective_context(state)
+
+
+def test_evaluate_panel_uses_minimum_pairwise_distance_and_stable_limiting_pair():
+    context = build_objective_context(optimized_state())
+    result = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Evaluate the baseline.",
+    )
+
+    assert result.score == pytest.approx(0.35)
+    assert result.limiting_pair == ("mol-0", "mol-1")
+    assert result.constraints_passed is True
+    assert result.achieved is False
+
+
+@pytest.mark.parametrize(
+    "selected_ids",
+    [
+        ("mol-0", "mol-0", "mol-2", "mol-3"),
+        ("mol-0", "mol-1", "mol-2"),
+        ("mol-0", "mol-1", "mol-2", "outside"),
+    ],
+)
+def test_invalid_panels_fail_before_scoring(selected_ids):
+    context = build_objective_context(optimized_state())
+    with pytest.raises(ValueError):
+        evaluate_diverse_panel(
+            context,
+            selected_ids,
+            attempt_number=1,
+            decision_basis="Invalid proposal.",
+        )
+
+
+def test_finalize_selects_best_attempt_and_uses_explicit_termination_reasons():
+    context = build_objective_context(optimized_state())
+    miss = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Baseline remains redundant.",
+    )
+    success = evaluate_diverse_panel(
+        context,
+        ("mol-0", "mol-2", "mol-4", "mol-6"),
+        attempt_number=2,
+        decision_basis="Remove the limiting analogue.",
+    )
+
+    achieved = finalize_objective_run(context, (miss, success))
+    misses = tuple(
+        evaluate_diverse_panel(
+            context,
+            context.baseline_ids,
+            attempt_number=number,
+            decision_basis="Baseline remains redundant.",
+        )
+        for number in (1, 2, 3)
+    )
+    exhausted = finalize_objective_run(context, misses)
+
+    assert achieved.achieved is True
+    assert achieved.termination_reason == "target_achieved"
+    assert achieved.final_ids == success.selected_ids
+    assert exhausted.achieved is False
+    assert exhausted.termination_reason == "attempt_limit_reached"
+
+
+def test_o01_is_canonical_and_does_not_expose_the_hidden_benchmark_panel():
+    _state, run = successful_run()
+    record = build_objective_evidence(run)
+    payload = json.loads(record.payload_json)
+
+    assert record.key == "O01"
+    assert record.label == "Objective-driven panel selection"
+    assert "benchmark_panel" not in record.payload_json
+    assert payload["achieved"] is True
+    assert payload["attempts"][0]["limiting_pair"] == ["mol-0", "mol-1"]
+    assert json.dumps(payload, sort_keys=True, separators=(",", ":")) == record.payload_json
+
+
+def test_objective_figures_show_trajectory_final_structures_and_heatmap():
+    state, run = successful_run()
+    trajectory, structures, heatmap = objective_figures(run, state)
+
+    assert trajectory.axes[0].get_title() == "Objective score trajectory"
+    assert structures.size[0] > 0 and structures.size[1] > 0
+    assert heatmap.axes[0].get_title() == "Final-panel Tanimoto similarity"
+    assert heatmap.axes[0].images[0].get_array().shape == (4, 4)
