@@ -86,6 +86,26 @@ def two_revision_context() -> ObjectiveContext:
     )
 
 
+def forged_nonachieved_attempt(
+    context: ObjectiveContext,
+    selected_ids: tuple[str, ...],
+    *,
+    score: float | bool | None = None,
+) -> ObjectiveAttempt:
+    computed_score, limiting_pair = objective_challenge._score_panel(
+        context, selected_ids
+    )
+    return ObjectiveAttempt(
+        attempt_number=1,
+        selected_ids=selected_ids,
+        decision_basis="Forged state used to verify ranker validation.",
+        score=computed_score if score is None else score,
+        limiting_pair=limiting_pair,
+        constraints_passed=True,
+        achieved=False,
+    )
+
+
 def successful_run() -> tuple[WorkflowState, ObjectiveRun]:
     state = optimized_state()
     context = build_objective_context(state)
@@ -317,6 +337,62 @@ def test_rank_legal_swaps_rejects_forged_nonachieved_attempt_scores(forged_score
 
     with pytest.raises(ValueError):
         rank_legal_swaps(context, forged)
+
+
+@pytest.mark.parametrize(
+    "selected_ids",
+    (
+        ("mol-0", "mol-0", "mol-2", "mol-3"),
+        ("mol-0", "mol-1", "mol-2"),
+    ),
+)
+def test_rank_legal_swaps_rejects_forged_malformed_nonachieved_panels(selected_ids):
+    context = build_objective_context(optimized_state())
+
+    with pytest.raises(ValueError):
+        rank_legal_swaps(
+            context, forged_nonachieved_attempt(context, selected_ids)
+        )
+
+
+def test_rank_legal_swaps_rejects_cross_context_cluster_conflicts():
+    context = build_objective_context(optimized_state())
+    conflicting_context = ObjectiveContext(
+        candidates=tuple(
+            ObjectiveCandidate(
+                molecule_id=candidate.molecule_id,
+                molecule_index=candidate.molecule_index,
+                source_row=candidate.source_row,
+                cluster_id=0
+                if candidate.molecule_id == "mol-1"
+                else candidate.cluster_id,
+            )
+            for candidate in context.candidates
+        ),
+        baseline_ids=context.baseline_ids,
+        baseline_score=context.baseline_score,
+        benchmark_score=context.benchmark_score,
+        target_score=context.target_score,
+        distance_matrix=context.distance_matrix,
+    )
+
+    with pytest.raises(ValueError):
+        rank_legal_swaps(
+            conflicting_context,
+            forged_nonachieved_attempt(
+                conflicting_context, conflicting_context.baseline_ids
+            ),
+        )
+
+
+def test_rank_legal_swaps_rejects_boolean_current_scores_explicitly():
+    context = build_objective_context(optimized_state())
+
+    with pytest.raises(ValueError, match="non-boolean"):
+        rank_legal_swaps(
+            context,
+            forged_nonachieved_attempt(context, context.baseline_ids, score=True),
+        )
 
 
 def test_rank_legal_swaps_supports_two_revisions_and_preserves_panel_order():

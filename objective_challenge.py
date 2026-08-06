@@ -149,6 +149,24 @@ def build_objective_context(state: WorkflowState) -> ObjectiveContext:
     )
 
 
+def _validated_panel(
+    context: ObjectiveContext, selected_ids: tuple[str, ...] | list[str]
+) -> tuple[tuple[str, ...], dict[str, ObjectiveCandidate]]:
+    """Return a structurally legal panel and its candidate lookup."""
+    panel = tuple(selected_ids)
+    if len(panel) != PANEL_SIZE or len(set(panel)) != PANEL_SIZE:
+        raise ValueError("Objective proposals require four unique molecule IDs.")
+    candidates = {candidate.molecule_id: candidate for candidate in context.candidates}
+    if any(molecule_id not in candidates for molecule_id in panel):
+        raise ValueError("Objective proposal contains an out-of-pool molecule ID.")
+    if (
+        len({candidates[molecule_id].cluster_id for molecule_id in panel})
+        != PANEL_SIZE
+    ):
+        raise ValueError("Objective proposal must use four distinct clusters.")
+    return panel, candidates
+
+
 def evaluate_diverse_panel(
     context: ObjectiveContext,
     selected_ids: tuple[str, ...] | list[str],
@@ -157,15 +175,7 @@ def evaluate_diverse_panel(
     decision_basis: str,
 ) -> ObjectiveAttempt:
     """Validate and score one proposed panel without mutating workflow state."""
-    panel = tuple(selected_ids)
-    if len(panel) != PANEL_SIZE or len(set(panel)) != PANEL_SIZE:
-        raise ValueError("Objective proposals require four unique molecule IDs.")
-    candidates = {candidate.molecule_id: candidate for candidate in context.candidates}
-    if any(molecule_id not in candidates for molecule_id in panel):
-        raise ValueError("Objective proposal contains an out-of-pool molecule ID.")
-    cluster_ids = {candidates[molecule_id].cluster_id for molecule_id in panel}
-    if len(cluster_ids) != PANEL_SIZE:
-        raise ValueError("Objective proposal must use four distinct clusters.")
+    panel, _ = _validated_panel(context, selected_ids)
     if type(attempt_number) is not int or not 1 <= attempt_number <= MAX_ATTEMPTS:
         raise ValueError("Objective attempt number is outside the accepted bound.")
     basis = decision_basis.strip() if isinstance(decision_basis, str) else ""
@@ -191,16 +201,14 @@ def rank_legal_swaps(
         raise ValueError("Objective swap ranking requires exact objective types.")
     if current.achieved:
         return ()
-    candidates = {candidate.molecule_id: candidate for candidate in context.candidates}
-    if any(molecule_id not in candidates for molecule_id in current.selected_ids):
-        raise ValueError("Objective attempt contains an out-of-pool molecule ID.")
-    recomputed_score, recomputed_limiting_pair = _score_panel(
-        context, current.selected_ids
-    )
-    if not isinstance(current.score, (int, float, np.floating)) or not np.isfinite(
+    panel, candidates = _validated_panel(context, current.selected_ids)
+    recomputed_score, recomputed_limiting_pair = _score_panel(context, panel)
+    if isinstance(current.score, bool) or not isinstance(
+        current.score, (int, float, np.floating)
+    ) or not np.isfinite(
         current.score
     ):
-        raise ValueError("Objective attempt score must be finite.")
+        raise ValueError("Objective attempt score must be a finite non-boolean number.")
     if not np.isclose(
         current.score, recomputed_score, rtol=0.0, atol=SCORE_TOLERANCE
     ):
@@ -213,19 +221,19 @@ def rank_legal_swaps(
         raise ValueError("Objective attempt below-target state is inconsistent.")
 
     suggestions = []
-    current_ids = set(current.selected_ids)
-    for replace_position, replace_id in enumerate(current.selected_ids):
+    current_ids = set(panel)
+    for replace_position, replace_id in enumerate(panel):
         for replacement_id, replacement in candidates.items():
             if replacement_id in current_ids:
                 continue
             resulting_ids = (
-                current.selected_ids[:replace_position]
+                panel[:replace_position]
                 + (replacement_id,)
-                + current.selected_ids[replace_position + 1 :]
+                + panel[replace_position + 1 :]
             )
-            if len(resulting_ids) != PANEL_SIZE or len(set(resulting_ids)) != PANEL_SIZE:
-                continue
-            if len({candidates[molecule_id].cluster_id for molecule_id in resulting_ids}) != PANEL_SIZE:
+            try:
+                resulting_ids, _ = _validated_panel(context, resulting_ids)
+            except ValueError:
                 continue
             predicted_score, limiting_pair = _score_panel(context, resulting_ids)
             score_delta = predicted_score - recomputed_score
