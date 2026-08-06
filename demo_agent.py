@@ -20,6 +20,7 @@ from pydantic import (
 )
 
 from chemistry_workflow import (
+    EvidenceRecord,
     StageResult,
     WorkflowPhase,
     WorkflowReport,
@@ -32,6 +33,17 @@ from chemistry_workflow import (
     inspect_library,
     measure_tanimoto_similarity,
     optimize_conformers_mmff94,
+)
+from objective_challenge import (
+    MAX_ATTEMPTS,
+    ObjectiveAttempt,
+    ObjectiveContext,
+    ObjectiveRun,
+    build_objective_context,
+    build_objective_evidence,
+    evaluate_diverse_panel,
+    finalize_objective_run,
+    no_improvement_run,
 )
 
 
@@ -223,6 +235,33 @@ class SubmitSynthesisArgs(_StrictModel):
     sections: list[ConclusionSection] = Field(min_length=6, max_length=6)
 
 
+ObjectiveConclusionTheme = Literal[
+    "dataset_scope",
+    "molecular_representation",
+    "similarity_structure",
+    "clustering",
+    "conformational_sampling",
+    "objective_driven_selection",
+    "limitations_and_next_steps",
+]
+ObjectiveEvidenceKey = Literal["E01", "E02", "E03", "E04", "E05", "E06", "O01"]
+
+
+class ObjectiveConclusionSection(_StrictModel):
+    theme: ObjectiveConclusionTheme
+    prose: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1200)
+    ]
+    evidence_keys: list[ObjectiveEvidenceKey] = Field(min_length=1)
+
+
+class ObjectiveSubmitConclusionArgs(_StrictModel):
+    headline: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)
+    ]
+    sections: list[ObjectiveConclusionSection] = Field(min_length=7, max_length=7)
+
+
 TOOL_ARGUMENT_MODELS: dict[str, type[BaseModel]] = {
     "inspect_library": InspectionArgs,
     "generate_morgan_fingerprints": FingerprintArgs,
@@ -239,6 +278,7 @@ TOOL_DESCRIPTIONS = {
     "discover_fused_butina_clusters": "Choose a bounded cutoff and run nvMolKit fused Butina clustering on the GPU.",
     "embed_representative_conformers": "Choose bounded sampling parameters and run nvMolKit conformer embedding on the GPU.",
     "optimize_conformers_mmff94": "Run nvMolKit MMFF94 conformer optimization on the GPU.",
+    "select_diverse_panel": "Select exactly four supplied candidate IDs to reach the maximin Tanimoto-distance objective.",
     "submit_synthesis": "Submit one grounded qualitative synthesis; keep evidence IDs only in evidence_keys fields.",
 }
 
@@ -288,9 +328,11 @@ class WorkflowResult:
     messages: tuple[dict[str, Any], ...]
     report: WorkflowReport
     plan: WorkflowPlan
-    conclusion: SubmitSynthesisArgs
+    conclusion: SubmitSynthesisArgs | ObjectiveSubmitConclusionArgs
     stage_results: tuple[StageResult, ...]
     turn_count: int = 8
+    objective_run: ObjectiveRun | None = None
+    objective_evidence: EvidenceRecord | None = None
 
 
 @dataclass(frozen=True)
@@ -346,6 +388,12 @@ _REQUIRED_CONCLUSION_EVIDENCE = {
     "limitations_and_next_steps": {"E01", "E06"},
 }
 
+_REQUIRED_OBJECTIVE_CONCLUSION_EVIDENCE = {
+    **_REQUIRED_CONCLUSION_EVIDENCE,
+    "objective_driven_selection": {"O01"},
+    "limitations_and_next_steps": {"E01", "E06", "O01"},
+}
+
 
 def validate_conclusion(conclusion: SubmitSynthesisArgs, report: WorkflowReport) -> SubmitSynthesisArgs:
     """Check the synthesis schema and evidence links, not the truth of qualitative prose."""
@@ -355,6 +403,34 @@ def validate_conclusion(conclusion: SubmitSynthesisArgs, report: WorkflowReport)
     known = set(report_keys)
     valid = set(themes) == set(_REQUIRED_CONCLUSION_EVIDENCE) and len(themes) == len(set(themes))
     valid &= report_keys == EvidenceKey.__args__ and cited == known
+    if not valid:
+        raise ConclusionValidationError(report)
+    return conclusion
+
+
+def validate_objective_conclusion(
+    conclusion: ObjectiveSubmitConclusionArgs,
+    report: WorkflowReport,
+    objective_evidence: EvidenceRecord,
+) -> ObjectiveSubmitConclusionArgs:
+    """Validate exact E01-E06 plus O01 coverage for the objective-aware conclusion."""
+    themes = [section.theme for section in conclusion.sections]
+    cited = {key for section in conclusion.sections for key in section.evidence_keys}
+    report_keys = tuple(record.key for record in report.evidence)
+    known = set(report_keys) | {objective_evidence.key}
+    valid = (
+        set(themes) == set(_REQUIRED_OBJECTIVE_CONCLUSION_EVIDENCE)
+        and len(themes) == len(set(themes))
+        and report_keys == EvidenceKey.__args__
+        and objective_evidence.key == "O01"
+        and cited == known
+    )
+    valid &= all(
+        _REQUIRED_OBJECTIVE_CONCLUSION_EVIDENCE[section.theme].issubset(
+            set(section.evidence_keys)
+        )
+        for section in conclusion.sections
+    )
     if not valid:
         raise ConclusionValidationError(report)
     return conclusion
@@ -389,9 +465,14 @@ def _request_call(
     model: str,
     *,
     _text_only_retries_remaining: int = 2,
+    _max_turns: int = 8,
 ) -> BaseModel:
     """Request, validate, and append exactly one forced hosted call."""
-    if session.turn_count >= 8 or (session.turn_count == 7 and expected_name != "submit_synthesis"):
+    if session.turn_count >= _max_turns or (
+        _max_turns == 8
+        and session.turn_count == 7
+        and expected_name != "submit_synthesis"
+    ):
         raise ToolCallError("The bounded hosted turn limit was reached.")
     try:
         response = client.chat.completions.create(
@@ -442,6 +523,7 @@ def _request_call(
                 argument_model,
                 model,
                 _text_only_retries_remaining=_text_only_retries_remaining - 1,
+                _max_turns=_max_turns,
             )
         if content_arguments is not None:
             call_id = f"compat-{session.turn_count + 1}-{expected_name}"
@@ -624,6 +706,13 @@ class BoundedWorkflowController:
     stage_results: list[StageResult] = field(default_factory=list)
     report: WorkflowReport | None = None
     synthesis_prompt_appended: bool = False
+    objective_required: bool = False
+    objective_context: ObjectiveContext | None = None
+    pending_objective: ObjectiveProposal | None = None
+    objective_attempts: list[ObjectiveAttempt] = field(default_factory=list)
+    objective_run: ObjectiveRun | None = None
+    objective_evidence: EvidenceRecord | None = None
+    objective_prompt_appended: bool = False
 
     @classmethod
     def create(
@@ -635,6 +724,7 @@ class BoundedWorkflowController:
         executors: dict[str, Any] | None = None,
         state: WorkflowState | None = None,
         skill: str | None = None,
+        objective_required: bool = False,
     ) -> "BoundedWorkflowController":
         """Validate and initialize the fixed workflow without making a hosted request."""
         _validate_api_key(api_key)
@@ -654,7 +744,12 @@ class BoundedWorkflowController:
             ],
             state=state or WorkflowState(),
         )
-        return cls(session=session, client=active_client, executors=active_executors)
+        return cls(
+            session=session,
+            client=active_client,
+            executors=active_executors,
+            objective_required=objective_required,
+        )
 
     def request_plan(self) -> WorkflowPlan:
         if self.plan is not None or self.session.turn_count != 0:
@@ -754,9 +849,14 @@ class BoundedWorkflowController:
             raise ToolCallError("The scientific workflow did not complete exactly once.")
         if self.pending is not None:
             raise ToolCallError("A stage proposal is still pending approval.")
+        turn_count_is_valid = (
+            self.session.turn_count == 7
+            if self.objective_context is None
+            else 7 <= self.session.turn_count <= 10
+        )
         if (
             tuple(result.stage for result in self.stage_results) != STAGES
-            or self.session.turn_count != 7
+            or not turn_count_is_valid
             or self.session.state.phase is not WorkflowPhase.OPTIMIZED
         ):
             raise ToolCallError("The scientific workflow did not complete exactly once.")
@@ -776,25 +876,168 @@ class BoundedWorkflowController:
             self.session.turn_count,
         )
 
-    def request_synthesis(self) -> WorkflowResult:
-        scientific = self.scientific_result()
-        if not self.synthesis_prompt_appended:
-            evidence = _serialize(
-                {"evidence": [item.__dict__ for item in scientific.report.evidence]}
+    def begin_objective_challenge(self) -> ObjectiveContext:
+        """Initialize the post-workflow objective from immutable scientific evidence."""
+        self.scientific_result()
+        if self.objective_context is not None or self.objective_prompt_appended:
+            raise ToolCallError("The objective challenge can be initialized exactly once.")
+        try:
+            context = build_objective_context(self.session.state)
+        except Exception:
+            raise ToolCallError("The objective challenge could not be constructed.") from None
+        candidates = [
+            {
+                "molecule_id": candidate.molecule_id,
+                "cluster_id": candidate.cluster_id,
+            }
+            for candidate in context.candidates
+        ]
+        prompt_payload = {
+            "objective": "Select four candidates that maximize the minimum pairwise Morgan/Tanimoto distance.",
+            "candidate_pool": candidates,
+            "distance_matrix": context.distance_matrix.tolist(),
+            "distance_matrix_order": [
+                candidate.molecule_id for candidate in context.candidates
+            ],
+            "baseline_ids": list(context.baseline_ids),
+            "baseline_score": context.baseline_score,
+            "benchmark_score": context.benchmark_score,
+            "target_score": context.target_score,
+            "target_rule": "baseline plus 80 percent of attainable improvement",
+            "constraints": [
+                "exactly four unique supplied molecule IDs",
+                "one molecule per fused Butina cluster",
+                "all candidates are RDKit MMFF94-parameter eligible",
+                "at most three accepted attempts",
+            ],
+            "instruction": (
+                "Call select_diverse_panel with one panel and a concise decision summary. "
+                "Use measured limiting-pair feedback to revise if the target is missed."
+            ),
+        }
+        self.session.messages.append(
+            {"role": "user", "content": _serialize(prompt_payload)}
+        )
+        self.objective_context = context
+        self.objective_prompt_appended = True
+        if abs(context.benchmark_score - context.baseline_score) <= 1e-12:
+            self.objective_run = no_improvement_run(context)
+            self.objective_evidence = build_objective_evidence(self.objective_run)
+        return context
+
+    def request_objective_attempt(self) -> ObjectiveProposal:
+        """Request one strict panel proposal without evaluating it."""
+        if self.objective_context is None or not self.objective_prompt_appended:
+            raise ToolCallError("The objective challenge has not been initialized.")
+        if self.objective_run is not None:
+            raise ToolCallError("The objective challenge is already complete.")
+        if self.pending_objective is not None:
+            raise ToolCallError("An objective proposal is already pending evaluation.")
+        if len(self.objective_attempts) >= MAX_ATTEMPTS:
+            raise ToolCallError("The objective attempt limit was reached.")
+        proposal = _request_call(
+            self.session,
+            self.client,
+            "select_diverse_panel",
+            ObjectiveProposal,
+            DEFAULT_MODEL,
+            _max_turns=11,
+        )
+        self.pending_objective = ObjectiveProposal.model_validate(
+            proposal.model_dump()
+        )
+        return self.pending_objective
+
+    def execute_objective_attempt(
+        self, proposal: ObjectiveProposal
+    ) -> ObjectiveAttempt:
+        """Evaluate the exact pending proposal and append its measured feedback."""
+        if proposal is not self.pending_objective or type(proposal) is not ObjectiveProposal:
+            raise ToolCallError("The exact pending objective proposal is required.")
+        context = self.objective_context
+        if context is None or self.objective_run is not None:
+            raise ToolCallError("The objective challenge is not awaiting evaluation.")
+        try:
+            attempt = evaluate_diverse_panel(
+                context,
+                tuple(proposal.selected_ids),
+                attempt_number=len(self.objective_attempts) + 1,
+                decision_basis=proposal.decision_basis,
             )
+        except Exception:
+            raise ToolCallError("The objective evaluator rejected the proposed panel.") from None
+        self.objective_attempts.append(attempt)
+        self.pending_objective = None
+        _append_tool_result(
+            self.session,
+            {
+                "accepted": True,
+                "attempt_number": attempt.attempt_number,
+                "selected_ids": list(attempt.selected_ids),
+                "score": attempt.score,
+                "target_score": context.target_score,
+                "limiting_pair": list(attempt.limiting_pair),
+                "constraints_passed": attempt.constraints_passed,
+                "achieved": attempt.achieved,
+                "attempts_remaining": MAX_ATTEMPTS - len(self.objective_attempts),
+            },
+        )
+        if attempt.achieved or len(self.objective_attempts) == MAX_ATTEMPTS:
+            self.objective_run = finalize_objective_run(
+                context, tuple(self.objective_attempts)
+            )
+            self.objective_evidence = build_objective_evidence(self.objective_run)
+        return attempt
+
+    def request_synthesis(self) -> WorkflowResult:
+        if (
+            self.objective_required or self.objective_context is not None
+        ) and self.objective_run is None:
+            raise ToolCallError(
+                "The objective challenge must terminate before the conclusion."
+            )
+        scientific = self.scientific_result()
+        objective_active = self.objective_required or self.objective_context is not None
+        objective_evidence = self.objective_evidence if objective_active else None
+        if objective_active and objective_evidence is None:
+            raise ToolCallError("The objective evidence record is missing.")
+        if not self.synthesis_prompt_appended:
+            evidence_records = list(scientific.report.evidence)
+            if objective_evidence is not None:
+                evidence_records.append(objective_evidence)
+            evidence = _serialize(
+                {"evidence": [item.__dict__ for item in evidence_records]}
+            )
+            prompt = _SYNTHESIS_PROMPT
+            if objective_active:
+                prompt += (
+                    " Add one objective_driven_selection section grounded in O01. "
+                    "Describe structural-library coverage only, and preserve whether the "
+                    "target was achieved or the attempt limit was reached."
+                )
             self.session.messages.append(
-                {"role": "user", "content": _SYNTHESIS_PROMPT + "\n" + evidence}
+                {"role": "user", "content": prompt + "\n" + evidence}
             )
             self.synthesis_prompt_appended = True
         try:
+            conclusion_model = (
+                ObjectiveSubmitConclusionArgs if objective_active else SubmitSynthesisArgs
+            )
             conclusion = _request_call(
                 self.session,
                 self.client,
                 "submit_synthesis",
-                SubmitSynthesisArgs,
+                conclusion_model,
                 DEFAULT_MODEL,
+                _max_turns=11 if objective_active else 8,
             )
-            conclusion = validate_conclusion(conclusion, scientific.report)
+            if objective_active:
+                assert objective_evidence is not None
+                conclusion = validate_objective_conclusion(
+                    conclusion, scientific.report, objective_evidence
+                )
+            else:
+                conclusion = validate_conclusion(conclusion, scientific.report)
         except _HostedArgumentsValidationError:
             raise ConclusionValidationError(scientific.report) from None
         return WorkflowResult(
@@ -804,6 +1047,8 @@ class BoundedWorkflowController:
             conclusion,
             scientific.stage_results,
             self.session.turn_count,
+            self.objective_run,
+            objective_evidence,
         )
 
 
