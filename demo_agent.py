@@ -548,7 +548,11 @@ def _request_call(
         if not isinstance(decoded, dict):
             raise ToolCallError("The hosted tool arguments must be a JSON object.")
         declared_fields = argument_model.model_fields
-        if "stage" in decoded and "stage" not in declared_fields:
+        if (
+            content_arguments is not None
+            and "stage" in decoded
+            and "stage" not in declared_fields
+        ):
             if decoded["stage"] != expected_name:
                 raise ToolCallError("The hosted tool call was out of phase.")
         if declared_fields and any(key not in declared_fields for key in decoded):

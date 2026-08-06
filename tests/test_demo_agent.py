@@ -1021,7 +1021,7 @@ def test_redundant_matching_stage_metadata_is_removed_before_strict_validation()
     )
 
 
-def test_redundant_mismatched_stage_metadata_fails_closed():
+def test_forced_call_uses_function_name_and_removes_mismatched_stage_metadata():
     session = demo_agent.AgentSession(
         messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
         state=WorkflowState(),
@@ -1034,10 +1034,48 @@ def test_redundant_mismatched_stage_metadata_fails_closed():
         [response("discover_fused_butina_clusters", arguments)]
     )
 
+    parsed = demo_agent._request_call(
+        session,
+        fake_client(completions),
+        "discover_fused_butina_clusters",
+        demo_agent.ClusterArgs,
+        demo_agent.DEFAULT_MODEL,
+    )
+
+    assert parsed == demo_agent.ClusterArgs.model_validate(
+        VALID_ARGS["discover_fused_butina_clusters"]
+    )
+    retained = json.loads(
+        session.messages[-1]["tool_calls"][0]["function"]["arguments"]
+    )
+    assert retained == VALID_ARGS["discover_fused_butina_clusters"]
+
+
+def test_text_json_fallback_mismatched_stage_metadata_fails_closed():
+    session = demo_agent.AgentSession(
+        messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+        state=WorkflowState(),
+    )
+    content_only = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=json.dumps(
+                        {
+                            "stage": "embed_representative_conformers",
+                            **VALID_ARGS["discover_fused_butina_clusters"],
+                        }
+                    ),
+                    tool_calls=None,
+                )
+            )
+        ]
+    )
+
     with pytest.raises(demo_agent.ToolCallError, match="out of phase"):
         demo_agent._request_call(
             session,
-            fake_client(completions),
+            fake_client(FakeCompletions([content_only])),
             "discover_fused_butina_clusters",
             demo_agent.ClusterArgs,
             demo_agent.DEFAULT_MODEL,

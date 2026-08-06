@@ -350,6 +350,66 @@ def test_objective_card_retains_attempts_receipts_scores_and_limiting_pairs(monk
     assert [attempt.score for attempt in controller.objective_attempts] == [0.35, 0.80]
 
 
+def test_known_objective_proposal_failure_after_measured_attempt_has_one_guarded_retry(monkeypatch):
+    monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
+    monkeypatch.setattr("interactive_workflow.objective_figures", lambda run, state: ())
+    controller = Controller()
+    original_request = controller.request_objective_attempt
+    failed_once = False
+
+    def fail_second_request_once():
+        nonlocal failed_once
+        if len(controller.objective_attempts) == 1 and not failed_once:
+            failed_once = True
+            controller.calls.append("objective_proposal")
+            raise ToolCallError("hosted objective proposal failed")
+        return original_request()
+
+    controller.request_objective_attempt = fail_second_request_once
+    workflow, _ = started(controller)
+    complete_six_stages(workflow)
+    workflow.objective_button.click()
+
+    assert workflow.status == "objective_failed"
+    assert len(controller.objective_attempts) == 1
+    assert len(workflow.objective_attempt_cards) == 1
+    retry = workflow.retry_button
+    assert retry.description == "Retry Objective Proposal"
+    retry.click()
+    retry.click()
+
+    assert retry.disabled
+    assert workflow.status == "completed"
+    assert len(controller.objective_attempts) == 2
+    assert controller.calls.count("objective_proposal") == 3
+
+
+def test_retry_objective_rechecks_pending_state_and_stops(monkeypatch):
+    controller = Controller()
+    original_request = controller.request_objective_attempt
+    failed_once = False
+
+    def fail_second_request_once():
+        nonlocal failed_once
+        if len(controller.objective_attempts) == 1 and not failed_once:
+            failed_once = True
+            controller.calls.append("objective_proposal")
+            raise ToolCallError("hosted objective proposal failed")
+        return original_request()
+
+    controller.request_objective_attempt = fail_second_request_once
+    workflow, _ = started(controller)
+    complete_six_stages(workflow)
+    workflow.objective_button.click()
+    before = controller.calls.count("objective_proposal")
+    controller.pending_objective = controller.objective_proposals[1]
+    workflow.retry_button.click()
+
+    assert workflow.status == "stopped"
+    assert workflow.retry_button is None
+    assert controller.calls.count("objective_proposal") == before
+
+
 def test_known_synthesis_failure_has_guarded_retry(monkeypatch):
     monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
     controller = Controller(); controller.synthesis_failures.append(ToolCallError("hosted synthesis failed"))

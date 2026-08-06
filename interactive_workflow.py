@@ -11,7 +11,7 @@ from pydantic import BaseModel, ValidationError
 
 import demo_agent
 from command_receipts import CommandReceipt, command_receipt
-from objective_challenge import objective_figures
+from objective_challenge import MAX_ATTEMPTS, objective_figures
 from objective_receipts import objective_receipt
 
 
@@ -100,6 +100,7 @@ class InteractiveWorkflow:
         self._approved: BaseModel | None = None
         self._control_observers: list[tuple[widgets.Widget, Any]] = []
         self._busy = False
+        self._objective_retry_used = False
         self.start_button = widgets.Button(description="Start Agent", button_style="primary")
         self.start_button.on_click(self.start)
         self._body = widgets.VBox()
@@ -195,6 +196,31 @@ class InteractiveWorkflow:
                 and self.controller.pending_objective is None
                 and self.controller.objective_prompt_appended is True
                 and 7 <= self.controller.session.turn_count <= 10
+            )
+        except Exception:
+            return False
+
+    def _objective_retryable(self) -> bool:
+        try:
+            attempts = tuple(self.controller.objective_attempts)
+            return (
+                not self._objective_retry_used
+                and len(self.completed_cards) == len(demo_agent.STAGES)
+                and self.controller.plan is not None
+                and self.controller.pending is None
+                and self.controller.session.state.phase is demo_agent.WorkflowPhase.OPTIMIZED
+                and tuple(result.stage for result in self.controller.stage_results)
+                == demo_agent.STAGES
+                and self.controller.report is not None
+                and self.controller.objective_context is not None
+                and self.controller.objective_prompt_appended is True
+                and self.controller.objective_run is None
+                and self.controller.objective_evidence is None
+                and self.controller.pending_objective is None
+                and len(attempts) < MAX_ATTEMPTS
+                and tuple(attempt.attempt_number for attempt in attempts)
+                == tuple(range(1, len(attempts) + 1))
+                and self.controller.session.turn_count == 7 + len(attempts)
             )
         except Exception:
             return False
@@ -573,6 +599,12 @@ class InteractiveWorkflow:
             return
         self._busy = True
         button.disabled = True
+        try:
+            self._continue_objective_challenge()
+        finally:
+            self._busy = False
+
+    def _continue_objective_challenge(self) -> None:
         self.status = "objective_running"
         try:
             while self.controller.objective_run is None:
@@ -580,8 +612,38 @@ class InteractiveWorkflow:
                 attempt = self.controller.execute_objective_attempt(proposal)
                 self._append_objective_attempt(proposal, attempt)
             self._finish_objective_challenge()
-        except Exception:
+        except Exception as error:
+            if self._known_failure(error) and self._objective_retryable():
+                self._retry_card(
+                    "Objective proposal failed",
+                    error,
+                    "objective_failed",
+                    "Retry Objective Proposal",
+                    self._retry_objective,
+                )
+            else:
+                self._stop()
+
+    def _retry_objective(self, button: widgets.Button) -> None:
+        if (
+            self._busy
+            or self.status != "objective_failed"
+            or button is not self.retry_button
+            or button.disabled
+        ):
+            return
+        if not self._objective_retryable():
+            button.disabled = True
             self._stop()
+            return
+        self._busy = True
+        self._objective_retry_used = True
+        button.disabled = True
+        self.retry_button = None
+        self.active_card = None
+        self._set_body()
+        try:
+            self._continue_objective_challenge()
         finally:
             self._busy = False
 
