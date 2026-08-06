@@ -11,6 +11,8 @@ from pydantic import BaseModel, ValidationError
 
 import demo_agent
 from command_receipts import CommandReceipt, command_receipt
+from objective_challenge import objective_figures
+from objective_receipts import objective_receipt
 
 
 _MODELS = demo_agent.TOOL_ARGUMENT_MODELS
@@ -87,6 +89,12 @@ class InteractiveWorkflow:
         self.completed_cards: tuple[widgets.VBox, ...] = ()
         self.completed_results: tuple[Any, ...] = ()
         self.active_card: widgets.VBox | None = None
+        self.objective_card: widgets.VBox | None = None
+        self.objective_button: widgets.Button | None = None
+        self.objective_summary = widgets.HTML()
+        self.objective_attempt_cards: tuple[widgets.Accordion, ...] = ()
+        self.objective_attempt_box = widgets.VBox()
+        self.objective_output = widgets.Output()
         self.workflow_result: Any | None = None
         self._active_proposal: demo_agent.StageProposal | None = None
         self._approved: BaseModel | None = None
@@ -106,6 +114,8 @@ class InteractiveWorkflow:
 
     def _set_body(self) -> None:
         children = [*self.plan_cards, *self.completed_cards]
+        if self.objective_card is not None:
+            children.append(self.objective_card)
         if self.active_card is not None:
             children.append(self.active_card)
         self._body.children = tuple(children)
@@ -176,11 +186,15 @@ class InteractiveWorkflow:
                 len(self.completed_cards) == len(demo_agent.STAGES)
                 and self.controller.plan is not None
                 and self.controller.pending is None
-                and self.controller.session.turn_count == 7
                 and self.controller.session.state.phase is demo_agent.WorkflowPhase.OPTIMIZED
                 and tuple(result.stage for result in self.controller.stage_results) == demo_agent.STAGES
                 and self.controller.report is not None
                 and self.controller.synthesis_prompt_appended is True
+                and self.controller.objective_run is not None
+                and self.controller.objective_evidence is not None
+                and self.controller.pending_objective is None
+                and self.controller.objective_prompt_appended is True
+                and 7 <= self.controller.session.turn_count <= 10
             )
         except Exception:
             return False
@@ -333,7 +347,7 @@ class InteractiveWorkflow:
             result = self.controller.execute_pending(approved)
             self._complete_card(proposal, approved, receipt, result)
             if len(self.completed_cards) == len(demo_agent.STAGES):
-                self._request_synthesis()
+                self._show_objective_challenge()
             else:
                 self._request_proposal()
         except Exception as error:
@@ -371,7 +385,7 @@ class InteractiveWorkflow:
             result = self.controller.execute_pending(approved)
             self._complete_card(proposal, approved, receipt, result)
             if len(self.completed_cards) == len(demo_agent.STAGES):
-                self._request_synthesis()
+                self._show_objective_challenge()
             else:
                 self._request_proposal()
         except Exception as error:
@@ -418,6 +432,185 @@ class InteractiveWorkflow:
                 card.children = (*card.children, widgets.HTML(f"<p>{placeholder}</p>"))
                 self._line(placeholder)
 
+    @staticmethod
+    def _objective_summary_html(context, attempts, run=None) -> str:
+        score_items = [
+            (
+                "Baseline",
+                context.baseline_score,
+                "Current largest-clusters-first policy",
+            )
+        ]
+        score_items.extend(
+            (
+                f"Attempt {attempt.attempt_number}",
+                attempt.score,
+                "Goal achieved" if attempt.achieved else "Revise",
+            )
+            for attempt in attempts
+        )
+        score_strip = "".join(
+            (
+                "<span style='display:inline-block;padding:6px 10px;margin:2px;"
+                "border:1px solid #aaa;border-radius:12px'>"
+                f"<b>{escape(label)}</b> {score:.3f}<br>"
+                f"<small>{escape(status)}</small></span>"
+            )
+            for label, score, status in score_items
+        )
+        rows = "".join(
+            "<tr>"
+            f"<td>Attempt {attempt.attempt_number}</td>"
+            f"<td>{escape(', '.join(attempt.selected_ids))}</td>"
+            f"<td>{attempt.score:.3f}</td>"
+            f"<td>{escape(' / '.join(attempt.limiting_pair))}</td>"
+            f"<td>{'Goal achieved' if attempt.achieved else 'Revise'}</td>"
+            "</tr>"
+            for attempt in attempts
+        )
+        final = ""
+        if run is not None:
+            label = (
+                "Goal achieved"
+                if run.achieved
+                else "Objective not achieved within attempt limit"
+            )
+            if run.termination_reason == "baseline_already_optimal":
+                label = "Baseline already optimal within the bounded pool"
+            final = f"<p><b>Outcome:</b> {escape(label)}</p>"
+        return (
+            "<p><b>Objective:</b> Select four MMFF94-parameter-eligible compounds "
+            "that maximize minimum pairwise Morgan/Tanimoto distance.</p>"
+            "<p><b>Constraints:</b> four unique supplied IDs · four distinct fused "
+            "Butina clusters · fixed fingerprint evidence · at most three attempts</p>"
+            f"<p><b>Target:</b> D_min ≥ {context.target_score:.3f} "
+            "(80% of attainable improvement over baseline)</p>"
+            f"<div>{score_strip}</div>"
+            "<table style='width:100%;margin-top:8px'><thead><tr>"
+            "<th>Step</th><th>Selected panel</th><th>D_min</th>"
+            "<th>Limiting pair</th><th>Result</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table>{final}"
+        )
+
+    def _show_objective_challenge(self) -> None:
+        self.status = "objective_initializing"
+        try:
+            context = self.controller.begin_objective_challenge()
+        except Exception as error:
+            self._stop()
+            return
+        self.objective_summary = widgets.HTML(
+            self._objective_summary_html(
+                context,
+                tuple(self.controller.objective_attempts),
+                self.controller.objective_run,
+            )
+        )
+        button = widgets.Button(
+            description="Run Objective Challenge", button_style="success"
+        )
+        button.on_click(self._run_objective_challenge)
+        self.objective_button = button
+        self.objective_attempt_cards = ()
+        self.objective_attempt_box = widgets.VBox()
+        self.objective_output = widgets.Output()
+        self.objective_card = widgets.VBox(
+            (
+                widgets.HTML("<h3>Objective-Driven Agent Challenge</h3>"),
+                self.objective_summary,
+                button,
+                self.objective_attempt_box,
+                self.objective_output,
+            )
+        )
+        self.active_card = None
+        self.status = "objective_ready"
+        self._line("Objective challenge ready")
+        self._set_body()
+        if self.controller.objective_run is not None:
+            button.disabled = True
+            self._finish_objective_challenge()
+
+    def _append_objective_attempt(self, proposal, attempt) -> None:
+        receipt = objective_receipt(proposal)
+        result_label = "Goal achieved" if attempt.achieved else "Revise"
+        details = widgets.HTML(
+            f"<p><b>Decision summary:</b> {escape(attempt.decision_basis)}</p>"
+            "<b>Validated Nemotron proposal</b>"
+            f"<pre>{escape(receipt.validated_proposal)}</pre>"
+            "<b>Evaluation executed by Python</b>"
+            f"<pre>{escape(receipt.python_evaluation)}</pre>"
+            f"<p><b>D_min:</b> {attempt.score:.3f} &nbsp; "
+            f"<b>Limiting pair:</b> {escape(' / '.join(attempt.limiting_pair))} "
+            f"&nbsp; <b>Result:</b> {escape(result_label)}</p>"
+        )
+        for prior in self.objective_attempt_cards:
+            prior.selected_index = None
+        card = widgets.Accordion((details,))
+        card.set_title(0, f"Attempt {attempt.attempt_number} — {result_label}")
+        card.selected_index = 0
+        self.objective_attempt_cards = (*self.objective_attempt_cards, card)
+        self.objective_attempt_box.children = self.objective_attempt_cards
+        self.objective_summary.value = self._objective_summary_html(
+            self.controller.objective_context,
+            tuple(self.controller.objective_attempts),
+            self.controller.objective_run,
+        )
+        self._line(
+            f"Objective attempt {attempt.attempt_number}: "
+            f"score={attempt.score:.3f}; limiting_pair={attempt.limiting_pair}; "
+            f"result={result_label}"
+        )
+        self._set_body()
+
+    def _run_objective_challenge(self, button: widgets.Button) -> None:
+        if (
+            self._busy
+            or self.status != "objective_ready"
+            or button is not self.objective_button
+            or button.disabled
+        ):
+            return
+        self._busy = True
+        button.disabled = True
+        self.status = "objective_running"
+        try:
+            while self.controller.objective_run is None:
+                proposal = self.controller.request_objective_attempt()
+                attempt = self.controller.execute_objective_attempt(proposal)
+                self._append_objective_attempt(proposal, attempt)
+            self._finish_objective_challenge()
+        except Exception:
+            self._stop()
+        finally:
+            self._busy = False
+
+    def _finish_objective_challenge(self) -> None:
+        run = self.controller.objective_run
+        if run is None:
+            raise RuntimeError("Objective challenge did not terminate.")
+        self.objective_summary.value = self._objective_summary_html(
+            self.controller.objective_context,
+            tuple(self.controller.objective_attempts),
+            run,
+        )
+        try:
+            figures = objective_figures(run, self.controller.session.state)
+            with self.objective_output:
+                for figure in figures:
+                    demo_agent._display_figure(figure)
+        except Exception:
+            placeholder = "Objective figures unavailable in this notebook frontend."
+            self.objective_card.children = (
+                *self.objective_card.children,
+                widgets.HTML(f"<p>{placeholder}</p>"),
+            )
+            self._line(placeholder)
+        self.status = "objective_completed"
+        self._line(f"Objective challenge complete: {run.termination_reason}")
+        self._set_body()
+        self._request_synthesis()
+
     def _request_synthesis(self) -> None:
         self.status = "synthesizing"
         try:
@@ -430,7 +623,7 @@ class InteractiveWorkflow:
             return
         self.workflow_result = result
         output = widgets.Output()
-        self.active_card = widgets.VBox((widgets.HTML("<h3>Final synthesis</h3>"), output))
+        self.active_card = widgets.VBox((widgets.HTML("<h3>Evidence-Backed Conclusion</h3>"), output))
         self.status = "completed"
         self.retry_button = None
         self._line("Final synthesis complete")
@@ -468,7 +661,12 @@ def launch_interactive_workflow(
     executors: dict[str, Any] | None = None,
 ) -> InteractiveWorkflow:
     controller = demo_agent.BoundedWorkflowController.create(
-        user_goal, api_key, skill=skill, client=client, executors=executors
+        user_goal,
+        api_key,
+        skill=skill,
+        client=client,
+        executors=executors,
+        objective_required=True,
     )
     workflow = InteractiveWorkflow(controller)
     workflow.display()

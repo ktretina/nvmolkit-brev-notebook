@@ -8,8 +8,9 @@ import demo_agent
 from chemistry_workflow import StageResult
 from demo_agent import (
     ClusterArgs, EmbedArgs, FingerprintArgs, InspectionArgs, OptimizationArgs,
-    SimilarityArgs, StageProposal, ToolCallError,
+    ObjectiveProposal, SimilarityArgs, StageProposal, ToolCallError,
 )
+from objective_challenge import ObjectiveAttempt
 from interactive_workflow import InteractiveWorkflow, controls_for
 
 
@@ -39,6 +40,7 @@ class Controller:
         self.proposal_failures = []
         self.execution_failures = []
         self.synthesis_failures = []
+        self.objective_failures = []
         self.index = 0
         self.pending = None
         self.plan = None
@@ -46,6 +48,22 @@ class Controller:
         self.synthesis_prompt_appended = False
         self.figures = ()
         self.stage_results = []
+        self.objective_context = None
+        self.pending_objective = None
+        self.objective_attempts = []
+        self.objective_run = None
+        self.objective_evidence = None
+        self.objective_prompt_appended = False
+        self.objective_proposals = [
+            ObjectiveProposal(
+                selected_ids=["mol-0", "mol-1", "mol-2", "mol-3"],
+                decision_basis="Measure the current policy baseline.",
+            ),
+            ObjectiveProposal(
+                selected_ids=["mol-0", "mol-2", "mol-4", "mol-6"],
+                decision_basis="Replace the member of the limiting pair.",
+            ),
+        ]
         self.session = Session(self)
 
     def request_plan(self):
@@ -79,12 +97,68 @@ class Controller:
         self.session.state.phase = tuple(demo_agent.POST_STAGE_PHASES.values())[self.index - 1]
         return result
 
+    def begin_objective_challenge(self):
+        self.calls.append("objective_begin")
+        self.report = SimpleNamespace(evidence=())
+        self.objective_prompt_appended = True
+        self.objective_context = SimpleNamespace(
+            baseline_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
+            baseline_score=0.35,
+            benchmark_score=0.80,
+            target_score=0.71,
+            candidates=tuple(
+                SimpleNamespace(molecule_id=f"mol-{index}", cluster_id=index)
+                for index in range(8)
+            ),
+        )
+        return self.objective_context
+
+    def request_objective_attempt(self):
+        self.calls.append("objective_proposal")
+        if self.objective_failures:
+            raise self.objective_failures.pop(0)
+        self.pending_objective = self.objective_proposals[len(self.objective_attempts)]
+        self.session.turn_count += 1
+        return self.pending_objective
+
+    def execute_objective_attempt(self, proposal):
+        self.calls.append(("objective_execute", proposal))
+        number = len(self.objective_attempts) + 1
+        achieved = number == len(self.objective_proposals)
+        attempt = ObjectiveAttempt(
+            attempt_number=number,
+            selected_ids=tuple(proposal.selected_ids),
+            decision_basis=proposal.decision_basis,
+            score=0.35 if number == 1 else 0.80,
+            limiting_pair=("mol-0", "mol-1") if number == 1 else ("mol-0", "mol-2"),
+            constraints_passed=True,
+            achieved=achieved,
+        )
+        self.objective_attempts.append(attempt)
+        self.pending_objective = None
+        if achieved:
+            self.objective_run = SimpleNamespace(
+                context=self.objective_context,
+                attempts=tuple(self.objective_attempts),
+                achieved=True,
+                termination_reason="target_achieved",
+                final_ids=attempt.selected_ids,
+                final_score=attempt.score,
+            )
+            self.objective_evidence = SimpleNamespace(key="O01")
+        return attempt
+
     def request_synthesis(self):
         self.calls.append("synthesis")
         self.report = SimpleNamespace(evidence=())
         self.synthesis_prompt_appended = True
         if self.synthesis_failures: raise self.synthesis_failures.pop(0)
-        return SimpleNamespace(conclusion=SimpleNamespace())
+        self.session.turn_count += 1
+        return SimpleNamespace(
+            conclusion=SimpleNamespace(),
+            objective_run=self.objective_run,
+            objective_evidence=self.objective_evidence,
+        )
 
 
 def html_text(widget):
@@ -99,6 +173,16 @@ def started(controller=None):
     workflow = InteractiveWorkflow(controller)
     workflow.start_button.click()
     return workflow, controller
+
+
+def complete_six_stages(workflow):
+    for _ in range(6):
+        workflow.approve_button.click()
+
+
+def run_objective(workflow):
+    complete_six_stages(workflow)
+    workflow.objective_button.click()
 
 
 def test_all_control_domains_and_parameter_free_stages():
@@ -222,28 +306,56 @@ def test_unexpected_failures_are_generic_stopped_and_secret_safe(monkeypatch, wh
     workflow = InteractiveWorkflow(controller); workflow.start_button.click()
     if where == "execution": workflow.approve_button.click()
     elif where == "synthesis":
-        for _ in range(6): workflow.approve_button.click()
+        complete_six_stages(workflow)
+        workflow.objective_button.click()
     assert workflow.status == "stopped" and workflow.retry_button is None
     assert secret not in workflow.transcript_text
     assert "local workflow error" in workflow.transcript_text.lower()
 
 
-def test_six_stages_gate_synthesis_and_render_conclusion(monkeypatch):
+def test_six_stages_open_objective_challenge_then_gate_conclusion(monkeypatch):
     rendered = []; monkeypatch.setattr(demo_agent, "_display_conclusion", rendered.append)
+    monkeypatch.setattr("interactive_workflow.objective_figures", lambda run, state: ())
     workflow, controller = started()
     for index in range(6):
         assert controller.calls.count("synthesis") == 0
         workflow.approve_button.click()
+    assert controller.calls.count("synthesis") == 0
+    assert workflow.status == "objective_ready"
+    assert workflow.objective_button.description == "Run Objective Challenge"
+    workflow.objective_button.click()
     assert controller.calls.count("synthesis") == 1
     assert workflow.status == "completed" and len(workflow.completed_cards) == 6
-    assert len(rendered) == 1 and "Final synthesis" in html_text(workflow.active_card)
+    assert len(rendered) == 1 and "Evidence-Backed Conclusion" in html_text(workflow.active_card)
+
+
+def test_objective_card_retains_attempts_receipts_scores_and_limiting_pairs(monkeypatch):
+    monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
+    monkeypatch.setattr("interactive_workflow.objective_figures", lambda run, state: ())
+    workflow, controller = started()
+
+    run_objective(workflow)
+
+    text = " ".join(html_text(card) for card in workflow.objective_attempt_cards)
+    assert len(workflow.objective_attempt_cards) == 2
+    assert "Validated Nemotron proposal" in text
+    assert "Evaluation executed by Python" in text
+    assert "select_diverse_panel" in text
+    assert "evaluate_diverse_panel" in text
+    assert "D_min" in text and "Limiting pair" in text
+    assert "Revise" in text and "Goal achieved" in text
+    assert "Baseline" in workflow.objective_summary.value
+    assert "Attempt 1" in workflow.objective_summary.value
+    assert "Attempt 2" in workflow.objective_summary.value
+    assert [attempt.score for attempt in controller.objective_attempts] == [0.35, 0.80]
 
 
 def test_known_synthesis_failure_has_guarded_retry(monkeypatch):
     monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
     controller = Controller(); controller.synthesis_failures.append(ToolCallError("hosted synthesis failed"))
     workflow, _ = started(controller)
-    for _ in range(6): workflow.approve_button.click()
+    complete_six_stages(workflow)
+    workflow.objective_button.click()
     assert workflow.status == "synthesis_failed"
     retry = workflow.retry_button; retry.click(); retry.click()
     assert workflow.status == "completed" and retry.disabled
@@ -254,7 +366,8 @@ def test_retry_synthesis_rechecks_turn_phase_and_pending(monkeypatch):
     monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
     controller = Controller(); controller.synthesis_failures.append(ToolCallError("hosted synthesis failed"))
     workflow, _ = started(controller)
-    for _ in range(6): workflow.approve_button.click()
+    complete_six_stages(workflow)
+    workflow.objective_button.click()
     before = controller.calls.count("synthesis")
     controller.session.state.phase = demo_agent.WorkflowPhase.EMBEDDED
     workflow.retry_button.click()
@@ -267,7 +380,8 @@ def test_retry_synthesis_rejects_noncanonical_state(monkeypatch, mutation):
     monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
     controller = Controller(); controller.synthesis_failures.append(ToolCallError("hosted synthesis failed"))
     workflow, _ = started(controller)
-    for _ in range(6): workflow.approve_button.click()
+    complete_six_stages(workflow)
+    workflow.objective_button.click()
     if mutation == "pending": controller.pending = proposals()[5]
     elif mutation == "plan": controller.plan = None
     elif mutation == "missing_stage": controller.stage_results.pop()
@@ -290,7 +404,8 @@ def test_known_synthesis_error_that_mutates_state_never_offers_retry(monkeypatch
         raise ToolCallError("known but state-mutating failure")
     controller.request_synthesis = unsafe_synthesis
     workflow, _ = started(controller)
-    for _ in range(6): workflow.approve_button.click()
+    complete_six_stages(workflow)
+    workflow.objective_button.click()
     assert workflow.status == "stopped" and workflow.retry_button is None
 
 
@@ -313,7 +428,7 @@ def test_launch_signature_create_display_and_no_hosted_call(monkeypatch):
     monkeypatch.setattr(demo_agent.BoundedWorkflowController, "create", create)
     monkeypatch.setattr(InteractiveWorkflow, "display", lambda self: displayed.append(self))
     workflow = launch_interactive_workflow("goal", "nvapi-test", skill="s", client="c", executors={})
-    assert created == [(("goal", "nvapi-test"), {"skill": "s", "client": "c", "executors": {}})]
+    assert created == [(("goal", "nvapi-test"), {"skill": "s", "client": "c", "executors": {}, "objective_required": True})]
     assert displayed == [workflow] and controller.calls == []
     assert str(inspect.signature(launch_interactive_workflow)).startswith("(user_goal: 'str', api_key: 'str', *")
     with pytest.raises(TypeError): launch_interactive_workflow("goal", "nvapi-test", "positional")
@@ -336,7 +451,8 @@ def test_conclusion_render_failure_retains_result_and_completion(monkeypatch):
     controller = Controller()
     monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: (_ for _ in ()).throw(RuntimeError("CONCLUSION-SECRET")))
     workflow, _ = started(controller)
-    for _ in range(6): workflow.approve_button.click()
+    complete_six_stages(workflow)
+    workflow.objective_button.click()
     assert workflow.status == "completed" and workflow.workflow_result is not None
     assert workflow.retry_button is None and controller.calls.count("synthesis") == 1
     assert "Conclusion rendering unavailable in this notebook frontend." in html_text(workflow.active_card)
