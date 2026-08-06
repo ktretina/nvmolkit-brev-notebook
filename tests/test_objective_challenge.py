@@ -1,10 +1,13 @@
+import itertools
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
 from rdkit import Chem
 
 from chemistry_workflow import WorkflowPhase, WorkflowState
+import objective_challenge
 from objective_challenge import (
     CANDIDATE_COUNT,
     MAX_ATTEMPTS,
@@ -15,6 +18,7 @@ from objective_challenge import (
     evaluate_diverse_panel,
     finalize_objective_run,
     objective_figures,
+    rank_legal_swaps,
 )
 
 
@@ -189,3 +193,104 @@ def test_objective_figures_show_trajectory_final_structures_and_heatmap():
     assert structures.size[0] > 0 and structures.size[1] > 0
     assert heatmap.axes[0].get_title() == "Final-panel Tanimoto similarity"
     assert heatmap.axes[0].images[0].get_array().shape == (4, 4)
+
+
+def test_rank_legal_swaps_returns_three_deterministic_target_reaching_suggestions():
+    context = build_objective_context(optimized_state())
+    baseline = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Measure the current policy baseline.",
+    )
+
+    suggestions = rank_legal_swaps(context, baseline)
+
+    assert len(suggestions) == 3
+    assert all(suggestion.predicted_score >= context.target_score for suggestion in suggestions)
+    assert all(suggestion.score_delta > 0 for suggestion in suggestions)
+    assert suggestions == tuple(
+        sorted(
+            suggestions,
+            key=lambda suggestion: (
+                -suggestion.predicted_score,
+                suggestion.replace_id,
+                suggestion.replacement_id,
+                suggestion.resulting_ids,
+            ),
+        )
+    )
+
+
+def test_rank_legal_swaps_suggestions_match_direct_evaluation():
+    context = build_objective_context(optimized_state())
+    current = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Measure the current policy baseline.",
+    )
+
+    for suggestion in rank_legal_swaps(context, current):
+        measured = evaluate_diverse_panel(
+            context,
+            suggestion.resulting_ids,
+            attempt_number=2,
+            decision_basis="Check the suggested legal swap.",
+        )
+
+        assert measured.score == pytest.approx(suggestion.predicted_score)
+        assert measured.limiting_pair == suggestion.limiting_pair
+        assert suggestion.score_delta == pytest.approx(measured.score - current.score)
+        assert suggestion.replace_id in current.selected_ids
+        assert suggestion.replacement_id not in current.selected_ids
+        assert len(suggestion.resulting_ids) == PANEL_SIZE
+        assert len(set(suggestion.resulting_ids)) == PANEL_SIZE
+
+
+def test_rank_legal_swaps_returns_none_after_success_and_stays_fixture_agnostic():
+    context = build_objective_context(optimized_state())
+    achieved = evaluate_diverse_panel(
+        context,
+        ("mol-0", "mol-2", "mol-4", "mol-6"),
+        attempt_number=1,
+        decision_basis="Use a diverse four-cluster panel.",
+    )
+    source = Path(objective_challenge.__file__).read_text(encoding="utf-8")
+
+    assert achieved.achieved is True
+    assert rank_legal_swaps(context, achieved) == ()
+    assert all(f"mol-{index}" not in source for index in range(CANDIDATE_COUNT))
+    assert "CHEMBL" not in source
+
+
+def test_rank_legal_swaps_can_reach_target_within_two_attempts_for_every_miss():
+    context = build_objective_context(optimized_state())
+    candidate_ids = tuple(candidate.molecule_id for candidate in context.candidates)
+    misses = 0
+
+    for panel in itertools.combinations(candidate_ids, PANEL_SIZE):
+        first = evaluate_diverse_panel(
+            context,
+            panel,
+            attempt_number=1,
+            decision_basis="Evaluate a candidate panel.",
+        )
+        if first.achieved:
+            continue
+        misses += 1
+        first_ranker = rank_legal_swaps(context, first)
+        assert first_ranker
+        second = evaluate_diverse_panel(
+            context,
+            first_ranker[0].resulting_ids,
+            attempt_number=2,
+            decision_basis="Apply the leading legal swap.",
+        )
+        if not second.achieved:
+            assert any(
+                suggestion.predicted_score >= context.target_score
+                for suggestion in rank_legal_swaps(context, second)
+            )
+
+    assert misses >= 1

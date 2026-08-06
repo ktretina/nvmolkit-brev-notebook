@@ -22,6 +22,7 @@ PANEL_SIZE = 4
 CANDIDATE_COUNT = 8
 MAX_ATTEMPTS = 3
 TARGET_FRACTION = 0.8
+SUGGESTION_LIMIT = 3
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,16 @@ class ObjectiveContext:
     benchmark_score: float
     target_score: float
     distance_matrix: np.ndarray = field(compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class ObjectiveSwap:
+    replace_id: str
+    replacement_id: str
+    resulting_ids: tuple[str, ...]
+    predicted_score: float
+    score_delta: float
+    limiting_pair: tuple[str, str]
 
 
 @dataclass(frozen=True)
@@ -169,6 +180,64 @@ def evaluate_diverse_panel(
         constraints_passed=True,
         achieved=bool(score + 1e-12 >= context.target_score),
     )
+
+
+def rank_legal_swaps(
+    context: ObjectiveContext, current: ObjectiveAttempt
+) -> tuple[ObjectiveSwap, ...]:
+    """Rank legal one-ID panel swaps by their predicted objective improvement."""
+    if type(context) is not ObjectiveContext or type(current) is not ObjectiveAttempt:
+        raise ValueError("Objective swap ranking requires exact objective types.")
+    candidates = {candidate.molecule_id: candidate for candidate in context.candidates}
+    if any(molecule_id not in candidates for molecule_id in current.selected_ids):
+        raise ValueError("Objective attempt contains an out-of-pool molecule ID.")
+    if current.achieved:
+        return ()
+
+    suggestions = []
+    current_ids = set(current.selected_ids)
+    for replace_position, replace_id in enumerate(current.selected_ids):
+        for replacement_id, replacement in candidates.items():
+            if replacement_id in current_ids:
+                continue
+            resulting_ids = (
+                current.selected_ids[:replace_position]
+                + (replacement_id,)
+                + current.selected_ids[replace_position + 1 :]
+            )
+            if len(resulting_ids) != PANEL_SIZE or len(set(resulting_ids)) != PANEL_SIZE:
+                continue
+            if len({candidates[molecule_id].cluster_id for molecule_id in resulting_ids}) != PANEL_SIZE:
+                continue
+            predicted_score, limiting_pair = _score_panel(context, resulting_ids)
+            score_delta = predicted_score - current.score
+            if score_delta <= 1e-12:
+                continue
+            suggestions.append(
+                ObjectiveSwap(
+                    replace_id=replace_id,
+                    replacement_id=replacement.molecule_id,
+                    resulting_ids=resulting_ids,
+                    predicted_score=float(predicted_score),
+                    score_delta=float(score_delta),
+                    limiting_pair=limiting_pair,
+                )
+            )
+
+    suggestions.sort(
+        key=lambda suggestion: (
+            -suggestion.predicted_score,
+            suggestion.replace_id,
+            suggestion.replacement_id,
+            suggestion.resulting_ids,
+        )
+    )
+    target_reaching = [
+        suggestion
+        for suggestion in suggestions
+        if suggestion.predicted_score + 1e-12 >= context.target_score
+    ]
+    return tuple((target_reaching or suggestions)[:SUGGESTION_LIMIT])
 
 
 def finalize_objective_run(
