@@ -50,7 +50,10 @@ class Controller:
         self.stage_results = []
         self.objective_context = None
         self.pending_objective = None
+        self.pending_objective_swap = None
         self.objective_attempts = []
+        self.objective_suggestions = ()
+        self.objective_rejection_count = 0
         self.objective_run = None
         self.objective_evidence = None
         self.objective_prompt_appended = False
@@ -384,6 +387,50 @@ def test_known_objective_proposal_failure_after_measured_attempt_has_one_guarded
     assert controller.calls.count("objective_proposal") == 3
 
 
+def test_objective_retry_invariant_counts_rejected_hosted_responses(monkeypatch):
+    monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
+    monkeypatch.setattr("interactive_workflow.objective_figures", lambda run, state: ())
+    controller = Controller()
+    original_request = controller.request_objective_attempt
+    failed_once = False
+
+    def fail_second_request_after_one_correction():
+        nonlocal failed_once
+        if len(controller.objective_attempts) == 1 and not failed_once:
+            failed_once = True
+            controller.objective_rejection_count = 1
+            controller.session.turn_count += 1
+            controller.calls.append("objective_proposal")
+            raise ToolCallError("hosted objective proposal failed")
+        return original_request()
+
+    controller.request_objective_attempt = fail_second_request_after_one_correction
+    workflow, _ = started(controller)
+    complete_six_stages(workflow)
+    workflow.objective_button.click()
+
+    assert workflow.status == "objective_failed"
+    assert workflow.retry_button.description == "Retry Objective Proposal"
+
+
+def test_objective_correction_exhaustion_does_not_offer_dead_retry(monkeypatch):
+    controller = Controller()
+
+    def exhaust_corrections():
+        controller.objective_rejection_count = demo_agent.MAX_OBJECTIVE_CORRECTIONS
+        controller.session.turn_count += demo_agent.MAX_OBJECTIVE_CORRECTIONS
+        controller.calls.append("objective_proposal")
+        raise ToolCallError("The objective correction limit was reached.")
+
+    controller.request_objective_attempt = exhaust_corrections
+    workflow, _ = started(controller)
+    complete_six_stages(workflow)
+    workflow.objective_button.click()
+
+    assert workflow.status == "stopped"
+    assert workflow.retry_button is None
+
+
 def test_retry_objective_rechecks_pending_state_and_stops(monkeypatch):
     controller = Controller()
     original_request = controller.request_objective_attempt
@@ -420,6 +467,32 @@ def test_known_synthesis_failure_has_guarded_retry(monkeypatch):
     retry = workflow.retry_button; retry.click(); retry.click()
     assert workflow.status == "completed" and retry.disabled
     assert controller.calls.count("synthesis") == 2
+
+
+def test_synthesis_failure_at_extended_objective_turn_bound_remains_retryable(monkeypatch):
+    monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
+    controller = Controller()
+    original_synthesis = controller.request_synthesis
+    failed_once = False
+
+    def fail_once_at_turn_twelve():
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            controller.calls.append("synthesis")
+            controller.report = SimpleNamespace(evidence=())
+            controller.synthesis_prompt_appended = True
+            controller.session.turn_count = demo_agent.MAX_OBJECTIVE_HOSTED_TURNS
+            raise ToolCallError("hosted synthesis failed")
+        return original_synthesis()
+
+    controller.request_synthesis = fail_once_at_turn_twelve
+    workflow, _ = started(controller)
+    complete_six_stages(workflow)
+    workflow.objective_button.click()
+
+    assert workflow.status == "synthesis_failed"
+    assert workflow.retry_button.description == "Retry Synthesis"
 
 
 def test_retry_synthesis_rechecks_turn_phase_and_pending(monkeypatch):

@@ -195,7 +195,9 @@ class InteractiveWorkflow:
                 and self.controller.objective_evidence is not None
                 and self.controller.pending_objective is None
                 and self.controller.objective_prompt_appended is True
-                and 7 <= self.controller.session.turn_count <= 10
+                and 7
+                <= self.controller.session.turn_count
+                <= demo_agent.MAX_OBJECTIVE_HOSTED_TURNS
             )
         except Exception:
             return False
@@ -217,10 +219,13 @@ class InteractiveWorkflow:
                 and self.controller.objective_run is None
                 and self.controller.objective_evidence is None
                 and self.controller.pending_objective is None
+                and self.controller.objective_rejection_count
+                < demo_agent.MAX_OBJECTIVE_CORRECTIONS
                 and len(attempts) < MAX_ATTEMPTS
                 and tuple(attempt.attempt_number for attempt in attempts)
                 == tuple(range(1, len(attempts) + 1))
-                and self.controller.session.turn_count == 7 + len(attempts)
+                and self.controller.session.turn_count
+                == 7 + len(attempts) + self.controller.objective_rejection_count
             )
         except Exception:
             return False

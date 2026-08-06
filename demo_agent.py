@@ -39,17 +39,22 @@ from objective_challenge import (
     ObjectiveAttempt,
     ObjectiveContext,
     ObjectiveRun,
+    ObjectiveSwap,
     build_objective_context,
     build_objective_evidence,
     evaluate_diverse_panel,
     finalize_objective_run,
     no_improvement_run,
+    rank_legal_swaps,
 )
 
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 DEFAULT_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
 NEMOTRON_TOOL_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
+MAX_OBJECTIVE_CORRECTIONS = 2
+MAX_OBJECTIVE_HOSTED_TURNS = 12
+MAX_OBJECTIVE_SYNTHESIS_TURNS = 13
 AUTH_GUIDANCE = (
     "NVIDIA_API_KEY must be a hosted Developer API key. Generate it from the "
     "Nemotron build.nvidia.com model page, then paste only the bare key; it "
@@ -288,9 +293,15 @@ class ToolCallError(RuntimeError):
 
 
 class _HostedArgumentsValidationError(ToolCallError):
-    def __init__(self, stage: str, issues: tuple[tuple[str, str], ...]):
+    def __init__(
+        self,
+        stage: str,
+        issues: tuple[tuple[str, str], ...],
+        call_id: str | None = None,
+    ):
         self.stage = stage
         self.issues = issues
+        self.call_id = call_id
         signature = ", ".join(
             f"{field}:{error_type}" for field, error_type in issues
         )
@@ -377,6 +388,21 @@ def _serialize(value: Any) -> str:
         )
     except Exception:
         raise ToolCallError(_SERIALIZATION_ERROR) from None
+
+
+def _swap_payload(item: ObjectiveSwap) -> dict[str, Any]:
+    return {
+        "replace_id": item.replace_id,
+        "replacement_id": item.replacement_id,
+        "resulting_ids": list(item.resulting_ids),
+        "predicted_score": item.predicted_score,
+        "score_delta": item.score_delta,
+        "limiting_pair": list(item.limiting_pair),
+    }
+
+
+def _panel_key(ids: Any) -> tuple[str, ...]:
+    return tuple(sorted(ids))
 
 
 _REQUIRED_CONCLUSION_EVIDENCE = {
@@ -598,6 +624,7 @@ def _request_call(
         raise _HostedArgumentsValidationError(
             expected_name,
             issues,
+            call_id,
         ) from None
     except (AttributeError, IndexError, TypeError, json.JSONDecodeError):
         raise ToolCallError("The hosted tool call failed strict validation.") from None
@@ -631,6 +658,37 @@ def _append_tool_result(session: AgentSession, content: Any) -> None:
             "content": _serialize(content),
         }
     )
+
+
+def _append_rejected_hosted_call(
+    session: AgentSession, error: _HostedArgumentsValidationError
+) -> None:
+    if not isinstance(error.call_id, str) or not error.call_id.strip():
+        raise ToolCallError("The rejected hosted tool call ID was missing.")
+    session.messages.append(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": error.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": error.stage,
+                        "arguments": _serialize(
+                            {
+                                "validation_issues": [
+                                    {"field": field, "error_type": error_type}
+                                    for field, error_type in error.issues
+                                ]
+                            }
+                        ),
+                    },
+                }
+            ],
+        }
+    )
+    session.turn_count += 1
 
 
 def _system_grounding(skill: str | None = None) -> str:
@@ -713,7 +771,10 @@ class BoundedWorkflowController:
     objective_required: bool = False
     objective_context: ObjectiveContext | None = None
     pending_objective: ObjectiveProposal | None = None
+    pending_objective_swap: ObjectiveSwap | None = None
     objective_attempts: list[ObjectiveAttempt] = field(default_factory=list)
+    objective_suggestions: tuple[ObjectiveSwap, ...] = ()
+    objective_rejection_count: int = 0
     objective_run: ObjectiveRun | None = None
     objective_evidence: EvidenceRecord | None = None
     objective_prompt_appended: bool = False
@@ -856,7 +917,7 @@ class BoundedWorkflowController:
         turn_count_is_valid = (
             self.session.turn_count == 7
             if self.objective_context is None
-            else 7 <= self.session.turn_count <= 10
+            else 7 <= self.session.turn_count <= MAX_OBJECTIVE_HOSTED_TURNS
         )
         if (
             tuple(result.stage for result in self.stage_results) != STAGES
@@ -937,20 +998,91 @@ class BoundedWorkflowController:
             raise ToolCallError("The objective challenge is already complete.")
         if self.pending_objective is not None:
             raise ToolCallError("An objective proposal is already pending evaluation.")
+        if self.pending_objective_swap is not None:
+            raise ToolCallError("The objective swap state is out of phase.")
         if len(self.objective_attempts) >= MAX_ATTEMPTS:
             raise ToolCallError("The objective attempt limit was reached.")
-        proposal = _request_call(
-            self.session,
-            self.client,
-            "select_diverse_panel",
-            ObjectiveProposal,
-            DEFAULT_MODEL,
-            _max_turns=11,
-        )
-        self.pending_objective = ObjectiveProposal.model_validate(
-            proposal.model_dump()
-        )
-        return self.pending_objective
+        is_revision = bool(self.objective_attempts)
+        if is_revision and not self.objective_suggestions:
+            raise ToolCallError("No legal improving objective swaps remain.")
+        if self.objective_rejection_count >= MAX_OBJECTIVE_CORRECTIONS:
+            raise ToolCallError("The objective correction limit was reached.")
+
+        context = self.objective_context
+        candidate_ids = tuple(candidate.molecule_id for candidate in context.candidates)
+        candidate_id_set = set(candidate_ids)
+        prior_panel_keys = {
+            _panel_key(attempt.selected_ids) for attempt in self.objective_attempts
+        }
+        while True:
+            matching_swaps: tuple[ObjectiveSwap, ...] = ()
+            try:
+                proposal = _request_call(
+                    self.session,
+                    self.client,
+                    "select_diverse_panel",
+                    ObjectiveProposal,
+                    DEFAULT_MODEL,
+                    _max_turns=MAX_OBJECTIVE_HOSTED_TURNS,
+                )
+            except _HostedArgumentsValidationError as error:
+                _append_rejected_hosted_call(self.session, error)
+                reason = "invalid_objective_proposal"
+                proposal = None
+            else:
+                panel_key = _panel_key(proposal.selected_ids)
+                matching_swaps = tuple(
+                    item
+                    for item in self.objective_suggestions
+                    if _panel_key(item.resulting_ids) == panel_key
+                )
+                reason = None
+                if panel_key in prior_panel_keys:
+                    reason = "duplicate_panel"
+                elif any(item not in candidate_id_set for item in proposal.selected_ids):
+                    reason = "out_of_pool_panel"
+                elif is_revision and len(matching_swaps) != 1:
+                    reason = "panel_not_in_legal_improving_swaps"
+                elif not is_revision:
+                    clusters = {
+                        candidate.molecule_id: candidate.cluster_id
+                        for candidate in context.candidates
+                    }
+                    if len({clusters[item] for item in proposal.selected_ids}) != len(
+                        proposal.selected_ids
+                    ):
+                        reason = "cluster_duplicate_panel"
+
+            if reason is None:
+                assert proposal is not None
+                self.pending_objective = ObjectiveProposal.model_validate(
+                    proposal.model_dump()
+                )
+                self.pending_objective_swap = matching_swaps[0] if is_revision else None
+                return self.pending_objective
+
+            self.objective_rejection_count += 1
+            rejection = {
+                "accepted": False,
+                "reason": reason,
+                "corrections_remaining": (
+                    MAX_OBJECTIVE_CORRECTIONS - self.objective_rejection_count
+                ),
+                "legal_improving_swaps": [
+                    _swap_payload(item) for item in self.objective_suggestions
+                ],
+                "instruction": (
+                    "Select exactly one listed resulting_ids panel and explain its "
+                    "limiting-pair rationale."
+                    if is_revision
+                    else "Select exactly four unique IDs from candidate_ids."
+                ),
+            }
+            if not is_revision:
+                rejection["candidate_ids"] = list(candidate_ids)
+            _append_tool_result(self.session, rejection)
+            if self.objective_rejection_count >= MAX_OBJECTIVE_CORRECTIONS:
+                raise ToolCallError("The objective correction limit was reached.")
 
     def execute_objective_attempt(
         self, proposal: ObjectiveProposal
@@ -967,25 +1099,42 @@ class BoundedWorkflowController:
                 tuple(proposal.selected_ids),
                 attempt_number=len(self.objective_attempts) + 1,
                 decision_basis=proposal.decision_basis,
+                selected_swap=self.pending_objective_swap,
             )
         except Exception:
             raise ToolCallError("The objective evaluator rejected the proposed panel.") from None
         self.objective_attempts.append(attempt)
         self.pending_objective = None
-        _append_tool_result(
-            self.session,
-            {
-                "accepted": True,
-                "attempt_number": attempt.attempt_number,
-                "selected_ids": list(attempt.selected_ids),
-                "score": attempt.score,
-                "target_score": context.target_score,
-                "limiting_pair": list(attempt.limiting_pair),
-                "constraints_passed": attempt.constraints_passed,
-                "achieved": attempt.achieved,
-                "attempts_remaining": MAX_ATTEMPTS - len(self.objective_attempts),
-            },
-        )
+        self.pending_objective_swap = None
+        if not attempt.achieved and len(self.objective_attempts) < MAX_ATTEMPTS:
+            try:
+                self.objective_suggestions = rank_legal_swaps(context, attempt)
+            except Exception:
+                raise ToolCallError(
+                    "The legal improving objective swaps could not be ranked."
+                ) from None
+        else:
+            self.objective_suggestions = ()
+        feedback = {
+            "accepted": True,
+            "attempt_number": attempt.attempt_number,
+            "selected_ids": list(attempt.selected_ids),
+            "score": attempt.score,
+            "target_score": context.target_score,
+            "limiting_pair": list(attempt.limiting_pair),
+            "constraints_passed": attempt.constraints_passed,
+            "achieved": attempt.achieved,
+            "attempts_remaining": MAX_ATTEMPTS - len(self.objective_attempts),
+            "legal_improving_swaps": [
+                _swap_payload(item) for item in self.objective_suggestions
+            ],
+        }
+        if self.objective_suggestions:
+            feedback["instruction"] = (
+                "Select exactly one listed resulting_ids panel and explain how its "
+                "limiting_pair and predicted_score compare with target_score."
+            )
+        _append_tool_result(self.session, feedback)
         if attempt.achieved or len(self.objective_attempts) == MAX_ATTEMPTS:
             self.objective_run = finalize_objective_run(
                 context, tuple(self.objective_attempts)
@@ -1033,7 +1182,7 @@ class BoundedWorkflowController:
                 "submit_synthesis",
                 conclusion_model,
                 DEFAULT_MODEL,
-                _max_turns=11 if objective_active else 8,
+                _max_turns=MAX_OBJECTIVE_SYNTHESIS_TURNS if objective_active else 8,
             )
             if objective_active:
                 assert objective_evidence is not None
