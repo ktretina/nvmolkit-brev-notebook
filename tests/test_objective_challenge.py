@@ -12,6 +12,7 @@ from objective_challenge import (
     CANDIDATE_COUNT,
     MAX_ATTEMPTS,
     PANEL_SIZE,
+    ObjectiveAttempt,
     ObjectiveRun,
     build_objective_context,
     build_objective_evidence,
@@ -256,10 +257,20 @@ def test_rank_legal_swaps_returns_none_after_success_and_stays_fixture_agnostic(
         attempt_number=1,
         decision_basis="Use a diverse four-cluster panel.",
     )
+    out_of_pool_achieved = ObjectiveAttempt(
+        attempt_number=1,
+        selected_ids=("outside-0", "outside-1", "outside-2", "outside-3"),
+        decision_basis="An already completed attempt needs no replacement.",
+        score=1.0,
+        limiting_pair=("outside-0", "outside-1"),
+        constraints_passed=False,
+        achieved=True,
+    )
     source = Path(objective_challenge.__file__).read_text(encoding="utf-8")
 
     assert achieved.achieved is True
     assert rank_legal_swaps(context, achieved) == ()
+    assert rank_legal_swaps(context, out_of_pool_achieved) == ()
     assert all(f"mol-{index}" not in source for index in range(CANDIDATE_COUNT))
     assert "CHEMBL" not in source
 
@@ -281,16 +292,17 @@ def test_rank_legal_swaps_can_reach_target_within_two_attempts_for_every_miss():
         misses += 1
         first_ranker = rank_legal_swaps(context, first)
         assert first_ranker
-        second = evaluate_diverse_panel(
-            context,
-            first_ranker[0].resulting_ids,
-            attempt_number=2,
-            decision_basis="Apply the leading legal swap.",
-        )
-        if not second.achieved:
-            assert any(
-                suggestion.predicted_score >= context.target_score
-                for suggestion in rank_legal_swaps(context, second)
+        for first_suggestion in first_ranker:
+            second = evaluate_diverse_panel(
+                context,
+                first_suggestion.resulting_ids,
+                attempt_number=2,
+                decision_basis="Apply a proposed legal swap.",
             )
+            if not second.achieved:
+                assert any(
+                    suggestion.predicted_score >= context.target_score
+                    for suggestion in rank_legal_swaps(context, second)
+                )
 
     assert misses >= 1

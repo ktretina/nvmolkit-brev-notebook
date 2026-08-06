@@ -188,11 +188,11 @@ def rank_legal_swaps(
     """Rank legal one-ID panel swaps by their predicted objective improvement."""
     if type(context) is not ObjectiveContext or type(current) is not ObjectiveAttempt:
         raise ValueError("Objective swap ranking requires exact objective types.")
+    if current.achieved:
+        return ()
     candidates = {candidate.molecule_id: candidate for candidate in context.candidates}
     if any(molecule_id not in candidates for molecule_id in current.selected_ids):
         raise ValueError("Objective attempt contains an out-of-pool molecule ID.")
-    if current.achieved:
-        return ()
 
     suggestions = []
     current_ids = set(current.selected_ids)
