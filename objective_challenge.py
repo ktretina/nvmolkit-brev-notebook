@@ -168,6 +168,71 @@ def _validated_panel(
     return panel, candidates
 
 
+def _validated_selected_swap(
+    context: ObjectiveContext, selected_swap: object
+) -> tuple[str, ...]:
+    """Validate canonical provenance for a scored legal one-ID panel swap."""
+    if type(selected_swap) is not ObjectiveSwap:
+        raise ValueError("Objective selected swap must use the exact swap type.")
+    candidate_ids = {candidate.molecule_id for candidate in context.candidates}
+    if (
+        type(selected_swap.replace_id) is not str
+        or type(selected_swap.replacement_id) is not str
+        or selected_swap.replace_id not in candidate_ids
+        or selected_swap.replacement_id not in candidate_ids
+    ):
+        raise ValueError("Objective selected swap IDs must be exact in-pool strings.")
+    if type(selected_swap.resulting_ids) is not tuple or any(
+        type(molecule_id) is not str for molecule_id in selected_swap.resulting_ids
+    ):
+        raise ValueError("Objective selected swap resulting IDs must be an exact string tuple.")
+    selected_swap_panel, _ = _validated_panel(context, selected_swap.resulting_ids)
+    if (
+        type(selected_swap.limiting_pair) is not tuple
+        or len(selected_swap.limiting_pair) != 2
+        or any(type(molecule_id) is not str for molecule_id in selected_swap.limiting_pair)
+    ):
+        raise ValueError("Objective selected swap limiting pair must be an exact string tuple.")
+    if (
+        type(selected_swap.predicted_score) is not float
+        or not np.isfinite(selected_swap.predicted_score)
+        or type(selected_swap.score_delta) is not float
+        or not np.isfinite(selected_swap.score_delta)
+    ):
+        raise ValueError("Objective selected swap scores must be finite built-in floats.")
+    if (
+        selected_swap.replacement_id not in selected_swap_panel
+        or selected_swap.replace_id in selected_swap_panel
+    ):
+        raise ValueError("Objective selected swap IDs do not describe the resulting panel.")
+    replacement_position = selected_swap_panel.index(selected_swap.replacement_id)
+    predecessor_panel = (
+        selected_swap_panel[:replacement_position]
+        + (selected_swap.replace_id,)
+        + selected_swap_panel[replacement_position + 1 :]
+    )
+    predecessor_panel, _ = _validated_panel(context, predecessor_panel)
+    predecessor_score, _ = _score_panel(context, predecessor_panel)
+    resulting_score, resulting_limiting_pair = _score_panel(context, selected_swap_panel)
+    if selected_swap.score_delta <= 0.0 or not np.isclose(
+        selected_swap.score_delta,
+        resulting_score - predecessor_score,
+        rtol=0.0,
+        atol=SCORE_TOLERANCE,
+    ):
+        raise ValueError("Objective selected swap score delta is invalid.")
+    if not np.isclose(
+        selected_swap.predicted_score,
+        resulting_score,
+        rtol=0.0,
+        atol=SCORE_TOLERANCE,
+    ):
+        raise ValueError("Objective selected swap predicted score does not match the panel.")
+    if selected_swap.limiting_pair != resulting_limiting_pair:
+        raise ValueError("Objective selected swap limiting pair does not match the panel.")
+    return selected_swap_panel
+
+
 def evaluate_diverse_panel(
     context: ObjectiveContext,
     selected_ids: tuple[str, ...] | list[str],
@@ -185,24 +250,9 @@ def evaluate_diverse_panel(
         raise ValueError("Objective decision basis is invalid.")
     score, limiting_pair = _score_panel(context, panel)
     if selected_swap is not None:
-        if type(selected_swap) is not ObjectiveSwap:
-            raise ValueError("Objective selected swap must use the exact swap type.")
-        selected_swap_panel, _ = _validated_panel(context, selected_swap.resulting_ids)
+        selected_swap_panel = _validated_selected_swap(context, selected_swap)
         if set(panel) != set(selected_swap_panel):
             raise ValueError("Objective selected swap does not match the selected panel.")
-        if isinstance(selected_swap.predicted_score, bool) or not isinstance(
-            selected_swap.predicted_score, (int, float, np.floating)
-        ) or not np.isfinite(selected_swap.predicted_score):
-            raise ValueError("Objective selected swap predicted score is invalid.")
-        if not np.isclose(
-            score,
-            selected_swap.predicted_score,
-            rtol=0.0,
-            atol=SCORE_TOLERANCE,
-        ):
-            raise ValueError("Objective selected swap predicted score does not match the panel.")
-        if limiting_pair != selected_swap.limiting_pair:
-            raise ValueError("Objective selected swap limiting pair does not match the panel.")
     return ObjectiveAttempt(
         attempt_number=attempt_number,
         selected_ids=panel,

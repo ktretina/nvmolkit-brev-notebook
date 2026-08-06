@@ -1,5 +1,6 @@
 import itertools
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -288,6 +289,43 @@ def test_evaluate_panel_rejects_a_selected_swap_with_a_malformed_panel():
             attempt_number=2,
             decision_basis="Reject the malformed selected legal swap.",
             selected_swap=malformed,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate_swap",
+    (
+        lambda swap: replace(swap, replace_id="outside-pool"),
+        lambda swap: replace(swap, replacement_id=swap.replace_id),
+        lambda swap: replace(swap, replace_id=swap.replacement_id),
+        lambda swap: replace(swap, score_delta=swap.score_delta + 0.1),
+        lambda swap: replace(swap, score_delta=-0.1),
+        lambda swap: replace(swap, score_delta=float("nan")),
+        lambda swap: replace(swap, resulting_ids=list(swap.resulting_ids)),
+        lambda swap: replace(swap, limiting_pair=list(swap.limiting_pair)),
+        lambda swap: replace(swap, predicted_score=np.float64(swap.predicted_score)),
+        lambda swap: replace(swap, score_delta=np.float64(swap.score_delta)),
+        lambda swap: replace(swap, resulting_ids=(1, *swap.resulting_ids[1:])),
+        lambda swap: replace(swap, limiting_pair=(swap.limiting_pair[0], 1)),
+    ),
+)
+def test_evaluate_panel_rejects_noncanonical_selected_swap_fields(mutate_swap):
+    context = build_objective_context(optimized_state())
+    first = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Measure the current policy baseline.",
+    )
+    selected = rank_legal_swaps(context, first)[0]
+
+    with pytest.raises(ValueError, match="selected swap|Objective proposal"):
+        evaluate_diverse_panel(
+            context,
+            selected.resulting_ids,
+            attempt_number=2,
+            decision_basis="Reject a noncanonical selected legal swap.",
+            selected_swap=mutate_swap(selected),
         )
 
 
