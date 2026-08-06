@@ -15,6 +15,7 @@ from pydantic import (
     Field,
     StringConstraints,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
@@ -164,6 +165,29 @@ class EmbedArgs(_StrictModel):
 
 class OptimizationArgs(_StrictModel):
     pass
+
+
+MoleculeId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=80,
+        pattern=r"^[^\s\r\n`]+$",
+    ),
+]
+
+
+class ObjectiveProposal(_StrictModel):
+    selected_ids: list[MoleculeId] = Field(min_length=4, max_length=4)
+    decision_basis: DecisionBasis
+
+    @field_validator("selected_ids")
+    @classmethod
+    def selected_ids_are_unique(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("Objective proposal molecule IDs must be unique.")
+        return value
 
 
 class PlanStage(_StrictModel):
