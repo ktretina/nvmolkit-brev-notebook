@@ -2,21 +2,23 @@
 
 This standalone project asks one presentation-sized question: **can an AI chemistry agent use nvMolKit to autonomously execute a real cheminformatics workflow?** One stateful, bounded Nemotron conversation follows a fixed dependency chain:
 
-`plan → RDKit inspect → MorganFingerprintGenerator → crossTanimotoSimilarity → fused_butina → EmbedMolecules → MMFFOptimizeMoleculesConfs → evidence-linked, schema-checked synthesis`
+`plan → RDKit inspect → MorganFingerprintGenerator → crossTanimotoSimilarity → fused_butina → EmbedMolecules → MMFFOptimizeMoleculesConfs → objective attempts → evidence-linked, schema-checked conclusion`
 
-The pinned BioNeMo Agent Toolkit nvMolKit skill grounds the conversation's initial context. Reading it is not an agent tool call and does not permanently teach or modify the model. The compact presentation is one plan, six approvals, six completed command receipts/result cards, and one synthesis. The user may override only bounded scientific parameters through the supplied dropdowns and sliders. Python validates and executes approved calls, renders results, and preserves exact artifact-grounded evidence records E01–E06; credentials, RDKit molecules, tensors, matrices, and coordinates remain local. Python verifies the synthesis schema, evidence references, and exact rendered metrics; Nemotron's qualitative interpretation is not automatically fact-verified.
+The pinned BioNeMo Agent Toolkit nvMolKit skill grounds the conversation's initial context. Reading it is not an agent tool call and does not permanently teach or modify the model. The compact presentation is one plan, six approvals, six completed command receipts/result cards, one objective challenge, and one conclusion. The user may override only bounded scientific parameters through the supplied dropdowns and sliders. Python validates and executes approved calls, renders results, and preserves exact artifact-grounded evidence records E01–E06 plus the objective ledger O01; credentials, RDKit molecules, tensors, matrices, and coordinates remain local. Python verifies the conclusion schema, evidence references, and exact rendered metrics; Nemotron's qualitative interpretation is not automatically fact-verified.
 
 ## What runs where
 
 - **Brev** provides the GPU VM and organization-only Secure Link to JupyterLab.
-- **Hosted Nemotron** creates one plan, makes six validated tool calls using prior evidence, and drafts one evidence-linked, schema-checked synthesis. It does not execute Python.
+- **Hosted Nemotron** creates one plan, makes six validated tool calls using prior evidence, proposes up to three objective panels using measured feedback, and drafts one evidence-linked, schema-checked conclusion. It does not execute Python.
 - **Python** owns the tool contract, dependency order, validation, execution, exact evidence, and presentation.
 - **RDKit** parses inputs, screens MMFF94 eligibility, and supports rendering.
 - **nvMolKit on the GPU** generates Morgan fingerprints, computes all-pairs Tanimoto similarity, runs fused Butina clustering, embeds conformers, and performs MMFF94 optimization.
 
 ## Interactive flow
 
-Run the final code cell to display the interface; the cell returns after the interface is displayed. Click **Start Agent** to request the plan, review the proposal and concise decision, and optionally adjust only the bounded controls. Then click **Approve & Run** on each stage in order. A completed card keeps its validated command receipt beside the corresponding result, and synthesis remains unavailable until all six approvals have completed through MMFF94. Guarded button failures stay inside the active card, leave it incomplete for review or retry, and do not mark the notebook cell failed.
+Run the final code cell to display the interface; the cell returns after the interface is displayed. Click **Start Agent** to request the plan, review the proposal and concise decision, and optionally adjust only the bounded controls. Then click **Approve & Run** on each stage in order. A completed card keeps its validated command receipt beside the corresponding result.
+
+After all six approvals complete through MMFF94, click **Run Objective Challenge**. The bounded eight-candidate challenge asks Nemotron to improve a four-compound panel by maximizing its minimum pairwise Tanimoto distance. The target is 80% of the attainable improvement over the current largest-clusters-first baseline. Up to three attempts remain visible in one score trajectory and attempt ledger; every attempt shows the validated Nemotron proposal, the deterministic evaluation executed by Python, the limiting pair, and the result. The final structures and four-by-four similarity heatmap appear before the **Evidence-Backed Conclusion**. Guarded button failures stay inside the active card, leave it incomplete for review or retry, and do not mark the notebook cell failed.
 
 ## Launch
 
@@ -35,8 +37,8 @@ These are separate evidence gates; one does not prove the others:
 
 - **Local deterministic acceptance:** run `pytest` to validate notebook structure, scientific state transitions, serialization boundaries, and agent wiring without claiming GPU or hosted execution.
 - **GPU acceptance:** on a compatible NVIDIA GPU, run `RUN_GPU_TESTS=1 pytest tests/test_gpu_acceptance.py -v` and retain the result before calling the nvMolKit runtime GPU-accepted.
-- **Hosted inference acceptance:** in a fresh Brev kernel, verify one plan, six approvals, six completed command receipts/result cards, and one evidence-linked, schema-checked synthesis using a valid hosted Developer API key; this does not fact-verify Nemotron's qualitative interpretation.
-- **Rendered deployment acceptance:** inspect the 24-molecule RDKit preview and invalid-input report, fingerprint histogram, similarity heatmap, cluster chart, conformer-energy chart, and static conformer views through the organization-only Secure Link.
+- **Hosted inference acceptance:** in a fresh Brev kernel, verify one plan, six approvals, six completed command receipts/result cards, up to three objective proposals with measured feedback, and one evidence-linked, schema-checked conclusion using a valid hosted Developer API key; this does not fact-verify Nemotron's qualitative interpretation.
+- **Rendered deployment acceptance:** inspect the 24-molecule RDKit preview and invalid-input report, fingerprint histogram, similarity heatmap, cluster chart, conformer-energy chart, static conformer views, objective score trajectory, attempt ledger, final four structures, and final-panel heatmap through the organization-only Secure Link.
 
 ## Boundaries
 

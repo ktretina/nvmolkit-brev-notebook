@@ -25,7 +25,7 @@ APPROVED_INTRO = """# AI Agents for Chemistry
 
 AI agents can extend language models from passive generators into systems that plan analyses, select validated operations, call scientific software, and interpret structured results. In chemistry, this creates a practical interface between high-level scientific questions and specialized computational tools while preserving explicit constraints, provenance, and reproducibility.
 
-This notebook demonstrates that pattern through a bounded molecular-library analysis. A Nemotron agent is grounded with the BioNeMo Agent Toolkit skill for nvMolKit, then uses nvMolKit GPU operations to generate Morgan fingerprints, calculate all-pairs Tanimoto similarity, discover fused Butina clusters, embed representative conformers, and optimize them with MMFF94. Python validates the workflow, executes the approved tool calls, and renders the results. The demonstration illustrates agent-guided cheminformatics—not unrestricted autonomy—and its outputs are computational descriptors and sampled force-field geometries rather than evidence of biological activity, safety, or experimental structure."""
+This notebook demonstrates that pattern through a bounded molecular-library analysis in two compact movements. During **Molecular Evidence Generation**, a Nemotron agent grounded with the BioNeMo Agent Toolkit skill for nvMolKit uses validated GPU operations to generate Morgan fingerprints, calculate all-pairs Tanimoto similarity, discover fused Butina clusters, embed representative conformers, and optimize them with MMFF94. During the **Objective-Driven Agent Challenge**, it uses the retained evidence to improve a four-compound panel against a measured minimum pairwise Tanimoto-distance target. Python validates every proposal, executes deterministic scientific code, and renders the progression. The demonstration illustrates bounded agent-guided cheminformatics—not unrestricted autonomy—and its outputs are computational descriptors and sampled force-field geometries rather than evidence of biological activity, safety, or experimental structure."""
 NVMOLKIT_ENTRY_POINTS = (
     "MorganFingerprintGenerator",
     "crossTanimotoSimilarity",
@@ -107,6 +107,8 @@ def test_notebook_exposes_one_goal_and_one_public_agent_call():
     )
     assert "skill=(PROJECT_ROOT / \"skills\" / \"nvmolkit\" / \"SKILL.md\").read_text(encoding=\"utf-8\")" in notebook.cells[6].source
     assert "run_workflow" not in code
+    assert "evaluate_diverse_panel" not in code
+    assert "select_diverse_panel" not in code
     assert all(forbidden not in code for forbidden in (
         "read_nvmolkit_skill", "prepare_molecular_sample", "compute_morgan_fingerprints",
         "compute_tanimoto_similarity", "cluster_with_fused_butina",
@@ -133,9 +135,18 @@ def test_intro_and_run_text_make_attribution_and_grounding_explicit():
         "review the Nemotron proposal and concise decision",
         "bounded dropdowns and sliders",
         "click **Approve & Run** for each of the six stages",
+        "**Molecular Evidence Generation**",
+        "**Objective-Driven Agent Challenge**",
+        "click **Run Objective Challenge**",
+        "minimum pairwise Tanimoto distance",
+        "at most three attempts",
+        "Validated Nemotron proposal",
+        "Evaluation executed by Python",
+        "score trajectory",
+        "attempt ledger",
+        "Evidence-Backed Conclusion",
         "validated, approved agent tool call",
         "corresponding RDKit inspection or nvMolKit invocation",
-        "final synthesis appears only after MMFF94",
         "Button callback failures remain in the active card",
         "do not mark the notebook cell failed",
     ):
@@ -167,7 +178,7 @@ def test_boundary_is_scientifically_bounded_and_claim_safe():
     for phrase in (
         "bounded fixed workflow", "binding", "activity", "admet", "safety",
         "within-molecule", "not global", "experimental", "no performance claims",
-        "checks the synthesis structure before rendering",
+        "checks the conclusion structure before rendering",
         "qualitative interpretation is not automatically fact-verified",
     ):
         assert phrase in boundary
@@ -218,7 +229,12 @@ def test_readme_preserves_launch_and_separate_acceptance_gates():
     assert "one plan" in lowered
     assert "six approvals" in lowered
     assert "six completed command receipts/result cards" in lowered
-    assert "one evidence-linked, schema-checked synthesis" in hosted_gate
+    assert "one objective challenge" in lowered
+    assert "up to three objective proposals" in hosted_gate
+    assert "one evidence-linked, schema-checked conclusion" in hosted_gate
+    assert "run objective challenge" in lowered
+    assert "minimum pairwise tanimoto distance" in lowered
+    assert "o01" in lowered
     assert "bounded scientific parameters" in lowered
     assert "returns after the interface is displayed" in lowered
     assert "guarded button failures stay inside the active card" in lowered
