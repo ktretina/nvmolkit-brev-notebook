@@ -240,7 +240,17 @@ class ObjectiveProposal(_StrictModel):
         placeholder_tokens = {
             "selected", "id", "ids", "decision", "basis", "bases",
         }
-        tokens = re.findall(r"[a-z0-9]+", value.casefold())
+        compound_tokens = {
+            "selectedid": ("selected", "id"),
+            "selectedids": ("selected", "ids"),
+            "decisionbasis": ("decision", "basis"),
+            "decisionbases": ("decision", "bases"),
+        }
+        tokens = [
+            part
+            for token in re.findall(r"[a-z0-9]+", value.casefold())
+            for part in compound_tokens.get(token, (token,))
+        ]
         meaningful_tokens = [token for token in tokens if token not in connectors]
         if not meaningful_tokens or all(
             token in placeholder_tokens for token in meaningful_tokens

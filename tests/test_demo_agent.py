@@ -649,6 +649,13 @@ def test_decision_basis_accepts_brief_nonempty_text():
         "decision basis decision_basis",
         "selected_ids and decision_basis",
         "The selected IDs decision basis",
+        "selectedIds",
+        "selectedids",
+        "decisionBasis",
+        "decisionbasis",
+        "decisionbases",
+        "selectedIds decisionBasis",
+        "SELECTEDIDS + DECISIONBASES",
     ],
 )
 def test_objective_decision_basis_rejects_schema_field_placeholders(value):
@@ -666,6 +673,18 @@ def test_objective_decision_basis_rejects_schema_field_placeholders(value):
     ["0.80 exceeds 0.71.", "Score 0.8 > 0.7."],
 )
 def test_objective_decision_basis_accepts_short_quantitative_reasons(value):
+    parsed = demo_agent.ObjectiveProposal.model_validate(
+        {
+            "selected_ids": ["mol-0", "mol-1", "mol-2", "mol-3"],
+            "decision_basis": value,
+        }
+    )
+
+    assert parsed.decision_basis == value
+
+
+def test_objective_placeholder_guard_does_not_match_unrelated_compound_words():
+    value = "Decisionmaking improves score to 0.8."
     parsed = demo_agent.ObjectiveProposal.model_validate(
         {
             "selected_ids": ["mol-0", "mol-1", "mol-2", "mol-3"],
