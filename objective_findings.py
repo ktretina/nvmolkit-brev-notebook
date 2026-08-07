@@ -442,6 +442,19 @@ def _build_summary(
     generated = _integer(
         e05["generated_conformer_count"], "E05 generated conformers"
     )
+    if not 3 <= requested_reps <= 6:
+        raise ValueError("E05 representative count must be 3 through 6 inclusive.")
+    if (
+        not 1 <= selected_reps <= requested_reps
+        or shortfall != requested_reps - selected_reps
+    ):
+        raise ValueError("E05 selected and requested representative counts conflict.")
+    if not 3 <= per_rep <= 8:
+        raise ValueError(
+            "E05 conformers per representative must be 3 through 8 inclusive."
+        )
+    if generated < 1:
+        raise ValueError("E05 must contain at least one generated conformer.")
     representatives = e05["representatives"]
     partial_embedding_ids = e05["partial_embedding_ids"]
     zero_embedding_ids = e05["zero_embedding_ids"]
@@ -811,7 +824,7 @@ _FINDING_PREDICATES: dict[str, _FindingPredicate] = {
     "representation_reuse": _FindingPredicate(
         "F04",
         "molecular_representation",
-        ("E02", "E03", "O01"),
+        ("E02", "E03", "E04", "O01"),
         lambda summary: summary.fingerprint_radius in (2, 3)
         and summary.fingerprint_size in (1024, 2048),
         lambda summary: (

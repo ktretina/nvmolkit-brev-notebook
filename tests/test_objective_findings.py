@@ -450,3 +450,48 @@ def test_snapshot_rejects_noncanonical_selected_conformer_on_energy_tie():
 
     with pytest.raises(ValueError, match="canonical|selected"):
         build_evidence_snapshot(mutate_record(report, "E06", forge_tie), run)
+
+
+@pytest.mark.parametrize(
+    ("mutations", "message"),
+    (
+        (
+            (
+                ("E05", {"requested_representative_count": 0, "selected_representative_count": 0, "representatives": [], "generated_conformer_count": 0}),
+                ("E06", {"attempted_conformer_count": 0, "converged_conformer_count": 0, "unconverged_conformer_count": 0, "per_conformer_records": [], "selected_conformer_records": []}),
+            ),
+            "representative|generated",
+        ),
+        ((("E05", {"requested_representative_count": 2}),), "representative"),
+        ((("E05", {"requested_conformers_per_representative": 2}),), "conformers per representative"),
+        ((("E05", {"requested_conformers_per_representative": 9}),), "conformers per representative"),
+        ((("E05", {"generated_conformer_count": 0}),), "generated"),
+    ),
+)
+def test_snapshot_rejects_out_of_policy_or_empty_embedding_cardinalities(
+    mutations, message
+):
+    report, run = report_and_run()
+    for key, updates in mutations:
+        report = mutate_record(
+            report, key, lambda payload, updates=updates: payload.update(updates)
+        )
+
+    with pytest.raises(ValueError, match=message):
+        build_evidence_snapshot(report, run)
+
+
+def test_representation_reuse_requires_clustering_evidence_and_revalidation():
+    report, run = report_and_run()
+    snapshot = build_evidence_snapshot(report, run)
+    finding = next(
+        finding
+        for finding in build_finding_catalog_from_snapshot(snapshot).findings
+        if finding.predicate_id == "representation_reuse"
+    )
+
+    assert finding.evidence_keys == ("E02", "E03", "E04", "O01")
+    with pytest.raises(ValueError, match="evidence"):
+        validate_finding(
+            replace(finding, evidence_keys=("E02", "E03", "O01")), snapshot
+        )
