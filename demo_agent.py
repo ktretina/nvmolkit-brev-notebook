@@ -572,7 +572,11 @@ def _request_call(
                 raise ToolCallError("The hosted tool arguments were missing.")
             decoded = json.loads(raw_arguments)
         if not isinstance(decoded, dict):
-            raise ToolCallError("The hosted tool arguments must be a JSON object.")
+            raise _HostedArgumentsValidationError(
+                expected_name,
+                (("arguments", "non_object_json"),),
+                call_id,
+            )
         declared_fields = argument_model.model_fields
         if (
             content_arguments is not None
@@ -626,7 +630,13 @@ def _request_call(
             issues,
             call_id,
         ) from None
-    except (AttributeError, IndexError, TypeError, json.JSONDecodeError):
+    except json.JSONDecodeError:
+        raise _HostedArgumentsValidationError(
+            expected_name,
+            (("arguments", "invalid_json"),),
+            call_id,
+        ) from None
+    except (AttributeError, IndexError, TypeError):
         raise ToolCallError("The hosted tool call failed strict validation.") from None
 
     session.messages.append(
