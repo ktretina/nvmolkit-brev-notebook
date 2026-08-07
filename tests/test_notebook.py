@@ -149,9 +149,14 @@ def test_intro_and_run_text_make_attribution_and_grounding_explicit():
         "corresponding RDKit inspection or nvMolKit invocation",
         "Button callback failures remain in the active card",
         "do not mark the notebook cell failed",
+        "deterministically evaluated candidate actions",
+        "state-bound Nemotron choice",
+        "co-limiting pairs",
+        "Python owns every numerical result",
+        "agent-selected evidence emphasis",
     ):
         assert phrase in run_text
-    assert "qualitative interpretation is not automatically fact-verified" in run_text
+    assert "qualitative interpretation is not automatically fact-verified" not in run_text
 
 
 def test_preflight_is_fixed_gpu_ready_and_credential_safe():
@@ -238,6 +243,12 @@ def test_readme_preserves_launch_and_separate_acceptance_gates():
     assert "bounded scientific parameters" in lowered
     assert "returns after the interface is displayed" in lowered
     assert "guarded button failures stay inside the active card" in lowered
+    assert "pytest -q" in readme
+    assert "RUN_GPU_TESTS=1 pytest tests/test_gpu_acceptance.py -v" in readme
+    assert "scripts/run_objective_reliability.py" in readme
+    assert "--trials 20" in readme
+    assert "--end-to-end-runs 3" in readme
+    assert "--output" in readme
     assert "start agent" in lowered and "approve & run" in lowered
     assert "qualitative interpretation is not automatically fact-verified" in lowered
     assert "not yet live-qualified" in lowered

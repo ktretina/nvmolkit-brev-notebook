@@ -35,6 +35,24 @@ Use Linux x86-64 with CPython 3.12 in VM mode. Enable Jupyter in the Brev Consol
 
 These are separate evidence gates; one does not prove the others:
 
+CPU deterministic suite:
+
+```bash
+pytest -q
+```
+
+GPU suite on the task-owned compatible NVIDIA GPU:
+
+```bash
+RUN_GPU_TESTS=1 pytest tests/test_gpu_acceptance.py -v
+```
+
+Hosted reliability qualification (20 isolated objective trials and three fresh end-to-end runs):
+
+```bash
+python scripts/run_objective_reliability.py --trials 20 --end-to-end-runs 3 --output objective-reliability-receipt.json
+```
+
 - **Local deterministic acceptance:** run `pytest` to validate notebook structure, scientific state transitions, serialization boundaries, and agent wiring without claiming GPU or hosted execution.
 - **GPU acceptance:** on a compatible NVIDIA GPU, run `RUN_GPU_TESTS=1 pytest tests/test_gpu_acceptance.py -v` and retain the result before calling the nvMolKit runtime GPU-accepted.
 - **Hosted inference acceptance:** in a fresh Brev kernel, verify one plan, six approvals, six completed command receipts/result cards, up to three objective proposals with measured feedback, and one evidence-linked, schema-checked conclusion using a valid hosted Developer API key; this does not fact-verify Nemotron's qualitative interpretation.

@@ -1,6 +1,7 @@
 import os
 import json
 import itertools
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,20 @@ import pytest
 
 # Request up to 20 conformers (4 representatives × 5); require at least half to converge.
 MIN_CONVERGED = 10
+
+
+def test_gpu_source_gate_covers_decision_ladder_and_persistent_conclusion():
+    source = inspect.getsource(test_nvmolkit_gpu_workflow)
+    for required in (
+        "certify_argmax_reachability",
+        "state_id",
+        "accepted_maxima",
+        "limiting_pairs",
+        'objective_evidence.key == "O01"',
+        "request_synthesis",
+        "evidence_controlled_conclusion",
+    ):
+        assert required in source
 
 
 def test_cpu_acceptance_contract_covers_certified_objective_terminal_evidence():
@@ -63,7 +78,7 @@ def test_nvmolkit_gpu_workflow():
         measure_tanimoto_similarity,
         optimize_conformers_mmff94,
     )
-    from demo_agent import BoundedWorkflowController, STAGES
+    from demo_agent import BoundedWorkflowController, EvidenceControlledConclusion, STAGES
     from objective_challenge import (
         accepted_maxima,
         build_action_menu,
@@ -138,12 +153,22 @@ def test_nvmolkit_gpu_workflow():
                 expected_name
             ]
             self.calls.append(kwargs)
+            arguments = self.arguments[call_index]
+            if expected_name == "select_evidence_findings":
+                findings = json.loads(kwargs["messages"][-1]["content"])["findings"]
+                selected_ids = []
+                seen_themes = set()
+                for finding in findings:
+                    if finding["theme"] not in seen_themes:
+                        selected_ids.append(finding["finding_id"])
+                        seen_themes.add(finding["theme"])
+                arguments = {"ordered_finding_ids": selected_ids}
             tool_call = SimpleNamespace(
                 id=f"gpu-acceptance-{call_index}",
                 type="function",
                 function=SimpleNamespace(
                     name=expected_name,
-                    arguments=json.dumps(self.arguments[call_index]),
+                    arguments=json.dumps(arguments),
                 ),
             )
             return SimpleNamespace(
@@ -241,36 +266,30 @@ def test_nvmolkit_gpu_workflow():
                 )
     assert len(below_target) == 35
 
-    completions.expected_names.append("select_diverse_panel")
-    completions.arguments.append(
-        {
-            "selected_ids": list(context.baseline_ids),
-            "decision_basis": "Measure the defined baseline before revising it.",
-        }
-    )
     accepted_panels = []
     accepted_scores = []
     while controller.objective_run is None:
+        current_menu = controller.pending_action_menu
+        assert current_menu is not None
+        selected_swap = accepted_maxima(current_menu)[0]
+        completions.expected_names.append("select_next_panel_swap")
+        completions.arguments.append({
+            "state_id": current_menu.state_id,
+            "swap_id": selected_swap.swap_id,
+            "observed_limiting_pairs": [
+                list(pair) for pair in current_menu.source.limiting_pairs
+            ],
+            "decision_rule": "maximize_predicted_minimum_distance",
+        })
         proposal = controller.request_objective_attempt()
         attempt = controller.execute_objective_attempt(proposal)
         accepted_panels.append(tuple(sorted(attempt.selected_ids)))
         accepted_scores.append(attempt.score)
         if controller.objective_run is None:
             assert controller.objective_suggestions
-            selected_swap = controller.objective_suggestions[0]
             assert is_strict_improvement(
-                selected_swap.predicted_score, attempt.score
-            )
-            completions.expected_names.append("select_diverse_panel")
-            completions.arguments.append(
-                {
-                    "selected_ids": list(selected_swap.resulting_ids),
-                    "decision_basis": (
-                        f"Replace {selected_swap.replace_id} with "
-                        f"{selected_swap.replacement_id}; limiting pair "
-                        f"{attempt.limiting_pair} requires more separation."
-                    ),
-                }
+                accepted_maxima(controller.pending_action_menu)[0].predicted_score,
+                attempt.score,
             )
     assert controller.objective_run is not None
     assert len(set(accepted_panels)) == len(accepted_panels)
@@ -301,6 +320,15 @@ def test_nvmolkit_gpu_workflow():
     assert [message["tool_call_id"] for message in tool_messages] == [
         message["tool_calls"][0]["id"] for message in assistant_messages
     ]
+
+    completions.expected_names.append("select_evidence_findings")
+    completions.arguments.append(None)
+    completed = controller.request_synthesis()
+    assert type(completed.conclusion) is EvidenceControlledConclusion
+    assert completed.conclusion is controller.evidence_controlled_conclusion
+    assert completed.conclusion.finding_selection_status == "selected"
+    assert len(completed.conclusion.ordered_findings) == 7
+    assert completed.conclusion.measured_summary.achieved is True
 
     fingerprints = state.fingerprints.torch()
     assert fingerprints.is_cuda

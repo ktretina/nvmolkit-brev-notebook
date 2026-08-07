@@ -491,6 +491,108 @@ class StageProposal:
     arguments: BaseModel
 
 
+_CANONICAL_REPORT_ROWS = (
+    ("E01", "Library inspection", "RDKit input validation"),
+    ("E02", "Morgan fingerprints", "MorganFingerprintGenerator"),
+    ("E03", "Tanimoto similarity", "crossTanimotoSimilarity"),
+    ("E04", "Fused Butina clusters", "fused_butina"),
+    ("E05", "Representative embedding", "EmbedMolecules"),
+    ("E06", "MMFF94 optimization", "MMFFOptimizeMoleculesConfs"),
+)
+_CANONICAL_REPORT_REQUIRED_FIELDS = {
+    "E01": {"raw_count", "valid_count", "invalid_count", "invalid_ids", "preview_count", "count_unit"},
+    "E02": {"fingerprint_radius", "fingerprint_size_bits", "packed_shape", "molecule_count", "active_bits_min", "active_bits_median", "active_bits_max", "executor", "size_unit"},
+    "E03": {"matrix_shape", "q1", "median", "q3", "p90", "max_off_diagonal", "most_similar_pair", "similarity_unit"},
+    "E04": {"cutoff", "cluster_count", "singleton_count", "singleton_fraction", "largest_cluster_sizes", "assignment_count", "cutoff_unit"},
+    "E05": {"requested_representative_count", "selected_representative_count", "selection_shortfall", "representative_policy", "representatives", "requested_conformers_per_representative", "generated_conformer_count", "partial_embedding_ids", "zero_embedding_ids", "count_unit"},
+    "E06": {"attempted_conformer_count", "converged_conformer_count", "unconverged_conformer_count", "per_conformer_records", "selected_conformer_records", "energy_unit", "comparison_scope"},
+}
+
+
+def _validate_prepared_messages(messages: Any) -> None:
+    if type(messages) is not list or len(messages) != 16:
+        raise ValueError("A prepared snapshot requires exactly 16 messages.")
+    if [item.get("role") for item in messages[:2]] != ["system", "user"]:
+        raise ValueError("A prepared snapshot requires system and user grounding.")
+    expected_names = ("submit_workflow_plan", *STAGES)
+    for index, expected_name in enumerate(expected_names):
+        assistant, tool = messages[2 + index * 2:4 + index * 2]
+        calls = assistant.get("tool_calls") if type(assistant) is dict else None
+        if (
+            assistant.get("role") != "assistant"
+            or type(calls) is not list
+            or len(calls) != 1
+            or type(calls[0]) is not dict
+            or calls[0].get("type") != "function"
+            or type(calls[0].get("id")) is not str
+            or not calls[0]["id"].strip()
+            or type(calls[0].get("function")) is not dict
+            or calls[0]["function"].get("name") != expected_name
+            or type(tool) is not dict
+            or tool.get("role") != "tool"
+            or tool.get("tool_call_id") != calls[0]["id"]
+        ):
+            raise ValueError("Prepared hosted messages must be exactly paired.")
+
+
+def _validate_prepared_report(report: Any) -> None:
+    if type(report) is not WorkflowReport or len(report.evidence) != 6:
+        raise ValueError("A prepared snapshot requires the canonical E01-E06 report.")
+    for record, expected in zip(report.evidence, _CANONICAL_REPORT_ROWS, strict=True):
+        if (
+            type(record) is not EvidenceRecord
+            or (record.key, record.label, record.provenance) != expected
+            or type(record.payload_json) is not str
+        ):
+            raise ValueError("A prepared snapshot requires the canonical E01-E06 report.")
+        try:
+            payload = json.loads(record.payload_json)
+        except (json.JSONDecodeError, TypeError):
+            raise ValueError("Prepared report evidence must contain canonical JSON.") from None
+        if (
+            type(payload) is not dict
+            or json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            != record.payload_json
+        ):
+            raise ValueError("Prepared report evidence must contain canonical JSON.")
+        if not _CANONICAL_REPORT_REQUIRED_FIELDS[record.key].issubset(payload):
+            raise ValueError("Prepared report evidence must be production-shaped.")
+
+
+@dataclass(frozen=True)
+class PreparedScientificSnapshot:
+    """A validated seven-turn scientific boundary reusable only by deep cloning."""
+
+    session: AgentSession
+    plan: WorkflowPlan
+    stage_results: tuple[StageResult, ...]
+    report: WorkflowReport
+    executors: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        if type(self.session) is not AgentSession or self.session.turn_count != 7:
+            raise ValueError("A prepared snapshot requires exactly seven hosted turns.")
+        _validate_prepared_messages(self.session.messages)
+        if self.session.state.phase is not WorkflowPhase.OPTIMIZED:
+            raise ValueError("A prepared snapshot requires an optimized scientific state.")
+        if (
+            type(self.plan) is not WorkflowPlan
+            or tuple(item.stage for item in self.plan.stages) != STAGES
+            or type(self.stage_results) is not tuple
+            or tuple(item.stage for item in self.stage_results) != STAGES
+            or any(type(item) is not StageResult for item in self.stage_results)
+        ):
+            raise ValueError("A prepared snapshot requires the exact six ordered stages.")
+        _validate_prepared_report(self.report)
+        required_executors = set(STAGES) | {"build_workflow_report"}
+        if (
+            type(self.executors) is not dict
+            or set(self.executors) != required_executors
+            or not all(callable(value) for value in self.executors.values())
+        ):
+            raise ValueError("Prepared executors must match the fixed workflow.")
+
+
 def _client(api_key: str) -> OpenAI:
     return OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key, max_retries=0)
 
@@ -2115,6 +2217,36 @@ class BoundedWorkflowController:
             self.objective_run,
             objective_evidence,
         )
+
+
+def clone_prepared_controller(
+    snapshot: PreparedScientificSnapshot,
+    *,
+    client: Any,
+) -> BoundedWorkflowController:
+    """Create one objective-clean controller from a deep-isolated scientific snapshot."""
+    if type(snapshot) is not PreparedScientificSnapshot:
+        raise TypeError("An exact prepared scientific snapshot is required.")
+    PreparedScientificSnapshot(
+        session=snapshot.session,
+        plan=snapshot.plan,
+        stage_results=snapshot.stage_results,
+        report=snapshot.report,
+        executors=snapshot.executors,
+    )
+    session = deepcopy(snapshot.session)
+    plan = WorkflowPlan.model_validate(deepcopy(snapshot.plan.model_dump()))
+    stage_results = list(deepcopy(snapshot.stage_results))
+    report = deepcopy(snapshot.report)
+    return BoundedWorkflowController(
+        session=session,
+        client=client,
+        executors=dict(snapshot.executors),
+        plan=plan,
+        stage_results=stage_results,
+        report=report,
+        objective_required=True,
+    )
 
 
 def _complete_scientific_loop(
