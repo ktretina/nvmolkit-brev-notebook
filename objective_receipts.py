@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from math import isclose, isfinite
 
 from demo_agent import ObjectiveProposal
-from objective_challenge import ObjectiveAttempt, ObjectiveSwap
+from objective_challenge import SCORE_TOLERANCE, ObjectiveAttempt, ObjectiveSwap
 
 
 @dataclass(frozen=True)
@@ -24,14 +24,15 @@ def objective_receipt(
         raise ValueError("Proposal does not match the objective schema.")
     selected_ids = repr(list(proposal.selected_ids))
     intervention = None
-    attempt_number = 1
-    selected_swap_value = "None"
     if selected_swap is None and prior_attempt is None:
         pass
     elif type(selected_swap) is not ObjectiveSwap or type(prior_attempt) is not ObjectiveAttempt:
         raise ValueError("Intervention provenance requires exact swap and prior attempt records.")
     else:
-        if prior_attempt.achieved is not False:
+        if (
+            prior_attempt.constraints_passed is not True
+            or prior_attempt.achieved is not False
+        ):
             raise ValueError("Intervention provenance requires a prior attempt below target.")
         if not _is_canonical_panel(prior_attempt.selected_ids):
             raise ValueError("Intervention provenance has an invalid prior panel.")
@@ -46,6 +47,7 @@ def objective_receipt(
             or not _is_canonical_panel(selected_swap.resulting_ids)
             or not _is_finite_float(selected_swap.predicted_score)
             or not _is_finite_float(selected_swap.score_delta)
+            or selected_swap.score_delta <= SCORE_TOLERANCE
         ):
             raise ValueError("Intervention provenance has invalid canonical values.")
         resulting_ids = selected_swap.resulting_ids
@@ -76,8 +78,6 @@ def objective_receipt(
             f"replace molecule_id={selected_swap.replace_id!r} "
             f"with molecule_id={selected_swap.replacement_id!r}"
         )
-        attempt_number = prior_attempt.attempt_number + 1
-        selected_swap_value = "selected_swap"
     return ObjectiveReceipt(
         validated_proposal=f"select_diverse_panel(selected_ids={selected_ids})",
         validated_intervention=intervention,
@@ -85,9 +85,9 @@ def objective_receipt(
             "result = evaluate_diverse_panel(\n"
             "    context,\n"
             "    tuple(proposal.selected_ids),\n"
-            f"    attempt_number={attempt_number},\n"
+            "    attempt_number=len(self.objective_attempts) + 1,\n"
             "    decision_basis=proposal.decision_basis,\n"
-            f"    selected_swap={selected_swap_value},\n"
+            "    selected_swap=self.pending_objective_swap,\n"
             ")"
         ),
     )

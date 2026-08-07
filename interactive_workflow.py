@@ -12,7 +12,10 @@ from pydantic import BaseModel, ValidationError
 
 import demo_agent
 from command_receipts import CommandReceipt, command_receipt
-from objective_challenge import MAX_ATTEMPTS, ObjectiveAttempt, ObjectiveSwap, objective_figures
+from objective_challenge import (
+    MAX_ATTEMPTS, SCORE_TOLERANCE, ObjectiveAttempt, ObjectiveSwap,
+    objective_figures,
+)
 from objective_receipts import objective_receipt
 
 
@@ -468,21 +471,20 @@ class InteractiveWorkflow:
 
     @staticmethod
     def _objective_summary_html(context, attempts, run=None) -> str:
-        precision = max(
-            (
-                InteractiveWorkflow._objective_precision(
-                    attempt.score,
-                    context.target_score,
-                    (
-                        attempt.score - context.baseline_score
-                        if attempt.selected_swap is None
-                        else attempt.selected_swap.score_delta
-                    ),
-                )
-                for attempt in attempts
-            ),
-            default=3,
+        display_values = tuple(
+            InteractiveWorkflow._objective_display_values(
+                attempt.score,
+                context.target_score,
+                (
+                    attempt.score - context.baseline_score
+                    if attempt.selected_swap is None
+                    else attempt.selected_swap.score_delta
+                ),
+            )
+            for attempt in attempts
         )
+        precision = max((values[3] for values in display_values), default=3)
+        scientific = any(values[4] for values in display_values)
         score_items = [
             (
                 "Baseline",
@@ -502,7 +504,8 @@ class InteractiveWorkflow:
             (
                 "<span style='display:inline-block;padding:6px 10px;margin:2px;"
                 "border:1px solid #aaa;border-radius:12px'>"
-                f"<b>{escape(label)}</b> {score:.{precision}f}<br>"
+                f"<b>{escape(label)}</b> "
+                f"{InteractiveWorkflow._objective_scalar(score, precision, scientific)}<br>"
                 f"<small>{escape(status)}</small></span>"
             )
             for label, score, status in score_items
@@ -530,7 +533,8 @@ class InteractiveWorkflow:
             "that maximize minimum pairwise Morgan/Tanimoto distance.</p>"
             "<p><b>Constraints:</b> four unique supplied IDs · four distinct fused "
             "Butina clusters · fixed fingerprint evidence · at most three attempts</p>"
-            f"<p><b>Target:</b> D_min ≥ {context.target_score:.{precision}f} "
+            "<p><b>Target:</b> D_min ≥ "
+            f"{InteractiveWorkflow._objective_scalar(context.target_score, precision, scientific)} "
             "(80% of attainable improvement over baseline)</p>"
             f"<div>{score_strip}</div>"
             f"<div aria-label='Objective decision ladder'>{decision_ladder}</div>{final}"
@@ -539,6 +543,11 @@ class InteractiveWorkflow:
     @staticmethod
     def _objective_attempt_row(context, attempt, prior_attempt=None) -> str:
         """Render one measured decision step without exposing model rationale."""
+        if (
+            not InteractiveWorkflow._is_finite_float(context.baseline_score)
+            or not InteractiveWorkflow._is_finite_float(context.target_score)
+        ):
+            raise ValueError("Objective attempt rows require finite context scores.")
         if type(attempt) is not ObjectiveAttempt:
             raise ValueError("Objective attempt rows require exact objective attempts.")
         if type(attempt.attempt_number) is not int or not 1 <= attempt.attempt_number <= MAX_ATTEMPTS:
@@ -547,14 +556,19 @@ class InteractiveWorkflow:
             raise ValueError("Objective attempt rows require canonical selected panels.")
         if not InteractiveWorkflow._is_finite_float(attempt.score):
             raise ValueError("Objective attempt rows require finite measured scores.")
+        if (
+            attempt.constraints_passed is not True
+            or type(attempt.achieved) is not bool
+            or attempt.achieved != (
+                attempt.score + SCORE_TOLERANCE >= context.target_score
+            )
+            or not InteractiveWorkflow._is_canonical_pair(attempt.limiting_pair)
+        ):
+            raise ValueError("Objective attempt rows require measured objective truth.")
         swap = attempt.selected_swap
         if attempt.attempt_number == 1:
             if swap is not None or prior_attempt is not None:
                 raise ValueError("The initial objective attempt cannot carry revision state.")
-            observation = (
-                f"baseline D_min {context.baseline_score:.3f}; "
-                f"current D_min {attempt.score:.3f}; initial agent proposal"
-            )
             action = f"Initial panel — {attempt.decision_basis}"
             delta = attempt.score - context.baseline_score
             accent = "#76B900" if attempt.achieved else "#6c757d"
@@ -568,9 +582,14 @@ class InteractiveWorkflow:
             if (
                 not InteractiveWorkflow._is_canonical_panel(prior_attempt.selected_ids)
                 or not InteractiveWorkflow._is_finite_float(prior_attempt.score)
+                or prior_attempt.constraints_passed is not True
+                or prior_attempt.achieved is not False
+                or not InteractiveWorkflow._is_canonical_pair(prior_attempt.limiting_pair)
                 or not InteractiveWorkflow._is_canonical_panel(swap.resulting_ids)
+                or not InteractiveWorkflow._is_canonical_pair(swap.limiting_pair)
                 or not InteractiveWorkflow._is_finite_float(swap.predicted_score)
                 or not InteractiveWorkflow._is_finite_float(swap.score_delta)
+                or swap.score_delta <= SCORE_TOLERANCE
                 or not InteractiveWorkflow._same_panel(swap.resulting_ids, attempt.selected_ids)
                 or swap.replacement_id not in swap.resulting_ids
                 or swap.replace_id in swap.resulting_ids
@@ -594,23 +613,33 @@ class InteractiveWorkflow:
                 )
             ):
                 raise ValueError("A revision does not match its prior measurement.")
-            observation = (
-                f"prior D_min {prior_attempt.score:.3f}; limiting pair {prior_attempt.limiting_pair[0]} / "
-                f"{prior_attempt.limiting_pair[1]}"
-            )
             action = (
                 f"replace {swap.replace_id} with {swap.replacement_id} — "
                 f"{attempt.decision_basis}"
             )
             delta = swap.score_delta
             accent = "#76B900" if attempt.achieved else "#D68A00"
-        precision = InteractiveWorkflow._objective_precision(
-            attempt.score, context.target_score, delta
+        score_text, target_text, delta_text, precision, scientific = (
+            InteractiveWorkflow._objective_display_values(
+                attempt.score, context.target_score, delta
+            )
         )
+        if attempt.attempt_number == 1:
+            observation = (
+                "baseline D_min "
+                f"{InteractiveWorkflow._objective_scalar(context.baseline_score, precision, scientific)}; "
+                f"current D_min {score_text}; initial agent proposal"
+            )
+        else:
+            observation = (
+                "prior D_min "
+                f"{InteractiveWorkflow._objective_scalar(prior_attempt.score, precision, scientific)}; "
+                f"limiting pair {prior_attempt.limiting_pair[0]} / {prior_attempt.limiting_pair[1]}"
+            )
         comparison = (
-            f"{attempt.score:.{precision}f} ≥ {context.target_score:.{precision}f}"
+            f"{score_text} ≥ {target_text}"
             if attempt.achieved
-            else f"{attempt.score:.{precision}f} < {context.target_score:.{precision}f}"
+            else f"{score_text} < {target_text}"
         )
         outcome = "Goal achieved" if attempt.achieved else "Revise"
         return (
@@ -619,7 +648,7 @@ class InteractiveWorkflow:
             f"<b>Attempt {attempt.attempt_number}</b> · {escape(outcome)}<br>"
             f"<small><b>Observe:</b> {escape(observation)}</small><br>"
             f"<small><b>Agent action:</b> {escape(action)}</small><br>"
-            f"<small><b>Measure:</b> D_min {attempt.score:.{precision}f} · Δ {delta:+.{precision}f} · {escape(comparison)}</small><br>"
+            f"<small><b>Measure:</b> D_min {score_text} · Δ {delta_text} · {escape(comparison)}</small><br>"
             f"<small><b>Outcome:</b> {escape(outcome)}</small>"
             "</section>"
         )
@@ -638,6 +667,37 @@ class InteractiveWorkflow:
         return 6
 
     @staticmethod
+    def _objective_display_values(
+        score: float, target: float, delta: float
+    ) -> tuple[str, str, str, int, bool]:
+        """Format one comparison without rounding a true difference away."""
+        precision = InteractiveWorkflow._objective_precision(score, target, delta)
+        comparison_scientific = (
+            score != target
+            and f"{score:.{precision}f}" == f"{target:.{precision}f}"
+        )
+        delta_scientific = delta != 0.0 and float(f"{delta:+.{precision}f}") == 0.0
+        if comparison_scientific or delta_scientific:
+            return (
+                f"{score:.17e}",
+                f"{target:.17e}",
+                f"{delta:+.12e}",
+                precision,
+                True,
+            )
+        return (
+            f"{score:.{precision}f}",
+            f"{target:.{precision}f}",
+            f"{delta:+.{precision}f}",
+            precision,
+            False,
+        )
+
+    @staticmethod
+    def _objective_scalar(value: float, precision: int, scientific: bool) -> str:
+        return f"{value:.17e}" if scientific else f"{value:.{precision}f}"
+
+    @staticmethod
     def _is_finite_float(value: object) -> bool:
         return type(value) is float and isfinite(value)
 
@@ -647,6 +707,14 @@ class InteractiveWorkflow:
             type(value) is tuple
             and len(value) == 4
             and len(set(value)) == len(value)
+            and all(type(molecule_id) is str for molecule_id in value)
+        )
+
+    @staticmethod
+    def _is_canonical_pair(value: object) -> bool:
+        return (
+            type(value) is tuple
+            and len(value) == 2
             and all(type(molecule_id) is str for molecule_id in value)
         )
 

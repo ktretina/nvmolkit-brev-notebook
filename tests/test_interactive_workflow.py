@@ -641,6 +641,108 @@ def test_objective_attempt_row_adapts_precision_without_erasing_near_threshold_d
     assert "Δ +0.0004" in row
 
 
+@pytest.mark.parametrize(
+    "attempt, prior, context",
+    [
+        (
+            lambda first, second: replace(first, constraints_passed=False),
+            lambda first, second: None,
+            lambda context: context,
+        ),
+        (
+            lambda first, second: replace(first, achieved=True),
+            lambda first, second: None,
+            lambda context: context,
+        ),
+        (
+            lambda first, second: replace(second, achieved=False),
+            lambda first, second: first,
+            lambda context: context,
+        ),
+        (
+            lambda first, second: second,
+            lambda first, second: replace(first, achieved=True),
+            lambda context: context,
+        ),
+        (
+            lambda first, second: replace(first, score=float("nan")),
+            lambda first, second: None,
+            lambda context: context,
+        ),
+        (
+            lambda first, second: first,
+            lambda first, second: None,
+            lambda context: SimpleNamespace(
+                baseline_score=float("inf"), target_score=context.target_score,
+            ),
+        ),
+    ],
+)
+def test_objective_attempt_row_rejects_false_domain_truth(attempt, prior, context):
+    objective_context, first, second = evaluated_objective_records()
+
+    with pytest.raises(ValueError):
+        InteractiveWorkflow._objective_attempt_row(
+            context(objective_context), attempt(first, second), prior(first, second)
+        )
+
+
+@pytest.mark.parametrize("delta", [0.0, -0.10])
+def test_objective_attempt_row_rejects_nonpositive_revision_delta(delta):
+    context, first, second = evaluated_objective_records()
+    no_op_swap = replace(
+        second.selected_swap,
+        predicted_score=first.score + delta,
+        score_delta=delta,
+    )
+    no_op = replace(
+        second,
+        score=first.score + delta,
+        achieved=False,
+        selected_swap=no_op_swap,
+    )
+
+    with pytest.raises(ValueError):
+        InteractiveWorkflow._objective_attempt_row(context, no_op, first)
+
+
+def test_objective_attempt_row_uses_scientific_notation_when_six_decimals_hide_truth():
+    context = SimpleNamespace(baseline_score=0.7099996, target_score=0.7100004)
+    prior = ObjectiveAttempt(
+        attempt_number=1,
+        selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
+        decision_basis="Measure the baseline.",
+        score=0.7099996,
+        limiting_pair=("mol-0", "mol-1"),
+        constraints_passed=True,
+        achieved=False,
+    )
+    swap = ObjectiveSwap(
+        replace_id="mol-1",
+        replacement_id="mol-5",
+        resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
+        predicted_score=0.7100000,
+        score_delta=0.0000004,
+        limiting_pair=("mol-0", "mol-2"),
+    )
+    attempt = ObjectiveAttempt(
+        attempt_number=2,
+        selected_ids=swap.resulting_ids,
+        decision_basis="Keep the measurable narrow improvement.",
+        score=0.7100000,
+        limiting_pair=swap.limiting_pair,
+        constraints_passed=True,
+        achieved=False,
+        selected_swap=swap,
+    )
+
+    row = InteractiveWorkflow._objective_attempt_row(context, attempt, prior)
+
+    assert "0.710000 &lt; 0.710000" not in row
+    assert "Δ +0.000000" not in row
+    assert "e-07" in row
+
+
 def test_known_objective_proposal_failure_after_measured_attempt_has_one_guarded_retry(monkeypatch):
     monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
     monkeypatch.setattr("interactive_workflow.objective_figures", lambda run, state: ())
