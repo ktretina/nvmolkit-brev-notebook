@@ -275,6 +275,104 @@ def test_build_context_uses_eight_distinct_mmff_eligible_clusters():
     assert context.distance_matrix.flags.writeable is False
 
 
+def test_build_context_canonicalizes_upstream_tolerated_directional_noise():
+    state = optimized_state()
+    state.similarity.tensor.values[0, 1] += 5e-8
+
+    context = build_objective_context(state)
+
+    assert np.array_equal(context.distance_matrix, context.distance_matrix.T)
+    assert context.distance_matrix.flags.owndata is True
+    assert context.distance_matrix.flags.writeable is False
+
+
+def _replace_context_candidates(
+    context: ObjectiveContext, candidates: tuple[ObjectiveCandidate, ...]
+) -> ObjectiveContext:
+    return replace(context, candidates=candidates)
+
+
+def test_objective_context_requires_exactly_eight_exact_candidates():
+    context = controlled_context(distances={}, default_distance=0.8)
+
+    with pytest.raises(ValueError, match="eight exact candidates"):
+        _replace_context_candidates(context, context.candidates[:-1])
+
+    class CandidateSubclass(ObjectiveCandidate):
+        pass
+
+    subclass = CandidateSubclass(**context.candidates[0].__dict__)
+    with pytest.raises(ValueError, match="eight exact candidates"):
+        _replace_context_candidates(context, (subclass, *context.candidates[1:]))
+
+
+def test_objective_context_rejects_duplicate_or_empty_candidate_ids():
+    context = controlled_context(distances={}, default_distance=0.8)
+
+    for molecule_id in ("", context.candidates[1].molecule_id):
+        candidates = (
+            replace(context.candidates[0], molecule_id=molecule_id),
+            *context.candidates[1:],
+        )
+        with pytest.raises(ValueError, match="molecule IDs"):
+            _replace_context_candidates(context, candidates)
+
+
+@pytest.mark.parametrize("field", ("molecule_index", "source_row"))
+def test_objective_context_rejects_ambiguous_candidate_provenance(field):
+    context = controlled_context(distances={}, default_distance=0.8)
+    candidates = (
+        replace(
+            context.candidates[0],
+            **{field: getattr(context.candidates[1], field)},
+        ),
+        *context.candidates[1:],
+    )
+
+    with pytest.raises(ValueError, match="provenance"):
+        _replace_context_candidates(context, candidates)
+
+
+def test_objective_context_rejects_boolean_or_negative_candidate_provenance():
+    context = controlled_context(distances={}, default_distance=0.8)
+
+    for field, value in (("molecule_index", True), ("source_row", -1)):
+        candidates = (
+            replace(context.candidates[0], **{field: value}),
+            *context.candidates[1:],
+        )
+        with pytest.raises(ValueError, match="provenance"):
+            _replace_context_candidates(context, candidates)
+
+
+def test_objective_context_requires_eight_distinct_cluster_ids():
+    context = controlled_context(distances={}, default_distance=0.8)
+    candidates = (
+        replace(
+            context.candidates[0], cluster_id=context.candidates[1].cluster_id
+        ),
+        *context.candidates[1:],
+    )
+
+    with pytest.raises(ValueError, match="cluster IDs"):
+        _replace_context_candidates(context, candidates)
+
+
+@pytest.mark.parametrize(
+    "baseline_ids",
+    (
+        ("mol-0", "mol-1", "mol-2"),
+        ("mol-0", "mol-1", "mol-2", "mol-2"),
+        ("mol-0", "mol-1", "mol-2", "outside"),
+    ),
+)
+def test_objective_context_rejects_invalid_or_out_of_pool_baseline(baseline_ids):
+    context = controlled_context(distances={}, default_distance=0.8)
+
+    with pytest.raises(ValueError, match="baseline"):
+        replace(context, baseline_ids=baseline_ids)
+
+
 def test_build_context_requires_optimized_state_and_eight_eligible_clusters():
     state = optimized_state()
     state.phase = WorkflowPhase.CLUSTERED
@@ -703,33 +801,26 @@ def test_rank_legal_swaps_rejects_forged_malformed_nonachieved_panels(selected_i
         )
 
 
-def test_rank_legal_swaps_rejects_cross_context_cluster_conflicts():
+def test_objective_context_rejects_cross_context_cluster_conflicts():
     context = build_objective_context(optimized_state())
-    conflicting_context = ObjectiveContext(
-        candidates=tuple(
-            ObjectiveCandidate(
-                molecule_id=candidate.molecule_id,
-                molecule_index=candidate.molecule_index,
-                source_row=candidate.source_row,
-                cluster_id=0
-                if candidate.molecule_id == "mol-1"
-                else candidate.cluster_id,
-            )
-            for candidate in context.candidates
-        ),
-        baseline_ids=context.baseline_ids,
-        baseline_score=context.baseline_score,
-        benchmark_score=context.benchmark_score,
-        target_score=context.target_score,
-        distance_matrix=context.distance_matrix,
-    )
-
-    with pytest.raises(ValueError):
-        rank_legal_swaps(
-            conflicting_context,
-            forged_nonachieved_attempt(
-                conflicting_context, conflicting_context.baseline_ids
+    with pytest.raises(ValueError, match="cluster IDs"):
+        ObjectiveContext(
+            candidates=tuple(
+                ObjectiveCandidate(
+                    molecule_id=candidate.molecule_id,
+                    molecule_index=candidate.molecule_index,
+                    source_row=candidate.source_row,
+                    cluster_id=0
+                    if candidate.molecule_id == "mol-1"
+                    else candidate.cluster_id,
+                )
+                for candidate in context.candidates
             ),
+            baseline_ids=context.baseline_ids,
+            baseline_score=context.baseline_score,
+            benchmark_score=context.benchmark_score,
+            target_score=context.target_score,
+            distance_matrix=context.distance_matrix,
         )
 
 

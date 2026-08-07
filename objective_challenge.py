@@ -66,6 +66,71 @@ class ObjectiveContext:
     distance_matrix: np.ndarray = field(compare=False, repr=False)
 
     def __post_init__(self) -> None:
+        if type(self.candidates) is not tuple or (
+            len(self.candidates) != CANDIDATE_COUNT
+            or any(
+                type(candidate) is not ObjectiveCandidate
+                for candidate in self.candidates
+            )
+        ):
+            raise ValueError("Objective context requires eight exact candidates.")
+        molecule_ids = tuple(candidate.molecule_id for candidate in self.candidates)
+        if (
+            any(
+                type(molecule_id) is not str or not molecule_id
+                for molecule_id in molecule_ids
+            )
+            or len(set(molecule_ids)) != CANDIDATE_COUNT
+        ):
+            raise ValueError(
+                "Objective candidate molecule IDs must be unique nonempty strings."
+            )
+        molecule_indices = tuple(
+            candidate.molecule_index for candidate in self.candidates
+        )
+        source_rows = tuple(candidate.source_row for candidate in self.candidates)
+        if any(
+            type(value) is not int or value < 0
+            for value in (*molecule_indices, *source_rows)
+        ) or any(
+            len(set(values)) != CANDIDATE_COUNT
+            for values in (molecule_indices, source_rows)
+        ):
+            raise ValueError(
+                "Objective candidate provenance must use unique nonnegative integers."
+            )
+        cluster_ids = tuple(candidate.cluster_id for candidate in self.candidates)
+        if (
+            any(
+                type(cluster_id) is not int or cluster_id < 0
+                for cluster_id in cluster_ids
+            )
+            or len(set(cluster_ids)) != CANDIDATE_COUNT
+        ):
+            raise ValueError("Objective candidates require eight distinct cluster IDs.")
+        candidates_by_id = {
+            candidate.molecule_id: candidate for candidate in self.candidates
+        }
+        if (
+            type(self.baseline_ids) is not tuple
+            or len(self.baseline_ids) != PANEL_SIZE
+            or any(type(molecule_id) is not str for molecule_id in self.baseline_ids)
+            or len(set(self.baseline_ids)) != PANEL_SIZE
+            or any(
+                molecule_id not in candidates_by_id
+                for molecule_id in self.baseline_ids
+            )
+            or len(
+                {
+                    candidates_by_id[molecule_id].cluster_id
+                    for molecule_id in self.baseline_ids
+                }
+            )
+            != PANEL_SIZE
+        ):
+            raise ValueError(
+                "Objective baseline requires four unique in-pool IDs from distinct clusters."
+            )
         try:
             source = np.asarray(self.distance_matrix)
             if not np.issubdtype(source.dtype, np.number) or np.issubdtype(
@@ -155,12 +220,14 @@ def build_objective_context(state: WorkflowState) -> ObjectiveContext:
     distance_matrix = np.array(
         1.0 - similarity[np.ix_(indices, indices)], dtype=float, copy=True
     )
+    distance_matrix = (distance_matrix + distance_matrix.T) / 2.0
     distance_matrix[np.diag_indices_from(distance_matrix)] = 0.0
     if not np.isfinite(distance_matrix).all() or np.any(
         (distance_matrix < -1e-7) | (distance_matrix > 1.0 + 1e-7)
     ):
         raise RuntimeError("Objective distance matrix invariants are invalid.")
     distance_matrix = np.clip(distance_matrix, 0.0, 1.0)
+    distance_matrix[np.diag_indices_from(distance_matrix)] = 0.0
     distance_matrix.setflags(write=False)
 
     provisional = ObjectiveContext(

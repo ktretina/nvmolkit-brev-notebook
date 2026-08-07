@@ -22,14 +22,16 @@ def test_gpu_acceptance_source_gates_default_objective_challenge():
         '"policy": "largest_clusters_first"',
         '"conformers_per_representative": 5',
         "begin_objective_challenge",
-        "benchmark_score > context.baseline_score",
+        "is_strict_improvement(",
+        "target_is_achieved(",
         "objective_suggestions",
-        "selected_swap.score_delta",
+        "selected_swap.predicted_score",
         "len(set(accepted_panels)) == len(accepted_panels)",
         'objective_evidence.key == "O01"',
         'termination_reason == "target_achieved"',
     ):
         assert required in source
+    assert "SCORE_TOLERANCE" not in source
 
 
 @pytest.mark.skipif(
@@ -53,9 +55,10 @@ def test_nvmolkit_gpu_workflow():
     )
     from demo_agent import BoundedWorkflowController, STAGES
     from objective_challenge import (
-        SCORE_TOLERANCE,
         evaluate_diverse_panel,
+        is_strict_improvement,
         rank_legal_swaps,
+        target_is_achieved,
     )
 
     assert torch.cuda.is_available(), "A CUDA-capable NVIDIA GPU is required."
@@ -181,7 +184,9 @@ def test_nvmolkit_gpu_workflow():
 
     context = controller.begin_objective_challenge()
     assert len(context.candidates) == 8
-    assert context.benchmark_score > context.baseline_score
+    assert is_strict_improvement(
+        context.benchmark_score, context.baseline_score
+    )
     candidate_ids = tuple(candidate.molecule_id for candidate in context.candidates)
     all_panels = tuple(itertools.combinations(candidate_ids, 4))
     assert len(all_panels) == 70
@@ -209,8 +214,9 @@ def test_nvmolkit_gpu_workflow():
             if not second.achieved:
                 next_suggestions = rank_legal_swaps(context, second)
                 assert any(
-                    suggestion.predicted_score + SCORE_TOLERANCE
-                    >= context.target_score
+                    target_is_achieved(
+                        suggestion.predicted_score, context.target_score
+                    )
                     for suggestion in next_suggestions
                 )
     assert len(below_target) == 35
@@ -232,7 +238,9 @@ def test_nvmolkit_gpu_workflow():
         if controller.objective_run is None:
             assert controller.objective_suggestions
             selected_swap = controller.objective_suggestions[0]
-            assert selected_swap.score_delta > 0
+            assert is_strict_improvement(
+                selected_swap.predicted_score, attempt.score
+            )
             completions.expected_names.append("select_diverse_panel")
             completions.arguments.append(
                 {
@@ -247,12 +255,14 @@ def test_nvmolkit_gpu_workflow():
     assert controller.objective_run is not None
     assert len(set(accepted_panels)) == len(accepted_panels)
     assert all(
-        later_score > earlier_score + SCORE_TOLERANCE
+        is_strict_improvement(later_score, earlier_score)
         for earlier_score, later_score in zip(accepted_scores, accepted_scores[1:])
     )
     assert 1 <= len(controller.objective_run.attempts) <= 3
     assert controller.objective_run.termination_reason == "target_achieved"
-    assert controller.objective_run.final_score >= context.target_score
+    assert target_is_achieved(
+        controller.objective_run.final_score, context.target_score
+    )
     assert controller.objective_evidence.key == "O01"
     assert controller.session.turn_count == 7 + len(accepted_panels)
     assert len(completions.calls) == 7 + len(accepted_panels)
