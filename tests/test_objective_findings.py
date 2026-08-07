@@ -495,3 +495,43 @@ def test_representation_reuse_requires_clustering_evidence_and_revalidation():
         validate_finding(
             replace(finding, evidence_keys=("E02", "E03", "O01")), snapshot
         )
+
+
+@pytest.mark.parametrize("selected_count", (1, 2))
+def test_snapshot_rejects_fewer_than_three_consistent_selected_representatives(
+    selected_count,
+):
+    report, run = report_and_run()
+    retained_ids = {f"mol-{index}" for index in range(selected_count)}
+    report = mutate_record(
+        report,
+        "E05",
+        lambda payload: payload.update(
+            selected_representative_count=selected_count,
+            selection_shortfall=4 - selected_count,
+            representatives=payload["representatives"][:selected_count],
+            generated_conformer_count=selected_count * 5,
+        ),
+    )
+    report = mutate_record(
+        report,
+        "E06",
+        lambda payload: payload.update(
+            attempted_conformer_count=selected_count * 5,
+            converged_conformer_count=selected_count * 5,
+            unconverged_conformer_count=0,
+            per_conformer_records=[
+                record
+                for record in payload["per_conformer_records"]
+                if record["molecule_id"] in retained_ids
+            ],
+            selected_conformer_records=[
+                record
+                for record in payload["selected_conformer_records"]
+                if record["molecule_id"] in retained_ids
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="selected representative"):
+        build_evidence_snapshot(report, run)

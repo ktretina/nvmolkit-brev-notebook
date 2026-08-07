@@ -445,10 +445,12 @@ def _build_summary(
     if not 3 <= requested_reps <= 6:
         raise ValueError("E05 representative count must be 3 through 6 inclusive.")
     if (
-        not 1 <= selected_reps <= requested_reps
+        not 3 <= selected_reps <= requested_reps
         or shortfall != requested_reps - selected_reps
     ):
-        raise ValueError("E05 selected and requested representative counts conflict.")
+        raise ValueError(
+            "E05 selected representative count must be 3 through the requested count."
+        )
     if not 3 <= per_rep <= 8:
         raise ValueError(
             "E05 conformers per representative must be 3 through 8 inclusive."
