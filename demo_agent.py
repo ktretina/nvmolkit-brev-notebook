@@ -421,6 +421,55 @@ _REQUIRED_OBJECTIVE_CONCLUSION_EVIDENCE = {
 }
 
 
+def _objective_conclusion_validation_feedback(
+    conclusion: ObjectiveSubmitConclusionArgs,
+    report: WorkflowReport,
+    objective_evidence: EvidenceRecord,
+) -> dict[str, Any]:
+    """Describe rejected objective metadata without retaining model-authored prose."""
+    expected_themes = tuple(_REQUIRED_OBJECTIVE_CONCLUSION_EVIDENCE)
+    actual_themes = [section.theme for section in conclusion.sections]
+    actual_theme_set = set(actual_themes)
+    duplicate_themes = [
+        theme for theme in expected_themes if actual_themes.count(theme) > 1
+    ]
+    missing_required: dict[str, list[str]] = {}
+    for theme in expected_themes:
+        sections = [section for section in conclusion.sections if section.theme == theme]
+        missing = {
+            key
+            for section in sections
+            for key in _REQUIRED_OBJECTIVE_CONCLUSION_EVIDENCE[theme]
+            if key not in section.evidence_keys
+        }
+        if missing:
+            missing_required[theme] = sorted(missing)
+
+    expected_keys = {record.key for record in report.evidence} | {
+        objective_evidence.key
+    }
+    cited_keys = {
+        key for section in conclusion.sections for key in section.evidence_keys
+    }
+    return {
+        "accepted": False,
+        "validation_issues": {
+            "missing_themes": [
+                theme for theme in expected_themes if theme not in actual_theme_set
+            ],
+            "extra_themes": sorted(actual_theme_set - set(expected_themes)),
+            "duplicate_themes": duplicate_themes,
+            "missing_required_evidence": missing_required,
+            "missing_evidence_keys": sorted(expected_keys - cited_keys),
+            "extra_evidence_keys": sorted(cited_keys - expected_keys),
+        },
+        "instruction": (
+            "Resubmit all seven themes with their required evidence_keys; "
+            "author the corrected evidence links without changing the evidence IDs."
+        ),
+    }
+
+
 def validate_conclusion(conclusion: SubmitSynthesisArgs, report: WorkflowReport) -> SubmitSynthesisArgs:
     """Check the synthesis schema and evidence links, not the truth of qualitative prose."""
     themes = [section.theme for section in conclusion.sections]
@@ -1276,9 +1325,18 @@ class BoundedWorkflowController:
             )
             if objective_active:
                 assert objective_evidence is not None
-                conclusion = validate_objective_conclusion(
-                    conclusion, scientific.report, objective_evidence
-                )
+                try:
+                    conclusion = validate_objective_conclusion(
+                        conclusion, scientific.report, objective_evidence
+                    )
+                except ConclusionValidationError:
+                    _append_tool_result(
+                        self.session,
+                        _objective_conclusion_validation_feedback(
+                            conclusion, scientific.report, objective_evidence
+                        ),
+                    )
+                    raise
             else:
                 conclusion = validate_conclusion(conclusion, scientific.report)
         except _HostedArgumentsValidationError:
