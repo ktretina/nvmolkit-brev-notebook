@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from html import escape
+from io import BytesIO
 from typing import Any
 
 import ipywidgets as widgets
@@ -102,7 +104,7 @@ class InteractiveWorkflow:
             ...,
         ] = ()
         self.objective_attempt_box = widgets.VBox()
-        self.objective_output = widgets.Output()
+        self.objective_output = widgets.VBox()
         self.workflow_result: Any | None = None
         self._active_proposal: demo_agent.StageProposal | None = None
         self._approved: BaseModel | None = None
@@ -485,7 +487,7 @@ class InteractiveWorkflow:
         changed = proposed_values != approved_values
         comparison = f"<p><b>Proposed:</b> {escape(str(proposed_values))}<br><b>Approved:</b> {escape(str(approved_values))}</p>" if changed else "<p>Proposal approved unchanged.</p>"
         metrics = {key: result.summary[key] for key in demo_agent._STAGE_METRICS[result.stage] if key in result.summary}
-        output = widgets.Output()
+        figure_box = widgets.VBox()
         completion = widgets.HTML(
             f"<h3>Completed: {escape(result.stage)}</h3>{comparison}"
             f"<b>Approved tool call</b><pre>{escape(receipt.approved_tool_call)}</pre>"
@@ -495,7 +497,7 @@ class InteractiveWorkflow:
         card = self.active_card
         if card is None:
             raise RuntimeError("Active proposal card was missing.")
-        card.children = (*card.children, completion, output)
+        card.children = (*card.children, completion, figure_box)
         self._detach_observers()
         self.completed_cards = (*self.completed_cards, card)
         self.completed_results = (*self.completed_results, result)
@@ -507,14 +509,30 @@ class InteractiveWorkflow:
         self.retry_button = None
         self.approve_button = None
         self._set_body()
+        rendered_figures = []
         for figure in result.figures:
             try:
-                with output:
-                    demo_agent._display_figure(figure)
+                rendered_figures.append(self._image_widget(figure))
             except Exception:
                 placeholder = "Figure unavailable in this notebook frontend."
-                card.children = (*card.children, widgets.HTML(f"<p>{placeholder}</p>"))
+                rendered_figures.append(widgets.HTML(f"<p>{placeholder}</p>"))
                 self._line(placeholder)
+        figure_box.children = tuple(rendered_figures)
+
+    @staticmethod
+    def _image_widget(figure: Any) -> widgets.Image:
+        """Persist a matplotlib or PIL/RDKit figure as standalone PNG bytes."""
+        png = BytesIO()
+        if callable(getattr(figure, "savefig", None)):
+            figure.savefig(png, format="png", dpi=120, bbox_inches="tight")
+        elif callable(getattr(figure, "save", None)):
+            figure.save(png, format="PNG")
+        else:
+            raise TypeError("Unsupported persistent figure type.")
+        value = png.getvalue()
+        if not value.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("Figure did not encode as PNG.")
+        return widgets.Image(value=value, format="png")
 
     @staticmethod
     def _objective_summary_html(context, decisions, run=None) -> str:
@@ -952,7 +970,7 @@ class InteractiveWorkflow:
         self.objective_attempt_cards = ()
         self.objective_decisions = ()
         self.objective_attempt_box = widgets.VBox()
-        self.objective_output = widgets.Output()
+        self.objective_output = widgets.VBox()
         self.objective_card = widgets.VBox(
             (
                 widgets.HTML("<h3>Objective-Driven Agent Challenge</h3>"),
@@ -1138,9 +1156,9 @@ class InteractiveWorkflow:
         )
         try:
             figures = objective_figures(run, self.controller.session.state)
-            with self.objective_output:
-                for figure in figures:
-                    demo_agent._display_figure(figure)
+            self.objective_output.children = tuple(
+                self._image_widget(figure) for figure in figures
+            )
         except Exception:
             placeholder = "Objective figures unavailable in this notebook frontend."
             self.objective_card.children = (
@@ -1164,25 +1182,113 @@ class InteractiveWorkflow:
                 self._stop()
             return
         self.workflow_result = result
-        sections = "".join(
-            f"<h4>{escape(section.theme.replace('_', ' ').title())}</h4>"
-            f"<p>{escape(demo_agent._presentation_text(section.prose))}</p>"
-            for section in result.conclusion.sections
-        )
-        conclusion = widgets.HTML(
-            "<h3>Evidence-Backed Conclusion</h3>"
-            "<h3>Schema-checked scientific conclusion</h3>"
-            f"<h4>{escape(demo_agent._presentation_text(result.conclusion.headline))}</h4>"
-            "<p>Python checks the response structure before rendering; Nemotron's "
-            "qualitative interpretation is not automatically fact-verified.</p>"
-            "<p>Python-rendered methods: 3D conformers use ETKDGv3; energies use MMFF94.</p>"
-            f"{sections}"
-        )
-        self.active_card = widgets.VBox((conclusion,))
+        try:
+            self._render_workflow_result(result.conclusion)
+        except Exception:
+            self.active_card = widgets.VBox((widgets.HTML(
+                "<h3>Evidence-Backed Conclusion</h3>"
+                "<p>Conclusion rendering unavailable in this notebook frontend. "
+                "The validated workflow result remains available.</p>"
+            ),))
+            self._line("Conclusion rendering unavailable in this notebook frontend.")
         self.status = "completed"
         self.retry_button = None
         self._line("Final synthesis complete")
         self._set_body()
+
+    def _render_workflow_result(self, conclusion: Any) -> None:
+        if isinstance(conclusion, demo_agent.EvidenceControlledConclusion):
+            conclusion = demo_agent.validate_evidence_controlled_conclusion(conclusion)
+            snapshot = conclusion.evidence_snapshot
+            catalog = demo_agent.build_finding_catalog_from_snapshot(snapshot)
+            summary = conclusion.measured_summary
+            if conclusion.finding_selection_status == "finding_selection_unavailable":
+                global_label = "agent-selected emphasis unavailable"
+            else:
+                global_label = "evidence-controlled measured findings"
+            facts = "".join(f"<li>{escape(fact)}</li>" for fact in summary.facts)
+            measured_summary = self._measured_summary_html(summary)
+            findings = []
+            for finding in conclusion.ordered_findings:
+                demo_agent.validate_finding(finding, snapshot)
+                if conclusion.finding_selection_status == "finding_selection_unavailable":
+                    label = "deterministic fallback finding"
+                elif len(catalog.ids_for_theme(finding.theme)) > 1:
+                    label = "agent-selected evidence emphasis"
+                else:
+                    label = "required measured finding"
+                findings.append(
+                    f"<h4>{escape(finding.theme.replace('_', ' ').title())}</h4>"
+                    f"<p><b>{escape(label)}</b></p>"
+                    f"<p>{escape(finding.text)}</p>"
+                )
+            content = widgets.HTML(
+                "<h3>Evidence-Backed Conclusion</h3>"
+                "<h3>Measured evidence-controlled conclusion</h3>"
+                f"<h4>{escape(summary.headline)}</h4>"
+                f"<p><b>{escape(global_label)}</b></p>"
+                f"<ul>{facts}</ul>{measured_summary}{''.join(findings)}"
+            )
+        else:
+            sections = "".join(
+                f"<h4>{escape(section.theme.replace('_', ' ').title())}</h4>"
+                f"<p>{escape(demo_agent._presentation_text(section.prose))}</p>"
+                for section in conclusion.sections
+            )
+            content = widgets.HTML(
+                "<h3>Evidence-Backed Conclusion</h3>"
+                "<h3>Schema-checked scientific conclusion</h3>"
+                f"<h4>{escape(demo_agent._presentation_text(conclusion.headline))}</h4>"
+                "<p>Python checks the response structure before rendering; Nemotron's "
+                "qualitative interpretation is not automatically fact-verified.</p>"
+                "<p>Python-rendered methods: 3D conformers use ETKDGv3; energies use MMFF94.</p>"
+                f"{sections}"
+            )
+        self.active_card = widgets.VBox((content,))
+        self._set_body()
+
+    @staticmethod
+    def _measured_summary_html(summary: demo_agent.MeasuredSummary) -> str:
+        """Render the complete required quantitative conclusion state deterministically."""
+        if type(summary) is not demo_agent.MeasuredSummary:
+            raise ValueError("Measured summary rendering requires the exact summary type.")
+        limiting_pairs = "; ".join(
+            f"{first} / {second}: Tanimoto {similarity}"
+            for (first, second), similarity in zip(
+                summary.limiting_pairs,
+                summary.limiting_similarities,
+                strict=True,
+            )
+        )
+        rows = []
+        for field in fields(summary):
+            raw_value = getattr(summary, field.name)
+            value = str(raw_value)
+            if field.name == "optimization_comparison_scope":
+                value = (
+                    "within molecule among converged sampled conformers; "
+                    f"recorded scope: {raw_value}"
+                )
+            elif field.name == "limiting_pairs":
+                value = f"{raw_value}; paired similarities: {limiting_pairs}"
+            rows.append((field.name, field.name.replace("_", " ").title(), value))
+        body = "".join(
+            f'<tr data-field="{escape(field_name)}">'
+            f"<th>{escape(label)}</th><td>{escape(value)}</td></tr>"
+            for field_name, label, value in rows
+        )
+        return (
+            '<h4>Deterministic Measured Summary</h4>'
+            f'<table class="measured-summary"><tbody>{body}</tbody></table>'
+        )
+
+    def reconstruct_completed_view(self) -> widgets.VBox:
+        """Rebuild the persistent conclusion from the retained result only."""
+        if self.workflow_result is None:
+            raise ValueError("No completed workflow result is available.")
+        self._render_workflow_result(self.workflow_result.conclusion)
+        assert self.active_card is not None
+        return self.active_card
 
     def _retry_synthesis(self, button: widgets.Button) -> None:
         if self._busy or self.status != "synthesis_failed" or button is not self.retry_button or button.disabled:

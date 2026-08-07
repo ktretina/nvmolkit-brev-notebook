@@ -392,6 +392,66 @@ def report_and_run(
     return evidence_report(), run
 
 
+def catalog(reason: str | TerminationReason = TerminationReason.TARGET_ACHIEVED):
+    from objective_findings import build_finding_catalog
+
+    report, run = report_and_run(reason)
+    return build_finding_catalog(report, run)
+
+
+def finding_selection(
+    finding_catalog=None,
+    *,
+    reverse: bool = False,
+):
+    from objective_findings import CONCLUSION_THEMES
+
+    finding_catalog = finding_catalog or catalog()
+    ids = [finding_catalog.ids_for_theme(theme)[0] for theme in CONCLUSION_THEMES]
+    if reverse:
+        ids.reverse()
+    return {"ordered_finding_ids": ids}
+
+
+def completed_terminal_controller(client, reason=TerminationReason.TARGET_ACHIEVED):
+    import demo_agent
+    from chemistry_workflow import StageResult
+
+    report, run = report_and_run(reason)
+    accepted_count = len(run.attempts)
+    session = demo_agent.AgentSession(
+        messages=[
+            {"role": "system", "content": "bounded chemistry agent"},
+            {"role": "user", "content": "analyze"},
+        ],
+        state=optimized_state(),
+        turn_count=7 + accepted_count,
+    )
+    plan = demo_agent.WorkflowPlan(stages=[
+        {"stage": stage, "rationale": f"Run {stage}."}
+        for stage in demo_agent.STAGES
+    ])
+    return demo_agent.BoundedWorkflowController(
+        session=session,
+        client=client,
+        executors={},
+        plan=plan,
+        stage_results=[
+            StageResult(stage, stage, {}) for stage in demo_agent.STAGES
+        ],
+        report=report,
+        objective_required=True,
+        objective_context=run.context,
+        objective_attempts=list(run.attempts),
+        accepted_attempt_count=accepted_count,
+        selection_response_count=accepted_count,
+        provider_request_attempt_count=accepted_count,
+        objective_run=run,
+        objective_evidence=build_objective_evidence(run),
+        objective_prompt_appended=True,
+    )
+
+
 BOUNDARY_CASES = (
     (0.5000000000004, 0.5, False),
     (0.5000000000005, 0.5, True),

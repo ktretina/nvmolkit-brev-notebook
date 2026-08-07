@@ -58,6 +58,16 @@ from objective_challenge import (
     target_is_achieved,
     terminal_objective_run,
 )
+from objective_findings import (
+    CONCLUSION_THEMES,
+    EvidenceFinding,
+    EvidenceSnapshot,
+    FindingCatalog,
+    MeasuredSummary,
+    build_evidence_snapshot,
+    build_finding_catalog_from_snapshot,
+    validate_finding,
+)
 
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
@@ -297,6 +307,91 @@ class ObjectiveSubmitConclusionArgs(_StrictModel):
     sections: list[ObjectiveConclusionSection] = Field(min_length=7, max_length=7)
 
 
+class FindingSelection(_StrictModel):
+    ordered_finding_ids: list[
+        Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    ] = Field(min_length=7, max_length=7)
+
+
+@dataclass(frozen=True)
+class EvidenceControlledConclusion:
+    evidence_snapshot: EvidenceSnapshot
+    measured_summary: MeasuredSummary
+    ordered_findings: tuple[EvidenceFinding, ...]
+    finding_selection_status: Literal["selected", "finding_selection_unavailable"]
+
+    def __post_init__(self) -> None:
+        if type(self.evidence_snapshot) is not EvidenceSnapshot:
+            raise ValueError("Conclusion requires an exact evidence snapshot.")
+        if self.measured_summary is not self.evidence_snapshot.summary:
+            raise ValueError("Conclusion summary must come from its evidence snapshot.")
+        if type(self.ordered_findings) is not tuple or len(self.ordered_findings) != 7:
+            raise ValueError("Conclusion requires exactly seven findings.")
+        if len({finding.finding_id for finding in self.ordered_findings}) != 7:
+            raise ValueError("Conclusion finding IDs must be unique.")
+        if {finding.theme for finding in self.ordered_findings} != set(CONCLUSION_THEMES):
+            raise ValueError("Conclusion requires exactly one finding per theme.")
+        for finding in self.ordered_findings:
+            validate_finding(finding, self.evidence_snapshot)
+        catalog = build_finding_catalog_from_snapshot(self.evidence_snapshot)
+        if any(finding.finding_id not in catalog.ids for finding in self.ordered_findings):
+            raise ValueError("Conclusion findings must belong to the current catalog.")
+        if self.finding_selection_status not in {
+            "selected", "finding_selection_unavailable"
+        }:
+            raise ValueError("Conclusion selection status is invalid.")
+        if (
+            self.finding_selection_status == "finding_selection_unavailable"
+            and tuple(finding.finding_id for finding in self.ordered_findings)
+            != tuple(catalog.ids_for_theme(theme)[0] for theme in CONCLUSION_THEMES)
+        ):
+            raise ValueError("Fallback findings must use canonical theme-order choices.")
+
+
+FindingSelectionFailureReason = Literal[
+    "authentication_failure",
+    "permission_failure",
+    "transport_failure",
+    "provider_failure",
+    "malformed_response",
+    "local_validation_failure",
+]
+
+
+@dataclass(frozen=True)
+class FindingSelectionAudit:
+    provider_response_count: int
+    failure_reason: FindingSelectionFailureReason | None
+    failure_detail: str | None
+
+    def __post_init__(self) -> None:
+        if self.provider_response_count not in (0, 1):
+            raise ValueError("Finding-selection response count must be zero or one.")
+        if (self.failure_reason is None) != (self.failure_detail is None):
+            raise ValueError("Finding-selection failure reason and detail must agree.")
+
+
+@dataclass(frozen=True)
+class _FindingSelectionOutcome:
+    findings: tuple[EvidenceFinding, ...] | None
+    audit: FindingSelectionAudit
+
+
+def validate_evidence_controlled_conclusion(
+    conclusion: EvidenceControlledConclusion,
+) -> EvidenceControlledConclusion:
+    """Re-run every immutable-container invariant at a later trust boundary."""
+    if type(conclusion) is not EvidenceControlledConclusion:
+        raise ValueError("Conclusion validation requires the exact conclusion type.")
+    EvidenceControlledConclusion(
+        evidence_snapshot=conclusion.evidence_snapshot,
+        measured_summary=conclusion.measured_summary,
+        ordered_findings=conclusion.ordered_findings,
+        finding_selection_status=conclusion.finding_selection_status,
+    )
+    return conclusion
+
+
 TOOL_ARGUMENT_MODELS: dict[str, type[BaseModel]] = {
     "inspect_library": InspectionArgs,
     "generate_morgan_fingerprints": FingerprintArgs,
@@ -314,6 +409,7 @@ TOOL_DESCRIPTIONS = {
     "embed_representative_conformers": "Choose bounded sampling parameters and run nvMolKit conformer embedding on the GPU.",
     "optimize_conformers_mmff94": "Run nvMolKit MMFF94 conformer optimization on the GPU.",
     "select_next_panel_swap": "Select one state-bound tied-maximum action from the current deterministic menu.",
+    "select_evidence_findings": "Select exactly one measured finding for each conclusion theme and order the selected finding IDs by evidence emphasis.",
     "submit_synthesis": "Submit one grounded qualitative synthesis; keep evidence IDs only in evidence_keys fields.",
 }
 
@@ -381,11 +477,12 @@ class WorkflowResult:
     messages: tuple[dict[str, Any], ...]
     report: WorkflowReport
     plan: WorkflowPlan
-    conclusion: SubmitSynthesisArgs | ObjectiveSubmitConclusionArgs
+    conclusion: SubmitSynthesisArgs | ObjectiveSubmitConclusionArgs | EvidenceControlledConclusion
     stage_results: tuple[StageResult, ...]
     turn_count: int = 8
     objective_run: ObjectiveRun | None = None
     objective_evidence: EvidenceRecord | None = None
+    finding_selection_audit: FindingSelectionAudit | None = None
 
 
 @dataclass(frozen=True)
@@ -597,6 +694,8 @@ def validate_objective_conclusion(
 def _tool_definition(
     name: str,
     model: type[BaseModel],
+    *,
+    finding_ids: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     parameters = model.model_json_schema()
     parameters["additionalProperties"] = False
@@ -628,6 +727,18 @@ def _tool_definition(
             "anyOf": section_branches
         }
         parameters.pop("$defs", None)
+    if name == "select_evidence_findings" and model is FindingSelection:
+        if (
+            type(finding_ids) is not tuple
+            or not finding_ids
+            or any(type(finding_id) is not str for finding_id in finding_ids)
+            or len(finding_ids) != len(set(finding_ids))
+        ):
+            raise ValueError("Finding selection schema requires unique current catalog IDs.")
+        parameters["properties"]["ordered_finding_ids"]["items"] = {
+            "type": "string",
+            "enum": list(finding_ids),
+        }
     return {
         "type": "function",
         "function": {
@@ -637,6 +748,185 @@ def _tool_definition(
             "parameters": parameters,
         },
     }
+
+
+def _canonical_findings(
+    catalog: FindingCatalog,
+    snapshot: EvidenceSnapshot,
+) -> tuple[EvidenceFinding, ...]:
+    by_id = {finding.finding_id: finding for finding in catalog.findings}
+    findings = tuple(
+        by_id[catalog.ids_for_theme(theme)[0]] for theme in CONCLUSION_THEMES
+    )
+    for finding in findings:
+        validate_finding(finding, snapshot)
+    return findings
+
+
+def _validate_finding_selection(
+    selection: FindingSelection,
+    catalog: FindingCatalog,
+    snapshot: EvidenceSnapshot,
+) -> tuple[EvidenceFinding, ...]:
+    ids = tuple(selection.ordered_finding_ids)
+    if len(ids) != 7 or len(set(ids)) != 7:
+        raise ValueError("Finding selection requires exactly seven unique IDs.")
+    by_id = {finding.finding_id: finding for finding in catalog.findings}
+    try:
+        findings = tuple(by_id[finding_id] for finding_id in ids)
+    except KeyError as error:
+        raise ValueError("Finding selection used an ID outside the current catalog.") from error
+    if {finding.theme for finding in findings} != set(CONCLUSION_THEMES):
+        raise ValueError("Finding selection requires exactly one finding per theme.")
+    for finding in findings:
+        validate_finding(finding, snapshot)
+    return findings
+
+
+def _finding_catalog_prompt(catalog: FindingCatalog) -> str:
+    return _serialize({
+        "instruction": (
+            "Select exactly one current finding per conclusion theme. Order the seven "
+            "IDs by the evidence emphasis you want presented. Do not write prose."
+        ),
+        "findings": [
+            {
+                "finding_id": finding.finding_id,
+                "theme": finding.theme,
+                "evidence_keys": list(finding.evidence_keys),
+                "text": finding.text,
+            }
+            for finding in catalog.findings
+        ],
+    })
+
+
+def _request_finding_selection(
+    session: AgentSession,
+    client: Any,
+    catalog: FindingCatalog,
+    snapshot: EvidenceSnapshot,
+) -> _FindingSelectionOutcome:
+    """Make one hosted request; pair every representable real call and never retry."""
+    try:
+        tool = _tool_definition(
+            "select_evidence_findings",
+            FindingSelection,
+            finding_ids=catalog.ids,
+        )
+    except Exception:
+        return _FindingSelectionOutcome(None, FindingSelectionAudit(
+            0,
+            "local_validation_failure",
+            "The finding-selection request could not be validated locally.",
+        ))
+    try:
+        response = client.chat.completions.create(
+            model=DEFAULT_MODEL,
+            messages=session.messages,
+            tools=[tool],
+            tool_choice={
+                "type": "function",
+                "function": {"name": "select_evidence_findings"},
+            },
+            extra_body=NEMOTRON_TOOL_EXTRA_BODY,
+            temperature=0.0,
+            max_tokens=400,
+            stream=False,
+        )
+    except Exception as error:
+        if isinstance(error, AuthenticationError):
+            reason: FindingSelectionFailureReason = "authentication_failure"
+            try:
+                _raise_request_error(error)
+            except ValueError as safe_error:
+                detail = str(safe_error)
+        elif isinstance(error, PermissionDeniedError):
+            reason = "permission_failure"
+            try:
+                _raise_request_error(error)
+            except ValueError as safe_error:
+                detail = str(safe_error)
+        elif isinstance(error, (httpx.TransportError, APIConnectionError)):
+            reason = "transport_failure"
+            detail = _REQUEST_ERROR
+        else:
+            reason = "provider_failure"
+            detail = _REQUEST_ERROR
+        return _FindingSelectionOutcome(
+            None, FindingSelectionAudit(0, reason, detail)
+        )
+
+    try:
+        message = response.choices[0].message
+    except (AttributeError, IndexError, TypeError):
+        return _FindingSelectionOutcome(None, FindingSelectionAudit(
+            1,
+            "malformed_response",
+            "The finding-selection response did not contain an assistant message.",
+        ))
+    assistant = BoundedWorkflowController._objective_assistant_payload(message)
+    session.messages.append(assistant)
+    session.turn_count += 1
+    calls = getattr(message, "tool_calls", None)
+    call_ids = tuple(
+        call_id
+        for call in calls
+        if isinstance((call_id := getattr(call, "id", None)), str)
+        and call_id.strip()
+    ) if isinstance(calls, (list, tuple)) else ()
+
+    selected: tuple[EvidenceFinding, ...] | None = None
+    accepted_id: str | None = None
+    failure_reason: FindingSelectionFailureReason | None = "malformed_response"
+    failure_detail: str | None = (
+        "The finding-selection response failed strict envelope or schema validation."
+    )
+    if isinstance(calls, (list, tuple)) and len(calls) == 1:
+        call = calls[0]
+        call_id = getattr(call, "id", None)
+        function = getattr(call, "function", None)
+        raw_arguments = getattr(function, "arguments", None)
+        try:
+            if (
+                getattr(call, "type", None) != "function"
+                or not isinstance(call_id, str)
+                or not call_id.strip()
+                or getattr(function, "name", None) != "select_evidence_findings"
+                or not isinstance(raw_arguments, str)
+            ):
+                raise ValueError
+            decoded = json.loads(raw_arguments)
+            selection = FindingSelection.model_validate(decoded)
+        except (json.JSONDecodeError, ValidationError, ValueError, TypeError):
+            selected = None
+        else:
+            try:
+                selected = _validate_finding_selection(selection, catalog, snapshot)
+            except ValueError:
+                failure_reason = "local_validation_failure"
+                failure_detail = (
+                    "The finding selection did not satisfy the current evidence catalog."
+                )
+            else:
+                accepted_id = call_id
+                failure_reason = None
+                failure_detail = None
+
+    for call_id in call_ids:
+        accepted = selected is not None and call_id == accepted_id
+        session.messages.append({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": _serialize({
+                "accepted": accepted,
+                "status": "selected" if accepted else "rejected",
+            }),
+        })
+    return _FindingSelectionOutcome(
+        selected,
+        FindingSelectionAudit(1, failure_reason, failure_detail),
+    )
 
 
 def _raise_request_error(error: Exception) -> None:
@@ -1062,6 +1352,8 @@ class BoundedWorkflowController:
     objective_run: ObjectiveRun | None = None
     objective_evidence: EvidenceRecord | None = None
     objective_prompt_appended: bool = False
+    evidence_controlled_conclusion: EvidenceControlledConclusion | None = None
+    finding_selection_audit: FindingSelectionAudit | None = None
 
     @classmethod
     def create(
@@ -1751,73 +2043,67 @@ class BoundedWorkflowController:
         objective_evidence = self.objective_evidence if objective_active else None
         if objective_active and objective_evidence is None:
             raise ToolCallError("The objective evidence record is missing.")
+        if objective_active:
+            assert self.objective_run is not None
+            if self.evidence_controlled_conclusion is None:
+                snapshot = build_evidence_snapshot(scientific.report, self.objective_run)
+                catalog = build_finding_catalog_from_snapshot(snapshot)
+                if not self.synthesis_prompt_appended:
+                    self.session.messages.append({
+                        "role": "user",
+                        "content": _finding_catalog_prompt(catalog),
+                    })
+                    self.synthesis_prompt_appended = True
+                outcome = _request_finding_selection(
+                    self.session, self.client, catalog, snapshot
+                )
+                selected = outcome.findings
+                self.finding_selection_audit = outcome.audit
+                status: Literal["selected", "finding_selection_unavailable"]
+                if selected is None:
+                    selected = _canonical_findings(catalog, snapshot)
+                    status = "finding_selection_unavailable"
+                else:
+                    status = "selected"
+                self.evidence_controlled_conclusion = EvidenceControlledConclusion(
+                    evidence_snapshot=snapshot,
+                    measured_summary=snapshot.summary,
+                    ordered_findings=selected,
+                    finding_selection_status=status,
+                )
+            return WorkflowResult(
+                tuple(self.session.messages),
+                scientific.report,
+                scientific.plan,
+                self.evidence_controlled_conclusion,
+                scientific.stage_results,
+                self.session.turn_count,
+                self.objective_run,
+                objective_evidence,
+                self.finding_selection_audit,
+            )
         if not self.synthesis_prompt_appended:
             evidence_records = list(scientific.report.evidence)
-            if objective_evidence is not None:
-                evidence_records.append(objective_evidence)
             evidence = _serialize(
                 {"evidence": [item.__dict__ for item in evidence_records]}
             )
             prompt = _SYNTHESIS_PROMPT
-            if objective_active:
-                prompt += (
-                    " Add one objective_driven_selection section grounded in O01. "
-                    "Describe structural-library coverage only, and preserve whether the "
-                    "target was achieved or the attempt limit was reached."
-                )
             self.session.messages.append(
                 {"role": "user", "content": prompt + "\n" + evidence}
             )
             self.synthesis_prompt_appended = True
         try:
-            conclusion_model = (
-                ObjectiveSubmitConclusionArgs if objective_active else SubmitSynthesisArgs
-            )
+            conclusion_model = SubmitSynthesisArgs
             conclusion = _request_call(
                 self.session,
                 self.client,
                 "submit_synthesis",
                 conclusion_model,
                 DEFAULT_MODEL,
-                _max_turns=MAX_OBJECTIVE_SYNTHESIS_TURNS if objective_active else 8,
+                _max_turns=8,
             )
-            if objective_active:
-                assert objective_evidence is not None
-                try:
-                    conclusion = validate_objective_conclusion(
-                        conclusion, scientific.report, objective_evidence
-                    )
-                except ConclusionValidationError:
-                    _append_tool_result(
-                        self.session,
-                        _objective_conclusion_validation_feedback(
-                            conclusion, scientific.report, objective_evidence
-                        ),
-                    )
-                    raise
-            else:
-                conclusion = validate_conclusion(conclusion, scientific.report)
+            conclusion = validate_conclusion(conclusion, scientific.report)
         except _HostedArgumentsValidationError as error:
-            if objective_active:
-                bounded_issues = _bounded_objective_synthesis_issues(error.issues)
-                rejected = _HostedArgumentsValidationError(
-                    error.stage, bounded_issues, error.call_id
-                )
-                _append_rejected_hosted_call(self.session, rejected)
-                _append_tool_result(
-                    self.session,
-                    {
-                        "accepted": False,
-                        "validation_issues": [
-                            {"field": field, "error_type": error_type}
-                            for field, error_type in bounded_issues
-                        ],
-                        "instruction": (
-                            "Resubmit a valid seven-theme objective conclusion using "
-                            "only the allowed evidence_keys."
-                        ),
-                    },
-                )
             raise ConclusionValidationError(scientific.report) from None
         return WorkflowResult(
             tuple(self.session.messages),

@@ -1,5 +1,7 @@
 import inspect
-from dataclasses import replace
+import re
+from io import BytesIO
+from dataclasses import fields, replace
 from html import escape
 from types import SimpleNamespace
 
@@ -7,6 +9,7 @@ import httpx
 import ipywidgets as widgets
 import numpy as np
 import pytest
+from PIL import Image as PILImage
 from openai import AuthenticationError
 
 import demo_agent
@@ -19,14 +22,19 @@ from objective_challenge import (
     ObjectiveAttempt, ObjectiveCandidate, ObjectiveContext, ObjectiveSwap,
     TerminationReason,
     TARGET_FRACTION, accepted_maxima, build_action_menu, evaluate_selected_swap,
-    measure_panel, score_key,
+    build_objective_evidence, measure_panel, score_key, terminal_objective_run,
 )
 from objective_fixtures import (
     BOUNDARY_CASES, controlled_context_with_action_count,
     controlled_context_without_improving_swaps, two_revision_context,
+    evidence_report, report_and_run,
+)
+from objective_findings import (
+    FindingCatalog, build_evidence_snapshot, build_finding_catalog_from_snapshot,
 )
 from objective_receipts import objective_receipt
 from interactive_workflow import InteractiveWorkflow, controls_for
+from ipywidgets.embed import dependency_state, embed_minimal_html
 
 
 def connect_error(label="objective transport failure"):
@@ -204,6 +212,62 @@ class Controller:
                     prose="The measured panel reached the bounded target. O01",
                 ),),
             ),
+            objective_run=self.objective_run,
+            objective_evidence=self.objective_evidence,
+        )
+
+
+class EvidenceConclusionController(Controller):
+    def __init__(self, finding_selection_status="selected"):
+        super().__init__()
+        self.finding_selection_status = finding_selection_status
+
+    def execute_objective_attempt(self, selection):
+        attempt = super().execute_objective_attempt(selection)
+        if attempt.achieved:
+            self.objective_run = terminal_objective_run(
+                self.objective_context,
+                tuple(self.objective_attempts),
+                TerminationReason.TARGET_ACHIEVED,
+            )
+            self.objective_evidence = build_objective_evidence(self.objective_run)
+        return attempt
+
+    def request_synthesis(self):
+        self.calls.append("synthesis")
+        self.report = evidence_report()
+        self.synthesis_prompt_appended = True
+        if self.synthesis_failures:
+            raise self.synthesis_failures.pop(0)
+        snapshot = build_evidence_snapshot(self.report, self.objective_run)
+        current_catalog = build_finding_catalog_from_snapshot(snapshot)
+        if self.finding_selection_status == "selected":
+            findings = tuple(
+                next(
+                    item for item in reversed(current_catalog.findings)
+                    if item.theme == theme
+                )
+                for theme in demo_agent.CONCLUSION_THEMES
+            )
+        else:
+            findings = tuple(
+                next(item for item in current_catalog.findings if item.theme == theme)
+                for theme in demo_agent.CONCLUSION_THEMES
+            )
+        conclusion = demo_agent.EvidenceControlledConclusion(
+            evidence_snapshot=snapshot,
+            measured_summary=snapshot.summary,
+            ordered_findings=findings,
+            finding_selection_status=self.finding_selection_status,
+        )
+        self.session.turn_count += 1
+        return demo_agent.WorkflowResult(
+            messages=(),
+            report=self.report,
+            plan=self.plan,
+            conclusion=conclusion,
+            stage_results=tuple(self.stage_results),
+            turn_count=self.session.turn_count,
             objective_run=self.objective_run,
             objective_evidence=self.objective_evidence,
         )
@@ -958,6 +1022,186 @@ def test_conclusion_factual_text_persists_in_html_value(monkeypatch):
     assert not any(isinstance(child, widgets.Output) for child in workflow.active_card.children)
 
 
+@pytest.mark.parametrize(
+    "finding_selection_status",
+    ["selected", "finding_selection_unavailable"],
+)
+def test_completed_real_workflow_root_survives_embed_with_ladder_conclusion_and_png(
+    monkeypatch, tmp_path, finding_selection_status
+):
+    from matplotlib.figure import Figure
+
+    controller = EvidenceConclusionController(finding_selection_status)
+    matplotlib_figure = Figure(figsize=(1, 1))
+    matplotlib_figure.subplots().plot([0, 1], [1, 0])
+    monkeypatch.setattr(
+        "interactive_workflow.objective_figures",
+        lambda run, state: (
+            PILImage.new("RGB", (4, 3), "green"),
+            matplotlib_figure,
+        ),
+    )
+    workflow, _ = started(controller)
+    complete_six_stages(workflow)
+    workflow.objective_button.click()
+
+    assert workflow.status == "completed"
+    assert isinstance(workflow.workflow_result, demo_agent.WorkflowResult)
+    assert isinstance(workflow.workflow_result.conclusion, demo_agent.EvidenceControlledConclusion)
+    target = tmp_path / "embedded.html"
+    embed_minimal_html(
+        target,
+        views=[workflow.root],
+        title="Evidence conclusion",
+        state=dependency_state([workflow.root]),
+    )
+    rendered = target.read_text(encoding="utf-8")
+    for text in (
+        "Step 0",
+        "Candidate actions",
+        "Nemotron choice",
+        "Evidence-Backed Conclusion",
+    ):
+        assert text in rendered
+    assert rendered.count("iVBOR") == 2
+    if finding_selection_status == "selected":
+        assert rendered.count("agent-selected evidence emphasis") == 7
+        assert "agent-selected emphasis unavailable" not in rendered
+    else:
+        assert "agent-selected emphasis unavailable" in rendered
+        assert rendered.count("deterministic fallback finding") == 7
+        assert "agent-selected evidence emphasis" not in rendered
+
+
+def test_unavailable_conclusion_never_claims_agent_selection(monkeypatch):
+    report, run = report_and_run()
+    snapshot = build_evidence_snapshot(report, run)
+    catalog = build_finding_catalog_from_snapshot(snapshot)
+    findings = tuple(
+        next(item for item in catalog.findings if item.theme == theme)
+        for theme in demo_agent.CONCLUSION_THEMES
+    )
+    conclusion = demo_agent.EvidenceControlledConclusion(
+        snapshot, snapshot.summary, findings, "finding_selection_unavailable"
+    )
+    workflow = ready_interactive_workflow()
+    workflow._render_workflow_result(conclusion)
+
+    rendered = combined_html(workflow.active_card)
+    assert "agent-selected emphasis unavailable" in rendered
+    assert rendered.count("deterministic fallback finding") == 7
+    assert "agent-selected evidence emphasis" not in rendered
+
+
+def test_selected_single_catalog_option_is_labeled_required_measured_finding(monkeypatch):
+    report, run = report_and_run()
+    snapshot = build_evidence_snapshot(report, run)
+    complete_catalog = build_finding_catalog_from_snapshot(snapshot)
+    single_theme = demo_agent.CONCLUSION_THEMES[0]
+    retained = []
+    for finding in complete_catalog.findings:
+        if finding.theme != single_theme or not any(
+            prior.theme == single_theme for prior in retained
+        ):
+            retained.append(finding)
+    reduced_catalog = FindingCatalog(tuple(retained))
+    findings = tuple(
+        next(item for item in reduced_catalog.findings if item.theme == theme)
+        for theme in demo_agent.CONCLUSION_THEMES
+    )
+    monkeypatch.setattr(
+        demo_agent,
+        "build_finding_catalog_from_snapshot",
+        lambda supplied: reduced_catalog,
+    )
+    conclusion = demo_agent.EvidenceControlledConclusion(
+        snapshot, snapshot.summary, findings, "selected"
+    )
+
+    workflow = ready_interactive_workflow()
+    workflow._render_workflow_result(conclusion)
+    rendered = combined_html(workflow.active_card)
+    assert rendered.count("required measured finding") == 1
+    assert rendered.count("agent-selected evidence emphasis") == 6
+
+
+def test_measured_summary_table_is_complete_deterministic_and_precedes_findings():
+    report, run = report_and_run()
+    snapshot = build_evidence_snapshot(report, run)
+    current_catalog = build_finding_catalog_from_snapshot(snapshot)
+    canonical = tuple(
+        next(item for item in current_catalog.findings if item.theme == theme)
+        for theme in demo_agent.CONCLUSION_THEMES
+    )
+    alternate = tuple(
+        next(
+            item for item in reversed(current_catalog.findings)
+            if item.theme == theme
+        )
+        for theme in demo_agent.CONCLUSION_THEMES
+    )
+    conclusions = (
+        demo_agent.EvidenceControlledConclusion(
+            snapshot, snapshot.summary, canonical, "finding_selection_unavailable"
+        ),
+        demo_agent.EvidenceControlledConclusion(
+            snapshot, snapshot.summary, canonical, "selected"
+        ),
+        demo_agent.EvidenceControlledConclusion(
+            snapshot, snapshot.summary, alternate, "selected"
+        ),
+    )
+    tables = []
+    for conclusion in conclusions:
+        workflow = ready_interactive_workflow()
+        workflow._render_workflow_result(conclusion)
+        rendered = combined_html(workflow.active_card)
+        table = re.search(
+            r'<table class="measured-summary">.*?</table>', rendered, re.DOTALL
+        ).group(0)
+        tables.append(table)
+        assert rendered.index(table) < rendered.index(conclusion.ordered_findings[0].text)
+
+    assert tables[0] == tables[1] == tables[2]
+    summary = snapshot.summary
+    limiting = "; ".join(
+        f"{first} / {second}: Tanimoto {similarity}"
+        for (first, second), similarity in zip(
+            summary.limiting_pairs, summary.limiting_similarities, strict=True
+        )
+    )
+    for field in fields(summary):
+        value = getattr(summary, field.name)
+        row = re.search(
+            rf'<tr data-field="{field.name}">.*?</tr>', tables[0], re.DOTALL
+        )
+        assert row is not None, field.name
+        assert escape(str(value)) in row.group(0), field.name
+    assert "within molecule among converged sampled conformers" in tables[0]
+    assert limiting in tables[0]
+
+
+def test_render_revalidates_the_entire_retained_conclusion_container():
+    report, run = report_and_run()
+    snapshot = build_evidence_snapshot(report, run)
+    catalog = build_finding_catalog_from_snapshot(snapshot)
+    findings = tuple(
+        next(item for item in catalog.findings if item.theme == theme)
+        for theme in demo_agent.CONCLUSION_THEMES
+    )
+    conclusion = demo_agent.EvidenceControlledConclusion(
+        snapshot, snapshot.summary, findings, "finding_selection_unavailable"
+    )
+    object.__setattr__(
+        conclusion,
+        "measured_summary",
+        replace(snapshot.summary, headline="Forged success headline"),
+    )
+
+    with pytest.raises(ValueError, match="snapshot"):
+        ready_interactive_workflow()._render_workflow_result(conclusion)
+
+
 def test_objective_card_retains_attempts_receipts_scores_and_limiting_pairs(monkeypatch):
     monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
     monkeypatch.setattr("interactive_workflow.objective_figures", lambda run, state: ())
@@ -1419,14 +1663,23 @@ def test_figure_render_failure_keeps_completed_result_and_advances(monkeypatch):
 
 def test_conclusion_render_failure_retains_result_and_completion(monkeypatch):
     controller = Controller()
-    monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: (_ for _ in ()).throw(RuntimeError("CONCLUSION-SECRET")))
+    original = InteractiveWorkflow._render_workflow_result
+    monkeypatch.setattr(
+        InteractiveWorkflow,
+        "_render_workflow_result",
+        lambda self, conclusion: (_ for _ in ()).throw(RuntimeError("CONCLUSION-SECRET")),
+    )
     workflow, _ = started(controller)
     complete_six_stages(workflow)
     workflow.objective_button.click()
     assert workflow.status == "completed" and workflow.workflow_result is not None
     assert workflow.retry_button is None and controller.calls.count("synthesis") == 1
-    assert "Schema-checked scientific conclusion" in html_text(workflow.active_card)
+    assert "Conclusion rendering unavailable" in html_text(workflow.active_card)
     assert "CONCLUSION-SECRET" not in workflow.transcript_text
+    monkeypatch.setattr(InteractiveWorkflow, "_render_workflow_result", original)
+    rebuilt = workflow.reconstruct_completed_view()
+    assert "Schema-checked scientific conclusion" in html_text(rebuilt)
+    assert controller.calls.count("synthesis") == 1
 
 
 def test_completed_control_observers_are_detached():

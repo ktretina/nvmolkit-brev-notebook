@@ -1,6 +1,6 @@
 import json
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import fields, replace
 from types import SimpleNamespace
 
 import httpx
@@ -20,7 +20,11 @@ from chemistry_workflow import (
 )
 from objective_challenge import accepted_maxima, build_action_menu, measure_panel, rank_legal_swaps
 from objective_fixtures import (
+    catalog,
+    completed_terminal_controller,
     controlled_context_with_ranked_swaps,
+    finding_selection,
+    evidence_report,
     quantized_baseline_target_context,
     two_revision_context,
 )
@@ -87,6 +91,258 @@ class FakeCompletions:
 
 
 AUTO_SELECTION = object()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"ordered_finding_ids": [f"F{index}" for index in range(6)]},
+        {"ordered_finding_ids": [f"F{index}" for index in range(8)]},
+        {"ordered_finding_ids": [f"F{index}" for index in range(7)], "extra": True},
+    ],
+)
+def test_finding_selection_is_strict_and_has_one_bounded_field(payload):
+    assert tuple(demo_agent.FindingSelection.model_fields) == ("ordered_finding_ids",)
+    with pytest.raises(demo_agent.ValidationError):
+        demo_agent.FindingSelection.model_validate(payload)
+
+
+def test_evidence_controlled_conclusion_has_exact_frozen_public_fields():
+    assert demo_agent.EvidenceControlledConclusion.__dataclass_params__.frozen is True
+    assert tuple(field.name for field in fields(demo_agent.EvidenceControlledConclusion)) == (
+        "evidence_snapshot",
+        "measured_summary",
+        "ordered_findings",
+        "finding_selection_status",
+    )
+
+
+def test_finding_selection_schema_enumerates_only_current_catalog_ids():
+    current_catalog = catalog()
+    completions = FakeCompletions([
+        response("select_evidence_findings", finding_selection(current_catalog))
+    ])
+    controller = completed_terminal_controller(
+        SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    )
+
+    result = controller.request_synthesis()
+
+    parameters = completions.calls[0]["tools"][0]["function"]["parameters"]
+    assert parameters["required"] == ["ordered_finding_ids"]
+    assert parameters["properties"]["ordered_finding_ids"]["items"]["enum"] == list(
+        current_catalog.ids
+    )
+    assert parameters["properties"]["ordered_finding_ids"]["minItems"] == 7
+    assert parameters["properties"]["ordered_finding_ids"]["maxItems"] == 7
+    assert result.conclusion.finding_selection_status == "selected"
+    assert tuple(item.finding_id for item in result.conclusion.ordered_findings) == tuple(
+        finding_selection(current_catalog)["ordered_finding_ids"]
+    )
+    assert (
+        result.conclusion.measured_summary.headline
+        == result.conclusion.evidence_snapshot.summary.headline
+    )
+    assert result.finding_selection_audit == demo_agent.FindingSelectionAudit(
+        provider_response_count=1,
+        failure_reason=None,
+        failure_detail=None,
+    )
+    assert len(completions.calls) == 1
+
+
+def test_invalid_real_finding_call_is_paired_then_uses_deterministic_fallback():
+    current_catalog = catalog()
+    invalid = finding_selection(current_catalog)
+    invalid["ordered_finding_ids"][-1] = invalid["ordered_finding_ids"][0]
+    completions = FakeCompletions([
+        response("select_evidence_findings", invalid)
+    ])
+    controller = completed_terminal_controller(
+        SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    )
+
+    result = controller.request_synthesis()
+
+    assert result.conclusion.finding_selection_status == "finding_selection_unavailable"
+    assert tuple(item.theme for item in result.conclusion.ordered_findings) == tuple(
+        demo_agent.CONCLUSION_THEMES
+    )
+    assistant, rejected = result.messages[-2:]
+    assert assistant["tool_calls"][0]["function"]["name"] == "select_evidence_findings"
+    assert rejected["role"] == "tool"
+    assert rejected["tool_call_id"] == assistant["tool_calls"][0]["id"]
+    assert json.loads(rejected["content"])["accepted"] is False
+    assert len(completions.calls) == 1
+
+
+def test_finding_selection_transport_failure_has_no_fabricated_call_and_falls_back():
+    completions = FakeCompletions([connect_error()])
+    controller = completed_terminal_controller(
+        SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    )
+    before = tuple(controller.session.messages)
+
+    result = controller.request_synthesis()
+
+    assert result.conclusion.finding_selection_status == "finding_selection_unavailable"
+    assert not any(message["role"] == "assistant" for message in result.messages[len(before):])
+    assert len(completions.calls) == 1
+
+
+def test_finding_selection_no_tool_call_falls_back_without_fabricating_assistant():
+    completions = FakeCompletions([content_response("No tool call was returned.")])
+    controller = completed_terminal_controller(
+        SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    )
+    before = len(controller.session.messages)
+
+    result = controller.request_synthesis()
+
+    assert result.conclusion.finding_selection_status == "finding_selection_unavailable"
+    new_messages = result.messages[before:]
+    assistant = next(message for message in new_messages if message["role"] == "assistant")
+    assert assistant == {
+        "role": "assistant",
+        "content": "No tool call was returned.",
+    }
+    assert not any(message["role"] == "tool" for message in new_messages)
+    assert result.finding_selection_audit.failure_reason == "malformed_response"
+    assert result.finding_selection_audit.provider_response_count == 1
+    assert len(completions.calls) == 1
+
+
+def test_invalid_finding_selection_preserves_achieved_run_and_o01_headline():
+    invalid = finding_selection()
+    invalid["ordered_finding_ids"][-1] = invalid["ordered_finding_ids"][0]
+    completions = FakeCompletions([
+        response("select_evidence_findings", invalid)
+    ])
+    controller = completed_terminal_controller(
+        SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    )
+
+    result = controller.request_synthesis()
+
+    assert result.objective_run.achieved is True
+    assert result.conclusion.finding_selection_status == "finding_selection_unavailable"
+    assert result.conclusion.measured_summary.headline.startswith("Target achieved:")
+
+
+def test_finding_selection_missing_id_only_preserves_response_and_counts_once():
+    arguments = json.dumps(finding_selection())
+    completions = FakeCompletions([envelope_response([
+        {
+            "id": None,
+            "type": "function",
+            "name": "select_evidence_findings",
+            "arguments": arguments,
+        }
+    ], content="actual assistant content")])
+    controller = completed_terminal_controller(
+        SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    )
+    before = len(controller.session.messages)
+
+    result = controller.request_synthesis()
+
+    new_messages = result.messages[before:]
+    assistant = next(message for message in new_messages if message["role"] == "assistant")
+    assert assistant == {
+        "role": "assistant",
+        "content": "actual assistant content",
+        "tool_calls": [{
+            "id": None,
+            "type": "function",
+            "function": {
+                "name": "select_evidence_findings",
+                "arguments": arguments,
+            },
+        }],
+    }
+    assert not any(message["role"] == "tool" for message in new_messages)
+    assert result.finding_selection_audit.provider_response_count == 1
+    assert result.finding_selection_audit.failure_reason == "malformed_response"
+
+
+def test_finding_selection_mixed_calls_preserve_exact_envelope_and_pair_real_ids_in_order():
+    calls = [
+        {"id": None, "type": "function", "name": None, "arguments": None},
+        {"id": "call-b", "type": "other", "name": "wrong", "arguments": 17},
+        {"id": "call-c", "type": "function", "name": "select_evidence_findings", "arguments": "{bad"},
+    ]
+    completions = FakeCompletions([envelope_response(calls, content="provider content")])
+    controller = completed_terminal_controller(
+        SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    )
+    before = len(controller.session.messages)
+
+    result = controller.request_synthesis()
+
+    new_messages = result.messages[before:]
+    assistant_index = next(
+        index for index, message in enumerate(new_messages)
+        if message["role"] == "assistant"
+    )
+    assistant = new_messages[assistant_index]
+    assert assistant["content"] == "provider content"
+    assert assistant["tool_calls"] == [
+        {
+            "id": call["id"],
+            "type": call["type"],
+            "function": {"name": call["name"], "arguments": call["arguments"]},
+        }
+        for call in calls
+    ]
+    tools = new_messages[assistant_index + 1:]
+    assert [message["tool_call_id"] for message in tools] == ["call-b", "call-c"]
+    assert all(json.loads(message["content"])["accepted"] is False for message in tools)
+    assert result.finding_selection_audit.provider_response_count == 1
+    assert result.finding_selection_audit.failure_reason == "malformed_response"
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason", "detail"),
+    [
+        (lambda: request_error(401, AuthenticationError), "authentication_failure", demo_agent.AUTH_GUIDANCE),
+        (lambda: request_error(403, PermissionDeniedError), "permission_failure", demo_agent.AUTH_GUIDANCE),
+        (lambda: connect_error("SECRET transport detail"), "transport_failure", demo_agent._REQUEST_ERROR),
+    ],
+)
+def test_finding_selection_provider_failures_have_secret_safe_audit_categories(
+    failure, reason, detail
+):
+    completions = FakeCompletions([failure()])
+    controller = completed_terminal_controller(
+        SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    )
+
+    result = controller.request_synthesis()
+
+    assert result.conclusion.finding_selection_status == "finding_selection_unavailable"
+    assert result.finding_selection_audit is controller.finding_selection_audit
+    assert result.finding_selection_audit.failure_reason == reason
+    assert result.finding_selection_audit.failure_detail == detail
+    assert "SECRET" not in result.finding_selection_audit.failure_detail
+    assert result.finding_selection_audit.provider_response_count == 0
+
+
+def test_invalid_finding_ids_are_distinct_local_validation_failure():
+    invalid = finding_selection()
+    invalid["ordered_finding_ids"][-1] = invalid["ordered_finding_ids"][0]
+    completions = FakeCompletions([
+        response("select_evidence_findings", invalid)
+    ])
+    controller = completed_terminal_controller(
+        SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    )
+
+    result = controller.request_synthesis()
+
+    assert result.finding_selection_audit.failure_reason == "local_validation_failure"
+    assert result.finding_selection_audit.provider_response_count == 1
+    assert "finding" in result.finding_selection_audit.failure_detail.lower()
+    assert len(completions.calls) == 1
 
 
 def connect_error(label="objective transport failure"):
@@ -174,10 +430,7 @@ def optimized_state(*, baseline_optimal=False):
 
 
 def full_report():
-    return WorkflowReport(tuple(
-        EvidenceRecord(f"E0{number}", f"Evidence {number}", "{}", "test")
-        for number in range(1, 7)
-    ))
+    return evidence_report()
 
 
 def completed_controller(objective_responses, *, baseline_optimal=False):
@@ -1270,7 +1523,7 @@ def test_objective_required_controller_blocks_conclusion_until_termination():
 def test_objective_conclusion_includes_o01_and_uses_the_extended_turn_budget():
     controller, completions = completed_controller([
         *safe_objective_proposals(),
-        response("submit_synthesis", objective_conclusion_arguments()),
+        response("select_evidence_findings", finding_selection()),
     ])
     controller.begin_objective_challenge()
     execute_safe_objective(controller)
@@ -1279,199 +1532,125 @@ def test_objective_conclusion_includes_o01_and_uses_the_extended_turn_budget():
 
     assert result.objective_run.achieved is True
     assert result.objective_evidence.key == "O01"
-    assert len(result.conclusion.sections) == 7
-    assert result.conclusion.sections[5].theme == "objective_driven_selection"
+    assert len(result.conclusion.ordered_findings) == 7
+    assert result.conclusion.evidence_snapshot.records[-1].key == "O01"
     assert result.turn_count == 9
     synthesis_call = completions.calls[-1]
-    assert synthesis_call["tools"][0]["function"]["name"] == "submit_synthesis"
-    supplied = controller.session.messages[-2]["content"]
+    assert synthesis_call["tools"][0]["function"]["name"] == "select_evidence_findings"
+    supplied = controller.session.messages[-3]["content"]
     assert "O01" in supplied
 
 
 def test_invalid_objective_conclusion_appends_sanitized_paired_feedback():
+    invalid = finding_selection()
+    invalid["ordered_finding_ids"][-1] = invalid["ordered_finding_ids"][0]
     controller, completions = completed_controller([
         *safe_objective_proposals(),
-        response("submit_synthesis", live_invalid_objective_conclusion_arguments()),
+        response("select_evidence_findings", invalid),
     ])
     controller.begin_objective_challenge()
     execute_safe_objective(controller)
 
-    objective_run = controller.objective_run
-    objective_evidence = controller.objective_evidence
-    with pytest.raises(demo_agent.ConclusionValidationError) as error:
-        controller.request_synthesis()
+    result = controller.request_synthesis()
 
     assistant, feedback = controller.session.messages[-2:]
     assert assistant["role"] == "assistant"
-    assert assistant["tool_calls"][0]["function"]["name"] == "submit_synthesis"
+    assert assistant["tool_calls"][0]["function"]["name"] == "select_evidence_findings"
     assert feedback["role"] == "tool"
     assert feedback["tool_call_id"] == assistant["tool_calls"][0]["id"]
-    assert json.loads(feedback["content"]) == {
-        "accepted": False,
-        "instruction": (
-            "Resubmit all seven themes with their required evidence_keys; "
-            "author the corrected evidence links without changing the evidence IDs."
-        ),
-        "validation_issues": {
-            "duplicate_themes": [],
-            "extra_evidence_keys": [],
-            "extra_themes": [],
-            "missing_evidence_keys": ["O01"],
-            "missing_required_evidence": {
-                "conformational_sampling": ["E06"],
-                "limitations_and_next_steps": ["O01"],
-                "objective_driven_selection": ["O01"],
-            },
-            "missing_themes": [],
-        },
-    }
-    assert "prose" not in feedback["content"]
-    assert error.value.report is controller.report
-    assert controller.objective_run is objective_run
-    assert controller.objective_evidence is objective_evidence
+    assert json.loads(feedback["content"]) == {"accepted": False, "status": "rejected"}
+    assert result.conclusion.finding_selection_status == "finding_selection_unavailable"
     assert controller.session.turn_count == 9
     assert len(completions.calls) == 2
 
 
 def test_objective_conclusion_feedback_reports_missing_and_duplicate_themes():
-    invalid = objective_conclusion_arguments()
-    invalid["sections"][5] = {
-        "theme": "dataset_scope",
-        "prose": "A duplicate dataset section.",
-        "evidence_keys": ["E01"],
-    }
+    invalid = finding_selection()
+    invalid["ordered_finding_ids"][-1] = "F02"
     controller, _ = completed_controller([
         *safe_objective_proposals(),
-        response("submit_synthesis", invalid),
+        response("select_evidence_findings", invalid),
     ])
     controller.begin_objective_challenge()
     execute_safe_objective(controller)
 
-    with pytest.raises(demo_agent.ConclusionValidationError):
-        controller.request_synthesis()
+    result = controller.request_synthesis()
 
-    issues = json.loads(controller.session.messages[-1]["content"])["validation_issues"]
-    assert issues["missing_themes"] == ["objective_driven_selection"]
-    assert issues["duplicate_themes"] == ["dataset_scope"]
-    assert issues["extra_themes"] == []
-    assert issues["missing_evidence_keys"] == []
-    assert issues["extra_evidence_keys"] == []
+    assert result.conclusion.finding_selection_status == "finding_selection_unavailable"
+    assert tuple(item.theme for item in result.conclusion.ordered_findings) == demo_agent.CONCLUSION_THEMES
 
 
 def test_objective_conclusion_retry_uses_feedback_and_succeeds_with_exact_coverage():
+    invalid = finding_selection()
+    invalid["ordered_finding_ids"][0] = "UNKNOWN"
     controller, completions = completed_controller([
         *safe_objective_proposals(),
-        response("submit_synthesis", live_invalid_objective_conclusion_arguments()),
-        response("submit_synthesis", objective_conclusion_arguments()),
+        response("select_evidence_findings", invalid),
+        response("select_evidence_findings", finding_selection()),
     ])
     controller.begin_objective_challenge()
     execute_safe_objective(controller)
 
-    with pytest.raises(demo_agent.ConclusionValidationError):
-        controller.request_synthesis()
     result = controller.request_synthesis()
+    repeated = controller.request_synthesis()
 
-    assert result.turn_count == 10 <= demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS
-    assert {key for section in result.conclusion.sections for key in section.evidence_keys} == {
-        "E01", "E02", "E03", "E04", "E05", "E06", "O01",
-    }
-    rejected_assistant, rejected_feedback = result.messages[-3:-1]
-    assert rejected_assistant["role"] == "assistant"
-    assert rejected_feedback["role"] == "tool"
-    assert rejected_feedback["tool_call_id"] == rejected_assistant["tool_calls"][0]["id"]
-    assert completions.calls[-1]["messages"][-2] == rejected_feedback
-    first_schema = completions.calls[-2]["tools"][0]["function"]["parameters"]
-    retry_schema = completions.calls[-1]["tools"][0]["function"]["parameters"]
-    assert retry_schema == first_schema
-    assert len(retry_schema["properties"]["sections"]["items"]["anyOf"]) == 7
+    assert result.conclusion.finding_selection_status == "finding_selection_unavailable"
+    assert repeated.conclusion is result.conclusion
+    assert len(completions.calls) == 2
 
 
 def test_valid_first_objective_conclusion_does_not_append_feedback():
     controller, _ = completed_controller([
         *safe_objective_proposals(),
-        response("submit_synthesis", objective_conclusion_arguments()),
+        response("select_evidence_findings", finding_selection()),
     ])
     controller.begin_objective_challenge()
     execute_safe_objective(controller)
 
     result = controller.request_synthesis()
 
-    assert result.messages[-1]["role"] == "assistant"
-    assert result.messages[-1]["tool_calls"][0]["function"]["name"] == "submit_synthesis"
+    assert result.messages[-1]["role"] == "tool"
+    assert json.loads(result.messages[-1]["content"])["accepted"] is True
 
 
 def test_schema_invalid_objective_conclusion_gets_paired_feedback_then_retries():
     controller, completions = completed_controller([
         *safe_objective_proposals(),
-        response("submit_synthesis", schema_invalid_objective_conclusion_arguments()),
-        response("submit_synthesis", objective_conclusion_arguments()),
+        raw_response("select_evidence_findings", "{malformed"),
+        response("select_evidence_findings", finding_selection()),
     ])
     controller.begin_objective_challenge()
     execute_safe_objective(controller)
-
-    with pytest.raises(demo_agent.ConclusionValidationError):
-        controller.request_synthesis()
-
-    rejected, feedback = controller.session.messages[-2:]
-    assert rejected["role"] == "assistant"
-    assert rejected["tool_calls"][0]["id"] == "call-submit_synthesis"
-    assert json.loads(rejected["tool_calls"][0]["function"]["arguments"]) == {
-        "validation_issues": [
-            {"error_type": "literal_error", "field": "sections.item.theme"},
-            {
-                "error_type": "literal_error",
-                "field": "sections.item.evidence_keys.item",
-            },
-        ]
-    }
-    assert feedback["role"] == "tool"
-    assert feedback["tool_call_id"] == rejected["tool_calls"][0]["id"]
-    assert json.loads(feedback["content"]) == {
-        "accepted": False,
-        "instruction": (
-            "Resubmit a valid seven-theme objective conclusion using only the "
-            "allowed evidence_keys."
-        ),
-        "validation_issues": [
-            {"error_type": "literal_error", "field": "sections.item.theme"},
-            {
-                "error_type": "literal_error",
-                "field": "sections.item.evidence_keys.item",
-            },
-        ],
-    }
-    assert "bogus_theme" not in json.dumps((rejected, feedback))
-    assert "UNKNOWN" not in json.dumps((rejected, feedback))
-    assert controller.session.turn_count == 9
 
     result = controller.request_synthesis()
 
-    assert result.turn_count == 10 <= demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS
-    assert result.messages[-3:-1] == (rejected, feedback)
-    assert completions.calls[-1]["messages"][-2] == feedback
+    rejected, feedback = controller.session.messages[-2:]
+    assert rejected["role"] == "assistant"
+    assert rejected["tool_calls"][0]["id"] == "call-select_evidence_findings"
+    assert feedback["role"] == "tool"
+    assert feedback["tool_call_id"] == rejected["tool_calls"][0]["id"]
+    assert json.loads(feedback["content"]) == {"accepted": False, "status": "rejected"}
+    assert result.conclusion.finding_selection_status == "finding_selection_unavailable"
+    assert controller.session.turn_count == 9
+    assert len(completions.calls) == 2
 
 
 def test_schema_invalid_objective_conclusions_consume_the_bounded_turns():
-    invalid_responses = [
-        response("submit_synthesis", schema_invalid_objective_conclusion_arguments())
-        for _ in range(5)
+    calls = [
+        {"id": "call-a", "type": "function", "name": "wrong_tool", "arguments": "{}"},
+        {"id": "call-b", "type": "function", "name": "select_evidence_findings", "arguments": "[]"},
     ]
     controller, completions = completed_controller([
         *safe_objective_proposals(),
-        *invalid_responses,
+        envelope_response(calls),
     ])
     controller.begin_objective_challenge()
     execute_safe_objective(controller)
 
-    for expected_turn in range(9, demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS + 1):
-        with pytest.raises(demo_agent.ConclusionValidationError):
-            controller.request_synthesis()
-        assert controller.session.turn_count == expected_turn
-        assert controller.session.messages[-2]["role"] == "assistant"
-        assert controller.session.messages[-1]["role"] == "tool"
+    result = controller.request_synthesis()
 
-    with pytest.raises(demo_agent.ToolCallError):
-        controller.request_synthesis()
-
-    assert controller.session.turn_count == demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS
-    assert len(completions.calls) == 6
+    assert result.conclusion.finding_selection_status == "finding_selection_unavailable"
+    assistant, first, second = result.messages[-3:]
+    assert [item["id"] for item in assistant["tool_calls"]] == ["call-a", "call-b"]
+    assert [first["tool_call_id"], second["tool_call_id"]] == ["call-a", "call-b"]
+    assert len(completions.calls) == 2
