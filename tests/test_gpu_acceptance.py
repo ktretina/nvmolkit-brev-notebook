@@ -20,6 +20,9 @@ def test_gpu_acceptance_source_gates_default_objective_challenge():
         "objective_required=True",
         "begin_objective_challenge",
         "benchmark_score > context.baseline_score",
+        "objective_suggestions",
+        "selected_swap.score_delta",
+        "len(set(accepted_panels)) == len(accepted_panels)",
         'objective_evidence.key == "O01"',
         'termination_reason == "target_achieved"',
     ):
@@ -46,7 +49,11 @@ def test_nvmolkit_gpu_workflow():
         optimize_conformers_mmff94,
     )
     from demo_agent import BoundedWorkflowController, STAGES
-    from objective_challenge import evaluate_diverse_panel
+    from objective_challenge import (
+        SCORE_TOLERANCE,
+        evaluate_diverse_panel,
+        rank_legal_swaps,
+    )
 
     assert torch.cuda.is_available(), "A CUDA-capable NVIDIA GPU is required."
     assert "L4" in torch.cuda.get_device_name(0), (
@@ -173,44 +180,86 @@ def test_nvmolkit_gpu_workflow():
     assert len(context.candidates) == 8
     assert context.benchmark_score > context.baseline_score
     candidate_ids = tuple(candidate.molecule_id for candidate in context.candidates)
-    best_panel = max(
-        itertools.combinations(candidate_ids, 4),
-        key=lambda panel: evaluate_diverse_panel(
+    all_panels = tuple(itertools.combinations(candidate_ids, 4))
+    assert len(all_panels) == 70
+    below_target = []
+    for panel in all_panels:
+        first = evaluate_diverse_panel(
             context,
             panel,
-            attempt_number=2,
-            decision_basis="Evaluate one bounded candidate panel.",
-        ).score,
+            attempt_number=1,
+            decision_basis="Qualify this bounded candidate panel.",
+        )
+        if first.achieved:
+            continue
+        below_target.append(first)
+        first_suggestions = rank_legal_swaps(context, first)
+        assert first_suggestions
+        for selected_swap in first_suggestions:
+            second = evaluate_diverse_panel(
+                context,
+                selected_swap.resulting_ids,
+                attempt_number=2,
+                decision_basis="Apply one ranked legal objective swap.",
+                selected_swap=selected_swap,
+            )
+            if not second.achieved:
+                next_suggestions = rank_legal_swaps(context, second)
+                assert any(
+                    suggestion.predicted_score + SCORE_TOLERANCE
+                    >= context.target_score
+                    for suggestion in next_suggestions
+                )
+    assert below_target
+
+    completions.expected_names.append("select_diverse_panel")
+    completions.arguments.append(
+        {
+            "selected_ids": list(context.baseline_ids),
+            "decision_basis": "Measure the defined baseline before revising it.",
+        }
     )
-    completions.expected_names.extend(["select_diverse_panel", "select_diverse_panel"])
-    completions.arguments.extend(
-        [
-            {
-                "selected_ids": list(context.baseline_ids),
-                "decision_basis": "Measure the defined baseline before revising it.",
-            },
-            {
-                "selected_ids": list(best_panel),
-                "decision_basis": "Replace the measured limiting analogue pair.",
-            },
-        ]
-    )
-    for _ in range(2):
+    accepted_panels = []
+    accepted_scores = []
+    while controller.objective_run is None:
         proposal = controller.request_objective_attempt()
-        controller.execute_objective_attempt(proposal)
+        attempt = controller.execute_objective_attempt(proposal)
+        accepted_panels.append(tuple(sorted(attempt.selected_ids)))
+        accepted_scores.append(attempt.score)
+        if controller.objective_run is None:
+            assert controller.objective_suggestions
+            selected_swap = controller.objective_suggestions[0]
+            assert selected_swap.score_delta > 0
+            completions.expected_names.append("select_diverse_panel")
+            completions.arguments.append(
+                {
+                    "selected_ids": list(selected_swap.resulting_ids),
+                    "decision_basis": (
+                        f"Replace {selected_swap.replace_id} with "
+                        f"{selected_swap.replacement_id}; limiting pair "
+                        f"{attempt.limiting_pair} requires more separation."
+                    ),
+                }
+            )
     assert controller.objective_run is not None
+    assert len(set(accepted_panels)) == len(accepted_panels)
+    assert all(
+        later_score > earlier_score + SCORE_TOLERANCE
+        for earlier_score, later_score in zip(accepted_scores, accepted_scores[1:])
+    )
     assert 1 <= len(controller.objective_run.attempts) <= 3
     assert controller.objective_run.termination_reason == "target_achieved"
     assert controller.objective_run.final_score >= context.target_score
     assert controller.objective_evidence.key == "O01"
-    assert controller.session.turn_count == 9 == len(completions.calls)
+    assert controller.session.turn_count == 7 + len(accepted_panels)
+    assert len(completions.calls) == 7 + len(accepted_panels)
     assistant_messages = [
         message for message in controller.session.messages if message["role"] == "assistant"
     ]
     tool_messages = [
         message for message in controller.session.messages if message["role"] == "tool"
     ]
-    assert len(assistant_messages) == len(tool_messages) == 9
+    assert len(assistant_messages) == len(tool_messages) == 7 + len(accepted_panels)
     assert [message["tool_call_id"] for message in tool_messages] == [
         message["tool_calls"][0]["id"] for message in assistant_messages
     ]
