@@ -1023,6 +1023,17 @@ class _ObjectiveCommitSnapshot:
     objective_prompt_appended: bool
 
 
+def _copy_objective_selection(
+    selection: ObjectiveSelection | None,
+) -> ObjectiveSelection | None:
+    """Reconstruct the shallow-frozen selection so nested pair lists cannot alias."""
+    if selection is None:
+        return None
+    if type(selection) is not ObjectiveSelection:
+        raise TypeError("Pending objective selection must use the exact schema type.")
+    return ObjectiveSelection.model_validate(deepcopy(selection.model_dump()))
+
+
 @dataclass
 class BoundedWorkflowController:
     """Expose one bounded hosted proposal and deterministic execution at a time."""
@@ -1455,7 +1466,9 @@ class BoundedWorkflowController:
             objective_required=self.objective_required,
             objective_context=self.objective_context,
             pending_action_menu=self.pending_action_menu,
-            pending_objective_selection=self.pending_objective_selection,
+            pending_objective_selection=_copy_objective_selection(
+                self.pending_objective_selection
+            ),
             objective_attempts=tuple(self.objective_attempts),
             accepted_attempt_count=self.accepted_attempt_count,
             rejected_selection_count=self.rejected_selection_count,
@@ -1478,7 +1491,9 @@ class BoundedWorkflowController:
         self.objective_required = snapshot.objective_required
         self.objective_context = snapshot.objective_context
         self.pending_action_menu = snapshot.pending_action_menu
-        self.pending_objective_selection = snapshot.pending_objective_selection
+        self.pending_objective_selection = _copy_objective_selection(
+            snapshot.pending_objective_selection
+        )
         self.objective_attempts = list(snapshot.objective_attempts)
         self.accepted_attempt_count = snapshot.accepted_attempt_count
         self.rejected_selection_count = snapshot.rejected_selection_count

@@ -1134,6 +1134,56 @@ def test_commit_snapshot_restores_plain_messages_and_every_objective_field(monke
     assert controller.objective_transport_retry_pending is False
 
 
+def test_double_failure_restores_deeply_isolated_pending_selection(monkeypatch):
+    controller, completions = completed_controller([])
+    monkeypatch.setattr(
+        demo_agent, "build_objective_context", lambda _state: two_revision_context()
+    )
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    completions.responses.append(selection(menu))
+    pending = controller.request_objective_selection()
+    expected_dump = deepcopy(pending.model_dump())
+    expected_json = demo_agent._serialize(expected_dump)
+    expected_messages = deepcopy(controller.session.messages)
+    expected_turn_count = controller.session.turn_count
+    reached = []
+
+    def mutate_then_fail(_transition):
+        reached.append("commit")
+        pending.observed_limiting_pairs[0][0] = "mutated-in-place"
+        raise RuntimeError("injected commit invariant failure")
+
+    def fail_terminal_recovery(*_args, **_kwargs):
+        reached.append("terminal_recovery")
+        raise RuntimeError("injected terminal recovery failure")
+
+    monkeypatch.setattr(controller, "_validate_objective_commit", mutate_then_fail)
+    monkeypatch.setattr(demo_agent, "terminal_objective_run", fail_terminal_recovery)
+
+    with pytest.raises(
+        demo_agent.ObjectiveEvaluationError,
+        match="before a safe terminal result could be recorded",
+    ):
+        controller.execute_objective_selection(pending)
+
+    restored = controller.pending_objective_selection
+    assert reached == ["commit", "terminal_recovery"]
+    assert demo_agent._serialize(restored.model_dump()) == expected_json
+    assert restored.model_dump() == expected_dump
+    assert restored is not pending
+    assert restored.observed_limiting_pairs is not pending.observed_limiting_pairs
+    assert restored.observed_limiting_pairs[0] is not pending.observed_limiting_pairs[0]
+    assert controller.session.messages == expected_messages
+    assert controller.session.messages is not expected_messages
+    assert controller.session.turn_count == expected_turn_count
+    assert controller.pending_action_menu == menu
+    assert controller.accepted_attempt_count == 0
+    assert controller.objective_attempts == []
+    assert controller.objective_run is None
+    assert controller.objective_evidence is None
+
+
 def test_unreachable_policy_maps_specific_eligibility_error_without_provider(monkeypatch):
     controller, completions = completed_controller([])
     context = two_revision_context()
