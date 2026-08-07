@@ -243,6 +243,28 @@ def test_attempt_feedback_returns_score_target_and_limiting_pair_to_same_convers
     }
 
 
+def test_revision_tool_schema_lists_exactly_current_legal_resulting_panels():
+    accepted_panel = ["mol-0", "mol-1", "mol-2", "mol-3"]
+    controller, completions = completed_controller([
+        proposal(accepted_panel, "Measure the baseline panel."),
+        proposal(["mol-4", "mol-1", "mol-2", "mol-3"], "Use a legal swap."),
+    ])
+    controller.begin_objective_challenge()
+    initial = controller.request_objective_attempt()
+    controller.execute_objective_attempt(initial)
+    expected_panels = [
+        list(item.resulting_ids) for item in controller.objective_suggestions
+    ]
+
+    controller.request_objective_attempt()
+
+    initial_schema = completions.calls[0]["tools"][0]["function"]["parameters"]
+    revision_schema = completions.calls[1]["tools"][0]["function"]["parameters"]
+    assert "enum" not in initial_schema["properties"]["selected_ids"]
+    assert revision_schema["properties"]["selected_ids"]["enum"] == expected_panels
+    assert accepted_panel not in revision_schema["properties"]["selected_ids"]["enum"]
+
+
 def test_duplicate_revision_is_rejected_then_corrected_without_scientific_attempt():
     controller, completions = completed_controller([
         proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Measure the baseline panel."),
@@ -550,6 +572,28 @@ def test_unlisted_in_pool_revision_is_rejected_then_listed_swap_is_retained():
     assert payload["instruction"] == (
         "Select exactly one listed resulting_ids panel and explain its limiting-pair rationale."
     )
+
+
+def test_revision_schema_allows_non_first_legal_panel_and_retains_exact_provenance():
+    controller, completions = completed_controller([
+        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Measure the baseline panel."),
+        proposal(["mol-5", "mol-1", "mol-2", "mol-3"], "Choose the second legal swap."),
+    ])
+    controller.begin_objective_challenge()
+    first = controller.request_objective_attempt()
+    controller.execute_objective_attempt(first)
+    selected_swap = controller.objective_suggestions[1]
+
+    revision = controller.request_objective_attempt()
+    accepted = controller.execute_objective_attempt(revision)
+
+    revision_schema = completions.calls[1]["tools"][0]["function"]["parameters"]
+    assert (
+        list(selected_swap.resulting_ids)
+        in revision_schema["properties"]["selected_ids"]["enum"]
+    )
+    assert accepted.selected_swap is selected_swap
+    assert accepted.selected_ids == selected_swap.resulting_ids
 
 
 def test_value_equal_revision_cannot_replace_exact_pending_proposal_or_swap():

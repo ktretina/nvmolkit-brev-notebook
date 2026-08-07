@@ -462,10 +462,41 @@ def validate_objective_conclusion(
     return conclusion
 
 
-def _tool_definition(name: str, model: type[BaseModel]) -> dict[str, Any]:
+def _tool_definition(
+    name: str,
+    model: type[BaseModel],
+    *,
+    _selected_ids_enum: tuple[tuple[str, ...], ...] | None = None,
+) -> dict[str, Any]:
     parameters = model.model_json_schema()
     parameters["additionalProperties"] = False
     parameters["required"] = list(model.model_fields)
+    if _selected_ids_enum is not None:
+        if (
+            name != "select_diverse_panel"
+            or model is not ObjectiveProposal
+            or type(_selected_ids_enum) is not tuple
+            or not _selected_ids_enum
+        ):
+            raise ValueError("The revision panel schema constraint was invalid.")
+        panels: list[list[str]] = []
+        seen: set[tuple[str, ...]] = set()
+        for panel in _selected_ids_enum:
+            if (
+                type(panel) is not tuple
+                or len(panel) != 4
+                or any(type(item) is not str for item in panel)
+                or len(set(panel)) != 4
+                or panel in seen
+            ):
+                raise ValueError("The revision panel schema constraint was invalid.")
+            ObjectiveProposal(
+                selected_ids=list(panel),
+                decision_basis="Validate the revision tool schema.",
+            )
+            seen.add(panel)
+            panels.append(list(panel))
+        parameters["properties"]["selected_ids"]["enum"] = panels
     return {
         "type": "function",
         "function": {
@@ -492,6 +523,7 @@ def _request_call(
     *,
     _text_only_retries_remaining: int = 2,
     _max_turns: int = 8,
+    _selected_ids_enum: tuple[tuple[str, ...], ...] | None = None,
 ) -> BaseModel:
     """Request, validate, and append exactly one forced hosted call."""
     if session.turn_count >= _max_turns or (
@@ -504,7 +536,13 @@ def _request_call(
         response = client.chat.completions.create(
             model=model,
             messages=session.messages,
-            tools=[_tool_definition(expected_name, argument_model)],
+            tools=[
+                _tool_definition(
+                    expected_name,
+                    argument_model,
+                    _selected_ids_enum=_selected_ids_enum,
+                )
+            ],
             tool_choice={
                 "type": "function",
                 "function": {"name": expected_name},
@@ -561,6 +599,7 @@ def _request_call(
                 model,
                 _text_only_retries_remaining=_text_only_retries_remaining - 1,
                 _max_turns=_max_turns,
+                _selected_ids_enum=_selected_ids_enum,
             )
         if content_arguments is not None:
             call_id = f"compat-{session.turn_count + 1}-{expected_name}"
@@ -1045,6 +1084,11 @@ class BoundedWorkflowController:
                     ObjectiveProposal,
                     DEFAULT_MODEL,
                     _max_turns=MAX_OBJECTIVE_HOSTED_TURNS,
+                    _selected_ids_enum=(
+                        tuple(item.resulting_ids for item in self.objective_suggestions)
+                        if is_revision
+                        else None
+                    ),
                 )
             except _HostedArgumentsValidationError as error:
                 _append_rejected_hosted_call(self.session, error)
