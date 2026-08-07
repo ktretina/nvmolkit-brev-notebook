@@ -22,6 +22,9 @@ def test_gpu_acceptance_source_gates_default_objective_challenge():
         '"policy": "largest_clusters_first"',
         '"conformers_per_representative": 5',
         "begin_objective_challenge",
+        "certify_argmax_reachability(context)",
+        "build_action_menu(context",
+        "accepted_maxima(menu)",
         "is_strict_improvement(",
         "target_is_achieved(",
         "objective_suggestions",
@@ -55,8 +58,12 @@ def test_nvmolkit_gpu_workflow():
     )
     from demo_agent import BoundedWorkflowController, STAGES
     from objective_challenge import (
+        accepted_maxima,
+        build_action_menu,
+        certify_argmax_reachability,
         evaluate_diverse_panel,
         is_strict_improvement,
+        measure_panel,
         rank_legal_swaps,
         target_is_achieved,
     )
@@ -184,6 +191,12 @@ def test_nvmolkit_gpu_workflow():
 
     context = controller.begin_objective_challenge()
     assert len(context.candidates) == 8
+    assert certify_argmax_reachability(context) is True
+    baseline_measurement = measure_panel(context, context.baseline_ids)
+    menu = build_action_menu(context, baseline_measurement, 0)
+    assert menu.state_id.startswith("state-")
+    assert accepted_maxima(menu)
+    assert all(action.limiting_pairs for action in menu.actions)
     assert is_strict_improvement(
         context.benchmark_score, context.baseline_score
     )
@@ -264,6 +277,11 @@ def test_nvmolkit_gpu_workflow():
         controller.objective_run.final_score, context.target_score
     )
     assert controller.objective_evidence.key == "O01"
+    objective_payload = json.loads(controller.objective_evidence.payload_json)
+    assert "decision_basis" not in controller.objective_evidence.payload_json
+    assert objective_payload["baseline"]["limiting_pairs"]
+    assert objective_payload["final_measurement"]["limiting_pairs"]
+    assert all(item["limiting_pairs"] for item in objective_payload["attempts"])
     assert controller.session.turn_count == 7 + len(accepted_panels)
     assert len(completions.calls) == 7 + len(accepted_panels)
     assistant_messages = [

@@ -18,21 +18,207 @@ from objective_challenge import (
     ObjectiveContext,
     ObjectiveRun,
     ObjectiveSwap,
+    TerminationReason,
+    accepted_maxima,
+    baseline_terminal_run,
+    build_action_menu,
     build_objective_context,
     build_objective_evidence,
     evaluate_diverse_panel,
+    evaluate_selected_swap,
+    enumerate_legal_swaps,
+    finalize_no_legal_swap,
     finalize_objective_run,
     objective_figures,
     rank_legal_swaps,
+    terminal_objective_run,
 )
 from objective_fixtures import (
     BOUNDARY_CASES,
     TARGET_BOUNDARY_CASES,
     context_from_distance,
+    boundary_policy_context,
     controlled_context,
+    controlled_context_with_ranked_swaps,
+    controlled_context_with_tied_paths,
+    controlled_context_with_action_count,
+    controlled_context_without_improving_swaps,
     optimized_state,
+    terminal_fixture,
     two_revision_context,
 )
+
+
+def test_action_menu_is_capped_by_rank_then_displayed_by_swap_id():
+    context = controlled_context_with_ranked_swaps()
+    source = objective_challenge.measure_panel(context, context.baseline_ids)
+
+    ranked = enumerate_legal_swaps(context, source)
+    menu = build_action_menu(context, source, 0)
+
+    assert len(ranked) == 4
+    assert {action.swap_id for action in menu.actions} == {
+        action.swap_id for action in ranked[:3]
+    }
+    assert tuple(action.swap_id for action in menu.actions) == tuple(
+        sorted(action.swap_id for action in menu.actions)
+    )
+    assert all(action.predicted_score_key == objective_challenge.score_key(action.predicted_score) for action in ranked)
+    assert all(action.limiting_pairs for action in ranked)
+    assert accepted_maxima(menu) == tuple(
+        action for action in menu.actions
+        if action.predicted_score_key == max(item.predicted_score_key for item in menu.actions)
+    )
+
+
+def test_state_id_is_stable_and_sensitive_to_source_count_and_displayed_actions():
+    context = controlled_context_with_ranked_swaps()
+    source = objective_challenge.measure_panel(context, context.baseline_ids)
+    first = build_action_menu(context, source, 0)
+
+    assert first.state_id == build_action_menu(context, source, 0).state_id
+    assert first.state_id.startswith("state-") and len(first.state_id) == 22
+    assert first.state_id != build_action_menu(context, source, 1).state_id
+    next_source = objective_challenge.measure_panel(context, first.actions[0].resulting_ids)
+    assert first.state_id != build_action_menu(context, next_source, 1).state_id
+
+
+def test_selected_swap_evaluation_is_menu_bound_and_measurement_backed():
+    context = controlled_context_with_ranked_swaps()
+    source = objective_challenge.measure_panel(context, context.baseline_ids)
+    menu = build_action_menu(context, source, 0)
+    selected = accepted_maxima(menu)[0]
+
+    attempt = evaluate_selected_swap(context, menu, selected, 1)
+
+    assert attempt.state_id == menu.state_id
+    assert attempt.measurement == objective_challenge.measure_panel(
+        context, selected.resulting_ids
+    )
+    assert attempt.score_key == selected.predicted_score_key
+    assert attempt.limiting_pairs == selected.limiting_pairs
+    with pytest.raises(ValueError, match="accepted maximum"):
+        evaluate_selected_swap(context, menu, menu.actions[-1], 1)
+    with pytest.raises(ValueError, match="current menu"):
+        evaluate_selected_swap(context, menu, replace(selected, swap_id="forged"), 1)
+
+
+def test_baseline_terminal_run_is_exact_and_o01_has_no_model_rationale():
+    context = build_objective_context(optimized_state(baseline_optimal=True))
+
+    run = baseline_terminal_run(context)
+    payload = json.loads(build_objective_evidence(run).payload_json)
+
+    assert run.termination_reason == "baseline_already_optimal"
+    assert run.attempts == () and run.achieved is True
+    assert payload["attempt_count"] == 0
+    assert payload["baseline"]["score_key"] == payload["final_measurement"]["score_key"]
+    assert "decision_basis" not in build_objective_evidence(run).payload_json
+
+
+@pytest.mark.parametrize("action_count", range(4))
+def test_action_menu_supports_every_bounded_display_count(action_count):
+    context = controlled_context_with_action_count(action_count)
+    source = objective_challenge.measure_panel(context, context.baseline_ids)
+
+    menu = build_action_menu(context, source, 0)
+
+    assert len(menu.actions) == action_count
+
+
+@pytest.mark.parametrize(("candidate", "current", "improving"), BOUNDARY_CASES)
+def test_boundary_policy_uses_exact_key_inclusion_and_maximality(
+    candidate, current, improving
+):
+    context = boundary_policy_context(candidate, current)
+    source = objective_challenge.measure_panel(context, context.baseline_ids)
+    menu = build_action_menu(context, source, 0)
+
+    assert bool(menu.actions) is improving
+    if improving:
+        assert accepted_maxima(menu) == menu.actions
+        assert menu.actions[0].predicted_score_key == objective_challenge.score_key(candidate)
+
+
+def test_empty_menu_finalizes_truthful_no_legal_terminal_and_o01():
+    context = controlled_context_without_improving_swaps()
+    current = objective_challenge.measure_panel(context, context.baseline_ids)
+    menu = build_action_menu(context, current, 0)
+
+    run = finalize_no_legal_swap(context, (), current, menu)
+    payload = json.loads(build_objective_evidence(run).payload_json)
+
+    assert menu.actions == ()
+    assert run.termination_reason == "no_legal_improving_swap"
+    assert run.achieved is False
+    assert payload["attempt_count"] == 0
+    assert payload["final_measurement"]["limiting_pairs"]
+
+
+@pytest.mark.parametrize(
+    "reason",
+    (
+        TerminationReason.OBJECTIVE_CORRECTION_LIMIT,
+        TerminationReason.OBJECTIVE_PROVIDER_FAILURE,
+        TerminationReason.EVALUATION_NOT_COMPLETED,
+    ),
+)
+def test_zero_attempt_failure_reasons_have_complete_terminal_evidence(reason):
+    context = controlled_context_with_ranked_swaps()
+
+    run = terminal_objective_run(context, (), reason)
+    payload = json.loads(build_objective_evidence(run).payload_json)
+
+    assert run.achieved is False
+    assert payload["termination_reason"] == reason.value
+    assert payload["attempt_count"] == 0
+    assert payload["baseline"] == payload["final_measurement"]
+
+
+def test_build_context_fails_closed_when_production_policy_is_uncertified(monkeypatch):
+    monkeypatch.setattr(objective_challenge, "certify_argmax_reachability", lambda context: False)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^Objective target is not reachable under the bounded decision policy\.$",
+    ):
+        build_objective_context(optimized_state())
+
+
+@pytest.mark.parametrize("all_paths_reach", (True, False))
+def test_certificate_branches_every_displayed_tied_maximum(all_paths_reach):
+    context = controlled_context_with_tied_paths(all_paths_reach)
+    baseline = objective_challenge.measure_panel(context, context.baseline_ids)
+    maxima = accepted_maxima(build_action_menu(context, baseline, 0))
+
+    assert len(maxima) == 2
+    assert len({action.predicted_score_key for action in maxima}) == 1
+    assert objective_challenge.certify_argmax_reachability(context) is all_paths_reach
+
+
+@pytest.mark.parametrize(
+    ("reason", "attempt_count", "achieved"),
+    (
+        ("target_achieved", 1, True),
+        ("baseline_already_optimal", 0, True),
+        ("attempt_limit_reached", 3, False),
+        ("no_legal_improving_swap", 0, False),
+        ("objective_correction_limit", 0, False),
+        ("objective_provider_failure", 0, False),
+        ("evaluation_not_completed", 0, False),
+    ),
+)
+def test_every_terminal_reason_has_one_truthful_run_and_o01(
+    reason, attempt_count, achieved
+):
+    run = terminal_fixture(reason, attempt_count)
+    payload = json.loads(build_objective_evidence(run).payload_json)
+
+    assert run.termination_reason == reason
+    assert run.achieved is achieved
+    assert payload["attempt_count"] == attempt_count
+    assert payload["termination_reason"] == reason
+    assert payload["final_measurement"]["score_key"] == run.final_score_key
 
 
 def forged_nonachieved_attempt(
@@ -663,10 +849,12 @@ def test_o01_serializes_the_selected_intervention_without_hidden_answers():
 
     assert payload["attempts"][0]["selected_swap"] is None
     assert payload["attempts"][1]["selected_swap"] == {
+        "swap_id": selected.swap_id,
         "replace_id": selected.replace_id,
         "replacement_id": selected.replacement_id,
         "resulting_ids": list(selected.resulting_ids),
         "predicted_score": selected.predicted_score,
+        "predicted_score_key": selected.predicted_score_key,
         "score_delta": selected.score_delta,
         "limiting_pair": list(selected.limiting_pair),
         "limiting_pairs": [
@@ -675,6 +863,7 @@ def test_o01_serializes_the_selected_intervention_without_hidden_answers():
                 context, selected.resulting_ids
             ).limiting_pairs
         ],
+        "target_status": selected.target_status,
     }
     assert "benchmark_panel" not in payload
 
