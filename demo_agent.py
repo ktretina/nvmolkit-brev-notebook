@@ -281,33 +281,6 @@ class SubmitSynthesisArgs(_StrictModel):
     sections: list[ConclusionSection] = Field(min_length=6, max_length=6)
 
 
-ObjectiveConclusionTheme = Literal[
-    "dataset_scope",
-    "molecular_representation",
-    "similarity_structure",
-    "clustering",
-    "conformational_sampling",
-    "objective_driven_selection",
-    "limitations_and_next_steps",
-]
-ObjectiveEvidenceKey = Literal["E01", "E02", "E03", "E04", "E05", "E06", "O01"]
-
-
-class ObjectiveConclusionSection(_StrictModel):
-    theme: ObjectiveConclusionTheme
-    prose: Annotated[
-        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1200)
-    ]
-    evidence_keys: list[ObjectiveEvidenceKey] = Field(min_length=1)
-
-
-class ObjectiveSubmitConclusionArgs(_StrictModel):
-    headline: Annotated[
-        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)
-    ]
-    sections: list[ObjectiveConclusionSection] = Field(min_length=7, max_length=7)
-
-
 class FindingSelection(_StrictModel):
     ordered_finding_ids: list[
         Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -478,7 +451,7 @@ class WorkflowResult:
     messages: tuple[dict[str, Any], ...]
     report: WorkflowReport
     plan: WorkflowPlan
-    conclusion: SubmitSynthesisArgs | ObjectiveSubmitConclusionArgs | EvidenceControlledConclusion
+    conclusion: SubmitSynthesisArgs | EvidenceControlledConclusion
     stage_results: tuple[StageResult, ...]
     turn_count: int = 8
     objective_run: ObjectiveRun | None = None
@@ -838,66 +811,6 @@ _REQUIRED_CONCLUSION_EVIDENCE = {
     "limitations_and_next_steps": {"E01", "E06"},
 }
 
-_REQUIRED_OBJECTIVE_CONCLUSION_EVIDENCE = {
-    "dataset_scope": {"E01"},
-    "molecular_representation": {"E02"},
-    "similarity_structure": {"E03"},
-    "clustering": {"E04"},
-    "conformational_sampling": {"E05", "E06"},
-    "objective_driven_selection": {"O01"},
-    "limitations_and_next_steps": {"E01", "E06", "O01"},
-}
-
-
-def _objective_conclusion_validation_feedback(
-    conclusion: ObjectiveSubmitConclusionArgs,
-    report: WorkflowReport,
-    objective_evidence: EvidenceRecord,
-) -> dict[str, Any]:
-    """Describe rejected objective metadata without retaining model-authored prose."""
-    expected_themes = tuple(_REQUIRED_OBJECTIVE_CONCLUSION_EVIDENCE)
-    actual_themes = [section.theme for section in conclusion.sections]
-    actual_theme_set = set(actual_themes)
-    duplicate_themes = [
-        theme for theme in expected_themes if actual_themes.count(theme) > 1
-    ]
-    missing_required: dict[str, list[str]] = {}
-    for theme in expected_themes:
-        sections = [section for section in conclusion.sections if section.theme == theme]
-        missing = {
-            key
-            for section in sections
-            for key in _REQUIRED_OBJECTIVE_CONCLUSION_EVIDENCE[theme]
-            if key not in section.evidence_keys
-        }
-        if missing:
-            missing_required[theme] = sorted(missing)
-
-    expected_keys = {record.key for record in report.evidence} | {
-        objective_evidence.key
-    }
-    cited_keys = {
-        key for section in conclusion.sections for key in section.evidence_keys
-    }
-    return {
-        "accepted": False,
-        "validation_issues": {
-            "missing_themes": [
-                theme for theme in expected_themes if theme not in actual_theme_set
-            ],
-            "extra_themes": sorted(actual_theme_set - set(expected_themes)),
-            "duplicate_themes": duplicate_themes,
-            "missing_required_evidence": missing_required,
-            "missing_evidence_keys": sorted(expected_keys - cited_keys),
-            "extra_evidence_keys": sorted(cited_keys - expected_keys),
-        },
-        "instruction": (
-            "Resubmit all seven themes with their required evidence_keys; "
-            "author the corrected evidence links without changing the evidence IDs."
-        ),
-    }
-
-
 def validate_conclusion(conclusion: SubmitSynthesisArgs, report: WorkflowReport) -> SubmitSynthesisArgs:
     """Check the synthesis schema and evidence links, not the truth of qualitative prose."""
     themes = [section.theme for section in conclusion.sections]
@@ -906,34 +819,6 @@ def validate_conclusion(conclusion: SubmitSynthesisArgs, report: WorkflowReport)
     known = set(report_keys)
     valid = set(themes) == set(_REQUIRED_CONCLUSION_EVIDENCE) and len(themes) == len(set(themes))
     valid &= report_keys == EvidenceKey.__args__ and cited == known
-    if not valid:
-        raise ConclusionValidationError(report)
-    return conclusion
-
-
-def validate_objective_conclusion(
-    conclusion: ObjectiveSubmitConclusionArgs,
-    report: WorkflowReport,
-    objective_evidence: EvidenceRecord,
-) -> ObjectiveSubmitConclusionArgs:
-    """Validate exact E01-E06 plus O01 coverage for the objective-aware conclusion."""
-    themes = [section.theme for section in conclusion.sections]
-    cited = {key for section in conclusion.sections for key in section.evidence_keys}
-    report_keys = tuple(record.key for record in report.evidence)
-    known = set(report_keys) | {objective_evidence.key}
-    valid = (
-        set(themes) == set(_REQUIRED_OBJECTIVE_CONCLUSION_EVIDENCE)
-        and len(themes) == len(set(themes))
-        and report_keys == EvidenceKey.__args__
-        and objective_evidence.key == "O01"
-        and cited == known
-    )
-    valid &= all(
-        _REQUIRED_OBJECTIVE_CONCLUSION_EVIDENCE[section.theme].issubset(
-            set(section.evidence_keys)
-        )
-        for section in conclusion.sections
-    )
     if not valid:
         raise ConclusionValidationError(report)
     return conclusion
@@ -948,33 +833,6 @@ def _tool_definition(
     parameters = model.model_json_schema()
     parameters["additionalProperties"] = False
     parameters["required"] = list(model.model_fields)
-    if name == "submit_synthesis" and model is ObjectiveSubmitConclusionArgs:
-        section_branches = []
-        for theme, required_evidence in _REQUIRED_OBJECTIVE_CONCLUSION_EVIDENCE.items():
-            evidence_keys = [
-                key for key in ObjectiveEvidenceKey.__args__ if key in required_evidence
-            ]
-            section_branches.append({
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "theme": {"type": "string", "enum": [theme]},
-                    "prose": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 1200,
-                    },
-                    "evidence_keys": {
-                        "type": "array",
-                        "enum": [evidence_keys],
-                    },
-                },
-                "required": ["theme", "prose", "evidence_keys"],
-            })
-        parameters["properties"]["sections"]["items"] = {
-            "anyOf": section_branches
-        }
-        parameters.pop("$defs", None)
     if name == "select_evidence_findings" and model is FindingSelection:
         if (
             type(finding_ids) is not tuple
@@ -1888,7 +1746,6 @@ class BoundedWorkflowController:
             "current_limiting_pairs": [list(pair) for pair in menu.source.limiting_pairs],
             "decision_rule": "maximize_predicted_minimum_distance",
             "remaining_rejections": 1,
-            "state_id": menu.state_id,
         })})
         self.correction_prompts_sent += 1
 

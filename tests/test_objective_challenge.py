@@ -44,6 +44,7 @@ from objective_fixtures import (
     controlled_context_without_improving_swaps,
     optimized_state,
     quantized_baseline_target_context,
+    recurring_swap_context,
     terminal_fixture,
     two_revision_context,
 )
@@ -97,6 +98,71 @@ def test_action_menu_is_capped_by_rank_then_displayed_by_swap_id():
         action for action in menu.actions
         if action.predicted_score_key == max(item.predicted_score_key for item in menu.actions)
     )
+
+
+def test_every_offered_action_is_independently_legal_across_certified_contexts():
+    contexts = (
+        controlled_context_with_ranked_swaps(),
+        two_revision_context(),
+        recurring_swap_context(),
+        controlled_context_with_tied_paths(True),
+    )
+    checked_actions = 0
+
+    for context in contexts:
+        context_actions = 0
+        assert objective_challenge.certify_argmax_reachability(context) is True
+        candidates = {candidate.molecule_id: candidate for candidate in context.candidates}
+        pending = [(objective_challenge.measure_panel(context, context.baseline_ids), 0)]
+        visited = set()
+
+        while pending:
+            source, accepted_count = pending.pop()
+            menu = build_action_menu(context, source, accepted_count)
+            identity = (menu.state_id, accepted_count)
+            if identity in visited:
+                continue
+            visited.add(identity)
+
+            assert menu.source == source
+            assert menu.accepted_attempt_count == accepted_count
+            for action in menu.actions:
+                context_actions += 1
+                checked_actions += 1
+                result_ids = action.resulting_ids
+                assert len(result_ids) == PANEL_SIZE
+                assert len(set(result_ids)) == PANEL_SIZE
+                assert set(result_ids) <= candidates.keys()
+                assert len({candidates[item].cluster_id for item in result_ids}) == PANEL_SIZE
+
+                removed = set(source.selected_ids) - set(result_ids)
+                added = set(result_ids) - set(source.selected_ids)
+                assert removed == {action.replace_id}
+                assert added == {action.replacement_id}
+                assert action.swap_id == f"{action.replace_id}->{action.replacement_id}"
+                replace_position = source.selected_ids.index(action.replace_id)
+                expected_result = list(source.selected_ids)
+                expected_result[replace_position] = action.replacement_id
+                assert result_ids == tuple(expected_result)
+
+                measured = objective_challenge.measure_panel(context, result_ids)
+                assert measured.score_key > source.score_key
+                assert action.predicted_score == measured.score
+                assert action.predicted_score_key == measured.score_key
+                assert action.score_delta == measured.score - source.score
+                assert action.limiting_pair == measured.limiting_pairs[0]
+                assert action.limiting_pairs == measured.limiting_pairs
+                assert action.target_status == (
+                    "meets_target" if measured.achieved else "below_target"
+                )
+                assert all(action.replace_id in pair for pair in source.limiting_pairs)
+
+                if accepted_count + 1 < MAX_ATTEMPTS and not measured.achieved:
+                    pending.append((measured, accepted_count + 1))
+
+        assert context_actions > 0
+
+    assert checked_actions > 0
 
 
 def test_state_id_is_stable_and_sensitive_to_source_count_and_displayed_actions():

@@ -491,7 +491,6 @@ def assert_paired(messages):
 
 
 def assert_exact_action_table(payload, menu):
-    assert payload["state_id"] == menu.state_id
     assert payload["candidate_actions"] == [
         {
             "limiting_pairs": [list(pair) for pair in action.limiting_pairs],
@@ -540,7 +539,9 @@ def test_initial_correction_and_subsequent_prompts_publish_exact_action_tables(m
     monkeypatch.setattr(demo_agent, "build_objective_context", lambda _state: context)
     controller.begin_objective_challenge()
     initial = controller.pending_action_menu
-    assert_exact_action_table(json.loads(controller.session.messages[-1]["content"]), initial)
+    initial_prompt = json.loads(controller.session.messages[-1]["content"])
+    assert initial_prompt["state_id"] == initial.state_id
+    assert_exact_action_table(initial_prompt, initial)
 
     completions.responses.extend([
         selection(initial, state_id="state-0000000000000000"),
@@ -552,14 +553,20 @@ def test_initial_correction_and_subsequent_prompts_publish_exact_action_tables(m
         for message in controller.session.messages
         if message.get("role") == "user" and "remaining_rejections" in message["content"]
     )
+    assert list(correction) == [
+        "candidate_actions",
+        "current_limiting_pairs",
+        "decision_rule",
+        "remaining_rejections",
+    ]
     assert_exact_action_table(correction, initial)
 
     controller.execute_objective_selection(pending)
     subsequent = controller.pending_action_menu
     assert subsequent is not None
-    assert_exact_action_table(
-        json.loads(controller.session.messages[-1]["content"]), subsequent
-    )
+    subsequent_prompt = json.loads(controller.session.messages[-1]["content"])
+    assert subsequent_prompt["state_id"] == subsequent.state_id
+    assert_exact_action_table(subsequent_prompt, subsequent)
 
 
 def test_invalid_invalid_terminalizes_with_one_correction_and_no_chemistry():
@@ -590,7 +597,6 @@ def test_invalid_invalid_terminalizes_with_one_correction_and_no_chemistry():
         "current_limiting_pairs",
         "decision_rule",
         "remaining_rejections",
-        "state_id",
     ]
     assert correction["remaining_rejections"] == 1
     assert_paired(controller.session.messages)
@@ -1039,110 +1045,6 @@ def execute_safe_objective(controller):
         controller.execute_objective_attempt(pending)
 
 
-def objective_conclusion_arguments():
-    themes_and_keys = (
-        ("dataset_scope", ["E01"]),
-        ("molecular_representation", ["E02"]),
-        ("similarity_structure", ["E03"]),
-        ("clustering", ["E04"]),
-        ("conformational_sampling", ["E05", "E06"]),
-        ("objective_driven_selection", ["O01"]),
-        ("limitations_and_next_steps", ["E01", "E06", "O01"]),
-    )
-    return {
-        "headline": "A bounded structural-diversity objective was measured",
-        "sections": [
-            {
-                "theme": theme,
-                "prose": f"Evidence-grounded interpretation for {theme}.",
-                "evidence_keys": keys,
-            }
-            for theme, keys in themes_and_keys
-        ],
-    }
-
-
-def live_invalid_objective_conclusion_arguments():
-    arguments = objective_conclusion_arguments()
-    arguments["sections"][4]["evidence_keys"] = ["E05"]
-    arguments["sections"][5]["evidence_keys"] = ["E06"]
-    arguments["sections"][6]["evidence_keys"] = ["E01", "E06"]
-    return arguments
-
-
-def schema_invalid_objective_conclusion_arguments():
-    arguments = objective_conclusion_arguments()
-    arguments["sections"][5]["theme"] = "bogus_theme"
-    arguments["sections"][5]["evidence_keys"] = ["UNKNOWN"]
-    return arguments
-
-
-def objective_theme_evidence_contract():
-    return (
-        ("dataset_scope", ["E01"]),
-        ("molecular_representation", ["E02"]),
-        ("similarity_structure", ["E03"]),
-        ("clustering", ["E04"]),
-        ("conformational_sampling", ["E05", "E06"]),
-        ("objective_driven_selection", ["O01"]),
-        ("limitations_and_next_steps", ["E01", "E06", "O01"]),
-    )
-
-
-def test_objective_synthesis_tool_schema_pairs_themes_with_exact_evidence_arrays():
-    parameters = demo_agent._tool_definition(
-        "submit_synthesis", demo_agent.ObjectiveSubmitConclusionArgs
-    )["function"]["parameters"]
-
-    assert parameters["properties"]["sections"]["minItems"] == 7
-    assert parameters["properties"]["sections"]["maxItems"] == 7
-    branches = parameters["properties"]["sections"]["items"]["anyOf"]
-    assert len(branches) == 7
-    assert [branch["properties"]["theme"]["enum"][0] for branch in branches] == [
-        theme for theme, _keys in objective_theme_evidence_contract()
-    ]
-    for branch, (theme, evidence_keys) in zip(
-        branches, objective_theme_evidence_contract(), strict=True
-    ):
-        assert branch["type"] == "object"
-        assert branch["additionalProperties"] is False
-        assert branch["required"] == ["theme", "prose", "evidence_keys"]
-        assert branch["properties"]["theme"] == {
-            "type": "string",
-            "enum": [theme],
-        }
-        assert branch["properties"]["prose"] == {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 1200,
-        }
-        assert branch["properties"]["evidence_keys"] == {
-            "type": "array",
-            "enum": [evidence_keys],
-        }
-
-
-def test_live_objective_synthesis_failure_mapping_is_not_representable_by_tool_schema():
-    parameters = demo_agent._tool_definition(
-        "submit_synthesis", demo_agent.ObjectiveSubmitConclusionArgs
-    )["function"]["parameters"]
-    branches = parameters["properties"]["sections"]["items"]["anyOf"]
-    invalid_sections = live_invalid_objective_conclusion_arguments()["sections"]
-
-    for section in invalid_sections:
-        matching_theme_branches = [
-            branch
-            for branch in branches
-            if section["theme"] in branch["properties"]["theme"]["enum"]
-        ]
-        assert len(matching_theme_branches) == 1
-        branch = matching_theme_branches[0]
-        if section["evidence_keys"] != branch["properties"]["evidence_keys"]["enum"][0]:
-            break
-    else:
-        pytest.fail("The live invalid theme/evidence mapping remained representable.")
-
-
 def test_non_objective_synthesis_tool_schema_is_unchanged():
     expected = demo_agent.SubmitSynthesisArgs.model_json_schema()
     expected["additionalProperties"] = False
@@ -1151,6 +1053,22 @@ def test_non_objective_synthesis_tool_schema_is_unchanged():
     assert demo_agent._tool_definition(
         "submit_synthesis", demo_agent.SubmitSynthesisArgs
     )["function"]["parameters"] == expected
+
+
+def test_dead_free_form_objective_conclusion_surface_is_absent():
+    for name in (
+        "ObjectiveConclusionTheme",
+        "ObjectiveEvidenceKey",
+        "ObjectiveConclusionSection",
+        "ObjectiveSubmitConclusionArgs",
+        "validate_objective_conclusion",
+        "_objective_conclusion_validation_feedback",
+        "_REQUIRED_OBJECTIVE_CONCLUSION_EVIDENCE",
+    ):
+        assert not hasattr(demo_agent, name)
+    assert demo_agent.FindingSelection is not None
+    assert demo_agent.EvidenceControlledConclusion is not None
+    assert demo_agent.SubmitSynthesisArgs is not None
 
 
 def test_legacy_objective_proposal_shape_is_not_available_or_executable():
