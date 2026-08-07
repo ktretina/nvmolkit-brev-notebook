@@ -3,6 +3,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from demo_agent import ObjectiveProposal
+from objective_challenge import ObjectiveSwap
 from objective_receipts import ObjectiveReceipt, objective_receipt
 
 
@@ -13,6 +14,24 @@ def proposal() -> ObjectiveProposal:
     )
 
 
+def selected_swap() -> ObjectiveSwap:
+    return ObjectiveSwap(
+        replace_id="mol-1",
+        replacement_id="mol-5",
+        resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
+        predicted_score=0.80,
+        score_delta=0.45,
+        limiting_pair=("mol-0", "mol-2"),
+    )
+
+
+def swapped_proposal() -> ObjectiveProposal:
+    return ObjectiveProposal(
+        selected_ids=["mol-0", "mol-5", "mol-2", "mol-3"],
+        decision_basis="Replace the member of the measured limiting pair.",
+    )
+
+
 def test_objective_receipt_displays_validated_ids_and_fixed_executor():
     receipt = objective_receipt(proposal())
 
@@ -20,6 +39,7 @@ def test_objective_receipt_displays_validated_ids_and_fixed_executor():
         validated_proposal=(
             "select_diverse_panel(selected_ids=['mol-0', 'mol-2', 'mol-5', 'mol-7'])"
         ),
+        validated_intervention=None,
         python_evaluation=(
             "result = evaluate_diverse_panel(\n"
             "    selected_ids=proposal.selected_ids,\n"
@@ -28,6 +48,52 @@ def test_objective_receipt_displays_validated_ids_and_fixed_executor():
             ")"
         ),
     )
+
+
+def test_objective_receipt_renders_exact_selected_intervention_without_scores_or_model_text():
+    receipt = objective_receipt(swapped_proposal(), selected_swap())
+
+    assert receipt.validated_intervention == (
+        "replace molecule_id='mol-1' with molecule_id='mol-5'"
+    )
+    assert "0.80" not in receipt.validated_intervention
+    assert "0.45" not in receipt.validated_intervention
+    assert "limiting" not in receipt.validated_intervention
+    assert "measured limiting pair" not in receipt.validated_intervention
+
+
+def test_objective_receipt_rejects_wrong_exact_swap_type():
+    class SwapSubclass(ObjectiveSwap):
+        pass
+
+    with pytest.raises(ValueError, match="swap schema"):
+        objective_receipt(swapped_proposal(), SwapSubclass(**selected_swap().__dict__))
+
+
+@pytest.mark.parametrize(
+    "swap",
+    [
+        ObjectiveSwap(
+            replace_id="mol-1",
+            replacement_id="mol-5",
+            resulting_ids=("mol-0", "mol-5", "mol-2", "mol-7"),
+            predicted_score=0.80,
+            score_delta=0.45,
+            limiting_pair=("mol-0", "mol-2"),
+        ),
+        ObjectiveSwap(
+            replace_id="mol-1",
+            replacement_id="mol-5",
+            resulting_ids=("mol-0", "mol-1", "mol-5", "mol-2"),
+            predicted_score=0.80,
+            score_delta=0.45,
+            limiting_pair=("mol-0", "mol-2"),
+        ),
+    ],
+)
+def test_objective_receipt_rejects_false_swap_panel_or_id_provenance(swap):
+    with pytest.raises(ValueError, match="provenance"):
+        objective_receipt(swapped_proposal(), swap)
 
 
 def test_objective_receipt_excludes_decision_text_and_is_deterministic():

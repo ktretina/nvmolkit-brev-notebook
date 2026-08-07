@@ -491,15 +491,13 @@ class InteractiveWorkflow:
             )
             for label, score, status in score_items
         )
-        rows = "".join(
-            "<tr>"
-            f"<td>Attempt {attempt.attempt_number}</td>"
-            f"<td>{escape(', '.join(attempt.selected_ids))}</td>"
-            f"<td>{attempt.score:.3f}</td>"
-            f"<td>{escape(' / '.join(attempt.limiting_pair))}</td>"
-            f"<td>{'Goal achieved' if attempt.achieved else 'Revise'}</td>"
-            "</tr>"
-            for attempt in attempts
+        decision_ladder = "".join(
+            InteractiveWorkflow._objective_attempt_row(
+                context,
+                attempt,
+                attempts[index - 1] if index else None,
+            )
+            for index, attempt in enumerate(attempts)
         )
         final = ""
         if run is not None:
@@ -519,10 +517,42 @@ class InteractiveWorkflow:
             f"<p><b>Target:</b> D_min ≥ {context.target_score:.3f} "
             "(80% of attainable improvement over baseline)</p>"
             f"<div>{score_strip}</div>"
-            "<table style='width:100%;margin-top:8px'><thead><tr>"
-            "<th>Step</th><th>Selected panel</th><th>D_min</th>"
-            "<th>Limiting pair</th><th>Result</th></tr></thead>"
-            f"<tbody>{rows}</tbody></table>{final}"
+            f"<div aria-label='Objective decision ladder'>{decision_ladder}</div>{final}"
+        )
+
+    @staticmethod
+    def _objective_attempt_row(context, attempt, prior_attempt=None) -> str:
+        """Render one measured decision step without exposing model rationale."""
+        swap = attempt.selected_swap
+        if swap is None:
+            observation = "Initial agent proposal"
+            action = "Initial panel"
+            delta = attempt.score - context.baseline_score
+            accent = "#6c757d"
+        else:
+            if prior_attempt is None:
+                raise ValueError("A guided revision requires its prior attempt.")
+            observation = (
+                f"limiting pair {prior_attempt.limiting_pair[0]} / "
+                f"{prior_attempt.limiting_pair[1]}"
+            )
+            action = f"replace {swap.replace_id} with {swap.replacement_id}"
+            delta = swap.score_delta
+            accent = "#76B900" if attempt.achieved else "#D68A00"
+        comparison = (
+            f"{attempt.score:.3f} ≥ {context.target_score:.3f}"
+            if attempt.achieved
+            else f"{attempt.score:.3f} < {context.target_score:.3f}"
+        )
+        outcome = "Goal achieved" if attempt.achieved else "Revise"
+        return (
+            f"<section style='border-left:3px solid {accent};padding:6px 10px;"
+            "margin:6px 0' aria-label='Objective attempt'>"
+            f"<b>Attempt {attempt.attempt_number}</b> · {escape(outcome)}<br>"
+            f"<small><b>Observe:</b> {escape(observation)}</small><br>"
+            f"<small><b>Agent action:</b> {escape(action)}</small><br>"
+            f"<small><b>Measure:</b> {escape(comparison)} · Δ {delta:+.3f}</small>"
+            "</section>"
         )
 
     def _show_objective_challenge(self) -> None:
@@ -565,12 +595,19 @@ class InteractiveWorkflow:
             self._finish_objective_challenge()
 
     def _append_objective_attempt(self, proposal, attempt) -> None:
-        receipt = objective_receipt(proposal)
+        receipt = objective_receipt(proposal, attempt.selected_swap)
         result_label = "Goal achieved" if attempt.achieved else "Revise"
+        intervention = ""
+        if receipt.validated_intervention is not None:
+            intervention = (
+                "<b>Validated intervention</b>"
+                f"<pre>{escape(receipt.validated_intervention)}</pre>"
+            )
         details = widgets.HTML(
             f"<p><b>Decision summary:</b> {escape(attempt.decision_basis)}</p>"
             "<b>Validated Nemotron proposal</b>"
             f"<pre>{escape(receipt.validated_proposal)}</pre>"
+            f"{intervention}"
             "<b>Evaluation executed by Python</b>"
             f"<pre>{escape(receipt.python_evaluation)}</pre>"
             f"<p><b>D_min:</b> {attempt.score:.3f} &nbsp; "

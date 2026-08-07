@@ -10,7 +10,7 @@ from demo_agent import (
     ClusterArgs, EmbedArgs, FingerprintArgs, InspectionArgs, OptimizationArgs,
     ObjectiveProposal, SimilarityArgs, StageProposal, ToolCallError,
 )
-from objective_challenge import ObjectiveAttempt
+from objective_challenge import ObjectiveAttempt, ObjectiveSwap
 from interactive_workflow import InteractiveWorkflow, controls_for
 
 
@@ -63,7 +63,7 @@ class Controller:
                 decision_basis="Measure the current policy baseline.",
             ),
             ObjectiveProposal(
-                selected_ids=["mol-0", "mol-2", "mol-4", "mol-6"],
+                selected_ids=["mol-0", "mol-5", "mol-2", "mol-3"],
                 decision_basis="Replace the member of the limiting pair.",
             ),
         ]
@@ -136,6 +136,16 @@ class Controller:
             limiting_pair=("mol-0", "mol-1") if number == 1 else ("mol-0", "mol-2"),
             constraints_passed=True,
             achieved=achieved,
+            selected_swap=(
+                None if number == 1 else ObjectiveSwap(
+                    replace_id="mol-1",
+                    replacement_id="mol-5",
+                    resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
+                    predicted_score=0.80,
+                    score_delta=0.45,
+                    limiting_pair=("mol-0", "mol-2"),
+                )
+            ),
         )
         self.objective_attempts.append(attempt)
         self.pending_objective = None
@@ -354,6 +364,52 @@ def test_objective_card_retains_attempts_receipts_scores_and_limiting_pairs(monk
     assert "Attempt 1" in workflow.objective_summary.value
     assert "Attempt 2" in workflow.objective_summary.value
     assert [attempt.score for attempt in controller.objective_attempts] == [0.35, 0.80]
+
+
+def test_objective_attempts_render_as_observe_act_measure_decision_ladder(monkeypatch):
+    monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
+    monkeypatch.setattr("interactive_workflow.objective_figures", lambda run, state: ())
+    workflow, _controller = started()
+
+    run_objective(workflow)
+
+    summary = workflow.objective_summary.value
+    details = " ".join(html_text(card) for card in workflow.objective_attempt_cards)
+    assert "Observe" in summary
+    assert "Agent action" in summary
+    assert "Measure" in summary
+    assert "replace mol-1" in summary
+    assert "with mol-5" in summary
+    assert "+0.450" in summary
+    assert "0.800 ≥ 0.710" in summary
+    assert "Validated intervention" in details
+    assert "Goal achieved" in details
+
+
+def test_objective_revision_without_prior_attempt_fails_closed():
+    attempt = ObjectiveAttempt(
+        attempt_number=2,
+        selected_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
+        decision_basis="Revise the measured panel.",
+        score=0.80,
+        limiting_pair=("mol-0", "mol-2"),
+        constraints_passed=True,
+        achieved=True,
+        selected_swap=ObjectiveSwap(
+            replace_id="mol-1",
+            replacement_id="mol-5",
+            resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
+            predicted_score=0.80,
+            score_delta=0.45,
+            limiting_pair=("mol-0", "mol-2"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="prior attempt"):
+        InteractiveWorkflow._objective_attempt_row(
+            SimpleNamespace(baseline_score=0.35, target_score=0.71),
+            attempt,
+        )
 
 
 def test_known_objective_proposal_failure_after_measured_attempt_has_one_guarded_retry(monkeypatch):
