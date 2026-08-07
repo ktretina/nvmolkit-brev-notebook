@@ -13,7 +13,7 @@ from demo_agent import (
     ObjectiveProposal, SimilarityArgs, StageProposal, ToolCallError,
 )
 from objective_challenge import (
-    ObjectiveAttempt, ObjectiveCandidate, ObjectiveContext, ObjectiveSwap,
+    SCORE_TOLERANCE, ObjectiveAttempt, ObjectiveCandidate, ObjectiveContext, ObjectiveSwap,
     evaluate_diverse_panel, rank_legal_swaps,
 )
 from interactive_workflow import InteractiveWorkflow, controls_for
@@ -741,6 +741,65 @@ def test_objective_attempt_row_uses_scientific_notation_when_six_decimals_hide_t
     assert "0.710000 &lt; 0.710000" not in row
     assert "Δ +0.000000" not in row
     assert "e-07" in row
+
+
+def test_objective_attempt_row_distinguishes_exact_tolerance_and_miss_outcomes():
+    target = 0.71
+
+    def initial(score, achieved):
+        return ObjectiveAttempt(
+            attempt_number=1,
+            selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
+            decision_basis="Measure the initial panel.",
+            score=score,
+            limiting_pair=("mol-0", "mol-1"),
+            constraints_passed=True,
+            achieved=achieved,
+        )
+
+    exact = InteractiveWorkflow._objective_attempt_row(
+        SimpleNamespace(baseline_score=target, target_score=target),
+        initial(target, True),
+    )
+    tolerance = InteractiveWorkflow._objective_attempt_row(
+        SimpleNamespace(
+            baseline_score=target - 0.5 * SCORE_TOLERANCE,
+            target_score=target,
+        ),
+        initial(target - 0.5 * SCORE_TOLERANCE, True),
+    )
+    miss = InteractiveWorkflow._objective_attempt_row(
+        SimpleNamespace(baseline_score=0.709, target_score=target),
+        initial(0.709, False),
+    )
+
+    assert "0.710 ≥ 0.710" in exact
+    assert "meets target within 1e-12 tolerance" in tolerance
+    assert "<b>Outcome:</b> Goal achieved" in tolerance
+    assert "0.709 &lt; 0.710" in miss
+
+
+@pytest.mark.parametrize(
+    "pair",
+    [
+        ("mol-9", "mol-0"),
+        ("mol-0", "mol-0"),
+        ("", "mol-0"),
+    ],
+)
+def test_objective_attempt_row_rejects_noncanonical_or_out_of_panel_limiting_pairs(pair):
+    context, first, second = evaluated_objective_records()
+    forged_swap = replace(second.selected_swap, limiting_pair=pair)
+    forged_second = replace(second, limiting_pair=pair, selected_swap=forged_swap)
+
+    with pytest.raises(ValueError):
+        InteractiveWorkflow._objective_attempt_row(
+            context, replace(first, limiting_pair=pair)
+        )
+    with pytest.raises(ValueError):
+        InteractiveWorkflow._objective_attempt_row(context, second, replace(first, limiting_pair=pair))
+    with pytest.raises(ValueError):
+        InteractiveWorkflow._objective_attempt_row(context, forged_second, first)
 
 
 def test_known_objective_proposal_failure_after_measured_attempt_has_one_guarded_retry(monkeypatch):

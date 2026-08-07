@@ -562,7 +562,9 @@ class InteractiveWorkflow:
             or attempt.achieved != (
                 attempt.score + SCORE_TOLERANCE >= context.target_score
             )
-            or not InteractiveWorkflow._is_canonical_pair(attempt.limiting_pair)
+            or not InteractiveWorkflow._is_canonical_pair(
+                attempt.limiting_pair, attempt.selected_ids
+            )
         ):
             raise ValueError("Objective attempt rows require measured objective truth.")
         swap = attempt.selected_swap
@@ -584,9 +586,13 @@ class InteractiveWorkflow:
                 or not InteractiveWorkflow._is_finite_float(prior_attempt.score)
                 or prior_attempt.constraints_passed is not True
                 or prior_attempt.achieved is not False
-                or not InteractiveWorkflow._is_canonical_pair(prior_attempt.limiting_pair)
+                or not InteractiveWorkflow._is_canonical_pair(
+                    prior_attempt.limiting_pair, prior_attempt.selected_ids
+                )
                 or not InteractiveWorkflow._is_canonical_panel(swap.resulting_ids)
-                or not InteractiveWorkflow._is_canonical_pair(swap.limiting_pair)
+                or not InteractiveWorkflow._is_canonical_pair(
+                    swap.limiting_pair, swap.resulting_ids
+                )
                 or not InteractiveWorkflow._is_finite_float(swap.predicted_score)
                 or not InteractiveWorkflow._is_finite_float(swap.score_delta)
                 or swap.score_delta <= SCORE_TOLERANCE
@@ -636,11 +642,15 @@ class InteractiveWorkflow:
                 f"{InteractiveWorkflow._objective_scalar(prior_attempt.score, precision, scientific)}; "
                 f"limiting pair {prior_attempt.limiting_pair[0]} / {prior_attempt.limiting_pair[1]}"
             )
-        comparison = (
-            f"{score_text} ≥ {target_text}"
-            if attempt.achieved
-            else f"{score_text} < {target_text}"
-        )
+        if attempt.achieved and attempt.score < context.target_score:
+            comparison = (
+                f"{score_text} meets target within 1e-12 tolerance "
+                f"(score + 1e-12 ≥ {target_text})"
+            )
+        elif attempt.achieved:
+            comparison = f"{score_text} ≥ {target_text}"
+        else:
+            comparison = f"{score_text} < {target_text}"
         outcome = "Goal achieved" if attempt.achieved else "Revise"
         return (
             f"<section style='border-left:3px solid {accent};padding:6px 10px;"
@@ -677,13 +687,28 @@ class InteractiveWorkflow:
             and f"{score:.{precision}f}" == f"{target:.{precision}f}"
         )
         delta_scientific = delta != 0.0 and float(f"{delta:+.{precision}f}") == 0.0
-        if comparison_scientific or delta_scientific:
+        if comparison_scientific:
+            scientific_precision = InteractiveWorkflow._scientific_precision(
+                score, target
+            )
             return (
-                f"{score:.17e}",
-                f"{target:.17e}",
-                f"{delta:+.12e}",
-                precision,
+                f"{score:.{scientific_precision}e}",
+                f"{target:.{scientific_precision}e}",
+                (
+                    f"{delta:+.{scientific_precision}e}"
+                    if delta_scientific
+                    else f"{delta:+.{precision}f}"
+                ),
+                scientific_precision,
                 True,
+            )
+        if delta_scientific:
+            return (
+                f"{score:.{precision}f}",
+                f"{target:.{precision}f}",
+                f"{delta:+.0e}",
+                precision,
+                False,
             )
         return (
             f"{score:.{precision}f}",
@@ -695,7 +720,14 @@ class InteractiveWorkflow:
 
     @staticmethod
     def _objective_scalar(value: float, precision: int, scientific: bool) -> str:
-        return f"{value:.17e}" if scientific else f"{value:.{precision}f}"
+        return f"{value:.{precision}e}" if scientific else f"{value:.{precision}f}"
+
+    @staticmethod
+    def _scientific_precision(first: float, second: float) -> int:
+        for precision in range(18):
+            if f"{first:.{precision}e}" != f"{second:.{precision}e}":
+                return precision
+        return 17
 
     @staticmethod
     def _is_finite_float(value: object) -> bool:
@@ -711,11 +743,13 @@ class InteractiveWorkflow:
         )
 
     @staticmethod
-    def _is_canonical_pair(value: object) -> bool:
+    def _is_canonical_pair(value: object, panel: tuple[str, ...]) -> bool:
         return (
             type(value) is tuple
             and len(value) == 2
-            and all(type(molecule_id) is str for molecule_id in value)
+            and all(type(molecule_id) is str and molecule_id for molecule_id in value)
+            and value[0] != value[1]
+            and all(molecule_id in panel for molecule_id in value)
         )
 
     @staticmethod
