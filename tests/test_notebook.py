@@ -25,7 +25,7 @@ APPROVED_INTRO = """# AI Agents for Chemistry
 
 AI agents can extend language models from passive generators into systems that plan analyses, select validated operations, call scientific software, and interpret structured results. In chemistry, this creates a practical interface between high-level scientific questions and specialized computational tools while preserving explicit constraints, provenance, and reproducibility.
 
-This notebook demonstrates that pattern through a bounded molecular-library analysis in two compact movements. During **Molecular Evidence Generation**, a Nemotron agent grounded with the BioNeMo Agent Toolkit skill for nvMolKit uses validated GPU operations to generate Morgan fingerprints, calculate all-pairs Tanimoto similarity, discover fused Butina clusters, embed representative conformers, and optimize them with MMFF94. During the **Objective-Driven Agent Challenge**, it uses the retained evidence to improve a four-compound panel against a measured minimum pairwise Tanimoto-distance target. Python validates every proposal, executes deterministic scientific code, and renders the progression. The demonstration illustrates bounded agent-guided cheminformatics—not unrestricted autonomy—and its outputs are computational descriptors and sampled force-field geometries rather than evidence of biological activity, safety, or experimental structure."""
+This notebook demonstrates that pattern through a bounded molecular-library analysis in two compact movements. During **Molecular Evidence Generation**, a Nemotron agent grounded with the BioNeMo Agent Toolkit skill for nvMolKit uses validated GPU operations to generate Morgan fingerprints, calculate all-pairs Tanimoto similarity, discover fused Butina clusters, embed representative conformers, and optimize them with MMFF94. During the **Objective-Driven Agent Challenge**, it uses the retained evidence to improve a four-compound panel against a measured minimum pairwise Tanimoto-distance target. Python validates every tool call, executes deterministic scientific code, and renders the progression. The demonstration illustrates bounded agent-guided cheminformatics—not unrestricted autonomy—and its outputs are computational descriptors and sampled force-field geometries rather than evidence of biological activity, safety, or experimental structure."""
 NVMOLKIT_ENTRY_POINTS = (
     "MorganFingerprintGenerator",
     "crossTanimotoSimilarity",
@@ -132,7 +132,7 @@ def test_intro_and_run_text_make_attribution_and_grounding_explicit():
         assert entry_point in combined
     for phrase in (
         "click **Start Agent**",
-        "review the Nemotron proposal and concise decision",
+        "review the validated Nemotron tool call and concise decision",
         "bounded dropdowns and sliders",
         "click **Approve & Run** for each of the six stages",
         "**Molecular Evidence Generation**",
@@ -140,8 +140,8 @@ def test_intro_and_run_text_make_attribution_and_grounding_explicit():
         "click **Run Objective Challenge**",
         "minimum pairwise Tanimoto distance",
         "at most three attempts",
-        "Validated Nemotron proposal",
-        "Evaluation executed by Python",
+        "Observe → Candidate actions → Nemotron choice → Execute → Measure",
+        "Python evaluator receipt",
         "score trajectory",
         "attempt ledger",
         "Evidence-Backed Conclusion",
@@ -149,14 +149,40 @@ def test_intro_and_run_text_make_attribution_and_grounding_explicit():
         "corresponding RDKit inspection or nvMolKit invocation",
         "Button callback failures remain in the active card",
         "do not mark the notebook cell failed",
-        "deterministically evaluated candidate actions",
-        "state-bound Nemotron choice",
+        "full deterministic action menu",
+        "state-bound argmax action selection",
         "co-limiting pairs",
-        "Python owns every numerical result",
-        "agent-selected evidence emphasis",
+        "Python-owned headline and facts",
+        "Nemotron-selected predicate-true emphasis",
     ):
         assert phrase in run_text
-    assert "qualitative interpretation is not automatically fact-verified" not in run_text
+    for stale in (
+        "qualitative interpretation is not automatically fact-verified",
+        "Validated Nemotron proposal",
+        "review the Nemotron proposal",
+    ):
+        assert stale not in combined
+
+
+def test_readme_uses_current_objective_and_receipt_contracts():
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    for phrase in (
+        "state-bound argmax action selection",
+        "all co-limiting pairs",
+        "Python-owned headline and facts",
+        "Nemotron-selected predicate-true emphasis",
+        "RUN_GPU_TESTS=1 .venv/bin/python -m pytest -q",
+        "Keep it separate from the GPU acceptance receipt",
+        "Persistence receipt",
+    ):
+        assert phrase in readme
+    for stale in (
+        "qualitative interpretation is not automatically fact-verified",
+        "validated Nemotron proposal",
+        "proposes up to three objective panels",
+        "drafts one evidence-linked",
+    ):
+        assert stale not in readme
 
 
 def test_preflight_is_fixed_gpu_ready_and_credential_safe():
@@ -183,8 +209,8 @@ def test_boundary_is_scientifically_bounded_and_claim_safe():
     for phrase in (
         "bounded fixed workflow", "binding", "activity", "admet", "safety",
         "within-molecule", "not global", "experimental", "no performance claims",
-        "checks the conclusion structure before rendering",
-        "qualitative interpretation is not automatically fact-verified",
+        "python owns the measured conclusion headline and facts",
+        "predicate-true findings",
     ):
         assert phrase in boundary
 
@@ -235,8 +261,8 @@ def test_readme_preserves_launch_and_separate_acceptance_gates():
     assert "six approvals" in lowered
     assert "six completed command receipts/result cards" in lowered
     assert "one objective challenge" in lowered
-    assert "up to three objective proposals" in hosted_gate
-    assert "one evidence-linked, schema-checked conclusion" in hosted_gate
+    assert "up to three state-bound selections" in hosted_gate
+    assert "one evidence-controlled conclusion" in hosted_gate
     assert "run objective challenge" in lowered
     assert "minimum pairwise tanimoto distance" in lowered
     assert "o01" in lowered
@@ -244,13 +270,13 @@ def test_readme_preserves_launch_and_separate_acceptance_gates():
     assert "returns after the interface is displayed" in lowered
     assert "guarded button failures stay inside the active card" in lowered
     assert "pytest -q" in readme
-    assert "RUN_GPU_TESTS=1 pytest tests/test_gpu_acceptance.py -v" in readme
+    assert "RUN_GPU_TESTS=1 .venv/bin/python -m pytest -q" in readme
     assert "scripts/run_objective_reliability.py" in readme
     assert "--trials 20" in readme
     assert "--end-to-end-runs 3" in readme
     assert "--output" in readme
     assert "start agent" in lowered and "approve & run" in lowered
-    assert "qualitative interpretation is not automatically fact-verified" in lowered
+    assert "python-owned headline and facts" in lowered
     assert "not yet live-qualified" in lowered
 
 

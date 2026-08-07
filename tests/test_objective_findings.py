@@ -7,7 +7,12 @@ import pytest
 from chemistry_workflow import WorkflowReport
 from objective_challenge import (
     TerminationReason,
+    accepted_maxima,
+    build_action_menu,
     build_objective_evidence,
+    evaluate_selected_swap,
+    measure_panel,
+    score_key,
     terminal_objective_run,
 )
 from objective_findings import (
@@ -101,13 +106,48 @@ def test_target_fixture_preserves_exact_accepted_distance_and_complement():
 
     assert summary.final_distance == 0.8374999910593033
     assert summary.final_max_similarity == 1.0 - summary.final_distance
-    assert summary.target_margin == summary.final_distance - summary.target_distance
+    assert summary.target_margin == (
+        score_key(summary.final_distance) - score_key(summary.target_distance)
+    ) / 10**12
     assert summary.candidate_pool_count == 8
     assert summary.final_panel_count == 4
     assert summary.limiting_pairs == run.attempts[-1].limiting_pairs
     assert summary.limiting_similarities == tuple(
         summary.final_max_similarity for _ in summary.limiting_pairs
     )
+
+
+def test_raw_unequal_key_tied_target_has_zero_decision_margin():
+    final = 0.5000000000003
+    target = 0.5000000000003599
+    benchmark = 0.5250000000004499
+    matrix = np.full((8, 8), 0.4, dtype=np.float64)
+    np.fill_diagonal(matrix, 0.0)
+    for first in range(4):
+        for second in range(first + 1, 4):
+            matrix[first, second] = matrix[second, first] = 0.95
+    matrix[0, 1] = matrix[1, 0] = 0.4
+    for baseline_index in (1, 2, 3):
+        matrix[4, baseline_index] = matrix[baseline_index, 4] = final
+    for first in range(4, 8):
+        for second in range(first + 1, 8):
+            matrix[first, second] = matrix[second, first] = benchmark
+    context = context_from_distance(matrix)
+    assert context.target_score == target
+    baseline = measure_panel(context, context.baseline_ids)
+    menu = build_action_menu(context, baseline, 0)
+    action = next(item for item in accepted_maxima(menu) if item.predicted_score == final)
+    attempt = evaluate_selected_swap(context, menu, action, 1)
+    run = terminal_objective_run(
+        context, (attempt,), TerminationReason.TARGET_ACHIEVED
+    )
+    summary = build_measured_summary(evidence_report(), run)
+
+    assert final != target
+    assert score_key(final) == score_key(target)
+    assert summary.achieved is True
+    assert summary.target_margin == 0.0
+    assert "Target achieved" in summary.headline
 
 
 @pytest.mark.parametrize("reason", tuple(TerminationReason))

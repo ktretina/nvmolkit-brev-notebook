@@ -766,7 +766,7 @@ def _build_summary(
         benchmark_distance=benchmark,
         target_distance=target,
         final_distance=final,
-        target_margin=final - target,
+        target_margin=(score_key(final) - score_key(target)) / 10**12,
         final_max_similarity=final_similarity,
         limiting_pairs=limiting_pairs,
         limiting_similarities=limiting_similarities,

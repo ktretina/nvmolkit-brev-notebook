@@ -10,7 +10,7 @@ import ipywidgets as widgets
 import numpy as np
 import pytest
 from PIL import Image as PILImage
-from openai import AuthenticationError
+from openai import AuthenticationError, PermissionDeniedError
 
 import demo_agent
 from chemistry_workflow import StageResult
@@ -27,10 +27,11 @@ from objective_challenge import (
 from objective_fixtures import (
     BOUNDARY_CASES, controlled_context_with_action_count,
     controlled_context_without_improving_swaps, two_revision_context,
-    evidence_report, report_and_run,
+    evidence_report, optimized_state, report_and_run,
 )
 from objective_findings import (
     FindingCatalog, build_evidence_snapshot, build_finding_catalog_from_snapshot,
+    build_measured_summary,
 )
 from objective_receipts import objective_receipt
 from interactive_workflow import InteractiveWorkflow, controls_for
@@ -50,6 +51,65 @@ def auth_error():
         request=httpx.Request("POST", f"{demo_agent.NVIDIA_BASE_URL}/chat/completions"),
     )
     return AuthenticationError("objective authorization failure", response=response, body=None)
+
+
+def permission_error():
+    response = httpx.Response(
+        403,
+        request=httpx.Request("POST", f"{demo_agent.NVIDIA_BASE_URL}/chat/completions"),
+    )
+    return PermissionDeniedError(
+        "objective authorization failure", response=response, body=None
+    )
+
+
+def raw_tool_response(name, raw_arguments):
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+        content=None,
+        tool_calls=[SimpleNamespace(
+            id=f"call-{name}",
+            type="function",
+            function=SimpleNamespace(name=name, arguments=raw_arguments),
+        )],
+    ))])
+
+
+class RealControllerCompletions:
+    def __init__(self, responses):
+        self.responses = list(responses)
+
+    def create(self, **kwargs):
+        item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def real_terminal_workflow(responses):
+    completions = RealControllerCompletions(responses)
+    controller = demo_agent.BoundedWorkflowController(
+        session=demo_agent.AgentSession(
+            messages=[
+                {"role": "system", "content": "bounded chemistry agent"},
+                {"role": "user", "content": "analyze"},
+            ],
+            state=optimized_state(),
+            turn_count=7,
+        ),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+        executors={},
+        plan=demo_agent.WorkflowPlan(stages=[
+            {"stage": stage, "rationale": f"Run {stage}."}
+            for stage in demo_agent.STAGES
+        ]),
+        stage_results=[StageResult(stage, stage, {}) for stage in demo_agent.STAGES],
+        report=evidence_report(),
+        objective_required=True,
+    )
+    workflow = InteractiveWorkflow(controller)
+    workflow.completed_cards = tuple(widgets.VBox() for _ in demo_agent.STAGES)
+    workflow._show_objective_challenge()
+    return workflow, controller
 
 
 def proposals():
@@ -646,6 +706,59 @@ def test_attempt_rows_bind_initial_and_revision_to_exact_menu_provenance():
     assert "Attempt 1" in first_row and "Attempt 2" in second_row
     assert first[0].source.selected_ids != second[0].source.selected_ids
     assert second[0].source == first[2].measurement
+
+
+def test_attempt_card_renders_complete_decision_ladder_without_rationale():
+    context, (first, _second) = two_revision_decisions()
+    menu, selection, attempt = first
+    rendered = InteractiveWorkflow._objective_attempt_row(
+        menu, selection, attempt, context.target_score
+    )
+
+    headings = tuple(
+        rendered.index(f"<b>{label}:</b>")
+        for label in ("Observe", "Nemotron choice", "Execute", "Measure")
+    )
+    candidate_index = rendered.index("<b>Candidate actions</b>")
+    assert headings[0] < candidate_index < headings[1] < headings[2] < headings[3]
+    for phrase in (
+        "source panel",
+        "target comparison=",
+        "replace=",
+        "replacement=",
+        "resulting panel=",
+        "predicted score=",
+        "score_key=",
+        "delta=",
+        "resulting co-limiting pairs=",
+        "validated structured payload",
+        "Python validation:",
+        "at 1e-12 decision precision",
+        "Python evaluator receipt",
+        "evaluate_selected_swap",
+        "limiting Tanimoto similarities=",
+        "constraints passed=true",
+    ):
+        assert phrase in rendered
+    assert "rationale" not in rendered.lower()
+
+
+def test_measured_summary_marks_raw_unequal_key_tied_target_without_contradiction():
+    report, run = report_and_run()
+    summary = replace(
+        build_measured_summary(report, run),
+        final_distance=0.5000000000003,
+        target_distance=0.5000000000003599,
+        target_margin=0.0,
+        achieved=True,
+        headline=(
+            "Target achieved: final minimum distance 0.500000; target 0.500000."
+        ),
+    )
+    rendered = InteractiveWorkflow._measured_summary_html(summary)
+
+    assert "Target achieved" in rendered
+    assert "0.0; tied at 1e-12 decision precision" in rendered
 
 
 def test_revision_row_rejects_wrong_attempt_number_or_missing_selected_swap():
@@ -1339,17 +1452,15 @@ def test_objective_retry_invariant_counts_rejected_hosted_responses(monkeypatch)
 
 
 @pytest.mark.parametrize("accepted_attempt_count", [0, 1])
-def test_objective_correction_exhaustion_stops_explicitly_without_fabricating_result(
+def test_fake_correction_exhaustion_without_terminal_receipt_uses_generic_stop(
     accepted_attempt_count,
 ):
     controller = Controller()
     original_request = controller.request_objective_attempt
-    summary_before_stop = []
 
     def exhaust_corrections():
         if len(controller.objective_attempts) < accepted_attempt_count:
             return original_request()
-        summary_before_stop.append(workflow.objective_summary.value)
         controller.objective_rejection_count = demo_agent.MAX_OBJECTIVE_CORRECTIONS
         controller.session.turn_count += demo_agent.MAX_OBJECTIVE_CORRECTIONS
         controller.calls.append("objective_proposal")
@@ -1365,27 +1476,20 @@ def test_objective_correction_exhaustion_stops_explicitly_without_fabricating_re
     objective_card = workflow.objective_card
     workflow.objective_button.click()
 
-    assert workflow.status == "objective_stopped"
+    assert workflow.status == "stopped"
     assert workflow.retry_button is None
     assert workflow.objective_button.disabled
     assert workflow.completed_cards == completed_cards
     assert tuple(controller.stage_results) == stage_results
     assert workflow.objective_card is objective_card
-    assert workflow.objective_summary.value == summary_before_stop[0]
     assert len(workflow.objective_attempt_cards) == accepted_attempt_count
     assert len(controller.objective_attempts) == accepted_attempt_count
     assert controller.objective_run is None
     assert controller.objective_evidence is None
     assert controller.calls.count("synthesis") == 0
-    expected_count = f"Accepted scientific attempts: {accepted_attempt_count}."
-    explicit_stop = "No additional scientific attempt was executed."
     rendered = html_text(workflow.objective_card)
-    assert expected_count in rendered and expected_count in workflow.transcript_text
-    assert explicit_stop in rendered and explicit_stop in workflow.transcript_text
-    assert "The objective correction limit was reached." in rendered
-    assert "&lt;do-not-render-as-html&gt;" in rendered
+    assert "local workflow error" in workflow.transcript_text.lower()
     assert "<do-not-render-as-html>" not in rendered
-    assert "local workflow error" not in workflow.transcript_text.lower()
     assert "O01" not in rendered and "O01" not in workflow.transcript_text
 
 
@@ -1536,6 +1640,95 @@ def test_auth_and_nontransport_objective_failures_offer_no_retry(failure):
     assert controller.objective_attempts == []
     assert controller.objective_run is None
     assert controller.objective_evidence is None
+
+
+@pytest.mark.parametrize(
+    ("responses", "reason", "headline"),
+    [
+        (
+            [
+                raw_tool_response("select_next_panel_swap", "{malformed"),
+                raw_tool_response("select_next_panel_swap", "{malformed"),
+                SimpleNamespace(choices=[]),
+            ],
+            TerminationReason.OBJECTIVE_CORRECTION_LIMIT,
+            "Objective selection stopped after invalid responses",
+        ),
+        (
+            [auth_error(), SimpleNamespace(choices=[])],
+            TerminationReason.OBJECTIVE_PROVIDER_FAILURE,
+            "Objective provider unavailable",
+        ),
+        (
+            [permission_error(), SimpleNamespace(choices=[])],
+            TerminationReason.OBJECTIVE_PROVIDER_FAILURE,
+            "Objective provider unavailable",
+        ),
+        (
+            [RuntimeError("provider exploded"), SimpleNamespace(choices=[])],
+            TerminationReason.OBJECTIVE_PROVIDER_FAILURE,
+            "Objective provider unavailable",
+        ),
+        (
+            [SimpleNamespace(choices=[]), SimpleNamespace(choices=[])],
+            TerminationReason.OBJECTIVE_PROVIDER_FAILURE,
+            "Objective provider unavailable",
+        ),
+    ],
+)
+def test_real_controller_terminal_errors_render_ladder_o01_and_fallback_conclusion(
+    monkeypatch, responses, reason, headline
+):
+    monkeypatch.setattr("interactive_workflow.objective_figures", lambda run, state: ())
+    workflow, controller = real_terminal_workflow(responses)
+
+    workflow.objective_button.click()
+
+    assert workflow.status == "completed"
+    assert controller.objective_run.termination_reason is reason
+    assert controller.objective_evidence == build_objective_evidence(
+        controller.objective_run
+    )
+    assert isinstance(
+        workflow.workflow_result.conclusion, demo_agent.EvidenceControlledConclusion
+    )
+    assert (
+        workflow.workflow_result.conclusion.finding_selection_status
+        == "finding_selection_unavailable"
+    )
+    rendered = combined_html(workflow.root)
+    assert "Objective decision ladder" in rendered
+    assert headline in rendered
+    assert "agent-selected emphasis unavailable" in rendered
+    assert "local workflow error" not in rendered.lower()
+
+
+def test_real_controller_second_transport_failure_finishes_terminal_ladder(
+    monkeypatch,
+):
+    monkeypatch.setattr("interactive_workflow.objective_figures", lambda run, state: ())
+    workflow, controller = real_terminal_workflow([
+        connect_error("first"),
+        connect_error("second"),
+        SimpleNamespace(choices=[]),
+    ])
+
+    workflow.objective_button.click()
+    assert workflow.status == "objective_failed"
+    workflow.retry_button.click()
+
+    assert workflow.status == "completed"
+    assert (
+        controller.objective_run.termination_reason
+        is TerminationReason.OBJECTIVE_PROVIDER_FAILURE
+    )
+    assert controller.objective_evidence == build_objective_evidence(
+        controller.objective_run
+    )
+    rendered = combined_html(workflow.root)
+    assert "Objective decision ladder" in rendered
+    assert "Objective provider unavailable" in rendered
+    assert "agent-selected emphasis unavailable" in rendered
 
 
 def test_known_synthesis_failure_has_guarded_retry(monkeypatch):

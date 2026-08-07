@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import fields
 from html import escape
 from io import BytesIO
+import json
 from typing import Any
 
 import ipywidgets as widgets
@@ -16,7 +17,7 @@ from command_receipts import CommandReceipt, command_receipt
 from objective_challenge import (
     MAX_ATTEMPTS, ObjectiveActionMenu, ObjectiveAttempt, ObjectiveSwap,
     TerminationReason, accepted_maxima, build_action_menu, measure_panel,
-    objective_figures, score_key, target_is_achieved,
+    build_objective_evidence, objective_figures, score_key, target_is_achieved,
 )
 from objective_receipts import objective_receipt
 
@@ -281,6 +282,22 @@ class InteractiveWorkflow:
                 == tuple(range(1, len(attempts) + 1))
                 and self.controller.session.turn_count
                 == 7 + len(attempts) + self.controller.objective_rejection_count
+            )
+        except Exception:
+            return False
+
+    def _has_safe_terminal_objective(self) -> bool:
+        """Accept only a complete controller-authored terminal run and O01 receipt."""
+        try:
+            run = self.controller.objective_run
+            evidence = self.controller.objective_evidence
+            return (
+                run is not None
+                and evidence is not None
+                and evidence == build_objective_evidence(run)
+                and self.controller.objective_context is run.context
+                and self.controller.pending_action_menu is None
+                and self.controller.pending_objective_selection is None
             )
         except Exception:
             return False
@@ -606,7 +623,9 @@ class InteractiveWorkflow:
             "</section>"
         )
         decision_ladder = baseline_row + "".join(
-            InteractiveWorkflow._objective_attempt_row(menu, selection, attempt)
+            InteractiveWorkflow._objective_attempt_row(
+                menu, selection, attempt, context.target_score
+            )
             for menu, selection, attempt in decisions
         )
         terminal_actions = ""
@@ -672,7 +691,9 @@ class InteractiveWorkflow:
             raise ValueError(
                 "Displayed objective menu does not match deterministic controller state."
             )
-        InteractiveWorkflow._objective_attempt_row(menu, selection, attempt)
+        InteractiveWorkflow._objective_attempt_row(
+            menu, selection, attempt, context.target_score
+        )
         if attempt is None:
             return
         measured = measure_panel(context, attempt.selected_ids)
@@ -725,7 +746,7 @@ class InteractiveWorkflow:
         if not menu.actions:
             return "<p><b>Candidate actions:</b> No legal improving candidate actions.</p>"
         rows = []
-        for action in sorted(menu.actions, key=lambda item: item.swap_id):
+        for action in menu.actions:
             pairs = " · ".join(
                 f"{escape(first)} / {escape(second)}"
                 for first, second in action.limiting_pairs
@@ -746,7 +767,7 @@ class InteractiveWorkflow:
         return "<div><b>Candidate actions</b>" + "".join(rows) + "</div>"
 
     @staticmethod
-    def _objective_attempt_row(menu, selection, attempt=None) -> str:
+    def _objective_attempt_row(menu, selection, attempt=None, target_score=None) -> str:
         """Render one exact menu/selection/commit decision without model rationale."""
         if type(menu) is not ObjectiveActionMenu or type(selection) is not demo_agent.ObjectiveSelection:
             raise ValueError("Objective rows require exact public menu and selection types.")
@@ -813,15 +834,19 @@ class InteractiveWorkflow:
         ):
             raise ValueError("Objective selected action is not canonical policy evidence.")
         action_rows = []
-        for action in sorted(menu.actions, key=lambda item: item.swap_id):
+        for action in menu.actions:
             pairs = " · ".join(
                 f"{escape(first)} / {escape(second)}" for first, second in action.limiting_pairs
             )
+            resulting = ", ".join(escape(item) for item in action.resulting_ids)
             action_rows.append(
                 "<li aria-label='Candidate action'>"
-                f"<b>{escape(action.swap_id)}</b>: score={action.predicted_score!r}; "
+                f"<b>{escape(action.swap_id)}</b>: replace={escape(action.replace_id)}; "
+                f"replacement={escape(action.replacement_id)}; resulting panel={resulting}; "
+                f"predicted score={action.predicted_score!r}; "
                 f"score_key={action.predicted_score_key}; delta={action.score_delta!r}; "
-                f"resulting co-limiting pairs={pairs}; target status={escape(action.target_status)}"
+                f"resulting co-limiting pairs={pairs}; target comparison="
+                f"{escape(InteractiveWorkflow._objective_target_status(action.predicted_score, target_score) if type(target_score) is float else action.target_status)}"
                 "</li>"
             )
         candidate_html = (
@@ -831,6 +856,27 @@ class InteractiveWorkflow:
         )
         source_pairs = " · ".join(
             f"{escape(first)} / {escape(second)}" for first, second in menu.source.limiting_pairs
+        )
+        source_panel = ", ".join(escape(item) for item in source_ids)
+        selection_payload = json.dumps(
+            {
+                "decision_rule": selection.decision_rule,
+                "observed_limiting_pairs": selection.observed_limiting_pairs,
+                "state_id": selection.state_id,
+                "swap_id": selection.swap_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        maximum_key = max(action.predicted_score_key for action in menu.actions)
+        maximum_count = sum(
+            action.predicted_score_key == maximum_key for action in menu.actions
+        )
+        policy_receipt = (
+            "Python validation: the selected action is one of "
+            f"{maximum_count} tied maxima at 1e-12 decision precision."
+            if maximum_count > 1
+            else "Python validation: the selected action is the unique argmax at 1e-12 decision precision."
         )
         attempt_number = menu.accepted_attempt_count + 1
         if attempt is None:
@@ -862,22 +908,30 @@ class InteractiveWorkflow:
             measured_pairs = " · ".join(
                 f"{escape(first)} / {escape(second)}" for first, second in attempt.limiting_pairs
             )
+            similarities = " · ".join(
+                f"{escape(first)} / {escape(second)}: {1.0 - attempt.score!r}"
+                for first, second in attempt.limiting_pairs
+            )
             measure = (
                 f"<small><b>Measure:</b> D_min {attempt.score!r}; score_key={attempt.score_key}; "
                 f"delta={selected.score_delta!r}; co-limiting pairs={measured_pairs}; "
-                f"target status={escape(selected.target_status)}</small><br>"
+                f"limiting Tanimoto similarities={similarities}; constraints passed=true; "
+                f"target comparison={escape(InteractiveWorkflow._objective_target_status(attempt.score, target_score) if type(target_score) is float else selected.target_status)}</small><br>"
                 f"<small><b>Outcome:</b> {escape(outcome)}</small>"
             )
         return (
             f"<section style='border-left:3px solid {accent};padding:6px 10px;"
             "margin:6px 0' aria-label='Objective attempt'>"
             f"<b>Attempt {attempt_number}</b> · {escape(outcome)}<br>"
-            f"<small><b>Observe:</b> state {escape(menu.state_id)}; source D_min "
-            f"{menu.source.score!r}; score_key={menu.source.score_key}; co-limiting pairs {source_pairs}</small><br>"
+            f"<small><b>Observe:</b> state {escape(menu.state_id)}; source panel {source_panel}; "
+            f"source D_min {menu.source.score!r}; score_key={menu.source.score_key}; "
+            f"co-limiting pairs {source_pairs}; target comparison="
+            f"{escape(InteractiveWorkflow._objective_target_status(menu.source.score, target_score) if type(target_score) is float else 'target supplied by the objective context')}</small><br>"
             f"<div><b>Candidate actions</b>{candidate_html}</div>"
-            f"<small><b>Nemotron choice:</b> {escape(selection.swap_id)} from state "
-            f"{escape(selection.state_id)} using {escape(selection.decision_rule)}</small><br>"
-            f"<small><b>Execute:</b> <code>select_next_panel_swap(state_id={escape(selection.state_id)!r}, "
+            f"<small><b>Nemotron choice:</b> validated structured payload "
+            f"<code>{escape(selection_payload)}</code>. {escape(policy_receipt)}</small><br>"
+            f"<small><b>Execute:</b> Python evaluator receipt "
+            f"<code>evaluate_selected_swap(state_id={escape(selection.state_id)!r}, "
             f"swap_id={escape(selection.swap_id)!r})</code></small><br>"
             f"{measure}</section>"
         )
@@ -997,7 +1051,9 @@ class InteractiveWorkflow:
         )
         cards = []
         for menu, selection, attempt in self.objective_decisions:
-            row = self._objective_attempt_row(menu, selection, attempt)
+            row = self._objective_attempt_row(
+                menu, selection, attempt, self.controller.objective_context.target_score
+            )
             if attempt is None:
                 result_label = "Evaluation not completed"
                 details_html = row
@@ -1114,9 +1170,9 @@ class InteractiveWorkflow:
                     "Retry Objective Proposal",
                     self._retry_objective,
                 )
-            elif isinstance(error, demo_agent.ObjectiveCorrectionLimitError):
+            elif self._has_safe_terminal_objective():
                 try:
-                    self._stop_objective(error)
+                    self._finish_objective_challenge()
                 except Exception:
                     self._stop()
             else:
@@ -1271,6 +1327,12 @@ class InteractiveWorkflow:
                 )
             elif field.name == "limiting_pairs":
                 value = f"{raw_value}; paired similarities: {limiting_pairs}"
+            elif (
+                field.name == "target_margin"
+                and summary.final_distance != summary.target_distance
+                and score_key(summary.final_distance) == score_key(summary.target_distance)
+            ):
+                value = f"{raw_value}; tied at 1e-12 decision precision"
             rows.append((field.name, field.name.replace("_", " ").title(), value))
         body = "".join(
             f'<tr data-field="{escape(field_name)}">'
