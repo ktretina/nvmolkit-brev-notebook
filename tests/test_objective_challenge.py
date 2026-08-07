@@ -2,7 +2,6 @@ import itertools
 import json
 from dataclasses import replace
 from decimal import Decimal, ROUND_FLOOR
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -45,6 +44,7 @@ from objective_fixtures import (
     controlled_context_with_action_count,
     controlled_context_without_improving_swaps,
     optimized_state,
+    quantized_baseline_target_context,
     terminal_fixture,
     two_revision_context,
 )
@@ -309,6 +309,39 @@ def test_exact_production_context_scores_pass_authoritative_validation():
 
     assert build_action_menu(context, source, 0).actions
     assert objective_challenge.certify_argmax_reachability(context) is True
+
+
+def test_quantized_baseline_target_is_zero_substitution_target_success():
+    context = quantized_baseline_target_context()
+    baseline = objective_challenge.measure_panel(context, context.baseline_ids)
+
+    assert baseline.score_key == objective_challenge.score_key(context.target_score)
+    assert baseline.score_key < objective_challenge.score_key(context.benchmark_score)
+    assert baseline.achieved is True
+    assert objective_challenge.certify_argmax_reachability(context) is True
+
+    run = terminal_objective_run(context, (), TerminationReason.TARGET_ACHIEVED)
+    payload = json.loads(build_objective_evidence(run).payload_json)
+
+    assert run.attempts == ()
+    assert run.final_ids == baseline.selected_ids
+    assert run.final_score == baseline.score
+    assert payload["attempt_count"] == 0
+    assert payload["termination_reason"] == "target_achieved"
+
+
+def test_zero_substitution_target_success_rejects_below_target_baseline():
+    context = controlled_context_with_ranked_swaps()
+
+    with pytest.raises(ValueError, match="measured target success"):
+        terminal_objective_run(context, (), TerminationReason.TARGET_ACHIEVED)
+
+
+def test_zero_substitution_target_reason_does_not_replace_exact_baseline_optimal_reason():
+    context = build_objective_context(optimized_state(baseline_optimal=True))
+
+    with pytest.raises(ValueError, match="baseline-optimal"):
+        terminal_objective_run(context, (), TerminationReason.TARGET_ACHIEVED)
 
 
 def test_legacy_finalizer_rejects_arbitrary_target_panel_without_swap():
@@ -604,11 +637,25 @@ def test_objective_context_owns_a_read_only_float64_distance_matrix():
     source[0, 1] = source[1, 0] = 0.1
 
     assert context.distance_matrix.dtype == np.dtype(np.float64)
-    assert context.distance_matrix.flags.owndata is True
+    assert context.distance_matrix.flags.owndata is False
+    assert isinstance(context.distance_matrix.base.base, bytes)
     assert context.distance_matrix.flags.writeable is False
     assert objective_challenge.measure_panel(context, context.baseline_ids) == original
     with pytest.raises(ValueError):
         context.distance_matrix[0, 1] = 0.1
+
+
+def test_distance_matrix_cannot_be_made_writeable_and_menu_identity_stays_stable():
+    context = controlled_context_with_ranked_swaps()
+    source = objective_challenge.measure_panel(context, context.baseline_ids)
+    menu = build_action_menu(context, source, 0)
+
+    with pytest.raises(ValueError):
+        context.distance_matrix.setflags(write=True)
+    with pytest.raises(ValueError):
+        context.distance_matrix[0, 1] = 0.0
+
+    assert build_action_menu(context, source, 0) == menu
 
 
 @pytest.mark.parametrize("invalid_distance", (float("nan"), float("inf"), -0.1, 1.1))
@@ -654,7 +701,8 @@ def test_build_context_canonicalizes_upstream_tolerated_directional_noise():
     context = build_objective_context(state)
 
     assert np.array_equal(context.distance_matrix, context.distance_matrix.T)
-    assert context.distance_matrix.flags.owndata is True
+    assert context.distance_matrix.flags.owndata is False
+    assert isinstance(context.distance_matrix.base.base, bytes)
     assert context.distance_matrix.flags.writeable is False
 
 
@@ -688,6 +736,22 @@ def test_objective_context_rejects_duplicate_or_empty_candidate_ids():
         )
         with pytest.raises(ValueError, match="molecule IDs"):
             _replace_context_candidates(context, candidates)
+
+
+def test_objective_context_rejects_reserved_swap_delimiter_before_identity_collision():
+    context = controlled_context_with_ranked_swaps()
+    colliding_ids = ("a->b", "c", "a", "b->c", "d", "e", "f", "g")
+    candidates = tuple(
+        replace(candidate, molecule_id=molecule_id)
+        for candidate, molecule_id in zip(context.candidates, colliding_ids)
+    )
+
+    with pytest.raises(ValueError, match="reserved delimiter"):
+        replace(
+            context,
+            candidates=candidates,
+            baseline_ids=colliding_ids[:4],
+        )
 
 
 @pytest.mark.parametrize("field", ("molecule_index", "source_row"))
@@ -1103,7 +1167,7 @@ def test_rank_legal_swaps_suggestions_match_direct_evaluation():
         assert len(set(suggestion.resulting_ids)) == PANEL_SIZE
 
 
-def test_rank_legal_swaps_returns_none_after_success_and_stays_fixture_agnostic():
+def test_rank_legal_swaps_validates_achieved_attempt_before_returning_none():
     context = build_objective_context(optimized_state())
     achieved = evaluate_diverse_panel(
         context,
@@ -1111,22 +1175,19 @@ def test_rank_legal_swaps_returns_none_after_success_and_stays_fixture_agnostic(
         attempt_number=1,
         decision_basis="Use a diverse four-cluster panel.",
     )
-    out_of_pool_achieved = ObjectiveAttempt(
-        attempt_number=1,
-        selected_ids=("outside-0", "outside-1", "outside-2", "outside-3"),
-        decision_basis="An already completed attempt needs no replacement.",
-        score=1.0,
-        limiting_pair=("outside-0", "outside-1"),
-        constraints_passed=False,
-        achieved=True,
-    )
-    source = Path(objective_challenge.__file__).read_text(encoding="utf-8")
-
     assert achieved.achieved is True
     assert rank_legal_swaps(context, achieved) == ()
-    assert rank_legal_swaps(context, out_of_pool_achieved) == ()
-    assert all(f"mol-{index}" not in source for index in range(CANDIDATE_COUNT))
-    assert "CHEMBL" not in source
+    for forged in (
+        replace(
+            achieved,
+            selected_ids=("outside-0", "outside-1", "outside-2", "outside-3"),
+        ),
+        replace(achieved, score=float(np.nextafter(achieved.score, 0.0))),
+        replace(achieved, limiting_pair=("mol-0", "mol-0")),
+        replace(achieved, constraints_passed=False),
+    ):
+        with pytest.raises(ValueError):
+            rank_legal_swaps(context, forged)
 
 
 @pytest.mark.parametrize("forged_score", (-1.0, float("nan")))

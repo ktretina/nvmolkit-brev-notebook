@@ -79,14 +79,21 @@ class ObjectiveContext:
         molecule_ids = tuple(candidate.molecule_id for candidate in self.candidates)
         if (
             any(
-                type(molecule_id) is not str or not molecule_id
+                type(molecule_id) is not str
+                or not molecule_id
+                or "->" in molecule_id
                 for molecule_id in molecule_ids
             )
             or len(set(molecule_ids)) != CANDIDATE_COUNT
         ):
-            raise ValueError(
-                "Objective candidate molecule IDs must be unique nonempty strings."
-            )
+            if any(
+                type(molecule_id) is str and "->" in molecule_id
+                for molecule_id in molecule_ids
+            ):
+                raise ValueError(
+                    "Objective candidate molecule IDs contain the reserved delimiter '->'."
+                )
+            raise ValueError("Objective candidate molecule IDs must be unique nonempty strings.")
         molecule_indices = tuple(
             candidate.molecule_index for candidate in self.candidates
         )
@@ -154,7 +161,10 @@ class ObjectiveContext:
             raise ValueError("Objective distance matrix must be symmetric.")
         if np.any(np.diag(distance_matrix) != 0.0):
             raise ValueError("Objective distance matrix must have a zero diagonal.")
-        distance_matrix.setflags(write=False)
+        immutable_bytes = distance_matrix.tobytes(order="C")
+        distance_matrix = np.frombuffer(
+            immutable_bytes, dtype=np.float64
+        ).reshape((CANDIDATE_COUNT, CANDIDATE_COUNT))
         object.__setattr__(self, "distance_matrix", distance_matrix)
 
 
@@ -755,8 +765,6 @@ def rank_legal_swaps(
     """Rank legal one-ID panel swaps by their predicted objective improvement."""
     if type(context) is not ObjectiveContext or type(current) is not ObjectiveAttempt:
         raise ValueError("Objective swap ranking requires exact objective types.")
-    if current.achieved:
-        return ()
     panel, _ = _validated_panel(context, current.selected_ids)
     recomputed = measure_panel(context, panel)
     if type(current.score) is not float or not np.isfinite(current.score):
@@ -774,8 +782,10 @@ def rank_legal_swaps(
         raise ValueError("Objective attempt evidence does not match its panel.")
     if current.constraints_passed is not True:
         raise ValueError("Objective attempt constraints must be passed.")
-    if recomputed.achieved:
-        raise ValueError("Objective attempt below-target state is inconsistent.")
+    if current.achieved is not recomputed.achieved:
+        raise ValueError("Objective attempt achieved state is inconsistent.")
+    if current.achieved:
+        return ()
 
     accepted_count = max(current.attempt_number - 1, 0)
     return accepted_maxima(build_action_menu(context, recomputed, accepted_count))
@@ -827,8 +837,12 @@ def terminal_objective_run(
         if attempts or baseline.score_key != actual_benchmark.score_key:
             raise ValueError("Objective baseline is not actually optimal.")
     elif reason is TerminationReason.TARGET_ACHIEVED:
-        if not attempts or not current.achieved:
-            raise ValueError("Target success requires a measured successful attempt.")
+        if not current.achieved:
+            raise ValueError("Target success requires measured target success.")
+        if not attempts and baseline.score_key == actual_benchmark.score_key:
+            raise ValueError(
+                "Exact baseline-optimal state requires baseline-optimal termination."
+            )
     elif reason is TerminationReason.ATTEMPT_LIMIT_REACHED:
         if len(attempts) != MAX_ATTEMPTS or current.achieved:
             raise ValueError("Attempt-limit termination requires exactly three measured misses.")

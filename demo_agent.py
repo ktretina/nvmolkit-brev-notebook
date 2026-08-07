@@ -40,12 +40,17 @@ from objective_challenge import (
     ObjectiveContext,
     ObjectiveRun,
     ObjectiveSwap,
+    TerminationReason,
     build_objective_context,
     build_objective_evidence,
     evaluate_diverse_panel,
     finalize_objective_run,
+    measure_panel,
     no_improvement_run,
     rank_legal_swaps,
+    score_key,
+    target_is_achieved,
+    terminal_objective_run,
 )
 
 
@@ -1250,8 +1255,14 @@ class BoundedWorkflowController:
         )
         self.objective_context = context
         self.objective_prompt_appended = True
-        if abs(context.benchmark_score - context.baseline_score) <= 1e-12:
-            self.objective_run = no_improvement_run(context)
+        baseline = measure_panel(context, context.baseline_ids)
+        if target_is_achieved(baseline.score, context.target_score):
+            if baseline.score_key == score_key(context.benchmark_score):
+                self.objective_run = no_improvement_run(context)
+            else:
+                self.objective_run = terminal_objective_run(
+                    context, (), TerminationReason.TARGET_ACHIEVED
+                )
             self.objective_evidence = build_objective_evidence(self.objective_run)
         return context
 

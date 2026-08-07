@@ -221,6 +221,15 @@ def controlled_context_with_three_misses() -> ObjectiveContext:
     return context_from_distance(matrix)
 
 
+def quantized_baseline_target_context() -> ObjectiveContext:
+    matrix = np.full((CANDIDATE_COUNT, CANDIDATE_COUNT), 0.5, dtype=np.float64)
+    np.fill_diagonal(matrix, 0.0)
+    for first in range(4, 8):
+        for second in range(first + 1, 8):
+            matrix[first, second] = matrix[second, first] = 0.5000000000006
+    return context_from_distance(matrix)
+
+
 def terminal_fixture(reason: str | TerminationReason, attempt_count: int):
     reason = TerminationReason(reason)
     if reason is TerminationReason.BASELINE_ALREADY_OPTIMAL:

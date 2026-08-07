@@ -1,6 +1,5 @@
 import os
 import json
-import inspect
 import itertools
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,29 +11,37 @@ import pytest
 MIN_CONVERGED = 10
 
 
-def test_gpu_acceptance_source_gates_default_objective_challenge():
-    source = inspect.getsource(test_nvmolkit_gpu_workflow)
+def test_cpu_acceptance_contract_covers_certified_objective_terminal_evidence():
+    from objective_challenge import (
+        TerminationReason,
+        accepted_maxima,
+        build_action_menu,
+        build_objective_context,
+        build_objective_evidence,
+        certify_argmax_reachability,
+        evaluate_selected_swap,
+        measure_panel,
+        terminal_objective_run,
+    )
+    from objective_fixtures import optimized_state
 
-    for required in (
-        "sample_molecules.csv",
-        "objective_required=True",
-        '"cutoff": 0.4',
-        '"policy": "largest_clusters_first"',
-        '"conformers_per_representative": 5',
-        "begin_objective_challenge",
-        "certify_argmax_reachability(context)",
-        "build_action_menu(context",
-        "accepted_maxima(menu)",
-        "is_strict_improvement(",
-        "target_is_achieved(",
-        "objective_suggestions",
-        "selected_swap.predicted_score",
-        "len(set(accepted_panels)) == len(accepted_panels)",
-        'objective_evidence.key == "O01"',
-        'termination_reason == "target_achieved"',
-    ):
-        assert required in source
-    assert "SCORE_TOLERANCE" not in source
+    context = build_objective_context(optimized_state())
+    baseline = measure_panel(context, context.baseline_ids)
+    menu = build_action_menu(context, baseline, 0)
+    maxima = accepted_maxima(menu)
+    attempt = evaluate_selected_swap(context, menu, maxima[0], 1)
+    run = terminal_objective_run(
+        context, (attempt,), TerminationReason.TARGET_ACHIEVED
+    )
+    payload = json.loads(build_objective_evidence(run).payload_json)
+
+    assert menu.state_id.startswith("state-")
+    assert maxima and all(action.limiting_pairs for action in menu.actions)
+    assert certify_argmax_reachability(context) is True
+    assert run.termination_reason == "target_achieved"
+    assert payload["attempts"][0]["state_id"] == menu.state_id
+    assert payload["baseline"]["limiting_pairs"]
+    assert payload["final_measurement"]["limiting_pairs"]
 
 
 @pytest.mark.skipif(

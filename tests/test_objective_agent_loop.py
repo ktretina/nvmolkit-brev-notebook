@@ -14,6 +14,7 @@ from chemistry_workflow import (
     WorkflowState,
 )
 from objective_challenge import rank_legal_swaps
+from objective_fixtures import quantized_baseline_target_context
 
 
 class FakeTensor:
@@ -950,6 +951,19 @@ def test_optimal_baseline_terminates_without_manufacturing_an_attempt():
     assert context.baseline_score == context.benchmark_score
     assert controller.objective_run.termination_reason == "baseline_already_optimal"
     assert controller.objective_run.attempts == ()
+    assert completions.calls == []
+
+
+def test_quantized_baseline_target_short_circuits_without_hosted_attempt(monkeypatch):
+    controller, completions = completed_controller([])
+    context = quantized_baseline_target_context()
+    monkeypatch.setattr(demo_agent, "build_objective_context", lambda state: context)
+
+    controller.begin_objective_challenge()
+
+    assert controller.objective_run.termination_reason == "target_achieved"
+    assert controller.objective_run.attempts == ()
+    assert controller.objective_evidence.key == "O01"
     assert completions.calls == []
 
 
