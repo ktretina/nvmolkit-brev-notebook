@@ -54,10 +54,8 @@ class _AuditedCompletions:
     def __init__(self, delegate: object) -> None:
         self._delegate = delegate
         self.calls: list[dict[str, object]] = []
-        self.schema_digests: list[str] = []
 
     def create(self, **kwargs: object) -> object:
-        self.schema_digests.append(_canonical_tool_schema_digest(kwargs.get("tools")))
         self.calls.append({
             "model": kwargs.get("model"),
             "temperature": kwargs.get("temperature"),
@@ -383,20 +381,129 @@ def _messages_are_paired(messages: object) -> bool:
     return bool(seen)
 
 
+def _independent_tool_contract(name: str, model: object) -> dict[str, object]:
+    """Build the strict static contract without invoking a production tool builder."""
+    parameters = deepcopy(model.model_json_schema())
+    parameters["additionalProperties"] = False
+    parameters["required"] = list(model.model_fields)
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": demo_agent.TOOL_DESCRIPTIONS[name],
+            "strict": True,
+            "parameters": parameters,
+        },
+    }
+
+
+def _independent_objective_contract(menu: object) -> dict[str, object]:
+    contract = _independent_tool_contract(
+        "select_next_panel_swap", demo_agent.ObjectiveSelection
+    )
+    properties = contract["function"]["parameters"]["properties"]
+    properties["state_id"]["enum"] = [menu.state_id]
+    properties["swap_id"]["enum"] = [action.swap_id for action in menu.actions]
+    properties["observed_limiting_pairs"]["enum"] = [[
+        list(pair) for pair in menu.source.limiting_pairs
+    ]]
+    properties["decision_rule"]["enum"] = [
+        "maximize_predicted_minimum_distance"
+    ]
+    return contract
+
+
+def _independent_objective_contracts(
+    controller: demo_agent.BoundedWorkflowController,
+) -> list[dict[str, object]]:
+    context = controller.objective_context
+    if context is None:
+        return []
+    current = measure_panel(context, context.baseline_ids)
+    contracts: list[dict[str, object]] = []
+    for attempt_index, attempt in enumerate(controller.objective_attempts):
+        menu = build_action_menu(context, current, attempt_index)
+        contracts.append(_independent_objective_contract(menu))
+        current = attempt.measurement
+    return contracts
+
+
+def _independent_finding_contract(
+    controller: demo_agent.BoundedWorkflowController,
+) -> dict[str, object]:
+    if controller.report is None or controller.objective_run is None:
+        raise ValueError("Finding contract requires completed objective evidence.")
+    snapshot = build_evidence_snapshot(controller.report, controller.objective_run)
+    catalog = build_finding_catalog_from_snapshot(snapshot)
+    contract = _independent_tool_contract(
+        "select_evidence_findings", demo_agent.FindingSelection
+    )
+    contract["function"]["parameters"]["properties"][
+        "ordered_finding_ids"
+    ]["items"] = {
+        "type": "string",
+        "enum": list(catalog.ids),
+    }
+    return contract
+
+
+def _tool_contract_matches(recorded: object, expected: object) -> bool:
+    return (
+        type(recorded) is dict
+        and recorded == expected
+        and _canonical_tool_schema_digest(recorded)
+        == _canonical_tool_schema_digest(expected)
+    )
+
+
+def _objective_contract_sequence_matches(
+    recorded: list[dict[str, object]], expected: list[dict[str, object]]
+) -> bool:
+    if not expected:
+        return not recorded
+    expected_index = 0
+    for tool in recorded:
+        if _tool_contract_matches(tool, expected[expected_index]):
+            continue
+        if (
+            expected_index + 1 < len(expected)
+            and _tool_contract_matches(tool, expected[expected_index + 1])
+        ):
+            expected_index += 1
+            continue
+        return False
+    return bool(recorded) and expected_index == len(expected) - 1
+
+
 def _calls_use_production_contract(
     controller: demo_agent.BoundedWorkflowController, kind: str
 ) -> bool:
     completions = getattr(getattr(controller.client, "chat", None), "completions", None)
     calls = getattr(completions, "calls", None)
-    schema_digests = getattr(completions, "schema_digests", None)
-    if (
-        type(calls) is not list
-        or not calls
-        or type(schema_digests) is not list
-        or len(schema_digests) != len(calls)
-    ):
+    if type(calls) is not list or not calls:
         return False
-    for call, trusted_schema_digest in zip(calls, schema_digests, strict=True):
+    try:
+        expected_static = {
+            "submit_workflow_plan": _independent_tool_contract(
+                "submit_workflow_plan", demo_agent.WorkflowPlan
+            ),
+            **{
+                stage: _independent_tool_contract(
+                    stage, demo_agent.TOOL_ARGUMENT_MODELS[stage]
+                )
+                for stage in demo_agent.STAGES
+            },
+        }
+        expected_objective = _independent_objective_contracts(controller)
+        expected_finding = (
+            _independent_finding_contract(controller)
+            if kind == "end_to_end"
+            else None
+        )
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        return False
+    recorded_objective_tools: list[dict[str, object]] = []
+    for call in calls:
         try:
             tools = call["tools"]
             choice = call["tool_choice"]
@@ -406,11 +513,6 @@ def _calls_use_production_contract(
         except (KeyError, IndexError, TypeError):
             return False
         if type(tools) is not list or len(tools) != 1:
-            return False
-        if (
-            type(trusted_schema_digest) is not str
-            or _canonical_tool_schema_digest(tools) != trusted_schema_digest
-        ):
             return False
         try:
             tool = tools[0]["function"]
@@ -439,6 +541,20 @@ def _calls_use_production_contract(
             or stream is not False
         ):
             return False
+        if choice_name == "select_next_panel_swap":
+            recorded_objective_tools.append(tools[0])
+        elif choice_name == "select_evidence_findings":
+            expected_tool = expected_finding
+            if expected_tool is None or not _tool_contract_matches(
+                tools[0], expected_tool
+            ):
+                return False
+        else:
+            expected_tool = expected_static.get(choice_name)
+            if expected_tool is None or not _tool_contract_matches(
+                tools[0], expected_tool
+            ):
+                return False
         expected_tokens = 900 if choice_name == "submit_workflow_plan" else 400
         if max_tokens != expected_tokens:
             return False
@@ -458,6 +574,10 @@ def _calls_use_production_contract(
             or set(parameters["required"]) != expected_fields
         ):
             return False
+    if not _objective_contract_sequence_matches(
+        recorded_objective_tools, expected_objective
+    ):
+        return False
     names = [call["tool_choice"]["function"]["name"] for call in calls]
     objective_count = controller.provider_request_attempt_count
     objective_names = ["select_next_panel_swap"] * objective_count

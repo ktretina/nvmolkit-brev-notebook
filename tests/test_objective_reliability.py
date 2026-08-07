@@ -202,13 +202,9 @@ class _CurrentMaximumCompletions:
         self.controller = None
         self.fail_first = fail_first
         self.calls = []
-        self.schema_digests = []
 
     def create(self, **kwargs):
-        from scripts.run_objective_reliability import _canonical_tool_schema_digest
-
         self.calls.append(kwargs)
-        self.schema_digests.append(_canonical_tool_schema_digest(kwargs["tools"]))
         if self.fail_first:
             self.fail_first = False
             raise httpx.ConnectError("provider details must not leak")
@@ -355,10 +351,7 @@ class _EndToEndCompletions(_CurrentMaximumCompletions):
         name = kwargs["tool_choice"]["function"]["name"]
         if name == "select_next_panel_swap":
             return super().create(**kwargs)
-        from scripts.run_objective_reliability import _canonical_tool_schema_digest
-
         self.calls.append(kwargs)
-        self.schema_digests.append(_canonical_tool_schema_digest(kwargs["tools"]))
         if name == "submit_workflow_plan":
             arguments = {
                 "stages": [
@@ -607,6 +600,51 @@ def test_request_audit_rejects_nested_schema_mutation(phase, mutation):
         kind = "end_to_end"
 
     assert reliability._calls_use_production_contract(controller, kind) is False
+
+
+def test_objective_audit_rejects_builder_regression_present_before_request(
+    monkeypatch,
+):
+    import scripts.run_objective_reliability as reliability
+
+    real_builder = demo_agent._objective_selection_tool
+
+    def regressed_builder(menu):
+        tool = real_builder(menu)
+        tool["function"]["parameters"]["properties"]["state_id"]["type"] = (
+            "integer"
+        )
+        return tool
+
+    monkeypatch.setattr(demo_agent, "_objective_selection_tool", regressed_builder)
+    record = reliability.run_trials(
+        ScriptedControllerFactory(prepared_snapshot()), trials=1
+    )[0]
+
+    assert record["completed"] is True
+    assert record["production_temperature_zero"] is False
+
+
+def test_finding_audit_rejects_builder_regression_present_before_request(
+    monkeypatch,
+):
+    import scripts.run_objective_reliability as reliability
+
+    real_builder = demo_agent._tool_definition
+
+    def regressed_builder(name, model, *, finding_ids=None):
+        tool = real_builder(name, model, finding_ids=finding_ids)
+        if name == "select_evidence_findings":
+            tool["function"]["parameters"]["properties"][
+                "ordered_finding_ids"
+            ]["type"] = "string"
+        return tool
+
+    monkeypatch.setattr(demo_agent, "_tool_definition", regressed_builder)
+    record = reliability.run_end_to_end(_fresh_end_to_end_controller, runs=1)[0]
+
+    assert record["completed"] is True
+    assert record["production_temperature_zero"] is False
 
 
 def test_reliability_receipt_has_exact_frozen_fields_and_fail_closed_exit_code():
