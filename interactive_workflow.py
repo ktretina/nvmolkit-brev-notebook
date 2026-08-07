@@ -163,6 +163,44 @@ class InteractiveWorkflow:
             self.active_card.children = (*self.active_card.children, error_widget)
         self._set_body()
 
+    def _stop_objective(self, error: demo_agent.ToolCallError) -> None:
+        """Render a truthful terminal state for a known objective-agent failure."""
+        if not isinstance(error, demo_agent.ToolCallError):
+            raise TypeError("Objective stops require a ToolCallError.")
+        attempts = tuple(self.controller.objective_attempts)
+        if (
+            self.objective_card is None
+            or len(self.objective_attempt_cards) != len(attempts)
+        ):
+            raise ValueError("Objective stop state does not match accepted attempts.")
+        self._detach_observers()
+        self.status = "objective_stopped"
+        if self.retry_button is not None:
+            self.retry_button.disabled = True
+        if self.approve_button is not None:
+            self.approve_button.disabled = True
+        if self.objective_button is not None:
+            self.objective_button.disabled = True
+        for control in self.controls.values():
+            control.disabled = True
+        self.retry_button = None
+        self.approve_button = None
+        message = _safe_message(error)
+        count_text = f"Accepted scientific attempts: {len(attempts)}."
+        execution_text = "No additional scientific attempt was executed."
+        self._line(
+            f"Objective challenge stopped: {message} {count_text} {execution_text}"
+        )
+        self.objective_card.children = (
+            *self.objective_card.children,
+            widgets.HTML(
+                "<b>Objective challenge stopped</b>"
+                f"<p>{message}</p><p>{escape(count_text)} "
+                f"{escape(execution_text)}</p>"
+            ),
+        )
+        self._set_body()
+
     def _detach_observers(self) -> None:
         for control, callback in self._control_observers:
             try:
@@ -871,6 +909,11 @@ class InteractiveWorkflow:
                     "Retry Objective Proposal",
                     self._retry_objective,
                 )
+            elif isinstance(error, demo_agent.ToolCallError):
+                try:
+                    self._stop_objective(error)
+                except Exception:
+                    self._stop()
             else:
                 self._stop()
 

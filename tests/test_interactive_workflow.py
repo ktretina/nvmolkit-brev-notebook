@@ -351,14 +351,14 @@ def test_retry_rechecks_pending_identity_and_phase_or_stops(mutation):
     assert len([x for x in controller.calls if isinstance(x, tuple)]) == executions
 
 
-@pytest.mark.parametrize("where", ["plan", "proposal", "execution", "synthesis"])
+@pytest.mark.parametrize("where", ["plan", "proposal", "execution", "objective", "synthesis"])
 def test_unexpected_failures_are_generic_stopped_and_secret_safe(monkeypatch, where):
     controller = Controller(); secret = "SECRET-raw-exception"
     getattr(controller, f"{where}_failures").append(RuntimeError(secret))
     monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
     workflow = InteractiveWorkflow(controller); workflow.start_button.click()
     if where == "execution": workflow.approve_button.click()
-    elif where == "synthesis":
+    elif where in {"objective", "synthesis"}:
         complete_six_stages(workflow)
         workflow.objective_button.click()
     assert workflow.status == "stopped" and workflow.retry_button is None
@@ -862,22 +862,55 @@ def test_objective_retry_invariant_counts_rejected_hosted_responses(monkeypatch)
     assert workflow.retry_button.description == "Retry Objective Proposal"
 
 
-def test_objective_correction_exhaustion_does_not_offer_dead_retry(monkeypatch):
+@pytest.mark.parametrize("accepted_attempt_count", [0, 1])
+def test_objective_correction_exhaustion_stops_explicitly_without_fabricating_result(
+    accepted_attempt_count,
+):
     controller = Controller()
+    original_request = controller.request_objective_attempt
+    summary_before_stop = []
 
     def exhaust_corrections():
+        if len(controller.objective_attempts) < accepted_attempt_count:
+            return original_request()
+        summary_before_stop.append(workflow.objective_summary.value)
         controller.objective_rejection_count = demo_agent.MAX_OBJECTIVE_CORRECTIONS
         controller.session.turn_count += demo_agent.MAX_OBJECTIVE_CORRECTIONS
         controller.calls.append("objective_proposal")
-        raise ToolCallError("The objective correction limit was reached.")
+        raise ToolCallError(
+            "The objective correction limit was reached. <do-not-render-as-html>"
+        )
 
     controller.request_objective_attempt = exhaust_corrections
     workflow, _ = started(controller)
     complete_six_stages(workflow)
+    completed_cards = workflow.completed_cards
+    stage_results = tuple(controller.stage_results)
+    objective_card = workflow.objective_card
     workflow.objective_button.click()
 
-    assert workflow.status == "stopped"
+    assert workflow.status == "objective_stopped"
     assert workflow.retry_button is None
+    assert workflow.objective_button.disabled
+    assert workflow.completed_cards == completed_cards
+    assert tuple(controller.stage_results) == stage_results
+    assert workflow.objective_card is objective_card
+    assert workflow.objective_summary.value == summary_before_stop[0]
+    assert len(workflow.objective_attempt_cards) == accepted_attempt_count
+    assert len(controller.objective_attempts) == accepted_attempt_count
+    assert controller.objective_run is None
+    assert controller.objective_evidence is None
+    assert controller.calls.count("synthesis") == 0
+    expected_count = f"Accepted scientific attempts: {accepted_attempt_count}."
+    explicit_stop = "No additional scientific attempt was executed."
+    rendered = html_text(workflow.objective_card)
+    assert expected_count in rendered and expected_count in workflow.transcript_text
+    assert explicit_stop in rendered and explicit_stop in workflow.transcript_text
+    assert "The objective correction limit was reached." in rendered
+    assert "&lt;do-not-render-as-html&gt;" in rendered
+    assert "<do-not-render-as-html>" not in rendered
+    assert "local workflow error" not in workflow.transcript_text.lower()
+    assert "O01" not in rendered and "O01" not in workflow.transcript_text
 
 
 def test_retry_objective_rechecks_pending_state_and_stops(monkeypatch):
