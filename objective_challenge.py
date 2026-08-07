@@ -310,17 +310,7 @@ def build_objective_context(state: WorkflowState) -> ObjectiveContext:
         distance_matrix=distance_matrix,
     )
     baseline = measure_panel(provisional, provisional.baseline_ids)
-    panels = itertools.combinations(
-        sorted(candidate.molecule_id for candidate in candidates), PANEL_SIZE
-    )
-    benchmark = max(
-        (measure_panel(provisional, panel) for panel in panels),
-        key=lambda measurement: (
-            measurement.score_key,
-            measurement.score,
-            measurement.selected_ids,
-        ),
-    )
+    benchmark = attainable_benchmark(provisional)
     baseline_score = baseline.score
     benchmark_score = benchmark.score
     target_score = baseline_score + TARGET_FRACTION * (
@@ -409,6 +399,37 @@ def measure_panel(
         limiting_pairs=limiting_pairs,
         achieved=target_is_achieved(raw_score, context.target_score),
     )
+
+
+def attainable_benchmark(context: ObjectiveContext) -> PanelMeasurement:
+    """Recompute the exact best attainable four-panel with canonical ties."""
+    if type(context) is not ObjectiveContext:
+        raise ValueError("Objective benchmark requires an exact context.")
+    candidate_ids = tuple(sorted(candidate.molecule_id for candidate in context.candidates))
+    return max(
+        (
+            measure_panel(context, panel)
+            for panel in itertools.combinations(candidate_ids, PANEL_SIZE)
+        ),
+        key=lambda measurement: (
+            measurement.score_key,
+            measurement.score,
+            measurement.selected_ids,
+        ),
+    )
+
+
+def _validated_attainable_benchmark(context: ObjectiveContext) -> PanelMeasurement:
+    benchmark = attainable_benchmark(context)
+    if (
+        type(context.benchmark_score) is not float
+        or context.benchmark_score != benchmark.score
+        or score_key(context.benchmark_score) != benchmark.score_key
+    ):
+        raise ValueError(
+            "Stored objective benchmark does not match the exact attainable benchmark."
+        )
+    return benchmark
 
 
 def _validated_measurement(
@@ -685,7 +706,8 @@ def evaluate_diverse_panel(
 ) -> ObjectiveAttempt:
     """Validate and score one proposed panel without mutating workflow state."""
     panel, _ = _validated_panel(context, selected_ids)
-    if type(attempt_number) is not int or not 1 <= attempt_number <= MAX_ATTEMPTS:
+    legacy_bound = MAX_ATTEMPTS + (1 if selected_swap is not None else 0)
+    if type(attempt_number) is not int or not 1 <= attempt_number <= legacy_bound:
         raise ValueError("Objective attempt number is outside the accepted bound.")
     basis = decision_basis.strip() if isinstance(decision_basis, str) else ""
     if not basis or len(basis) > 240 or any(character in basis for character in "\r\n`"):
@@ -717,7 +739,7 @@ def rank_legal_swaps(
         raise ValueError("Objective swap ranking requires exact objective types.")
     if current.achieved:
         return ()
-    panel, candidates = _validated_panel(context, current.selected_ids)
+    panel, _ = _validated_panel(context, current.selected_ids)
     recomputed = measure_panel(context, panel)
     if type(current.score) is not float or not np.isfinite(current.score):
         raise ValueError(
@@ -727,61 +749,18 @@ def rank_legal_swaps(
         raise ValueError("Objective attempt score does not match its panel.")
     if current.limiting_pair != recomputed.limiting_pairs[0]:
         raise ValueError("Objective attempt limiting pair does not match its panel.")
+    if (
+        current.score_key != recomputed.score_key
+        or current.limiting_pairs != recomputed.limiting_pairs
+    ):
+        raise ValueError("Objective attempt evidence does not match its panel.")
     if current.constraints_passed is not True:
         raise ValueError("Objective attempt constraints must be passed.")
     if recomputed.achieved:
         raise ValueError("Objective attempt below-target state is inconsistent.")
 
-    suggestions = []
-    current_ids = set(panel)
-    for replace_position, replace_id in enumerate(panel):
-        for replacement_id, replacement in candidates.items():
-            if replacement_id in current_ids:
-                continue
-            resulting_ids = (
-                panel[:replace_position]
-                + (replacement_id,)
-                + panel[replace_position + 1 :]
-            )
-            try:
-                resulting_ids, _ = _validated_panel(context, resulting_ids)
-            except ValueError:
-                continue
-            predicted = measure_panel(context, resulting_ids)
-            score_delta = predicted.score - recomputed.score
-            if not is_strict_improvement(predicted.score, recomputed.score):
-                continue
-            suggestions.append(
-                ObjectiveSwap(
-                    swap_id=f"{replace_id}->{replacement.molecule_id}",
-                    replace_id=replace_id,
-                    replacement_id=replacement.molecule_id,
-                    resulting_ids=resulting_ids,
-                    predicted_score=predicted.score,
-                    predicted_score_key=predicted.score_key,
-                    score_delta=float(score_delta),
-                    limiting_pair=predicted.limiting_pairs[0],
-                    limiting_pairs=predicted.limiting_pairs,
-                    target_status=(
-                        "meets_target" if predicted.achieved else "below_target"
-                    ),
-                )
-            )
-
-    suggestions.sort(
-        key=lambda suggestion: (
-            -score_key(suggestion.predicted_score),
-            suggestion.replace_id,
-            suggestion.replacement_id,
-            suggestion.resulting_ids,
-        )
-    )
-    target_reaching = [
-        suggestion
-        for suggestion in suggestions
-        if target_is_achieved(suggestion.predicted_score, context.target_score)
-    ]
-    return tuple((target_reaching or suggestions)[:SUGGESTION_LIMIT])
+    accepted_count = max(current.attempt_number - 1, 0)
+    return accepted_maxima(build_action_menu(context, recomputed, accepted_count))
 
 
 def _attempt_matches_policy(
@@ -818,6 +797,7 @@ def terminal_objective_run(
     except ValueError as error:
         raise ValueError("Objective run has an invalid termination reason.") from error
     baseline = measure_panel(context, context.baseline_ids)
+    actual_benchmark = attainable_benchmark(context)
     current = baseline
     for accepted_count, attempt in enumerate(attempts):
         if current.achieved:
@@ -827,8 +807,8 @@ def terminal_objective_run(
         )
 
     if reason is TerminationReason.BASELINE_ALREADY_OPTIMAL:
-        if attempts or baseline.score_key != score_key(context.benchmark_score):
-            raise ValueError("Baseline-optimal termination is inconsistent.")
+        if attempts or baseline.score_key != actual_benchmark.score_key:
+            raise ValueError("Objective baseline is not actually optimal.")
     elif reason is TerminationReason.TARGET_ACHIEVED:
         if not attempts or not current.achieved:
             raise ValueError("Target success requires a measured successful attempt.")
@@ -893,13 +873,9 @@ def finalize_no_legal_swap(
 def finalize_objective_run(
     context: ObjectiveContext, attempts: tuple[ObjectiveAttempt, ...]
 ) -> ObjectiveRun:
-    """Close a successful attempt sequence or an exact three-attempt miss."""
-    if not attempts or len(attempts) > MAX_ATTEMPTS:
+    """Normalize the legacy baseline-first flow into authoritative substitutions."""
+    if not attempts or len(attempts) > MAX_ATTEMPTS + 1:
         raise ValueError("Objective run has an invalid accepted-attempt count.")
-    if tuple(attempt.attempt_number for attempt in attempts) != tuple(
-        range(1, len(attempts) + 1)
-    ):
-        raise ValueError("Objective attempts are not sequential.")
     if all(attempt.state_id for attempt in attempts):
         reason = (
             TerminationReason.TARGET_ACHIEVED
@@ -907,24 +883,68 @@ def finalize_objective_run(
             else TerminationReason.ATTEMPT_LIMIT_REACHED
         )
         return terminal_objective_run(context, attempts, reason)
-    achieved_positions = [index for index, attempt in enumerate(attempts) if attempt.achieved]
-    if achieved_positions and achieved_positions != [len(attempts) - 1]:
-        raise ValueError("Objective run continued after the target was achieved.")
-    achieved = bool(attempts[-1].achieved)
-    if not achieved and len(attempts) != MAX_ATTEMPTS:
-        raise ValueError("An unsuccessful objective run requires three attempts.")
-    best = max(
-        attempts,
-        key=lambda attempt: (score_key(attempt.score), -attempt.attempt_number),
+
+    baseline = measure_panel(context, context.baseline_ids)
+    legacy_baseline = attempts[0]
+    if (
+        type(legacy_baseline) is not ObjectiveAttempt
+        or legacy_baseline.attempt_number != 1
+        or legacy_baseline.state_id
+        or legacy_baseline.selected_swap is not None
+        or legacy_baseline.measurement != baseline
+        or legacy_baseline.constraints_passed is not True
+    ):
+        raise ValueError(
+            "Legacy objective finalization requires the exact measured baseline Step 0."
+        )
+    if baseline.achieved:
+        if len(attempts) != 1:
+            raise ValueError("Objective run continued after measured baseline success.")
+        return baseline_terminal_run(context)
+
+    normalized: list[ObjectiveAttempt] = []
+    current = baseline
+    for substitution_number, legacy in enumerate(attempts[1:], start=1):
+        if (
+            type(legacy) is not ObjectiveAttempt
+            or legacy.attempt_number != substitution_number + 1
+            or legacy.state_id
+            or legacy.selected_swap is None
+        ):
+            raise ValueError("Legacy objective revisions are not sequential substitutions.")
+        menu = build_action_menu(context, current, substitution_number - 1)
+        offered = next(
+            (
+                action
+                for action in menu.actions
+                if action.swap_id == legacy.selected_swap.swap_id
+            ),
+            None,
+        )
+        if offered is None or legacy.selected_swap != offered:
+            raise ValueError("Legacy objective revision is not in the exact current menu.")
+        if offered not in accepted_maxima(menu):
+            raise ValueError("Legacy objective revision is not an accepted maximum.")
+        measured = measure_panel(context, offered.resulting_ids)
+        if (
+            legacy.measurement != measured
+            or legacy.constraints_passed is not True
+        ):
+            raise ValueError("Legacy objective revision evidence is stale or mismatched.")
+        authoritative = evaluate_selected_swap(
+            context, menu, offered, substitution_number
+        )
+        normalized.append(authoritative)
+        current = authoritative.measurement
+
+    if not normalized:
+        raise ValueError("A below-target legacy baseline is not a terminal run.")
+    reason = (
+        TerminationReason.TARGET_ACHIEVED
+        if normalized[-1].achieved
+        else TerminationReason.ATTEMPT_LIMIT_REACHED
     )
-    return ObjectiveRun(
-        context=context,
-        attempts=attempts,
-        achieved=achieved,
-        termination_reason="target_achieved" if achieved else "attempt_limit_reached",
-        final_ids=best.selected_ids,
-        final_score=best.score,
-    )
+    return terminal_objective_run(context, tuple(normalized), reason)
 
 
 def no_improvement_run(context: ObjectiveContext) -> ObjectiveRun:
@@ -941,28 +961,28 @@ def build_objective_evidence(run: ObjectiveRun) -> EvidenceRecord:
     if type(run) is not ObjectiveRun:
         raise ValueError("Objective evidence requires an exact terminal run.")
     context = run.context
-    if not run.attempts or all(attempt.state_id for attempt in run.attempts):
-        terminal_menu = None
-        if run.termination_reason is TerminationReason.NO_LEGAL_IMPROVING_SWAP:
-            current = (
-                run.attempts[-1].measurement
-                if run.attempts
-                else measure_panel(context, context.baseline_ids)
-            )
-            terminal_menu = build_action_menu(context, current, len(run.attempts))
-        validated_run = terminal_objective_run(
-            context,
-            run.attempts,
-            run.termination_reason,
-            menu=terminal_menu,
+    benchmark = _validated_attainable_benchmark(context)
+    terminal_menu = None
+    if run.termination_reason is TerminationReason.NO_LEGAL_IMPROVING_SWAP:
+        current = (
+            run.attempts[-1].measurement
+            if run.attempts
+            else measure_panel(context, context.baseline_ids)
         )
-        if (
-            run.achieved != validated_run.achieved
-            or run.final_ids != validated_run.final_ids
-            or run.final_score != validated_run.final_score
-            or run.final_score_key != validated_run.final_score_key
-        ):
-            raise ValueError("Objective terminal evidence is inconsistent.")
+        terminal_menu = build_action_menu(context, current, len(run.attempts))
+    validated_run = terminal_objective_run(
+        context,
+        run.attempts,
+        run.termination_reason,
+        menu=terminal_menu,
+    )
+    if (
+        run.achieved != validated_run.achieved
+        or run.final_ids != validated_run.final_ids
+        or run.final_score != validated_run.final_score
+        or run.final_score_key != validated_run.final_score_key
+    ):
+        raise ValueError("Objective terminal evidence is inconsistent.")
     attempt_payloads = []
     for attempt in run.attempts:
         measurement = measure_panel(context, attempt.selected_ids)
@@ -1045,7 +1065,7 @@ def build_objective_evidence(run: ObjectiveRun) -> EvidenceRecord:
         "baseline_score_key": baseline.score_key,
         "baseline": measurement_payload(baseline),
         "benchmark_score": context.benchmark_score,
-        "benchmark_score_key": score_key(context.benchmark_score),
+        "benchmark_score_key": benchmark.score_key,
         "target_rule": "baseline plus 80 percent of attainable improvement",
         "target_score": context.target_score,
         "target_score_key": score_key(context.target_score),

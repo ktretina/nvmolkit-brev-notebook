@@ -41,6 +41,7 @@ from objective_fixtures import (
     controlled_context,
     controlled_context_with_ranked_swaps,
     controlled_context_with_tied_paths,
+    controlled_context_with_three_misses,
     controlled_context_with_action_count,
     controlled_context_without_improving_swaps,
     optimized_state,
@@ -221,6 +222,136 @@ def test_every_terminal_reason_has_one_truthful_run_and_o01(
     assert payload["final_measurement"]["score_key"] == run.final_score_key
 
 
+def test_baseline_terminal_recomputes_attainable_best_instead_of_trusting_context():
+    context = controlled_context_with_ranked_swaps()
+    forged = replace(context, benchmark_score=context.baseline_score)
+
+    with pytest.raises(ValueError, match="actually optimal"):
+        baseline_terminal_run(forged)
+
+
+@pytest.mark.parametrize("forgery", ("baseline", "same_key_raw"))
+def test_o01_rejects_every_incoherent_stored_benchmark(forgery):
+    context = controlled_context_with_ranked_swaps()
+    run = terminal_objective_run(
+        context, (), TerminationReason.OBJECTIVE_PROVIDER_FAILURE
+    )
+    benchmark = objective_challenge.attainable_benchmark(context).score
+    forged_score = (
+        context.baseline_score
+        if forgery == "baseline"
+        else float(np.nextafter(benchmark, 0.0))
+    )
+    assert forged_score != benchmark
+    if forgery == "same_key_raw":
+        assert objective_challenge.score_key(forged_score) == objective_challenge.score_key(benchmark)
+    forged_context = replace(context, benchmark_score=forged_score)
+    forged_run = replace(
+        run,
+        context=forged_context,
+        baseline=objective_challenge.measure_panel(
+            forged_context, forged_context.baseline_ids
+        ),
+    )
+
+    with pytest.raises(ValueError, match="benchmark"):
+        build_objective_evidence(forged_run)
+
+
+def test_legacy_finalizer_rejects_arbitrary_target_panel_without_swap():
+    context = controlled_context_with_ranked_swaps()
+    arbitrary = evaluate_diverse_panel(
+        context,
+        enumerate_legal_swaps(
+            context, objective_challenge.measure_panel(context, context.baseline_ids)
+        )[0].resulting_ids,
+        attempt_number=1,
+        decision_basis="Unsafe direct target panel.",
+    )
+    assert arbitrary.achieved is True and arbitrary.selected_swap is None
+
+    with pytest.raises(ValueError, match="baseline Step 0"):
+        finalize_objective_run(context, (arbitrary,))
+
+    forged_run = ObjectiveRun(
+        context=context,
+        attempts=(arbitrary,),
+        achieved=True,
+        termination_reason="target_achieved",
+        final_ids=arbitrary.selected_ids,
+        final_score=arbitrary.score,
+    )
+    with pytest.raises(ValueError, match="exact current state"):
+        build_objective_evidence(forged_run)
+
+
+def test_legacy_finalizer_rejects_nonmax_revision_and_normalizes_exact_maximum():
+    context = controlled_context_with_ranked_swaps()
+    baseline = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Measure baseline Step 0.",
+    )
+    source = objective_challenge.measure_panel(context, context.baseline_ids)
+    menu = build_action_menu(context, source, 0)
+    nonmax = menu.actions[-1]
+    unsafe = evaluate_diverse_panel(
+        context,
+        nonmax.resulting_ids,
+        attempt_number=2,
+        decision_basis="Unsafe nonmax revision.",
+        selected_swap=nonmax,
+    )
+    with pytest.raises(ValueError, match="accepted maximum"):
+        finalize_objective_run(context, (baseline, unsafe))
+
+    maximum = accepted_maxima(menu)[0]
+    safe = evaluate_diverse_panel(
+        context,
+        maximum.resulting_ids,
+        attempt_number=2,
+        decision_basis="Exact accepted maximum.",
+        selected_swap=maximum,
+    )
+    run = finalize_objective_run(context, (baseline, safe))
+    payload = json.loads(build_objective_evidence(run).payload_json)
+
+    assert len(run.attempts) == 1
+    assert run.attempts[0].state_id == menu.state_id
+    assert payload["attempt_count"] == 1
+    assert payload["baseline"]["selected_ids"] == list(context.baseline_ids)
+    assert all(item["state_id"] for item in payload["attempts"])
+
+
+def test_legacy_adapter_supports_exactly_three_accepted_substitutions_after_step_zero():
+    context = controlled_context_with_three_misses()
+    legacy = [
+        evaluate_diverse_panel(
+            context,
+            context.baseline_ids,
+            attempt_number=1,
+            decision_basis="Measure baseline Step 0.",
+        )
+    ]
+    current = legacy[0]
+    for legacy_number in (2, 3, 4):
+        selected = rank_legal_swaps(context, current)[0]
+        current = evaluate_diverse_panel(
+            context,
+            selected.resulting_ids,
+            attempt_number=legacy_number,
+            decision_basis="Apply the current accepted maximum.",
+            selected_swap=selected,
+        )
+        legacy.append(current)
+
+    run = finalize_objective_run(context, tuple(legacy))
+
+    assert run.termination_reason == "attempt_limit_reached"
+    assert tuple(attempt.attempt_number for attempt in run.attempts) == (1, 2, 3)
+
+
 def forged_nonachieved_attempt(
     context: ObjectiveContext,
     selected_ids: tuple[str, ...],
@@ -248,11 +379,13 @@ def successful_run() -> tuple[WorkflowState, ObjectiveRun]:
         attempt_number=1,
         decision_basis="Measure the current policy baseline.",
     )
+    selected = rank_legal_swaps(context, first)[0]
     second = evaluate_diverse_panel(
         context,
-        ("mol-0", "mol-2", "mol-4", "mol-6"),
+        selected.resulting_ids,
         attempt_number=2,
         decision_basis="Remove the closest baseline analogue.",
+        selected_swap=selected,
     )
     return state, finalize_objective_run(context, (first, second))
 
@@ -613,24 +746,17 @@ def test_finalize_selects_best_attempt_and_uses_explicit_termination_reasons():
         attempt_number=1,
         decision_basis="Baseline remains redundant.",
     )
+    selected = rank_legal_swaps(context, miss)[0]
     success = evaluate_diverse_panel(
         context,
-        ("mol-0", "mol-2", "mol-4", "mol-6"),
+        selected.resulting_ids,
         attempt_number=2,
         decision_basis="Remove the limiting analogue.",
+        selected_swap=selected,
     )
 
     achieved = finalize_objective_run(context, (miss, success))
-    misses = tuple(
-        evaluate_diverse_panel(
-            context,
-            context.baseline_ids,
-            attempt_number=number,
-            decision_basis="Baseline remains redundant.",
-        )
-        for number in (1, 2, 3)
-    )
-    exhausted = finalize_objective_run(context, misses)
+    exhausted = terminal_fixture("attempt_limit_reached", 3)
 
     assert achieved.achieved is True
     assert achieved.termination_reason == "target_achieved"
@@ -648,7 +774,7 @@ def test_o01_is_canonical_and_does_not_expose_the_hidden_benchmark_panel():
     assert record.label == "Objective-driven panel selection"
     assert "benchmark_panel" not in record.payload_json
     assert payload["achieved"] is True
-    assert payload["attempts"][0]["limiting_pair"] == ["mol-0", "mol-1"]
+    assert payload["baseline"]["limiting_pairs"][0] == ["mol-0", "mol-1"]
     assert json.dumps(payload, sort_keys=True, separators=(",", ":")) == record.payload_json
 
 
@@ -659,24 +785,18 @@ def test_o01_retains_every_recomputed_canonical_limiting_pair():
             ("mol-2", "mol-3"): 0.4,
         },
         default_distance=0.8,
-        target_score=0.4,
+        target_score=0.9,
     )
-    attempt = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Measure the tied deterministic panel.",
+    run = terminal_objective_run(
+        context, (), TerminationReason.OBJECTIVE_PROVIDER_FAILURE
     )
 
-    payload = json.loads(
-        build_objective_evidence(finalize_objective_run(context, (attempt,))).payload_json
-    )
+    payload = json.loads(build_objective_evidence(run).payload_json)
 
-    assert payload["attempts"][0]["limiting_pairs"] == [
+    assert payload["baseline"]["limiting_pairs"] == [
         ["mol-0", "mol-1"],
         ["mol-2", "mol-3"],
     ]
-    assert payload["attempts"][0]["limiting_pair"] == ["mol-0", "mol-1"]
 
 
 def test_evaluate_panel_records_only_an_exact_selected_swap():
@@ -847,8 +967,8 @@ def test_o01_serializes_the_selected_intervention_without_hidden_answers():
         build_objective_evidence(finalize_objective_run(context, (first, second))).payload_json
     )
 
-    assert payload["attempts"][0]["selected_swap"] is None
-    assert payload["attempts"][1]["selected_swap"] == {
+    assert payload["attempt_count"] == 1
+    assert payload["attempts"][0]["selected_swap"] == {
         "swap_id": selected.swap_id,
         "replace_id": selected.replace_id,
         "replacement_id": selected.replacement_id,

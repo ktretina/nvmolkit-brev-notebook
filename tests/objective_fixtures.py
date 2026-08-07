@@ -216,7 +216,7 @@ def controlled_context_with_tied_paths(all_paths_reach: bool) -> ObjectiveContex
     )
 
 
-def _three_miss_context() -> ObjectiveContext:
+def controlled_context_with_three_misses() -> ObjectiveContext:
     matrix = np.array(
         [
             [0, .2, .4, .2, .2, .1, .4, .8],
@@ -251,7 +251,7 @@ def terminal_fixture(reason: str | TerminationReason, attempt_count: int):
     context = (
         controlled_context_with_ranked_swaps()
         if reason is TerminationReason.TARGET_ACHIEVED
-        else _three_miss_context()
+        else controlled_context_with_three_misses()
     )
     attempts = []
     current = measure_panel(context, context.baseline_ids)

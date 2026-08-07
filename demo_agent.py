@@ -1265,7 +1265,8 @@ class BoundedWorkflowController:
             raise ToolCallError("An objective proposal is already pending evaluation.")
         if self.pending_objective_swap is not None:
             raise ToolCallError("The objective swap state is out of phase.")
-        if len(self.objective_attempts) >= MAX_ATTEMPTS:
+        accepted_substitutions = max(len(self.objective_attempts) - 1, 0)
+        if accepted_substitutions >= MAX_ATTEMPTS:
             raise ToolCallError("The objective attempt limit was reached.")
         is_revision = bool(self.objective_attempts)
         if is_revision and not self.objective_suggestions:
@@ -1380,7 +1381,8 @@ class BoundedWorkflowController:
         except Exception:
             raise ToolCallError("The objective evaluator rejected the proposed panel.") from None
         prospective_attempts = (*self.objective_attempts, attempt)
-        if not attempt.achieved and len(prospective_attempts) < MAX_ATTEMPTS:
+        substitution_count = len(prospective_attempts) - 1
+        if not attempt.achieved and substitution_count < MAX_ATTEMPTS:
             try:
                 prospective_suggestions = rank_legal_swaps(context, attempt)
             except Exception:
@@ -1391,7 +1393,7 @@ class BoundedWorkflowController:
             prospective_suggestions = ()
         prospective_run = None
         prospective_evidence = None
-        if attempt.achieved or len(prospective_attempts) == MAX_ATTEMPTS:
+        if attempt.achieved or substitution_count == MAX_ATTEMPTS:
             try:
                 prospective_run = finalize_objective_run(
                     context, prospective_attempts
@@ -1410,7 +1412,7 @@ class BoundedWorkflowController:
             "limiting_pair": list(attempt.limiting_pair),
             "constraints_passed": attempt.constraints_passed,
             "achieved": attempt.achieved,
-            "attempts_remaining": MAX_ATTEMPTS - len(prospective_attempts),
+            "attempts_remaining": MAX_ATTEMPTS - substitution_count,
             "legal_improving_swaps": [
                 _swap_payload(item) for item in prospective_suggestions
             ],

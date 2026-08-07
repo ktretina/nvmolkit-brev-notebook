@@ -138,6 +138,25 @@ def proposal(selected_ids, basis):
     })
 
 
+def safe_objective_proposals():
+    return [
+        proposal(
+            ["mol-0", "mol-1", "mol-2", "mol-3"],
+            "Measure deterministic baseline Step 0.",
+        ),
+        proposal(
+            ["mol-4", "mol-1", "mol-2", "mol-3"],
+            "Apply an accepted maximum replacement.",
+        ),
+    ]
+
+
+def execute_safe_objective(controller):
+    for _ in range(2):
+        pending = controller.request_objective_attempt()
+        controller.execute_objective_attempt(pending)
+
+
 def objective_conclusion_arguments():
     themes_and_keys = (
         ("dataset_scope", ["E01"]),
@@ -975,12 +994,11 @@ def test_objective_required_controller_blocks_conclusion_until_termination():
 
 def test_objective_conclusion_includes_o01_and_uses_the_extended_turn_budget():
     controller, completions = completed_controller([
-        proposal(["mol-0", "mol-2", "mol-4", "mol-6"], "Remove the limiting analogue."),
+        *safe_objective_proposals(),
         response("submit_synthesis", objective_conclusion_arguments()),
     ])
     controller.begin_objective_challenge()
-    pending = controller.request_objective_attempt()
-    controller.execute_objective_attempt(pending)
+    execute_safe_objective(controller)
 
     result = controller.request_synthesis()
 
@@ -988,7 +1006,7 @@ def test_objective_conclusion_includes_o01_and_uses_the_extended_turn_budget():
     assert result.objective_evidence.key == "O01"
     assert len(result.conclusion.sections) == 7
     assert result.conclusion.sections[5].theme == "objective_driven_selection"
-    assert result.turn_count == 9
+    assert result.turn_count == 10
     synthesis_call = completions.calls[-1]
     assert synthesis_call["tools"][0]["function"]["name"] == "submit_synthesis"
     supplied = controller.session.messages[-2]["content"]
@@ -997,12 +1015,11 @@ def test_objective_conclusion_includes_o01_and_uses_the_extended_turn_budget():
 
 def test_invalid_objective_conclusion_appends_sanitized_paired_feedback():
     controller, completions = completed_controller([
-        proposal(["mol-0", "mol-2", "mol-4", "mol-6"], "Remove the limiting analogue."),
+        *safe_objective_proposals(),
         response("submit_synthesis", live_invalid_objective_conclusion_arguments()),
     ])
     controller.begin_objective_challenge()
-    pending = controller.request_objective_attempt()
-    controller.execute_objective_attempt(pending)
+    execute_safe_objective(controller)
 
     objective_run = controller.objective_run
     objective_evidence = controller.objective_evidence
@@ -1037,8 +1054,8 @@ def test_invalid_objective_conclusion_appends_sanitized_paired_feedback():
     assert error.value.report is controller.report
     assert controller.objective_run is objective_run
     assert controller.objective_evidence is objective_evidence
-    assert controller.session.turn_count == 9
-    assert len(completions.calls) == 2
+    assert controller.session.turn_count == 10
+    assert len(completions.calls) == 3
 
 
 def test_objective_conclusion_feedback_reports_missing_and_duplicate_themes():
@@ -1049,12 +1066,11 @@ def test_objective_conclusion_feedback_reports_missing_and_duplicate_themes():
         "evidence_keys": ["E01"],
     }
     controller, _ = completed_controller([
-        proposal(["mol-0", "mol-2", "mol-4", "mol-6"], "Remove the limiting analogue."),
+        *safe_objective_proposals(),
         response("submit_synthesis", invalid),
     ])
     controller.begin_objective_challenge()
-    pending = controller.request_objective_attempt()
-    controller.execute_objective_attempt(pending)
+    execute_safe_objective(controller)
 
     with pytest.raises(demo_agent.ConclusionValidationError):
         controller.request_synthesis()
@@ -1069,19 +1085,18 @@ def test_objective_conclusion_feedback_reports_missing_and_duplicate_themes():
 
 def test_objective_conclusion_retry_uses_feedback_and_succeeds_with_exact_coverage():
     controller, completions = completed_controller([
-        proposal(["mol-0", "mol-2", "mol-4", "mol-6"], "Remove the limiting analogue."),
+        *safe_objective_proposals(),
         response("submit_synthesis", live_invalid_objective_conclusion_arguments()),
         response("submit_synthesis", objective_conclusion_arguments()),
     ])
     controller.begin_objective_challenge()
-    pending = controller.request_objective_attempt()
-    controller.execute_objective_attempt(pending)
+    execute_safe_objective(controller)
 
     with pytest.raises(demo_agent.ConclusionValidationError):
         controller.request_synthesis()
     result = controller.request_synthesis()
 
-    assert result.turn_count == 10 <= demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS
+    assert result.turn_count == 11 <= demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS
     assert {key for section in result.conclusion.sections for key in section.evidence_keys} == {
         "E01", "E02", "E03", "E04", "E05", "E06", "O01",
     }
@@ -1098,12 +1113,11 @@ def test_objective_conclusion_retry_uses_feedback_and_succeeds_with_exact_covera
 
 def test_valid_first_objective_conclusion_does_not_append_feedback():
     controller, _ = completed_controller([
-        proposal(["mol-0", "mol-2", "mol-4", "mol-6"], "Remove the limiting analogue."),
+        *safe_objective_proposals(),
         response("submit_synthesis", objective_conclusion_arguments()),
     ])
     controller.begin_objective_challenge()
-    pending = controller.request_objective_attempt()
-    controller.execute_objective_attempt(pending)
+    execute_safe_objective(controller)
 
     result = controller.request_synthesis()
 
@@ -1113,13 +1127,12 @@ def test_valid_first_objective_conclusion_does_not_append_feedback():
 
 def test_schema_invalid_objective_conclusion_gets_paired_feedback_then_retries():
     controller, completions = completed_controller([
-        proposal(["mol-0", "mol-2", "mol-4", "mol-6"], "Remove the limiting analogue."),
+        *safe_objective_proposals(),
         response("submit_synthesis", schema_invalid_objective_conclusion_arguments()),
         response("submit_synthesis", objective_conclusion_arguments()),
     ])
     controller.begin_objective_challenge()
-    pending = controller.request_objective_attempt()
-    controller.execute_objective_attempt(pending)
+    execute_safe_objective(controller)
 
     with pytest.raises(demo_agent.ConclusionValidationError):
         controller.request_synthesis()
@@ -1154,11 +1167,11 @@ def test_schema_invalid_objective_conclusion_gets_paired_feedback_then_retries()
     }
     assert "bogus_theme" not in json.dumps((rejected, feedback))
     assert "UNKNOWN" not in json.dumps((rejected, feedback))
-    assert controller.session.turn_count == 9
+    assert controller.session.turn_count == 10
 
     result = controller.request_synthesis()
 
-    assert result.turn_count == 10 <= demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS
+    assert result.turn_count == 11 <= demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS
     assert result.messages[-3:-1] == (rejected, feedback)
     assert completions.calls[-1]["messages"][-2] == feedback
 
@@ -1169,14 +1182,13 @@ def test_schema_invalid_objective_conclusions_consume_the_bounded_turns():
         for _ in range(5)
     ]
     controller, completions = completed_controller([
-        proposal(["mol-0", "mol-2", "mol-4", "mol-6"], "Remove the limiting analogue."),
+        *safe_objective_proposals(),
         *invalid_responses,
     ])
     controller.begin_objective_challenge()
-    pending = controller.request_objective_attempt()
-    controller.execute_objective_attempt(pending)
+    execute_safe_objective(controller)
 
-    for expected_turn in range(9, demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS + 1):
+    for expected_turn in range(10, demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS + 1):
         with pytest.raises(demo_agent.ConclusionValidationError):
             controller.request_synthesis()
         assert controller.session.turn_count == expected_turn
