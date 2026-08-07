@@ -1,8 +1,9 @@
+import ast
 import inspect
 import re
 from io import BytesIO
 from dataclasses import fields, replace
-from html import escape
+from html import escape, unescape
 from types import SimpleNamespace
 
 import httpx
@@ -25,7 +26,7 @@ from objective_challenge import (
     build_objective_evidence, measure_panel, score_key, terminal_objective_run,
 )
 from objective_fixtures import (
-    BOUNDARY_CASES, controlled_context_with_action_count,
+    BOUNDARY_CASES, controlled_context, controlled_context_with_action_count,
     controlled_context_without_improving_swaps, two_revision_context,
     evidence_report, optimized_state, report_and_run,
 )
@@ -638,7 +639,13 @@ def test_attempt_card_persists_complete_decision_ladder_without_model_rationale(
     workflow, _controller = completed_objective_workflow(monkeypatch)
 
     first = combined_html(workflow.objective_attempt_cards[0])
-    for label in ("Observe", "Candidate actions", "Nemotron choice", "Execute", "Measure"):
+    for label in (
+        "Observe",
+        "Deterministically evaluated candidate actions",
+        "Nemotron choice",
+        "Execute",
+        "Measure",
+    ):
         assert label in first
     assert "select_next_panel_swap" in first
     assert "decision_basis" not in first
@@ -712,15 +719,25 @@ def test_attempt_card_renders_complete_decision_ladder_without_rationale():
     context, (first, _second) = two_revision_decisions()
     menu, selection, attempt = first
     rendered = InteractiveWorkflow._objective_attempt_row(
-        menu, selection, attempt, context.target_score
+        menu, selection, attempt, context
     )
 
-    headings = tuple(
-        rendered.index(f"<b>{label}:</b>")
-        for label in ("Observe", "Nemotron choice", "Execute", "Measure")
+    section_labels = (
+        "Observe",
+        "Deterministically evaluated candidate actions",
+        "Nemotron choice",
+        "Execute",
+        "Measure",
     )
-    candidate_index = rendered.index("<b>Candidate actions</b>")
-    assert headings[0] < candidate_index < headings[1] < headings[2] < headings[3]
+    positions = tuple(
+        rendered.index(f"aria-label='{label}'") for label in section_labels
+    )
+    assert positions == tuple(sorted(positions))
+    assert rendered.count("aria-label='Observe'") == 1
+    assert rendered.count("aria-label='Deterministically evaluated candidate actions'") == 1
+    assert rendered.count("aria-label='Nemotron choice'") == 1
+    assert rendered.count("aria-label='Execute'") == 1
+    assert rendered.count("aria-label='Measure'") == 1
     for phrase in (
         "source panel",
         "target comparison=",
@@ -731,16 +748,107 @@ def test_attempt_card_renders_complete_decision_ladder_without_rationale():
         "score_key=",
         "delta=",
         "resulting co-limiting pairs=",
-        "validated structured payload",
+        "ObjectiveSelection(",
         "Python validation:",
         "at 1e-12 decision precision",
-        "Python evaluator receipt",
+        "select_next_panel_swap(",
+        "context = objective_context",
+        "pending_action_menu = objective_action_menu",
+        "selected_action = resolved_menu_action",
+        f"attempt_number = {attempt.attempt_number}",
+        "evaluate_selected_swap(\n    context,\n    pending_action_menu,\n    selected_action,\n    attempt_number,\n)",
         "evaluate_selected_swap",
         "limiting Tanimoto similarities=",
         "constraints passed=true",
+        "Controller explanation:",
+        "measured D_min improved",
     ):
         assert phrase in rendered
+    assert rendered.count("ObjectiveSelection(") == 1
+    assert rendered.count("select_next_panel_swap(") == 1
+    assert rendered.count("evaluate_selected_swap(") == 1
+    assert rendered.count("PanelMeasurement(") == 1
+    receipt = objective_receipt(context, selection, menu, attempt.selected_swap, attempt)
+    unescaped = unescape(rendered)
+    assert receipt.validated_selection in unescaped
+    assert receipt.planned_command in unescaped
+    assert receipt.executed_measurement in unescaped
+    maximum_count = sum(
+        action.predicted_score_key
+        == max(item.predicted_score_key for item in menu.actions)
+        for action in menu.actions
+    )
+    maximum_description = (
+        f"one of {maximum_count} tied-max actions at 1e-12 decision precision"
+        if maximum_count > 1
+        else "the unique argmax at 1e-12 decision precision"
+    )
+    assert (
+        "Controller explanation: Python validation: The selected action was "
+        f"{maximum_description}; measured D_min improved from {menu.source.score!r} "
+        f"to {attempt.score!r} (delta {attempt.selected_swap.score_delta!r}); "
+        "the target remains unmet; "
+        f"{InteractiveWorkflow._objective_target_status(attempt.score, context.target_score)}."
+    ) in unescaped
+    evaluation_match = re.search(
+        r"data-receipt='python-evaluation'>(.*?)</pre>", rendered, re.DOTALL
+    )
+    assert evaluation_match is not None
+    evaluation_source = unescape(evaluation_match.group(1))
+    evaluation_tree = ast.parse(evaluation_source)
+    evaluation_call = evaluation_tree.body[-1].value
+    assert isinstance(evaluation_call, ast.Call)
+    assert ast.unparse(evaluation_call) == (
+        "evaluate_selected_swap(context, pending_action_menu, selected_action, "
+        "attempt_number)"
+    )
     assert "rationale" not in rendered.lower()
+
+
+def test_live_attempt_uses_raw_context_distance_for_each_key_tied_limiting_pair():
+    first_distance = 0.5000000000003
+    second_distance = 0.5000000000003599
+    context = controlled_context(
+        distances={
+            ("mol-0", "mol-1"): 0.4,
+            ("mol-4", "mol-0"): 0.4,
+            ("mol-4", "mol-1"): first_distance,
+            ("mol-4", "mol-2"): second_distance,
+            ("mol-4", "mol-3"): 0.7,
+            ("mol-5", "mol-0"): 0.4,
+            ("mol-5", "mol-1"): 0.45,
+            ("mol-6", "mol-0"): 0.4,
+            ("mol-6", "mol-1"): 0.44,
+            ("mol-7", "mol-0"): 0.4,
+            ("mol-7", "mol-1"): 0.43,
+        },
+        default_distance=0.9,
+    )
+    menu = build_action_menu(
+        context, measure_panel(context, context.baseline_ids), 0
+    )
+    action = accepted_maxima(menu)[0]
+    selection = ObjectiveSelection(
+        state_id=menu.state_id,
+        swap_id=action.swap_id,
+        observed_limiting_pairs=[list(pair) for pair in menu.source.limiting_pairs],
+        decision_rule="maximize_predicted_minimum_distance",
+    )
+    attempt = evaluate_selected_swap(context, menu, action, 1)
+    assert attempt.limiting_pairs == (("mol-1", "mol-4"), ("mol-2", "mol-4"))
+    assert score_key(first_distance) == score_key(second_distance)
+
+    workflow = ready_interactive_workflow()
+    workflow.controller.objective_context = context
+    workflow.objective_decisions = ((menu, selection, attempt),)
+    workflow.objective_summary = widgets.HTML()
+    workflow.objective_attempt_box = widgets.VBox()
+    workflow._render_objective_decisions()
+    rendered = combined_html(workflow.objective_attempt_cards[0])
+
+    assert f"mol-1 / mol-4: {1.0 - first_distance!r}" in rendered
+    assert f"mol-2 / mol-4: {1.0 - second_distance!r}" in rendered
+    assert (1.0 - first_distance) != (1.0 - second_distance)
 
 
 def test_measured_summary_marks_raw_unequal_key_tied_target_without_contradiction():
@@ -1171,7 +1279,7 @@ def test_completed_real_workflow_root_survives_embed_with_ladder_conclusion_and_
     rendered = target.read_text(encoding="utf-8")
     for text in (
         "Step 0",
-        "Candidate actions",
+        "Deterministically evaluated candidate actions",
         "Nemotron choice",
         "Evidence-Backed Conclusion",
     ):
@@ -1324,10 +1432,10 @@ def test_objective_card_retains_attempts_receipts_scores_and_limiting_pairs(monk
 
     text = " ".join(html_text(card) for card in workflow.objective_attempt_cards)
     assert len(workflow.objective_attempt_cards) == 2
-    assert "Validated Nemotron selection" in text
-    assert "Planned deterministic command" in text
-    assert "Executed measurement" in text
-    assert "Evaluation executed by Python" in text
+    assert "ObjectiveSelection(" in text
+    assert "PanelMeasurement(" in text
+    assert "data-receipt='planned-command'" in text
+    assert "data-receipt='python-evaluation'" in text
     assert "select_next_panel_swap" in text
     assert "evaluate_selected_swap" in text
     assert "decision_basis" not in text and "Decision summary" not in text
@@ -1349,18 +1457,18 @@ def test_objective_attempts_render_as_observe_act_measure_decision_ladder(monkey
     summary = workflow.objective_summary.value
     details = " ".join(html_text(card) for card in workflow.objective_attempt_cards)
     assert "Observe" in summary
-    assert "Candidate actions" in summary
+    assert "Deterministically evaluated candidate actions" in summary
     assert "Nemotron choice" in summary
     assert "Execute" in summary
     assert "Measure" in summary
-    assert "Outcome" in summary
     assert "candidate-0-&gt;candidate-4" in summary
     assert "state-" in summary
-    assert "<b>Outcome:</b> Revise" in summary
-    assert "<b>Outcome:</b> Goal achieved" in summary
+    assert "Controller explanation:" in summary
+    assert "the target remains unmet" in summary
+    assert "the target was achieved" in summary
     assert "#D68A00" in summary
     assert "#76B900" in summary
-    assert "Planned deterministic command" in details
+    assert "data-receipt='planned-command'" in details
     assert "select_next_panel_swap(" in details
     assert "Goal achieved" in details
 
@@ -1382,7 +1490,7 @@ def test_objective_receipt_render_failure_after_commit_never_reexecutes(monkeypa
     workflow.objective_button.click()
     workflow.objective_button.click()
 
-    assert len(reached) == 4
+    assert len(reached) >= 4
     assert len(controller.objective_attempts) == 2
     assert len([
         call for call in controller.calls

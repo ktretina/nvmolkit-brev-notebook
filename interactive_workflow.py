@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import fields
 from html import escape
 from io import BytesIO
-import json
 from typing import Any
 
 import ipywidgets as widgets
@@ -624,7 +623,7 @@ class InteractiveWorkflow:
         )
         decision_ladder = baseline_row + "".join(
             InteractiveWorkflow._objective_attempt_row(
-                menu, selection, attempt, context.target_score
+                menu, selection, attempt, context
             )
             for menu, selection, attempt in decisions
         )
@@ -692,7 +691,7 @@ class InteractiveWorkflow:
                 "Displayed objective menu does not match deterministic controller state."
             )
         InteractiveWorkflow._objective_attempt_row(
-            menu, selection, attempt, context.target_score
+            menu, selection, attempt, context
         )
         if attempt is None:
             return
@@ -767,7 +766,7 @@ class InteractiveWorkflow:
         return "<div><b>Candidate actions</b>" + "".join(rows) + "</div>"
 
     @staticmethod
-    def _objective_attempt_row(menu, selection, attempt=None, target_score=None) -> str:
+    def _objective_attempt_row(menu, selection, attempt=None, context=None) -> str:
         """Render one exact menu/selection/commit decision without model rationale."""
         if type(menu) is not ObjectiveActionMenu or type(selection) is not demo_agent.ObjectiveSelection:
             raise ValueError("Objective rows require exact public menu and selection types.")
@@ -833,6 +832,10 @@ class InteractiveWorkflow:
             )
         ):
             raise ValueError("Objective selected action is not canonical policy evidence.")
+        objective_context = context if type(context) is demo_agent.ObjectiveContext else None
+        target_score = (
+            objective_context.target_score if objective_context is not None else None
+        )
         action_rows = []
         for action in menu.actions:
             pairs = " · ".join(
@@ -858,33 +861,62 @@ class InteractiveWorkflow:
             f"{escape(first)} / {escape(second)}" for first, second in menu.source.limiting_pairs
         )
         source_panel = ", ".join(escape(item) for item in source_ids)
-        selection_payload = json.dumps(
-            {
-                "decision_rule": selection.decision_rule,
-                "observed_limiting_pairs": selection.observed_limiting_pairs,
-                "state_id": selection.state_id,
-                "swap_id": selection.swap_id,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
         maximum_key = max(action.predicted_score_key for action in menu.actions)
         maximum_count = sum(
             action.predicted_score_key == maximum_key for action in menu.actions
         )
-        policy_receipt = (
-            "Python validation: the selected action is one of "
-            f"{maximum_count} tied maxima at 1e-12 decision precision."
+        maximum_description = (
+            f"one of {maximum_count} tied-max actions at 1e-12 decision precision"
             if maximum_count > 1
-            else "Python validation: the selected action is the unique argmax at 1e-12 decision precision."
+            else "the unique argmax at 1e-12 decision precision"
         )
         attempt_number = menu.accepted_attempt_count + 1
+        if objective_context is not None:
+            receipt = objective_receipt(
+                objective_context, selection, menu, selected, attempt
+            )
+            validated_selection = receipt.validated_selection
+            planned_command = receipt.planned_command
+            python_evaluation = (
+                "context = objective_context\n"
+                "pending_action_menu = objective_action_menu\n"
+                "selected_action = resolved_menu_action\n"
+                f"attempt_number = {attempt_number}\n"
+                f"{receipt.python_evaluation.replace('accepted_attempt_count + 1', 'attempt_number')}"
+            )
+            executed_measurement = receipt.executed_measurement
+        else:
+            validated_selection = (
+                "ObjectiveSelection("
+                f"state_id={selection.state_id!r}, swap_id={selection.swap_id!r}, "
+                f"observed_limiting_pairs={menu.source.limiting_pairs!r}, "
+                f"decision_rule={selection.decision_rule!r})"
+            )
+            planned_command = (
+                "select_next_panel_swap("
+                f"state_id={menu.state_id!r}, swap_id={selected.swap_id!r}, "
+                "decision_rule='maximize_predicted_minimum_distance')"
+            )
+            python_evaluation = (
+                "context = objective_context\n"
+                "pending_action_menu = objective_action_menu\n"
+                "selected_action = resolved_menu_action\n"
+                f"attempt_number = {attempt_number}\n"
+                "result = evaluate_selected_swap(\n"
+                "    context,\n"
+                "    pending_action_menu,\n"
+                "    selected_action,\n"
+                "    attempt_number,\n"
+                ")"
+            )
+            executed_measurement = None
         if attempt is None:
             accent = "#6c757d"
             measure = (
-                "<small><b>Measure:</b> Evaluation not completed; selection validated but unmeasured. "
-                "No measurement is available.</small><br>"
-                "<small><b>Outcome:</b> Evaluation not completed</small>"
+                "Evaluation not completed; selection validated but unmeasured. "
+                "No measurement is available.<br>"
+                f"<small>Controller explanation: Python validation: The selected action was {escape(maximum_description)}; "
+                "evaluation was not completed, so no measured improvement or target result is claimed.</small>"
             )
             outcome = "Evaluation not completed"
         else:
@@ -908,32 +940,61 @@ class InteractiveWorkflow:
             measured_pairs = " · ".join(
                 f"{escape(first)} / {escape(second)}" for first, second in attempt.limiting_pairs
             )
-            similarities = " · ".join(
-                f"{escape(first)} / {escape(second)}: {1.0 - attempt.score!r}"
-                for first, second in attempt.limiting_pairs
+            if objective_context is None:
+                similarities = "context required for raw per-pair similarities"
+            else:
+                positions = {
+                    candidate.molecule_id: index
+                    for index, candidate in enumerate(objective_context.candidates)
+                }
+                similarities = " · ".join(
+                    f"{escape(first)} / {escape(second)}: "
+                    f"{1.0 - float(objective_context.distance_matrix[positions[first], positions[second]])!r}"
+                    for first, second in attempt.limiting_pairs
+                )
+            target_comparison = (
+                InteractiveWorkflow._objective_target_status(
+                    attempt.score, target_score
+                )
+                if type(target_score) is float
+                else selected.target_status
+            )
+            target_outcome = (
+                "the target was achieved" if attempt.achieved
+                else "the target remains unmet"
+            )
+            explanation = (
+                "Controller explanation: Python validation: The selected action was "
+                f"{maximum_description}; measured D_min improved from "
+                f"{menu.source.score!r} to {attempt.score!r} "
+                f"(delta {selected.score_delta!r}); {target_outcome}; "
+                f"{target_comparison}."
             )
             measure = (
-                f"<small><b>Measure:</b> D_min {attempt.score!r}; score_key={attempt.score_key}; "
+                f"D_min {attempt.score!r}; score_key={attempt.score_key}; "
                 f"delta={selected.score_delta!r}; co-limiting pairs={measured_pairs}; "
                 f"limiting Tanimoto similarities={similarities}; constraints passed=true; "
-                f"target comparison={escape(InteractiveWorkflow._objective_target_status(attempt.score, target_score) if type(target_score) is float else selected.target_status)}</small><br>"
-                f"<small><b>Outcome:</b> {escape(outcome)}</small>"
+                f"target comparison={escape(target_comparison)}<br>"
+                f"<pre data-receipt='executed-measurement'>{escape(executed_measurement or '')}</pre>"
+                f"<small>{escape(explanation)}</small>"
             )
         return (
-            f"<section style='border-left:3px solid {accent};padding:6px 10px;"
+            f"<div style='border-left:3px solid {accent};padding:6px 10px;"
             "margin:6px 0' aria-label='Objective attempt'>"
             f"<b>Attempt {attempt_number}</b> · {escape(outcome)}<br>"
-            f"<small><b>Observe:</b> state {escape(menu.state_id)}; source panel {source_panel}; "
+            "<section aria-label='Observe'><b>Observe:</b> "
+            f"<small>state {escape(menu.state_id)}; source panel {source_panel}; "
             f"source D_min {menu.source.score!r}; score_key={menu.source.score_key}; "
             f"co-limiting pairs {source_pairs}; target comparison="
-            f"{escape(InteractiveWorkflow._objective_target_status(menu.source.score, target_score) if type(target_score) is float else 'target supplied by the objective context')}</small><br>"
-            f"<div><b>Candidate actions</b>{candidate_html}</div>"
-            f"<small><b>Nemotron choice:</b> validated structured payload "
-            f"<code>{escape(selection_payload)}</code>. {escape(policy_receipt)}</small><br>"
-            f"<small><b>Execute:</b> Python evaluator receipt "
-            f"<code>evaluate_selected_swap(state_id={escape(selection.state_id)!r}, "
-            f"swap_id={escape(selection.swap_id)!r})</code></small><br>"
-            f"{measure}</section>"
+            f"{escape(InteractiveWorkflow._objective_target_status(menu.source.score, target_score) if type(target_score) is float else 'target supplied by the objective context')}</small></section>"
+            "<section aria-label='Deterministically evaluated candidate actions'>"
+            f"<b>Deterministically evaluated candidate actions:</b>{candidate_html}</section>"
+            "<section aria-label='Nemotron choice'><b>Nemotron choice:</b> "
+            f"<pre data-receipt='validated-selection'>{escape(validated_selection)}</pre></section>"
+            "<section aria-label='Execute'><b>Execute:</b> "
+            f"<pre data-receipt='planned-command'>{escape(planned_command)}</pre>"
+            f"<pre data-receipt='python-evaluation'>{escape(python_evaluation)}</pre></section>"
+            f"<section aria-label='Measure'><b>Measure:</b> {measure}</section></div>"
         )
 
     @staticmethod
@@ -1052,27 +1113,13 @@ class InteractiveWorkflow:
         cards = []
         for menu, selection, attempt in self.objective_decisions:
             row = self._objective_attempt_row(
-                menu, selection, attempt, self.controller.objective_context.target_score
+                menu, selection, attempt, self.controller.objective_context
             )
-            if attempt is None:
-                result_label = "Evaluation not completed"
-                details_html = row
-            else:
-                receipt = objective_receipt(
-                    context, selection, menu, attempt.selected_swap, attempt
-                )
-                result_label = "Goal achieved" if attempt.achieved else "Revise"
-                details_html = (
-                    row
-                    + "<b>Validated Nemotron selection</b>"
-                    f"<pre>{escape(receipt.validated_selection)}</pre>"
-                    "<b>Planned deterministic command</b>"
-                    f"<pre>{escape(receipt.planned_command)}</pre>"
-                    "<b>Evaluation executed by Python</b>"
-                    f"<pre>{escape(receipt.python_evaluation)}</pre>"
-                    "<b>Executed measurement</b>"
-                    f"<pre>{escape(receipt.executed_measurement or '')}</pre>"
-                )
+            result_label = (
+                "Evaluation not completed" if attempt is None
+                else "Goal achieved" if attempt.achieved else "Revise"
+            )
+            details_html = row
             card = widgets.Accordion((widgets.HTML(details_html),))
             card.set_title(
                 0, f"Attempt {menu.accepted_attempt_count + 1} — {result_label}"
