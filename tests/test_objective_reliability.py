@@ -1,4 +1,5 @@
 import copy
+import inspect
 import json
 from dataclasses import fields, replace
 from types import SimpleNamespace
@@ -8,7 +9,7 @@ import pytest
 
 import demo_agent
 from chemistry_workflow import StageResult, WorkflowPhase, WorkflowReport
-from objective_fixtures import evidence_report, optimized_state
+from objective_fixtures import evidence_report, optimized_state, report_and_run
 
 
 CANONICAL_REPORT_ROWS = (
@@ -21,7 +22,7 @@ CANONICAL_REPORT_ROWS = (
 )
 
 
-def _make_prepared_snapshot():
+def prepared_snapshot():
     messages = [
         {"role": "system", "content": "grounding"},
         {"role": "user", "content": "goal"},
@@ -44,33 +45,37 @@ def _make_prepared_snapshot():
         demo_agent.PlanStage(stage=stage, rationale=f"Run {stage} safely.")
         for stage in demo_agent.STAGES
     ])
+    report, _run = report_and_run()
     stages = tuple(
-        StageResult(stage, stage, {"stage": stage}) for stage in demo_agent.STAGES
+        StageResult(stage, record.label, json.loads(record.payload_json))
+        for stage, record in zip(demo_agent.STAGES, report.evidence, strict=True)
     )
-    report = evidence_report()
     return demo_agent.PreparedScientificSnapshot(
-        session=demo_agent.AgentSession(messages, optimized_state(), 7),
+        messages=tuple(messages),
+        state=optimized_state(),
         plan=plan,
         stage_results=stages,
         report=report,
-        executors={
-            **{stage: (lambda state, **kwargs: None) for stage in demo_agent.STAGES},
-            "build_workflow_report": lambda state: report,
-        },
+        turn_count=7,
     )
 
 
-@pytest.fixture
-def prepared_snapshot():
-    return _make_prepared_snapshot()
+def _prepared_executors(report):
+    return {
+        **{stage: (lambda state, **kwargs: None) for stage in demo_agent.STAGES},
+        "build_workflow_report": lambda state: report,
+    }
 
 
-def test_prepared_snapshot_requires_exact_completed_scientific_boundary(prepared_snapshot):
-    snapshot = prepared_snapshot
+def test_prepared_snapshot_requires_exact_completed_scientific_boundary():
+    snapshot = prepared_snapshot()
 
-    assert snapshot.session.turn_count == 7
-    assert len(snapshot.session.messages) == 16
-    assert snapshot.session.state.phase.value == "optimized"
+    assert [field.name for field in fields(demo_agent.PreparedScientificSnapshot)] == [
+        "messages", "state", "plan", "stage_results", "report", "turn_count"
+    ]
+    assert snapshot.turn_count == 7
+    assert len(snapshot.messages) == 16
+    assert snapshot.state.phase.value == "optimized"
     assert tuple(item.stage for item in snapshot.plan.stages) == demo_agent.STAGES
     assert tuple(item.stage for item in snapshot.stage_results) == demo_agent.STAGES
     assert tuple(item.key for item in snapshot.report.evidence) == (
@@ -80,30 +85,32 @@ def test_prepared_snapshot_requires_exact_completed_scientific_boundary(prepared
 
 @pytest.mark.parametrize("mutation", ("turn_count", "messages", "report"))
 def test_prepared_snapshot_fails_closed_on_incomplete_or_noncanonical_input(
-    prepared_snapshot, mutation
+    mutation,
 ):
-    valid = prepared_snapshot
+    valid = prepared_snapshot()
+    messages = copy.deepcopy(valid.messages)
+    turn_count = valid.turn_count
+    report = valid.report
     if mutation == "turn_count":
-        valid.session.turn_count = 6
+        turn_count = 6
     elif mutation == "messages":
-        valid.session.messages[-1]["tool_call_id"] = "unpaired"
+        messages[-1]["tool_call_id"] = "unpaired"
     else:
-        object.__setattr__(valid, "report", WorkflowReport(valid.report.evidence[:-1]))
+        report = WorkflowReport(valid.report.evidence[:-1])
 
     with pytest.raises((TypeError, ValueError), match="prepared|canonical|paired"):
         demo_agent.PreparedScientificSnapshot(
-            session=valid.session,
+            messages=tuple(messages),
+            state=valid.state,
             plan=valid.plan,
             stage_results=valid.stage_results,
-            report=valid.report,
-            executors=valid.executors,
+            report=report,
+            turn_count=turn_count,
         )
 
 
-def test_prepared_snapshot_rejects_named_but_fabricated_evidence_payload(
-    prepared_snapshot,
-):
-    valid = prepared_snapshot
+def test_prepared_snapshot_rejects_named_but_fabricated_evidence_payload():
+    valid = prepared_snapshot()
     records = list(valid.report.evidence)
     records[0] = type(records[0])(
         records[0].key,
@@ -114,23 +121,30 @@ def test_prepared_snapshot_rejects_named_but_fabricated_evidence_payload(
 
     with pytest.raises(ValueError, match="production-shaped"):
         demo_agent.PreparedScientificSnapshot(
-            session=valid.session,
+            messages=valid.messages,
+            state=valid.state,
             plan=valid.plan,
             stage_results=valid.stage_results,
             report=WorkflowReport(tuple(records)),
-            executors=valid.executors,
+            turn_count=valid.turn_count,
         )
 
 
-def test_clone_prepared_controller_is_deep_isolated_and_objective_clean(
-    prepared_snapshot,
-):
-    snapshot = prepared_snapshot
-    first = demo_agent.clone_prepared_controller(snapshot, client=object())
-    second = demo_agent.clone_prepared_controller(snapshot, client=object())
+def test_clone_prepared_controller_is_deep_isolated_and_objective_clean():
+    snapshot = prepared_snapshot()
+    executors = _prepared_executors(snapshot.report)
+    assert tuple(inspect.signature(demo_agent.clone_prepared_controller).parameters) == (
+        "snapshot", "client", "executors"
+    )
+    first = demo_agent.clone_prepared_controller(
+        snapshot, client=object(), executors=executors
+    )
+    second = demo_agent.clone_prepared_controller(
+        snapshot, client=object(), executors=executors
+    )
 
-    assert first.session is not second.session is not snapshot.session
-    assert first.session.state is not second.session.state is not snapshot.session.state
+    assert first.session is not second.session
+    assert first.session.state is not second.session.state is not snapshot.state
     assert first.plan is not second.plan is not snapshot.plan
     assert first.stage_results is not second.stage_results
     assert first.report is not second.report is not snapshot.report
@@ -149,7 +163,7 @@ def test_clone_prepared_controller_is_deep_isolated_and_objective_clean(
     first.stage_results[0].summary["mutated"] = True
 
     assert second.session.messages[0]["content"] == "grounding"
-    assert snapshot.session.messages[0]["content"] == "grounding"
+    assert snapshot.messages[0]["content"] == "grounding"
     assert second.session.state.records[0]["id"] == "mol-0"
     assert "mutated" not in second.stage_results[0].summary
 
@@ -186,29 +200,33 @@ class _CurrentMaximumCompletions:
 
 
 class ScriptedControllerFactory:
-    def __init__(self, snapshot=None, *, transport_failure_trial=None):
-        self.snapshot = snapshot or _make_prepared_snapshot()
-        self.transport_failure_trial = transport_failure_trial
+    def __init__(self, snapshot, retry_trial_index=None):
+        self.snapshot = snapshot
+        self.retry_trial_index = retry_trial_index
         self.created = 0
         self.completions = []
 
     def __call__(self):
         self.created += 1
         completions = _CurrentMaximumCompletions(
-            fail_first=self.created == self.transport_failure_trial
+            fail_first=(self.created - 1) == self.retry_trial_index
         )
         client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
-        controller = demo_agent.clone_prepared_controller(self.snapshot, client=client)
+        controller = demo_agent.clone_prepared_controller(
+            self.snapshot,
+            client=client,
+            executors=_prepared_executors(self.snapshot.report),
+        )
         completions.controller = controller
         self.completions.append(completions)
         return controller
 
 
-def test_run_trials_uses_current_argmax_and_labels_one_transport_retry(prepared_snapshot):
+def test_run_trials_uses_current_argmax_and_labels_one_transport_retry():
     from scripts.run_objective_reliability import run_trials
 
     factory = ScriptedControllerFactory(
-        prepared_snapshot, transport_failure_trial=2
+        prepared_snapshot(), retry_trial_index=1
     )
     trials = run_trials(factory, trials=2)
 
@@ -231,10 +249,25 @@ def test_run_trials_uses_current_argmax_and_labels_one_transport_retry(prepared_
     )
 
 
-def test_failed_trial_retains_sanitized_controller_counters_and_pairing(prepared_snapshot):
+def test_successful_trial_fails_temperature_gate_when_request_settings_are_unobservable(
+):
     from scripts.run_objective_reliability import run_trials
 
-    factory = ScriptedControllerFactory(prepared_snapshot)
+    factory = ScriptedControllerFactory(prepared_snapshot())
+    controller = factory()
+    recorded = factory.completions[-1]
+    controller.client.chat.completions = SimpleNamespace(create=recorded.create)
+
+    trials = run_trials(lambda: controller, trials=1)
+
+    assert trials[0]["completed"] is True
+    assert trials[0]["production_temperature_zero"] is False
+
+
+def test_failed_trial_retains_sanitized_controller_counters_and_pairing():
+    from scripts.run_objective_reliability import run_trials
+
+    factory = ScriptedControllerFactory(prepared_snapshot())
     controller = factory()
     completions = factory.completions[-1]
     real_create = completions.create
@@ -402,7 +435,8 @@ def test_reliability_receipt_has_exact_frozen_fields_and_fail_closed_exit_code(m
         for index in range(runs)
     ))
     receipt = reliability.run_qualification(
-        ScriptedControllerFactory(), ScriptedControllerFactory(),
+        ScriptedControllerFactory(prepared_snapshot()),
+        ScriptedControllerFactory(prepared_snapshot()),
         trials=2, end_to_end_runs=1,
     )
 
@@ -416,6 +450,32 @@ def test_reliability_receipt_has_exact_frozen_fields_and_fail_closed_exit_code(m
         **{**receipt.__dict__, "claim_safety_passes": 2}
     )
     assert reliability.qualification_exit_code(unsafe) != 0
+
+
+def test_run_qualification_covers_20_isolated_trials_and_3_fresh_runs(
+):
+    import scripts.run_objective_reliability as reliability
+
+    objective_factory = ScriptedControllerFactory(
+        prepared_snapshot(), retry_trial_index=0
+    )
+    receipt = reliability.run_qualification(
+        objective_factory,
+        _fresh_end_to_end_controller,
+        trials=20,
+        end_to_end_runs=3,
+    )
+
+    assert receipt.completed_trials == 20
+    assert receipt.argmax_successes == 20
+    assert receipt.retry_assisted_trials == 1
+    assert receipt.clean_first_request_trials == 19
+    assert receipt.completed_end_to_end_runs == 3
+    assert receipt.message_pairing_passes == 23
+    assert receipt.claim_safety_passes == 23
+    assert receipt.production_temperature_zero is True
+    assert receipt.failed_trials == ()
+    assert reliability.qualification_exit_code(receipt) == 0
 
 
 def test_completed_but_nonqualifying_trial_is_listed_as_failed(monkeypatch):
@@ -454,6 +514,8 @@ def test_completed_but_nonqualifying_trial_is_listed_as_failed(monkeypatch):
         {"message_pairing_passes": 2},
         {"claim_safety_passes": 2},
         {"production_temperature_zero": False},
+        {"clean_first_request_trials": 999},
+        {"retry_assisted_trials": 999},
     ),
 )
 def test_qualification_exit_code_directly_rejects_each_incomplete_gate(monkeypatch, change):
@@ -466,7 +528,8 @@ def test_qualification_exit_code_directly_rejects_each_incomplete_gate(monkeypat
         "conclusion_status": "selected", "termination_reason": "target_achieved",
     },))
     receipt = reliability.run_qualification(
-        ScriptedControllerFactory(), ScriptedControllerFactory(),
+        ScriptedControllerFactory(prepared_snapshot()),
+        ScriptedControllerFactory(prepared_snapshot()),
         trials=2, end_to_end_runs=1,
     )
 
@@ -513,3 +576,87 @@ def test_cli_calls_run_qualification_and_writes_only_allowlisted_receipt(monkeyp
     assert payload["requested_trials"] == 1
     assert "nvapi-secret" not in output.read_text()
     assert "metadata" not in output.read_text()
+
+
+@pytest.fixture
+def receipt_with_sensitive_trial_metadata():
+    from scripts.run_objective_reliability import ReliabilityReceipt
+
+    trial = {
+        "kind": "objective",
+        "index": 1,
+        "model": demo_agent.DEFAULT_MODEL,
+        "environment": "production_hosted_api",
+        "completed": True,
+        "argmax_success": True,
+        "accepted_attempt_count": 1,
+        "rejected_selection_count": 0,
+        "correction_prompts_sent": 0,
+        "selection_response_count": 1,
+        "provider_request_attempt_count": 1,
+        "retry_assisted": False,
+        "baseline_score": 0.35,
+        "target_score": 0.71,
+        "final_score": 0.8,
+        "termination_reason": "target_achieved",
+        "message_pairing_passed": True,
+        "claim_safety_passed": True,
+        "production_temperature_zero": True,
+        "conclusion_status": None,
+        "api_key": "nvapi-SENSITIVE-SENTINEL",
+        "raw_model_response": "RAW-RESPONSE-SENTINEL",
+        "metadata": {"arbitrary": "ARBITRARY-METADATA-SENTINEL"},
+    }
+    return ReliabilityReceipt(
+        requested_trials=1,
+        completed_trials=1,
+        argmax_successes=1,
+        clean_first_request_trials=1,
+        retry_assisted_trials=0,
+        requested_end_to_end_runs=1,
+        completed_end_to_end_runs=1,
+        message_pairing_passes=2,
+        claim_safety_passes=2,
+        production_temperature_zero=True,
+        objective_trials=(trial,),
+        end_to_end_runs=({**trial, "kind": "end_to_end", "conclusion_status": "selected"},),
+        failed_trials=(),
+    )
+
+
+def test_write_reliability_receipt_rebuilds_explicit_allowlisted_json(
+    receipt_with_sensitive_trial_metadata, tmp_path
+):
+    import scripts.run_objective_reliability as reliability
+
+    output = tmp_path / "allowlisted.json"
+    reliability.write_reliability_receipt(output, receipt_with_sensitive_trial_metadata)
+    raw = output.read_text()
+    payload = json.loads(raw)
+
+    assert set(payload) == {
+        "model", "environment", "requested_trials", "completed_trials",
+        "argmax_successes", "clean_first_request_trials", "retry_assisted_trials",
+        "requested_end_to_end_runs", "completed_end_to_end_runs",
+        "message_pairing_passes", "claim_safety_passes",
+        "production_temperature_zero", "objective_trials", "end_to_end_runs",
+        "failed_trials",
+    }
+    assert set(payload["objective_trials"][0]) == {
+        "kind", "index", "model", "environment", "completed",
+        "argmax_success", "accepted_attempt_count", "rejected_selection_count",
+        "correction_prompts_sent", "selection_response_count",
+        "provider_request_attempt_count", "retry_assisted", "baseline_score",
+        "target_score", "final_score", "termination_reason",
+        "message_pairing_passed", "claim_safety_passed",
+        "production_temperature_zero", "conclusion_status",
+    }
+    for sentinel in (
+        "nvapi-SENSITIVE-SENTINEL",
+        "RAW-RESPONSE-SENTINEL",
+        "ARBITRARY-METADATA-SENTINEL",
+        "api_key",
+        "raw_model_response",
+        "metadata",
+    ):
+        assert sentinel not in raw

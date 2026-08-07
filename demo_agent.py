@@ -510,7 +510,7 @@ _CANONICAL_REPORT_REQUIRED_FIELDS = {
 
 
 def _validate_prepared_messages(messages: Any) -> None:
-    if type(messages) is not list or len(messages) != 16:
+    if type(messages) is not tuple or len(messages) != 16:
         raise ValueError("A prepared snapshot requires exactly 16 messages.")
     if [item.get("role") for item in messages[:2]] != ["system", "user"]:
         raise ValueError("A prepared snapshot requires system and user grounding.")
@@ -563,17 +563,18 @@ def _validate_prepared_report(report: Any) -> None:
 class PreparedScientificSnapshot:
     """A validated seven-turn scientific boundary reusable only by deep cloning."""
 
-    session: AgentSession
+    messages: tuple[dict[str, Any], ...]
+    state: WorkflowState
     plan: WorkflowPlan
     stage_results: tuple[StageResult, ...]
     report: WorkflowReport
-    executors: dict[str, Any]
+    turn_count: int
 
     def __post_init__(self) -> None:
-        if type(self.session) is not AgentSession or self.session.turn_count != 7:
+        if self.turn_count != 7:
             raise ValueError("A prepared snapshot requires exactly seven hosted turns.")
-        _validate_prepared_messages(self.session.messages)
-        if self.session.state.phase is not WorkflowPhase.OPTIMIZED:
+        _validate_prepared_messages(self.messages)
+        if type(self.state) is not WorkflowState or self.state.phase is not WorkflowPhase.OPTIMIZED:
             raise ValueError("A prepared snapshot requires an optimized scientific state.")
         if (
             type(self.plan) is not WorkflowPlan
@@ -581,16 +582,16 @@ class PreparedScientificSnapshot:
             or type(self.stage_results) is not tuple
             or tuple(item.stage for item in self.stage_results) != STAGES
             or any(type(item) is not StageResult for item in self.stage_results)
+            or any(
+                type(item.display_label) is not str
+                or not item.display_label
+                or type(item.summary) is not dict
+                or not item.summary
+                for item in self.stage_results
+            )
         ):
             raise ValueError("A prepared snapshot requires the exact six ordered stages.")
         _validate_prepared_report(self.report)
-        required_executors = set(STAGES) | {"build_workflow_report"}
-        if (
-            type(self.executors) is not dict
-            or set(self.executors) != required_executors
-            or not all(callable(value) for value in self.executors.values())
-        ):
-            raise ValueError("Prepared executors must match the fixed workflow.")
 
 
 def _client(api_key: str) -> OpenAI:
@@ -2223,25 +2224,38 @@ def clone_prepared_controller(
     snapshot: PreparedScientificSnapshot,
     *,
     client: Any,
+    executors: dict[str, Any],
 ) -> BoundedWorkflowController:
     """Create one objective-clean controller from a deep-isolated scientific snapshot."""
     if type(snapshot) is not PreparedScientificSnapshot:
         raise TypeError("An exact prepared scientific snapshot is required.")
     PreparedScientificSnapshot(
-        session=snapshot.session,
+        messages=snapshot.messages,
+        state=snapshot.state,
         plan=snapshot.plan,
         stage_results=snapshot.stage_results,
         report=snapshot.report,
-        executors=snapshot.executors,
+        turn_count=snapshot.turn_count,
     )
-    session = deepcopy(snapshot.session)
+    required_executors = set(STAGES) | {"build_workflow_report"}
+    if (
+        type(executors) is not dict
+        or set(executors) != required_executors
+        or not all(callable(value) for value in executors.values())
+    ):
+        raise ValueError("Prepared executors must match the fixed workflow.")
+    session = AgentSession(
+        messages=list(deepcopy(snapshot.messages)),
+        state=deepcopy(snapshot.state),
+        turn_count=snapshot.turn_count,
+    )
     plan = WorkflowPlan.model_validate(deepcopy(snapshot.plan.model_dump()))
     stage_results = list(deepcopy(snapshot.stage_results))
     report = deepcopy(snapshot.report)
     return BoundedWorkflowController(
         session=session,
         client=client,
-        executors=dict(snapshot.executors),
+        executors=dict(executors),
         plan=plan,
         stage_results=stage_results,
         report=report,

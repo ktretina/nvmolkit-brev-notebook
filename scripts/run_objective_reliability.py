@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -31,6 +32,30 @@ ControllerFactory = Callable[[], demo_agent.BoundedWorkflowController]
 QUALIFICATION_GOAL = (
     "Qualify the fixed nvMolKit workflow and bounded molecular-diversity objective."
 )
+
+
+class _AuditedCompletions:
+    """Record only hosted request contract fields, never messages or responses."""
+
+    def __init__(self, delegate: object) -> None:
+        self._delegate = delegate
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> object:
+        self.calls.append({
+            "model": kwargs.get("model"),
+            "temperature": kwargs.get("temperature"),
+            "extra_body": deepcopy(kwargs.get("extra_body")),
+            "tool_choice": deepcopy(kwargs.get("tool_choice")),
+            "tools": deepcopy(kwargs.get("tools")),
+        })
+        return self._delegate.create(**kwargs)
+
+
+def _audited_client(api_key: str) -> object:
+    client = demo_agent._client(api_key)
+    completions = _AuditedCompletions(client.chat.completions)
+    return SimpleNamespace(chat=SimpleNamespace(completions=completions))
 
 
 class _DeterministicScientificCompletions:
@@ -112,11 +137,12 @@ def _build_prepared_snapshot(api_key: str) -> demo_agent.PreparedScientificSnaps
     if len(completions.calls) != 7:
         raise RuntimeError("Scientific preparation did not execute exactly seven calls.")
     return demo_agent.PreparedScientificSnapshot(
-        session=controller.session,
+        messages=result.messages,
+        state=controller.session.state,
         plan=result.plan,
         stage_results=result.stage_results,
         report=result.report,
-        executors=controller.executors,
+        turn_count=result.turn_count,
     )
 
 
@@ -135,6 +161,72 @@ class ReliabilityReceipt:
     objective_trials: tuple[dict[str, object], ...]
     end_to_end_runs: tuple[dict[str, object], ...]
     failed_trials: tuple[dict[str, object], ...]
+
+
+_TRIAL_RECEIPT_FIELDS = (
+    "kind",
+    "index",
+    "model",
+    "environment",
+    "completed",
+    "argmax_success",
+    "accepted_attempt_count",
+    "rejected_selection_count",
+    "correction_prompts_sent",
+    "selection_response_count",
+    "provider_request_attempt_count",
+    "retry_assisted",
+    "baseline_score",
+    "target_score",
+    "final_score",
+    "termination_reason",
+    "message_pairing_passed",
+    "claim_safety_passed",
+    "production_temperature_zero",
+    "conclusion_status",
+)
+
+
+def _allowlisted_trial(trial: dict[str, object]) -> dict[str, object]:
+    if type(trial) is not dict:
+        raise TypeError("Reliability trial records must be dictionaries.")
+    return {field: trial.get(field) for field in _TRIAL_RECEIPT_FIELDS}
+
+
+def write_reliability_receipt(
+    path: Path | str,
+    receipt: ReliabilityReceipt,
+) -> None:
+    """Write canonical receipt JSON rebuilt exclusively from explicit allowlists."""
+    if type(receipt) is not ReliabilityReceipt:
+        raise TypeError("An exact reliability receipt is required.")
+    payload = {
+        "model": demo_agent.DEFAULT_MODEL,
+        "environment": "production_hosted_api",
+        "requested_trials": receipt.requested_trials,
+        "completed_trials": receipt.completed_trials,
+        "argmax_successes": receipt.argmax_successes,
+        "clean_first_request_trials": receipt.clean_first_request_trials,
+        "retry_assisted_trials": receipt.retry_assisted_trials,
+        "requested_end_to_end_runs": receipt.requested_end_to_end_runs,
+        "completed_end_to_end_runs": receipt.completed_end_to_end_runs,
+        "message_pairing_passes": receipt.message_pairing_passes,
+        "claim_safety_passes": receipt.claim_safety_passes,
+        "production_temperature_zero": receipt.production_temperature_zero,
+        "objective_trials": [
+            _allowlisted_trial(item) for item in receipt.objective_trials
+        ],
+        "end_to_end_runs": [
+            _allowlisted_trial(item) for item in receipt.end_to_end_runs
+        ],
+        "failed_trials": [
+            _allowlisted_trial(item) for item in receipt.failed_trials
+        ],
+    }
+    Path(path).write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _positive_count(value: int, label: str) -> int:
@@ -170,22 +262,32 @@ def _messages_are_paired(messages: object) -> bool:
 def _calls_use_production_contract(controller: demo_agent.BoundedWorkflowController) -> bool:
     completions = getattr(getattr(controller.client, "chat", None), "completions", None)
     calls = getattr(completions, "calls", None)
-    if calls is None:
-        return True
     if type(calls) is not list or not calls:
         return False
     for call in calls:
         try:
-            tool = call["tools"][0]["function"]
-            choice = call["tool_choice"]["function"]["name"]
+            tools = call["tools"]
+            choice = call["tool_choice"]
+            extra_body = call["extra_body"]
+        except (KeyError, IndexError, TypeError):
+            return False
+        if type(tools) is not list or len(tools) != 1:
+            return False
+        try:
+            tool = tools[0]["function"]
+            choice_name = choice["function"]["name"]
+            thinking = extra_body["chat_template_kwargs"]["enable_thinking"]
         except (KeyError, IndexError, TypeError):
             return False
         if (
             call.get("model") != demo_agent.DEFAULT_MODEL
-            or call.get("temperature") != 0.0
+            or type(call.get("temperature")) is not float
+            or call["temperature"] != 0.0
             or call.get("extra_body") != demo_agent.NEMOTRON_TOOL_EXTRA_BODY
+            or thinking is not False
+            or choice.get("type") != "function"
             or tool.get("strict") is not True
-            or tool.get("name") != choice
+            or tool.get("name") != choice_name
         ):
             return False
     return True
@@ -438,6 +540,24 @@ def qualification_exit_code(receipt: ReliabilityReceipt) -> int:
     if type(receipt) is not ReliabilityReceipt:
         return 1
     expected_total = receipt.requested_trials + receipt.requested_end_to_end_runs
+    expected_clean = sum(
+        item.get("completed") is True
+        and item.get("argmax_success") is True
+        and item.get("message_pairing_passed") is True
+        and item.get("claim_safety_passed") is True
+        and item.get("production_temperature_zero") is True
+        and item.get("retry_assisted") is False
+        for item in receipt.objective_trials
+    )
+    expected_retry = sum(
+        item.get("completed") is True
+        and item.get("argmax_success") is True
+        and item.get("message_pairing_passed") is True
+        and item.get("claim_safety_passed") is True
+        and item.get("production_temperature_zero") is True
+        and item.get("retry_assisted") is True
+        for item in receipt.objective_trials
+    )
     valid = (
         receipt.completed_trials == receipt.requested_trials
         and receipt.argmax_successes == receipt.requested_trials
@@ -448,6 +568,9 @@ def qualification_exit_code(receipt: ReliabilityReceipt) -> int:
         and not receipt.failed_trials
         and len(receipt.objective_trials) == receipt.requested_trials
         and len(receipt.end_to_end_runs) == receipt.requested_end_to_end_runs
+        and receipt.clean_first_request_trials == expected_clean
+        and receipt.retry_assisted_trials == expected_retry
+        and expected_clean + expected_retry == receipt.requested_trials
     )
     valid &= all(
         item.get("completed") is True
@@ -487,14 +610,16 @@ def main(argv: list[str] | None = None) -> int:
 
     def objective_factory() -> demo_agent.BoundedWorkflowController:
         return demo_agent.clone_prepared_controller(
-            snapshot, client=demo_agent._client(api_key)
+            snapshot,
+            client=_audited_client(api_key),
+            executors=demo_agent._default_executors(),
         )
 
     def end_to_end_factory() -> demo_agent.BoundedWorkflowController:
         return demo_agent.BoundedWorkflowController.create(
             QUALIFICATION_GOAL,
             api_key,
-            client=demo_agent._client(api_key),
+            client=_audited_client(api_key),
             objective_required=True,
         )
 
@@ -504,15 +629,7 @@ def main(argv: list[str] | None = None) -> int:
         trials=args.trials,
         end_to_end_runs=args.end_to_end_runs,
     )
-    payload = {
-        "model": demo_agent.DEFAULT_MODEL,
-        "environment": "production_hosted_api",
-        **asdict(receipt),
-    }
-    args.output.write_text(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
-        encoding="utf-8",
-    )
+    write_reliability_receipt(args.output, receipt)
     return qualification_exit_code(receipt)
 
 
