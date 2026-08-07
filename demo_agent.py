@@ -415,7 +415,11 @@ _REQUIRED_CONCLUSION_EVIDENCE = {
 }
 
 _REQUIRED_OBJECTIVE_CONCLUSION_EVIDENCE = {
-    **_REQUIRED_CONCLUSION_EVIDENCE,
+    "dataset_scope": {"E01"},
+    "molecular_representation": {"E02"},
+    "similarity_structure": {"E03"},
+    "clustering": {"E04"},
+    "conformational_sampling": {"E05", "E06"},
     "objective_driven_selection": {"O01"},
     "limitations_and_next_steps": {"E01", "E06", "O01"},
 }
@@ -520,6 +524,33 @@ def _tool_definition(
     parameters = model.model_json_schema()
     parameters["additionalProperties"] = False
     parameters["required"] = list(model.model_fields)
+    if name == "submit_synthesis" and model is ObjectiveSubmitConclusionArgs:
+        section_branches = []
+        for theme, required_evidence in _REQUIRED_OBJECTIVE_CONCLUSION_EVIDENCE.items():
+            evidence_keys = [
+                key for key in ObjectiveEvidenceKey.__args__ if key in required_evidence
+            ]
+            section_branches.append({
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "theme": {"type": "string", "enum": [theme]},
+                    "prose": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1200,
+                    },
+                    "evidence_keys": {
+                        "type": "array",
+                        "enum": [evidence_keys],
+                    },
+                },
+                "required": ["theme", "prose", "evidence_keys"],
+            })
+        parameters["properties"]["sections"]["items"] = {
+            "anyOf": section_branches
+        }
+        parameters.pop("$defs", None)
     if _selected_ids_enum is not None:
         if (
             name != "select_diverse_panel"

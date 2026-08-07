@@ -176,6 +176,82 @@ def schema_invalid_objective_conclusion_arguments():
     return arguments
 
 
+def objective_theme_evidence_contract():
+    return (
+        ("dataset_scope", ["E01"]),
+        ("molecular_representation", ["E02"]),
+        ("similarity_structure", ["E03"]),
+        ("clustering", ["E04"]),
+        ("conformational_sampling", ["E05", "E06"]),
+        ("objective_driven_selection", ["O01"]),
+        ("limitations_and_next_steps", ["E01", "E06", "O01"]),
+    )
+
+
+def test_objective_synthesis_tool_schema_pairs_themes_with_exact_evidence_arrays():
+    parameters = demo_agent._tool_definition(
+        "submit_synthesis", demo_agent.ObjectiveSubmitConclusionArgs
+    )["function"]["parameters"]
+
+    assert parameters["properties"]["sections"]["minItems"] == 7
+    assert parameters["properties"]["sections"]["maxItems"] == 7
+    branches = parameters["properties"]["sections"]["items"]["anyOf"]
+    assert len(branches) == 7
+    assert [branch["properties"]["theme"]["enum"][0] for branch in branches] == [
+        theme for theme, _keys in objective_theme_evidence_contract()
+    ]
+    for branch, (theme, evidence_keys) in zip(
+        branches, objective_theme_evidence_contract(), strict=True
+    ):
+        assert branch["type"] == "object"
+        assert branch["additionalProperties"] is False
+        assert branch["required"] == ["theme", "prose", "evidence_keys"]
+        assert branch["properties"]["theme"] == {
+            "type": "string",
+            "enum": [theme],
+        }
+        assert branch["properties"]["prose"] == {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1200,
+        }
+        assert branch["properties"]["evidence_keys"] == {
+            "type": "array",
+            "enum": [evidence_keys],
+        }
+
+
+def test_live_objective_synthesis_failure_mapping_is_not_representable_by_tool_schema():
+    parameters = demo_agent._tool_definition(
+        "submit_synthesis", demo_agent.ObjectiveSubmitConclusionArgs
+    )["function"]["parameters"]
+    branches = parameters["properties"]["sections"]["items"]["anyOf"]
+    invalid_sections = live_invalid_objective_conclusion_arguments()["sections"]
+
+    for section in invalid_sections:
+        matching_theme_branches = [
+            branch
+            for branch in branches
+            if section["theme"] in branch["properties"]["theme"]["enum"]
+        ]
+        assert len(matching_theme_branches) == 1
+        branch = matching_theme_branches[0]
+        if section["evidence_keys"] != branch["properties"]["evidence_keys"]["enum"][0]:
+            break
+    else:
+        pytest.fail("The live invalid theme/evidence mapping remained representable.")
+
+
+def test_non_objective_synthesis_tool_schema_is_unchanged():
+    expected = demo_agent.SubmitSynthesisArgs.model_json_schema()
+    expected["additionalProperties"] = False
+    expected["required"] = list(demo_agent.SubmitSynthesisArgs.model_fields)
+
+    assert demo_agent._tool_definition(
+        "submit_synthesis", demo_agent.SubmitSynthesisArgs
+    )["function"]["parameters"] == expected
+
+
 def test_objective_proposal_requires_four_unique_bounded_ids():
     valid = demo_agent.ObjectiveProposal(
         selected_ids=["mol-0", "mol-2", "mol-4", "mol-6"],
@@ -861,6 +937,10 @@ def test_objective_conclusion_retry_uses_feedback_and_succeeds_with_exact_covera
     assert rejected_feedback["role"] == "tool"
     assert rejected_feedback["tool_call_id"] == rejected_assistant["tool_calls"][0]["id"]
     assert completions.calls[-1]["messages"][-2] == rejected_feedback
+    first_schema = completions.calls[-2]["tools"][0]["function"]["parameters"]
+    retry_schema = completions.calls[-1]["tools"][0]["function"]["parameters"]
+    assert retry_schema == first_schema
+    assert len(retry_schema["properties"]["sections"]["items"]["anyOf"]) == 7
 
 
 def test_valid_first_objective_conclusion_does_not_append_feedback():
