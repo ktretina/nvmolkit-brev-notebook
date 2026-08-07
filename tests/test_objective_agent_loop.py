@@ -25,6 +25,18 @@ from objective_fixtures import (
 )
 
 
+class FailOnceList(list):
+    def __init__(self, values):
+        super().__init__(values)
+        self.append_attempts = 0
+
+    def append(self, value):
+        self.append_attempts += 1
+        if self.append_attempts == 1:
+            raise RuntimeError("injected append failure")
+        return super().append(value)
+
+
 class FakeTensor:
     def __init__(self, values):
         self.values = np.asarray(values, dtype=float)
@@ -1023,6 +1035,98 @@ def test_execute_revalidates_pending_selection_against_current_menu(drift):
         controller.execute_objective_selection(pending)
     assert controller.accepted_attempt_count == 0
     assert controller.objective_attempts == []
+
+
+@pytest.mark.parametrize(
+    "failure_site",
+    ["evaluation", "next_menu", "terminal_run", "o01", "serialization", "append", "invariant"],
+)
+def test_objective_evaluation_failures_roll_back_and_terminalize_atomically(
+    monkeypatch, failure_site
+):
+    context = (
+        controlled_context_with_ranked_swaps()
+        if failure_site in {"terminal_run", "o01"}
+        else two_revision_context()
+    )
+    controller, completions = completed_controller([])
+    monkeypatch.setattr(demo_agent, "build_objective_context", lambda _state: context)
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    completions.responses.append(selection(menu))
+    pending = controller.request_objective_selection()
+    reached = []
+
+    target = {
+        "evaluation": "evaluate_selected_swap",
+        "next_menu": "build_action_menu",
+        "terminal_run": "terminal_objective_run",
+        "o01": "build_objective_evidence",
+        "serialization": "_serialize",
+    }.get(failure_site)
+    if target is not None:
+        original = getattr(demo_agent, target)
+
+        def fail_once(*args, **kwargs):
+            reached.append(target)
+            monkeypatch.setattr(demo_agent, target, original)
+            raise RuntimeError(f"injected {failure_site} failure")
+
+        monkeypatch.setattr(demo_agent, target, fail_once)
+    elif failure_site == "append":
+        controller.session.messages = FailOnceList(controller.session.messages)
+    else:
+        original = controller._validate_objective_commit
+
+        def fail_invariant(transition):
+            reached.append("invariant")
+            controller._validate_objective_commit = original
+            raise RuntimeError("injected invariant failure")
+
+        controller._validate_objective_commit = fail_invariant
+
+    with pytest.raises(demo_agent.ObjectiveEvaluationError):
+        controller.execute_objective_selection(pending)
+
+    if failure_site == "append":
+        assert controller.session.messages[-1]["role"] == "tool"
+        assert type(controller.session.messages) is list
+    else:
+        assert reached == [target or "invariant"]
+    assert controller.accepted_attempt_count == 0
+    assert controller.objective_attempts == []
+    assert controller.pending_objective_selection is None
+    assert controller.pending_action_menu is None
+    assert controller.objective_run.termination_reason == "evaluation_not_completed"
+    assert controller.objective_run.attempts == ()
+    assert controller.objective_evidence.key == "O01"
+    error_result = json.loads(controller.session.messages[-1]["content"])
+    assert error_result == {"accepted": False, "reason": "evaluation_not_completed"}
+    assert_paired(controller.session.messages)
+
+
+def test_commit_snapshot_restores_plain_messages_and_every_objective_field(monkeypatch):
+    controller, completions = completed_controller([])
+    monkeypatch.setattr(demo_agent, "build_objective_context", lambda _state: two_revision_context())
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    completions.responses.append(selection(menu))
+    pending = controller.request_objective_selection()
+    injected = FailOnceList(controller.session.messages)
+    controller.session.messages = injected
+
+    with pytest.raises(demo_agent.ObjectiveEvaluationError):
+        controller.execute_objective_selection(pending)
+
+    assert injected.append_attempts == 1
+    assert type(controller.session.messages) is list
+    assert controller.accepted_attempt_count == len(controller.objective_attempts) == 0
+    assert controller.rejected_selection_count == 0
+    assert controller.correction_prompts_sent == 0
+    assert controller.selection_response_count == 1
+    assert controller.provider_request_attempt_count == 1
+    assert controller.objective_transport_retry_used is False
+    assert controller.objective_transport_retry_pending is False
 
 
 def test_unreachable_policy_maps_specific_eligibility_error_without_provider(monkeypatch):

@@ -853,20 +853,19 @@ class InteractiveWorkflow:
             else prior_attempt.measurement
         )
         menu = build_action_menu(context, source, attempt.attempt_number - 1)
-        receipt = objective_receipt(proposal, menu, attempt.selected_swap)
+        receipt = objective_receipt(
+            context, proposal, menu, attempt.selected_swap, attempt
+        )
         result_label = "Goal achieved" if attempt.achieved else "Revise"
-        intervention = ""
-        if receipt.validated_intervention is not None:
-            intervention = (
-                "<b>Validated intervention</b>"
-                f"<pre>{escape(receipt.validated_intervention)}</pre>"
-            )
         details = widgets.HTML(
-            "<b>Validated Nemotron proposal</b>"
-            f"<pre>{escape(receipt.validated_proposal)}</pre>"
-            f"{intervention}"
+            "<b>Validated Nemotron selection</b>"
+            f"<pre>{escape(receipt.validated_selection)}</pre>"
+            "<b>Planned deterministic command</b>"
+            f"<pre>{escape(receipt.planned_command)}</pre>"
             "<b>Evaluation executed by Python</b>"
             f"<pre>{escape(receipt.python_evaluation)}</pre>"
+            "<b>Executed measurement</b>"
+            f"<pre>{escape(receipt.executed_measurement or '')}</pre>"
             f"<p><b>D_min:</b> {attempt.score:.3f} &nbsp; "
             f"<b>Limiting pair:</b> {escape(' / '.join(attempt.limiting_pair))} "
             f"&nbsp; <b>Result:</b> {escape(result_label)}</p>"

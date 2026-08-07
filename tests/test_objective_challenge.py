@@ -30,6 +30,7 @@ from objective_challenge import (
     finalize_objective_run,
     objective_figures,
     rank_legal_swaps,
+    resolve_menu_action,
     terminal_objective_run,
 )
 from objective_fixtures import (
@@ -48,6 +49,34 @@ from objective_fixtures import (
     terminal_fixture,
     two_revision_context,
 )
+
+
+def test_resolve_menu_action_rebuilds_revision_and_returns_only_domain_maximum():
+    context = controlled_context_with_ranked_swaps()
+    source = objective_challenge.measure_panel(context, context.baseline_ids)
+    menu = build_action_menu(context, source, 0)
+    maximum = accepted_maxima(menu)[0]
+
+    resolved = resolve_menu_action(
+        context,
+        menu,
+        state_id=menu.state_id,
+        swap_id=maximum.swap_id,
+        observed_limiting_pairs=menu.source.limiting_pairs,
+        decision_rule="maximize_predicted_minimum_distance",
+    )
+
+    assert resolved == maximum
+    lower = next(action for action in menu.actions if action not in accepted_maxima(menu))
+    with pytest.raises(ValueError, match="accepted exact menu action"):
+        resolve_menu_action(
+            context,
+            menu,
+            state_id=menu.state_id,
+            swap_id=lower.swap_id,
+            observed_limiting_pairs=menu.source.limiting_pairs,
+            decision_rule="maximize_predicted_minimum_distance",
+        )
 
 
 def test_action_menu_is_capped_by_rank_then_displayed_by_swap_id():

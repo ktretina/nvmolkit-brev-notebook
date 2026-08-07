@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
@@ -52,6 +53,7 @@ from objective_challenge import (
     finalize_no_legal_swap,
     measure_panel,
     no_improvement_run,
+    resolve_menu_action,
     score_key,
     target_is_achieved,
     terminal_objective_run,
@@ -326,6 +328,10 @@ class ObjectiveCorrectionLimitError(ToolCallError):
 
 class ObjectiveEligibilityError(ToolCallError):
     """The measured workflow cannot enter the certified bounded policy."""
+
+
+class ObjectiveEvaluationError(ToolCallError):
+    """The selected objective action could not be evaluated and committed atomically."""
 
 
 class _HostedArgumentsValidationError(ToolCallError):
@@ -975,6 +981,57 @@ def _emit_progress(callback: ProgressCallback | None, event: str, payload: Any) 
         raise ToolCallError("Local progress display failed.") from None
 
 
+def _plain_message_copy(value: Any) -> Any:
+    """Deep-copy transcript values while normalizing every list to a built-in list."""
+    if isinstance(value, dict):
+        return {deepcopy(key): _plain_message_copy(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_message_copy(item) for item in value]
+    return deepcopy(value)
+
+
+@dataclass(frozen=True)
+class _ObjectiveTransition:
+    attempt: ObjectiveAttempt
+    objective_attempts: tuple[ObjectiveAttempt, ...]
+    accepted_attempt_count: int
+    rejected_selection_count: int
+    correction_prompts_sent: int
+    selection_response_count: int
+    provider_request_attempt_count: int
+    objective_transport_retry_used: bool
+    objective_transport_retry_pending: bool
+    pending_action_menu: ObjectiveActionMenu | None
+    pending_objective_selection: ObjectiveSelection | None
+    objective_failure_reason: TerminationReason | None
+    objective_run: ObjectiveRun | None
+    objective_evidence: EvidenceRecord | None
+    serialized_tool_message: str
+    serialized_next_prompt: str | None
+
+
+@dataclass(frozen=True)
+class _ObjectiveCommitSnapshot:
+    messages: list[Any]
+    turn_count: int
+    objective_required: bool
+    objective_context: ObjectiveContext | None
+    pending_action_menu: ObjectiveActionMenu | None
+    pending_objective_selection: ObjectiveSelection | None
+    objective_attempts: tuple[ObjectiveAttempt, ...]
+    accepted_attempt_count: int
+    rejected_selection_count: int
+    correction_prompts_sent: int
+    selection_response_count: int
+    provider_request_attempt_count: int
+    objective_transport_retry_used: bool
+    objective_transport_retry_pending: bool
+    objective_failure_reason: TerminationReason | None
+    objective_run: ObjectiveRun | None
+    objective_evidence: EvidenceRecord | None
+    objective_prompt_appended: bool
+
+
 @dataclass
 class BoundedWorkflowController:
     """Expose one bounded hosted proposal and deterministic execution at a time."""
@@ -1400,31 +1457,99 @@ class BoundedWorkflowController:
             if self.selection_response_count >= 5 or self.provider_request_attempt_count >= 6:
                 raise ToolCallError("The objective hosted request bound was reached.")
 
-    def execute_objective_selection(self, selection: ObjectiveSelection) -> ObjectiveAttempt:
-        """Measure and commit the exact pending state-bound selection."""
-        self._check_objective_bounds()
-        menu = self.pending_action_menu
-        context = self.objective_context
-        if selection is not self.pending_objective_selection or type(selection) is not ObjectiveSelection:
-            raise ToolCallError("The exact pending objective selection is required.")
-        if context is None or menu is None or self.objective_run is not None:
-            raise ToolCallError("The objective challenge is not awaiting evaluation.")
-        expected_pairs = [list(pair) for pair in menu.source.limiting_pairs]
-        action = next((item for item in menu.actions if item.swap_id == selection.swap_id), None)
-        if (
-            selection.state_id != menu.state_id
-            or selection.observed_limiting_pairs != expected_pairs
-            or selection.decision_rule != "maximize_predicted_minimum_distance"
-            or action is None
-            or action not in accepted_maxima(menu)
-            or not all(action.replace_id in pair for pair in menu.source.limiting_pairs)
-        ):
-            raise ToolCallError("The pending objective selection no longer matches the current menu.")
-        try:
-            attempt = evaluate_selected_swap(context, menu, action, self.accepted_attempt_count + 1)
-        except Exception:
-            raise ToolCallError("The objective evaluator rejected the selected swap.") from None
-        _append_tool_result(self.session, {
+    def _capture_objective_commit_snapshot(self) -> _ObjectiveCommitSnapshot:
+        return _ObjectiveCommitSnapshot(
+            messages=_plain_message_copy(list(self.session.messages)),
+            turn_count=self.session.turn_count,
+            objective_required=self.objective_required,
+            objective_context=self.objective_context,
+            pending_action_menu=self.pending_action_menu,
+            pending_objective_selection=self.pending_objective_selection,
+            objective_attempts=tuple(self.objective_attempts),
+            accepted_attempt_count=self.accepted_attempt_count,
+            rejected_selection_count=self.rejected_selection_count,
+            correction_prompts_sent=self.correction_prompts_sent,
+            selection_response_count=self.selection_response_count,
+            provider_request_attempt_count=self.provider_request_attempt_count,
+            objective_transport_retry_used=self.objective_transport_retry_used,
+            objective_transport_retry_pending=self._objective_transport_retry_pending,
+            objective_failure_reason=self.objective_failure_reason,
+            objective_run=self.objective_run,
+            objective_evidence=self.objective_evidence,
+            objective_prompt_appended=self.objective_prompt_appended,
+        )
+
+    def _restore_objective_commit_snapshot(
+        self, snapshot: _ObjectiveCommitSnapshot
+    ) -> None:
+        self.session.messages = [
+            _plain_message_copy(item) for item in snapshot.messages
+        ]
+        self.session.turn_count = snapshot.turn_count
+        self.objective_required = snapshot.objective_required
+        self.objective_context = snapshot.objective_context
+        self.pending_action_menu = snapshot.pending_action_menu
+        self.pending_objective_selection = snapshot.pending_objective_selection
+        self.objective_attempts = list(snapshot.objective_attempts)
+        self.accepted_attempt_count = snapshot.accepted_attempt_count
+        self.rejected_selection_count = snapshot.rejected_selection_count
+        self.correction_prompts_sent = snapshot.correction_prompts_sent
+        self.selection_response_count = snapshot.selection_response_count
+        self.provider_request_attempt_count = snapshot.provider_request_attempt_count
+        self.objective_transport_retry_used = snapshot.objective_transport_retry_used
+        self._objective_transport_retry_pending = snapshot.objective_transport_retry_pending
+        self.objective_failure_reason = snapshot.objective_failure_reason
+        self.objective_run = snapshot.objective_run
+        self.objective_evidence = snapshot.objective_evidence
+        self.objective_prompt_appended = snapshot.objective_prompt_appended
+
+    def _build_objective_transition(
+        self,
+        context: ObjectiveContext,
+        menu: ObjectiveActionMenu,
+        action: ObjectiveSwap,
+    ) -> _ObjectiveTransition:
+        attempt = evaluate_selected_swap(
+            context, menu, action, self.accepted_attempt_count + 1
+        )
+        attempts = (*self.objective_attempts, attempt)
+        accepted_count = self.accepted_attempt_count + 1
+        next_menu = None
+        run = None
+        evidence = None
+        next_prompt = None
+        if attempt.achieved:
+            run = terminal_objective_run(
+                context, attempts, TerminationReason.TARGET_ACHIEVED
+            )
+        elif accepted_count == MAX_ATTEMPTS:
+            run = terminal_objective_run(
+                context, attempts, TerminationReason.ATTEMPT_LIMIT_REACHED
+            )
+        else:
+            next_menu = build_action_menu(context, attempt.measurement, accepted_count)
+            if not next_menu.actions:
+                run = terminal_objective_run(
+                    context,
+                    attempts,
+                    TerminationReason.NO_LEGAL_IMPROVING_SWAP,
+                    menu=next_menu,
+                )
+                next_menu = None
+            else:
+                next_prompt = _serialize({
+                    "candidate_actions": [
+                        _objective_action_payload(item) for item in next_menu.actions
+                    ],
+                    "current_limiting_pairs": [
+                        list(pair) for pair in next_menu.source.limiting_pairs
+                    ],
+                    "decision_rule": "maximize_predicted_minimum_distance",
+                    "state_id": next_menu.state_id,
+                })
+        if run is not None:
+            evidence = build_objective_evidence(run)
+        tool_message = _serialize({
             "accepted": True,
             "achieved": attempt.achieved,
             "attempt_number": attempt.attempt_number,
@@ -1432,26 +1557,149 @@ class BoundedWorkflowController:
             "score": attempt.score,
             "selected_ids": list(attempt.selected_ids),
         })
-        self.objective_attempts.append(attempt)
-        self.accepted_attempt_count += 1
+        return _ObjectiveTransition(
+            attempt=attempt,
+            objective_attempts=attempts,
+            accepted_attempt_count=accepted_count,
+            rejected_selection_count=self.rejected_selection_count,
+            correction_prompts_sent=self.correction_prompts_sent,
+            selection_response_count=self.selection_response_count,
+            provider_request_attempt_count=self.provider_request_attempt_count,
+            objective_transport_retry_used=self.objective_transport_retry_used,
+            objective_transport_retry_pending=self._objective_transport_retry_pending,
+            pending_action_menu=next_menu,
+            pending_objective_selection=None,
+            objective_failure_reason=None,
+            objective_run=run,
+            objective_evidence=evidence,
+            serialized_tool_message=tool_message,
+            serialized_next_prompt=next_prompt,
+        )
+
+    def _validate_objective_commit(self, transition: _ObjectiveTransition) -> None:
+        self._check_objective_bounds()
+        if (
+            type(self.session.messages) is not list
+            or tuple(self.objective_attempts) != transition.objective_attempts
+            or self.accepted_attempt_count != transition.accepted_attempt_count
+            or self.rejected_selection_count != transition.rejected_selection_count
+            or self.correction_prompts_sent != transition.correction_prompts_sent
+            or self.selection_response_count != transition.selection_response_count
+            or self.provider_request_attempt_count
+            != transition.provider_request_attempt_count
+            or self.objective_transport_retry_used
+            is not transition.objective_transport_retry_used
+            or self._objective_transport_retry_pending
+            is not transition.objective_transport_retry_pending
+            or self.pending_action_menu != transition.pending_action_menu
+            or self.pending_objective_selection is not None
+            or self.objective_failure_reason != transition.objective_failure_reason
+            or self.objective_run != transition.objective_run
+            or self.objective_evidence != transition.objective_evidence
+            or self.session.messages[-1].get("role")
+            != ("user" if transition.serialized_next_prompt is not None else "tool")
+        ):
+            raise RuntimeError("Objective transition commit invariant failed.")
+
+    def _commit_objective_transition(self, transition: _ObjectiveTransition) -> None:
+        snapshot = self._capture_objective_commit_snapshot()
+        try:
+            self.objective_attempts = list(transition.objective_attempts)
+            self.accepted_attempt_count = transition.accepted_attempt_count
+            self.rejected_selection_count = transition.rejected_selection_count
+            self.correction_prompts_sent = transition.correction_prompts_sent
+            self.selection_response_count = transition.selection_response_count
+            self.provider_request_attempt_count = transition.provider_request_attempt_count
+            self.objective_transport_retry_used = transition.objective_transport_retry_used
+            self._objective_transport_retry_pending = transition.objective_transport_retry_pending
+            self.pending_action_menu = transition.pending_action_menu
+            self.pending_objective_selection = transition.pending_objective_selection
+            self.objective_failure_reason = transition.objective_failure_reason
+            self.objective_run = transition.objective_run
+            self.objective_evidence = transition.objective_evidence
+            assistant = self.session.messages[-1]
+            self.session.messages.append({
+                "role": "tool",
+                "tool_call_id": assistant["tool_calls"][0]["id"],
+                "content": transition.serialized_tool_message,
+            })
+            if transition.serialized_next_prompt is not None:
+                self.session.messages.append({
+                    "role": "user", "content": transition.serialized_next_prompt
+                })
+            self._validate_objective_commit(transition)
+        except Exception:
+            self._restore_objective_commit_snapshot(snapshot)
+            raise
+
+    def _fail_objective_evaluation(
+        self, snapshot: _ObjectiveCommitSnapshot
+    ) -> None:
+        self._restore_objective_commit_snapshot(snapshot)
+        context = self.objective_context
+        if context is None:
+            raise RuntimeError("Objective evaluation failure lost its context.")
+        run = terminal_objective_run(
+            context,
+            tuple(self.objective_attempts),
+            TerminationReason.EVALUATION_NOT_COMPLETED,
+        )
+        evidence = build_objective_evidence(run)
+        error_content = _serialize({
+            "accepted": False, "reason": "evaluation_not_completed"
+        })
+        assistant = self.session.messages[-1]
+        self.objective_run = run
+        self.objective_evidence = evidence
+        self.objective_failure_reason = TerminationReason.EVALUATION_NOT_COMPLETED
+        self.pending_action_menu = None
         self.pending_objective_selection = None
-        if attempt.achieved:
-            self._terminalize_objective(TerminationReason.TARGET_ACHIEVED)
-        elif self.accepted_attempt_count == MAX_ATTEMPTS:
-            self._terminalize_objective(TerminationReason.ATTEMPT_LIMIT_REACHED)
-        else:
-            next_menu = build_action_menu(context, attempt.measurement, self.accepted_attempt_count)
-            self.pending_action_menu = next_menu
-            if not next_menu.actions:
-                self._terminalize_objective(TerminationReason.NO_LEGAL_IMPROVING_SWAP, menu=next_menu)
-            else:
-                self.session.messages.append({"role": "user", "content": _serialize({
-                    "candidate_actions": [_objective_action_payload(item) for item in next_menu.actions],
-                    "current_limiting_pairs": [list(pair) for pair in next_menu.source.limiting_pairs],
-                    "decision_rule": "maximize_predicted_minimum_distance",
-                    "state_id": next_menu.state_id,
-                })})
-        return attempt
+        self.session.messages.append({
+            "role": "tool",
+            "tool_call_id": assistant["tool_calls"][0]["id"],
+            "content": error_content,
+        })
+
+    def execute_objective_selection(self, selection: ObjectiveSelection) -> ObjectiveAttempt:
+        """Evaluate prospectively, then atomically commit the exact pending action."""
+        self._check_objective_bounds()
+        menu = self.pending_action_menu
+        context = self.objective_context
+        if selection is not self.pending_objective_selection or type(selection) is not ObjectiveSelection:
+            raise ToolCallError("The exact pending objective selection is required.")
+        if context is None or menu is None or self.objective_run is not None:
+            raise ToolCallError("The objective challenge is not awaiting evaluation.")
+        try:
+            action = resolve_menu_action(
+                context,
+                menu,
+                state_id=selection.state_id,
+                swap_id=selection.swap_id,
+                observed_limiting_pairs=tuple(
+                    tuple(pair) for pair in selection.observed_limiting_pairs
+                ),
+                decision_rule=selection.decision_rule,
+            )
+        except Exception:
+            raise ToolCallError(
+                "The pending objective selection no longer matches the current menu."
+            ) from None
+        snapshot = self._capture_objective_commit_snapshot()
+        try:
+            transition = self._build_objective_transition(context, menu, action)
+            self._commit_objective_transition(transition)
+        except Exception:
+            try:
+                self._fail_objective_evaluation(snapshot)
+            except Exception:
+                self._restore_objective_commit_snapshot(snapshot)
+                raise ObjectiveEvaluationError(
+                    "The objective evaluation failed before a safe terminal result could be recorded."
+                ) from None
+            raise ObjectiveEvaluationError(
+                "The objective evaluation was not completed; no attempt was accepted."
+            ) from None
+        return transition.attempt
 
     # Task-5 compatibility aliases: deterministic selection only, no hosted rationale.
     def request_objective_attempt(self) -> ObjectiveSelection:

@@ -573,6 +573,37 @@ def accepted_maxima(menu: ObjectiveActionMenu) -> tuple[ObjectiveSwap, ...]:
     )
 
 
+def resolve_menu_action(
+    context: ObjectiveContext,
+    menu: ObjectiveActionMenu,
+    *,
+    state_id: str,
+    swap_id: str,
+    observed_limiting_pairs: tuple[tuple[str, str], ...],
+    decision_rule: str,
+) -> ObjectiveSwap:
+    """Resolve one selection only after independently rebuilding its exact menu."""
+    if type(context) is not ObjectiveContext or type(menu) is not ObjectiveActionMenu:
+        raise ValueError("Objective action resolution requires exact domain records.")
+    rebuilt = build_action_menu(context, menu.source, menu.accepted_attempt_count)
+    if menu != rebuilt or state_id != rebuilt.state_id:
+        raise ValueError("Objective selection does not match the exact menu revision.")
+    if (
+        type(observed_limiting_pairs) is not tuple
+        or observed_limiting_pairs != rebuilt.source.limiting_pairs
+        or decision_rule != "maximize_predicted_minimum_distance"
+    ):
+        raise ValueError("Objective selection does not match the source measurement or rule.")
+    action = next((item for item in rebuilt.actions if item.swap_id == swap_id), None)
+    if (
+        action is None
+        or action not in accepted_maxima(rebuilt)
+        or not all(action.replace_id in pair for pair in rebuilt.source.limiting_pairs)
+    ):
+        raise ValueError("Objective selection is not an accepted exact menu action.")
+    return action
+
+
 def evaluate_selected_swap(
     context: ObjectiveContext,
     menu: ObjectiveActionMenu,

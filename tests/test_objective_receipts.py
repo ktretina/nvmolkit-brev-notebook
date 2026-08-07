@@ -32,18 +32,19 @@ def records():
 
 def test_objective_receipt_is_state_bound_rationale_free_and_deterministic():
     _context, menu, action, selection = records()
-    first = objective_receipt(selection, menu, action)
-    second = objective_receipt(selection, menu, action)
+    first = objective_receipt(_context, selection, menu, action)
+    second = objective_receipt(_context, selection, menu, action)
 
     assert first == second == ObjectiveReceipt(
-        validated_proposal=(
+        status="validated",
+        validated_selection=(
             "select_next_panel_swap("
             f"state_id={menu.state_id!r}, swap_id={action.swap_id!r}, "
             "decision_rule='maximize_predicted_minimum_distance')"
         ),
-        validated_intervention=(
-            f"replace molecule_id={action.replace_id!r} "
-            f"with molecule_id={action.replacement_id!r}"
+        planned_command=(
+            "selected_action = next(action for action in pending_action_menu.actions "
+            f"if action.swap_id == {action.swap_id!r})"
         ),
         python_evaluation=(
             "result = evaluate_selected_swap(\n"
@@ -53,6 +54,7 @@ def test_objective_receipt_is_state_bound_rationale_free_and_deterministic():
             "    accepted_attempt_count + 1,\n"
             ")"
         ),
+        executed_measurement=None,
     )
     rendered = repr(first)
     assert "decision_basis" not in rendered
@@ -60,9 +62,26 @@ def test_objective_receipt_is_state_bound_rationale_free_and_deterministic():
     assert "selected_ids" not in rendered
 
 
+def test_objective_receipt_validates_and_renders_exact_executed_measurement():
+    context, menu, action, selection = records()
+    result = evaluate_selected_swap(context, menu, action, 1)
+
+    receipt = objective_receipt(context, selection, menu, action, result)
+
+    assert receipt.status == "executed"
+    assert receipt.executed_measurement == (
+        "measurement = PanelMeasurement("
+        f"selected_ids={result.selected_ids!r}, score={result.score!r}, "
+        f"score_key={result.score_key!r}, limiting_pairs={result.limiting_pairs!r}, "
+        f"achieved={result.achieved!r})"
+    )
+    with pytest.raises(ValueError, match="result"):
+        objective_receipt(context, selection, menu, action, replace(result, score=0.123))
+
+
 def test_objective_receipt_evaluation_matches_domain_signature_and_executes():
     context, menu, action, selection = records()
-    receipt = objective_receipt(selection, menu, action)
+    receipt = objective_receipt(context, selection, menu, action)
     signature = inspect.signature(evaluate_selected_swap)
     assert list(signature.parameters) == ["context", "menu", "action", "attempt_number"]
     namespace = {
@@ -90,7 +109,7 @@ def test_objective_receipt_rejects_stale_or_forged_provenance(mutator, match):
     _context, menu, action, selection = records()
     forged = mutator(selection, menu, action)
     with pytest.raises(ValueError, match=match):
-        objective_receipt(*forged)
+        objective_receipt(_context, *forged)
 
 
 def test_objective_receipt_rejects_nonmax_displayed_action():
@@ -103,7 +122,7 @@ def test_objective_receipt_rejects_nonmax_displayed_action():
         decision_rule="maximize_predicted_minimum_distance",
     )
     with pytest.raises(ValueError, match="menu"):
-        objective_receipt(selection, menu, lower)
+        objective_receipt(_context, selection, menu, lower)
 
 
 def test_objective_receipt_requires_exact_types_and_rejects_legacy_shape():
@@ -119,17 +138,17 @@ def test_objective_receipt_requires_exact_types_and_rejects_legacy_shape():
         pass
 
     with pytest.raises(ValueError, match="schema"):
-        objective_receipt(SelectionSubclass(**selection.model_dump()), menu, action)
+        objective_receipt(_context, SelectionSubclass(**selection.model_dump()), menu, action)
     with pytest.raises(ValueError, match="domain"):
-        objective_receipt(selection, MenuSubclass(**menu.__dict__), action)
+        objective_receipt(_context, selection, MenuSubclass(**menu.__dict__), action)
     with pytest.raises(ValueError, match="domain"):
-        objective_receipt(selection, menu, SwapSubclass(**action.__dict__))
+        objective_receipt(_context, selection, menu, SwapSubclass(**action.__dict__))
     with pytest.raises((TypeError, ValueError)):
-        objective_receipt({"selected_ids": list(action.resulting_ids), "decision_basis": "model prose"}, menu, action)
+        objective_receipt(_context, {"selected_ids": list(action.resulting_ids), "decision_basis": "model prose"}, menu, action)
 
 
 def test_objective_receipt_is_frozen():
     _context, menu, action, selection = records()
-    receipt = objective_receipt(selection, menu, action)
+    receipt = objective_receipt(_context, selection, menu, action)
     with pytest.raises(FrozenInstanceError):
         receipt.validated_proposal = "changed"

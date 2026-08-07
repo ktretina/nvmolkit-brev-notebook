@@ -390,7 +390,9 @@ def test_objective_card_retains_attempts_receipts_scores_and_limiting_pairs(monk
 
     text = " ".join(html_text(card) for card in workflow.objective_attempt_cards)
     assert len(workflow.objective_attempt_cards) == 2
-    assert "Validated Nemotron proposal" in text
+    assert "Validated Nemotron selection" in text
+    assert "Planned deterministic command" in text
+    assert "Executed measurement" in text
     assert "Evaluation executed by Python" in text
     assert "select_next_panel_swap" in text
     assert "evaluate_selected_swap" in text
@@ -424,8 +426,31 @@ def test_objective_attempts_render_as_observe_act_measure_decision_ladder(monkey
     assert "<b>Outcome:</b> Goal achieved" in summary
     assert "#D68A00" in summary
     assert "#76B900" in summary
-    assert "Validated intervention" in details
+    assert "Planned deterministic command" in details
+    assert "if action.swap_id == &#x27;mol-0-&gt;mol-4&#x27;" in details
     assert "Goal achieved" in details
+
+
+def test_objective_receipt_render_failure_after_commit_never_reexecutes(monkeypatch):
+    workflow, controller = started()
+    complete_six_stages(workflow)
+    reached = []
+
+    def fail_receipt(*args, **kwargs):
+        reached.append("render")
+        raise RuntimeError("injected receipt render failure")
+
+    monkeypatch.setattr("interactive_workflow.objective_receipt", fail_receipt)
+    workflow.objective_button.click()
+    workflow.objective_button.click()
+
+    assert reached == ["render"]
+    assert len(controller.objective_attempts) == 1
+    assert len([
+        call for call in controller.calls
+        if isinstance(call, tuple) and call[0] == "objective_execute"
+    ]) == 1
+    assert workflow.status == "stopped"
 
 
 def test_objective_revision_without_prior_attempt_fails_closed():
