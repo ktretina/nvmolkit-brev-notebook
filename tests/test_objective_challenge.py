@@ -24,13 +24,10 @@ from objective_challenge import (
     build_objective_context,
     build_objective_evidence,
     validate_objective_evidence,
-    evaluate_diverse_panel,
     evaluate_selected_swap,
     enumerate_legal_swaps,
     finalize_no_legal_swap,
-    finalize_objective_run,
     objective_figures,
-    rank_legal_swaps,
     resolve_menu_action,
     terminal_objective_run,
 )
@@ -385,173 +382,29 @@ def test_zero_substitution_target_reason_does_not_replace_exact_baseline_optimal
         terminal_objective_run(context, (), TerminationReason.TARGET_ACHIEVED)
 
 
-def test_legacy_quantized_baseline_success_normalizes_to_zero_substitution_target():
-    context = quantized_baseline_target_context()
-    legacy_baseline = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Measure baseline Step 0.",
-    )
-
-    run = finalize_objective_run(context, (legacy_baseline,))
-    payload = json.loads(build_objective_evidence(run).payload_json)
-
-    assert legacy_baseline.achieved is True
-    assert legacy_baseline.score_key < objective_challenge.score_key(
-        context.benchmark_score
-    )
-    assert run.termination_reason == "target_achieved"
-    assert run.attempts == ()
-    assert payload["attempt_count"] == 0
-    assert payload["termination_reason"] == "target_achieved"
 
 
-def test_legacy_exact_baseline_optimal_normalizes_to_baseline_terminal_reason():
-    context = build_objective_context(optimized_state(baseline_optimal=True))
-    legacy_baseline = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Measure baseline Step 0.",
-    )
-
-    run = finalize_objective_run(context, (legacy_baseline,))
-
-    assert run.termination_reason == "baseline_already_optimal"
-    assert run.attempts == ()
 
 
-def test_legacy_finalizer_rejects_arbitrary_target_panel_without_swap():
-    context = controlled_context_with_ranked_swaps()
-    arbitrary = evaluate_diverse_panel(
-        context,
-        enumerate_legal_swaps(
-            context, objective_challenge.measure_panel(context, context.baseline_ids)
-        )[0].resulting_ids,
-        attempt_number=1,
-        decision_basis="Unsafe direct target panel.",
-    )
-    assert arbitrary.achieved is True and arbitrary.selected_swap is None
-
-    with pytest.raises(ValueError, match="baseline Step 0"):
-        finalize_objective_run(context, (arbitrary,))
-
-    forged_run = ObjectiveRun(
-        context=context,
-        attempts=(arbitrary,),
-        achieved=True,
-        termination_reason="target_achieved",
-        final_ids=arbitrary.selected_ids,
-        final_score=arbitrary.score,
-    )
-    with pytest.raises(ValueError, match="exact current state"):
-        build_objective_evidence(forged_run)
 
 
-def test_legacy_finalizer_rejects_nonmax_revision_and_normalizes_exact_maximum():
-    context = controlled_context_with_ranked_swaps()
-    baseline = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Measure baseline Step 0.",
-    )
-    source = objective_challenge.measure_panel(context, context.baseline_ids)
-    menu = build_action_menu(context, source, 0)
-    nonmax = menu.actions[-1]
-    unsafe = evaluate_diverse_panel(
-        context,
-        nonmax.resulting_ids,
-        attempt_number=2,
-        decision_basis="Unsafe nonmax revision.",
-        selected_swap=nonmax,
-    )
-    with pytest.raises(ValueError, match="accepted maximum"):
-        finalize_objective_run(context, (baseline, unsafe))
-
-    maximum = accepted_maxima(menu)[0]
-    safe = evaluate_diverse_panel(
-        context,
-        maximum.resulting_ids,
-        attempt_number=2,
-        decision_basis="Exact accepted maximum.",
-        selected_swap=maximum,
-    )
-    run = finalize_objective_run(context, (baseline, safe))
-    payload = json.loads(build_objective_evidence(run).payload_json)
-
-    assert len(run.attempts) == 1
-    assert run.attempts[0].state_id == menu.state_id
-    assert payload["attempt_count"] == 1
-    assert payload["baseline"]["selected_ids"] == list(context.baseline_ids)
-    assert all(item["state_id"] for item in payload["attempts"])
 
 
-def test_legacy_adapter_supports_exactly_three_accepted_substitutions_after_step_zero():
-    context = controlled_context_with_three_misses()
-    legacy = [
-        evaluate_diverse_panel(
-            context,
-            context.baseline_ids,
-            attempt_number=1,
-            decision_basis="Measure baseline Step 0.",
-        )
-    ]
-    current = legacy[0]
-    for legacy_number in (2, 3, 4):
-        selected = rank_legal_swaps(context, current)[0]
-        current = evaluate_diverse_panel(
-            context,
-            selected.resulting_ids,
-            attempt_number=legacy_number,
-            decision_basis="Apply the current accepted maximum.",
-            selected_swap=selected,
-        )
-        legacy.append(current)
-
-    run = finalize_objective_run(context, tuple(legacy))
-
-    assert run.termination_reason == "attempt_limit_reached"
-    assert tuple(attempt.attempt_number for attempt in run.attempts) == (1, 2, 3)
 
 
-def forged_nonachieved_attempt(
-    context: ObjectiveContext,
-    selected_ids: tuple[str, ...],
-    *,
-    score: float | bool | None = None,
-) -> ObjectiveAttempt:
-    measurement = objective_challenge.measure_panel(context, selected_ids)
-    return ObjectiveAttempt(
-        attempt_number=1,
-        selected_ids=selected_ids,
-        decision_basis="Forged state used to verify ranker validation.",
-        score=measurement.score if score is None else score,
-        limiting_pair=measurement.limiting_pairs[0],
-        constraints_passed=True,
-        achieved=False,
-    )
 
 
 def successful_run() -> tuple[WorkflowState, ObjectiveRun]:
     state = optimized_state()
     context = build_objective_context(state)
-    first = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Measure the current policy baseline.",
+    baseline = objective_challenge.measure_panel(context, context.baseline_ids)
+    menu = build_action_menu(context, baseline, 0)
+    attempt = evaluate_selected_swap(
+        context, menu, accepted_maxima(menu)[0], 1
     )
-    selected = rank_legal_swaps(context, first)[0]
-    second = evaluate_diverse_panel(
-        context,
-        selected.resulting_ids,
-        attempt_number=2,
-        decision_basis="Remove the closest baseline analogue.",
-        selected_swap=selected,
+    return state, terminal_objective_run(
+        context, (attempt,), TerminationReason.TARGET_ACHIEVED
     )
-    return state, finalize_objective_run(context, (first, second))
 
 
 def test_constants_keep_the_challenge_visually_bounded():
@@ -899,65 +752,10 @@ def test_build_context_requires_optimized_state_and_eight_eligible_clusters():
         build_objective_context(state)
 
 
-def test_evaluate_panel_uses_minimum_pairwise_distance_and_stable_limiting_pair():
-    context = build_objective_context(optimized_state())
-    result = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Evaluate the baseline.",
-    )
-
-    assert result.score == pytest.approx(0.35)
-    assert result.limiting_pair == ("mol-0", "mol-1")
-    assert result.constraints_passed is True
-    assert result.achieved is False
 
 
-@pytest.mark.parametrize(
-    "selected_ids",
-    [
-        ("mol-0", "mol-0", "mol-2", "mol-3"),
-        ("mol-0", "mol-1", "mol-2"),
-        ("mol-0", "mol-1", "mol-2", "outside"),
-    ],
-)
-def test_invalid_panels_fail_before_scoring(selected_ids):
-    context = build_objective_context(optimized_state())
-    with pytest.raises(ValueError):
-        evaluate_diverse_panel(
-            context,
-            selected_ids,
-            attempt_number=1,
-            decision_basis="Invalid proposal.",
-        )
 
 
-def test_finalize_selects_best_attempt_and_uses_explicit_termination_reasons():
-    context = build_objective_context(optimized_state())
-    miss = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Baseline remains redundant.",
-    )
-    selected = rank_legal_swaps(context, miss)[0]
-    success = evaluate_diverse_panel(
-        context,
-        selected.resulting_ids,
-        attempt_number=2,
-        decision_basis="Remove the limiting analogue.",
-        selected_swap=selected,
-    )
-
-    achieved = finalize_objective_run(context, (miss, success))
-    exhausted = terminal_fixture("attempt_limit_reached", 3)
-
-    assert achieved.achieved is True
-    assert achieved.termination_reason == "target_achieved"
-    assert achieved.final_ids == success.selected_ids
-    assert exhausted.achieved is False
-    assert exhausted.termination_reason == "attempt_limit_reached"
 
 
 def test_o01_is_canonical_and_does_not_expose_the_hidden_benchmark_panel():
@@ -993,193 +791,16 @@ def test_o01_retains_every_recomputed_canonical_limiting_pair():
     ]
 
 
-def test_evaluate_panel_records_only_an_exact_selected_swap():
-    context = build_objective_context(optimized_state())
-    first = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Measure the current policy baseline.",
-    )
-    selected = rank_legal_swaps(context, first)[0]
-
-    second = evaluate_diverse_panel(
-        context,
-        selected.resulting_ids,
-        attempt_number=2,
-        decision_basis="Apply the selected legal swap.",
-        selected_swap=selected,
-    )
-
-    assert second.selected_swap is selected
-    with pytest.raises(ValueError, match="selected swap"):
-        evaluate_diverse_panel(
-            context,
-            context.baseline_ids,
-            attempt_number=2,
-            decision_basis="Reject a mismatched selected legal swap.",
-            selected_swap=selected,
-        )
 
 
-def test_evaluate_panel_rejects_a_selected_swap_with_a_malformed_panel():
-    context = build_objective_context(optimized_state())
-    first = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Measure the current policy baseline.",
-    )
-    selected = rank_legal_swaps(context, first)[0]
-    malformed = ObjectiveSwap(
-        replace_id=selected.replace_id,
-        replacement_id=selected.replacement_id,
-        resulting_ids=selected.resulting_ids + (selected.resulting_ids[0],),
-        predicted_score=selected.predicted_score,
-        score_delta=selected.score_delta,
-        limiting_pair=selected.limiting_pair,
-    )
-
-    with pytest.raises(ValueError, match="selected swap|Objective proposal"):
-        evaluate_diverse_panel(
-            context,
-            selected.resulting_ids,
-            attempt_number=2,
-            decision_basis="Reject the malformed selected legal swap.",
-            selected_swap=malformed,
-        )
 
 
-@pytest.mark.parametrize(
-    "mutate_swap",
-    (
-        lambda swap: replace(swap, replace_id="outside-pool"),
-        lambda swap: replace(swap, replacement_id=swap.replace_id),
-        lambda swap: replace(swap, replace_id=swap.replacement_id),
-        lambda swap: replace(swap, score_delta=swap.score_delta + 0.1),
-        lambda swap: replace(swap, score_delta=-0.1),
-        lambda swap: replace(swap, score_delta=float("nan")),
-        lambda swap: replace(swap, resulting_ids=list(swap.resulting_ids)),
-        lambda swap: replace(swap, limiting_pair=list(swap.limiting_pair)),
-        lambda swap: replace(swap, predicted_score=np.float64(swap.predicted_score)),
-        lambda swap: replace(swap, score_delta=np.float64(swap.score_delta)),
-        lambda swap: replace(swap, resulting_ids=(1, *swap.resulting_ids[1:])),
-        lambda swap: replace(swap, limiting_pair=(swap.limiting_pair[0], 1)),
-    ),
-)
-def test_evaluate_panel_rejects_noncanonical_selected_swap_fields(mutate_swap):
-    context = build_objective_context(optimized_state())
-    first = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Measure the current policy baseline.",
-    )
-    selected = rank_legal_swaps(context, first)[0]
-
-    with pytest.raises(ValueError, match="selected swap|Objective proposal"):
-        evaluate_diverse_panel(
-            context,
-            selected.resulting_ids,
-            attempt_number=2,
-            decision_basis="Reject a noncanonical selected legal swap.",
-            selected_swap=mutate_swap(selected),
-        )
 
 
-def test_evaluate_panel_rejects_integer_selected_swap_scores():
-    context = build_objective_context(optimized_state())
-    current = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Measure the current policy baseline.",
-    )
-    selected = rank_legal_swaps(context, current)[0]
-
-    for forged in (
-        replace(selected, predicted_score=int(selected.predicted_score)),
-        replace(selected, score_delta=int(selected.score_delta)),
-    ):
-        with pytest.raises(ValueError, match="built-in floats"):
-            evaluate_diverse_panel(
-                context,
-                selected.resulting_ids,
-                attempt_number=2,
-                decision_basis="Reject integer raw score evidence.",
-                selected_swap=forged,
-            )
 
 
-@pytest.mark.parametrize("field", ("predicted_score", "score_delta"))
-def test_evaluate_panel_rejects_different_raw_swap_values_with_the_same_score_key(
-    field,
-):
-    context = build_objective_context(optimized_state())
-    current = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Measure the current policy baseline.",
-    )
-    selected = rank_legal_swaps(context, current)[0]
-    original = getattr(selected, field)
-    forged_raw = float(np.nextafter(original, 1.0))
-    assert forged_raw != original
-    assert objective_challenge.score_key(forged_raw) == objective_challenge.score_key(
-        original
-    )
-
-    with pytest.raises(ValueError, match="predicted score|score delta"):
-        evaluate_diverse_panel(
-            context,
-            selected.resulting_ids,
-            attempt_number=2,
-            decision_basis="Reject altered raw score evidence.",
-            selected_swap=replace(selected, **{field: forged_raw}),
-        )
 
 
-def test_o01_serializes_the_selected_intervention_without_hidden_answers():
-    context = build_objective_context(optimized_state())
-    first = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Measure the current policy baseline.",
-    )
-    selected = rank_legal_swaps(context, first)[0]
-    second = evaluate_diverse_panel(
-        context,
-        selected.resulting_ids,
-        attempt_number=2,
-        decision_basis="Apply the selected legal swap.",
-        selected_swap=selected,
-    )
-
-    payload = json.loads(
-        build_objective_evidence(finalize_objective_run(context, (first, second))).payload_json
-    )
-
-    assert payload["attempt_count"] == 1
-    assert payload["attempts"][0]["selected_swap"] == {
-        "swap_id": selected.swap_id,
-        "replace_id": selected.replace_id,
-        "replacement_id": selected.replacement_id,
-        "resulting_ids": list(selected.resulting_ids),
-        "predicted_score": selected.predicted_score,
-        "predicted_score_key": selected.predicted_score_key,
-        "score_delta": selected.score_delta,
-        "limiting_pair": list(selected.limiting_pair),
-        "limiting_pairs": [
-            list(pair)
-            for pair in objective_challenge.measure_panel(
-                context, selected.resulting_ids
-            ).limiting_pairs
-        ],
-        "target_status": selected.target_status,
-    }
-    assert "benchmark_panel" not in payload
 
 
 def test_objective_figures_show_trajectory_final_structures_and_heatmap():
@@ -1192,113 +813,14 @@ def test_objective_figures_show_trajectory_final_structures_and_heatmap():
     assert heatmap.axes[0].images[0].get_array().shape == (4, 4)
 
 
-def test_rank_legal_swaps_returns_three_deterministic_target_reaching_suggestions():
-    context = build_objective_context(optimized_state())
-    baseline = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Measure the current policy baseline.",
-    )
-
-    suggestions = rank_legal_swaps(context, baseline)
-
-    assert len(suggestions) == 3
-    assert all(suggestion.predicted_score >= context.target_score for suggestion in suggestions)
-    assert all(suggestion.score_delta > 0 for suggestion in suggestions)
-    assert suggestions == tuple(
-        sorted(
-            suggestions,
-            key=lambda suggestion: (
-                -suggestion.predicted_score,
-                suggestion.replace_id,
-                suggestion.replacement_id,
-                suggestion.resulting_ids,
-            ),
-        )
-    )
 
 
-def test_rank_legal_swaps_suggestions_match_direct_evaluation():
-    context = build_objective_context(optimized_state())
-    current = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Measure the current policy baseline.",
-    )
-
-    for suggestion in rank_legal_swaps(context, current):
-        measured = evaluate_diverse_panel(
-            context,
-            suggestion.resulting_ids,
-            attempt_number=2,
-            decision_basis="Check the suggested legal swap.",
-        )
-
-        assert measured.score == pytest.approx(suggestion.predicted_score)
-        assert measured.limiting_pair == suggestion.limiting_pair
-        assert suggestion.score_delta == pytest.approx(measured.score - current.score)
-        assert suggestion.replace_id in current.selected_ids
-        assert suggestion.replacement_id not in current.selected_ids
-        assert len(suggestion.resulting_ids) == PANEL_SIZE
-        assert len(set(suggestion.resulting_ids)) == PANEL_SIZE
 
 
-def test_rank_legal_swaps_validates_achieved_attempt_before_returning_none():
-    context = build_objective_context(optimized_state())
-    achieved = evaluate_diverse_panel(
-        context,
-        ("mol-0", "mol-2", "mol-4", "mol-6"),
-        attempt_number=1,
-        decision_basis="Use a diverse four-cluster panel.",
-    )
-    assert achieved.achieved is True
-    assert rank_legal_swaps(context, achieved) == ()
-    for forged in (
-        replace(
-            achieved,
-            selected_ids=("outside-0", "outside-1", "outside-2", "outside-3"),
-        ),
-        replace(achieved, score=float(np.nextafter(achieved.score, 0.0))),
-        replace(achieved, limiting_pair=("mol-0", "mol-0")),
-        replace(achieved, constraints_passed=False),
-    ):
-        with pytest.raises(ValueError):
-            rank_legal_swaps(context, forged)
 
 
-@pytest.mark.parametrize("forged_score", (-1.0, float("nan")))
-def test_rank_legal_swaps_rejects_forged_nonachieved_attempt_scores(forged_score):
-    context = build_objective_context(optimized_state())
-    forged = ObjectiveAttempt(
-        attempt_number=1,
-        selected_ids=("mol-0", "mol-2", "mol-4", "mol-6"),
-        decision_basis="This forged record pretends a solved panel is pending.",
-        score=forged_score,
-        limiting_pair=("mol-0", "mol-2"),
-        constraints_passed=True,
-        achieved=False,
-    )
-
-    with pytest.raises(ValueError):
-        rank_legal_swaps(context, forged)
 
 
-@pytest.mark.parametrize(
-    "selected_ids",
-    (
-        ("mol-0", "mol-0", "mol-2", "mol-3"),
-        ("mol-0", "mol-1", "mol-2"),
-    ),
-)
-def test_rank_legal_swaps_rejects_forged_malformed_nonachieved_panels(selected_ids):
-    context = build_objective_context(optimized_state())
-
-    with pytest.raises(ValueError):
-        rank_legal_swaps(
-            context, forged_nonachieved_attempt(context, selected_ids)
-        )
 
 
 def test_objective_context_rejects_cross_context_cluster_conflicts():
@@ -1322,118 +844,3 @@ def test_objective_context_rejects_cross_context_cluster_conflicts():
             target_score=context.target_score,
             distance_matrix=context.distance_matrix,
         )
-
-
-def test_rank_legal_swaps_rejects_boolean_current_scores_explicitly():
-    context = build_objective_context(optimized_state())
-
-    with pytest.raises(ValueError, match="non-boolean"):
-        rank_legal_swaps(
-            context,
-            forged_nonachieved_attempt(context, context.baseline_ids, score=True),
-        )
-
-
-def test_rank_legal_swaps_rejects_integer_current_score_instead_of_coercing_it():
-    context = controlled_context(
-        distances={("mol-0", "mol-1"): 0.0},
-        default_distance=0.8,
-    )
-    forged = forged_nonachieved_attempt(
-        context, context.baseline_ids, score=0
-    )
-
-    with pytest.raises(ValueError, match="built-in float"):
-        rank_legal_swaps(context, forged)
-
-
-def test_rank_legal_swaps_rejects_different_raw_score_with_the_same_score_key():
-    context = build_objective_context(optimized_state())
-    forged_raw = float(np.nextafter(context.baseline_score, 1.0))
-    assert forged_raw != context.baseline_score
-    assert objective_challenge.score_key(forged_raw) == objective_challenge.score_key(
-        context.baseline_score
-    )
-    forged = forged_nonachieved_attempt(
-        context, context.baseline_ids, score=forged_raw
-    )
-
-    with pytest.raises(ValueError, match="does not match"):
-        rank_legal_swaps(context, forged)
-
-
-def test_rank_legal_swaps_supports_two_revisions_and_preserves_panel_order():
-    context = two_revision_context()
-    current = evaluate_diverse_panel(
-        context,
-        ("candidate-1", "candidate-0", "candidate-2", "candidate-3"),
-        attempt_number=1,
-        decision_basis="Start in a deliberately noncanonical panel order.",
-    )
-
-    first_ranker = rank_legal_swaps(context, current)
-
-    assert current.achieved is False
-    assert first_ranker
-    first_swap = first_ranker[0]
-    assert first_swap.replace_id == "candidate-0"
-    assert first_swap.replacement_id == "candidate-4"
-    assert first_swap.resulting_ids == (
-        "candidate-1",
-        "candidate-4",
-        "candidate-2",
-        "candidate-3",
-    )
-    assert current.score < first_swap.predicted_score < context.target_score
-
-    second = evaluate_diverse_panel(
-        context,
-        first_swap.resulting_ids,
-        attempt_number=2,
-        decision_basis="Resolve the first independent limiting pair.",
-    )
-    second_ranker = rank_legal_swaps(context, second)
-
-    assert second.achieved is False
-    assert second_ranker
-    third = evaluate_diverse_panel(
-        context,
-        second_ranker[0].resulting_ids,
-        attempt_number=3,
-        decision_basis="Resolve the remaining independent limiting pair.",
-    )
-    assert second_ranker[0].predicted_score >= context.target_score
-    assert third.achieved is True
-
-
-def test_rank_legal_swaps_can_reach_target_within_two_attempts_for_every_miss():
-    context = build_objective_context(optimized_state())
-    candidate_ids = tuple(candidate.molecule_id for candidate in context.candidates)
-    misses = 0
-
-    for panel in itertools.combinations(candidate_ids, PANEL_SIZE):
-        first = evaluate_diverse_panel(
-            context,
-            panel,
-            attempt_number=1,
-            decision_basis="Evaluate a candidate panel.",
-        )
-        if first.achieved:
-            continue
-        misses += 1
-        first_ranker = rank_legal_swaps(context, first)
-        assert first_ranker
-        for first_suggestion in first_ranker:
-            second = evaluate_diverse_panel(
-                context,
-                first_suggestion.resulting_ids,
-                attempt_number=2,
-                decision_basis="Apply a proposed legal swap.",
-            )
-            if not second.achieved:
-                assert any(
-                    suggestion.predicted_score >= context.target_score
-                    for suggestion in rank_legal_swaps(context, second)
-                )
-
-    assert misses >= 1

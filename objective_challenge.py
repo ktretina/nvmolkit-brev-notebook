@@ -213,7 +213,6 @@ class ObjectiveActionMenu:
 class ObjectiveAttempt:
     attempt_number: int
     selected_ids: tuple[str, ...]
-    decision_basis: str = field(repr=False)
     score: float
     limiting_pair: tuple[str, str]
     constraints_passed: bool
@@ -228,8 +227,8 @@ class ObjectiveAttempt:
             try:
                 object.__setattr__(self, "score_key", score_key(self.score))
             except ValueError:
-                # Legacy callers can still construct forged records for downstream
-                # rejection; authoritative evaluators never emit this state.
+                # Forged records remain constructible for downstream fail-closed
+                # validation; authoritative evaluators never emit this state.
                 pass
         if not self.limiting_pairs and self.limiting_pair:
             object.__setattr__(self, "limiting_pairs", (self.limiting_pair,))
@@ -648,7 +647,6 @@ def evaluate_selected_swap(
         state_id=menu.state_id,
         selected_swap=action,
         selected_ids=measured.selected_ids,
-        decision_basis="",
         score=measured.score,
         score_key=measured.score_key,
         limiting_pair=measured.limiting_pairs[0],
@@ -686,140 +684,6 @@ def certify_argmax_reachability(context: ObjectiveContext) -> bool:
         )
 
     return reaches(baseline, 0)
-
-
-def _score_panel(
-    context: ObjectiveContext, selected_ids: tuple[str, ...]
-) -> tuple[float, tuple[str, str]]:
-    """Return the legacy singular-pair view of a canonical panel measurement."""
-    measurement = measure_panel(context, selected_ids)
-    return measurement.score, measurement.limiting_pairs[0]
-
-
-def _validated_selected_swap(
-    context: ObjectiveContext, selected_swap: object
-) -> tuple[str, ...]:
-    """Validate canonical provenance for a scored legal one-ID panel swap."""
-    if type(selected_swap) is not ObjectiveSwap:
-        raise ValueError("Objective selected swap must use the exact swap type.")
-    candidate_ids = {candidate.molecule_id for candidate in context.candidates}
-    if (
-        type(selected_swap.replace_id) is not str
-        or type(selected_swap.replacement_id) is not str
-        or selected_swap.replace_id not in candidate_ids
-        or selected_swap.replacement_id not in candidate_ids
-    ):
-        raise ValueError("Objective selected swap IDs must be exact in-pool strings.")
-    if type(selected_swap.resulting_ids) is not tuple or any(
-        type(molecule_id) is not str for molecule_id in selected_swap.resulting_ids
-    ):
-        raise ValueError("Objective selected swap resulting IDs must be an exact string tuple.")
-    selected_swap_panel, _ = _validated_panel(context, selected_swap.resulting_ids)
-    if (
-        type(selected_swap.limiting_pair) is not tuple
-        or len(selected_swap.limiting_pair) != 2
-        or any(type(molecule_id) is not str for molecule_id in selected_swap.limiting_pair)
-    ):
-        raise ValueError("Objective selected swap limiting pair must be an exact string tuple.")
-    if (
-        type(selected_swap.predicted_score) is not float
-        or not np.isfinite(selected_swap.predicted_score)
-        or type(selected_swap.score_delta) is not float
-        or not np.isfinite(selected_swap.score_delta)
-    ):
-        raise ValueError("Objective selected swap scores must be finite built-in floats.")
-    if (
-        selected_swap.replacement_id not in selected_swap_panel
-        or selected_swap.replace_id in selected_swap_panel
-    ):
-        raise ValueError("Objective selected swap IDs do not describe the resulting panel.")
-    replacement_position = selected_swap_panel.index(selected_swap.replacement_id)
-    predecessor_panel = (
-        selected_swap_panel[:replacement_position]
-        + (selected_swap.replace_id,)
-        + selected_swap_panel[replacement_position + 1 :]
-    )
-    predecessor_panel, _ = _validated_panel(context, predecessor_panel)
-    predecessor = measure_panel(context, predecessor_panel)
-    resulting = measure_panel(context, selected_swap_panel)
-    expected_delta = resulting.score - predecessor.score
-    if (
-        not is_strict_improvement(resulting.score, predecessor.score)
-        or selected_swap.score_delta != expected_delta
-    ):
-        raise ValueError("Objective selected swap score delta is invalid.")
-    if selected_swap.predicted_score != resulting.score:
-        raise ValueError("Objective selected swap predicted score does not match the panel.")
-    if selected_swap.limiting_pair != resulting.limiting_pairs[0]:
-        raise ValueError("Objective selected swap limiting pair does not match the panel.")
-    return selected_swap_panel
-
-
-def evaluate_diverse_panel(
-    context: ObjectiveContext,
-    selected_ids: tuple[str, ...] | list[str],
-    *,
-    attempt_number: int,
-    decision_basis: str,
-    selected_swap: ObjectiveSwap | None = None,
-) -> ObjectiveAttempt:
-    """Validate and score one proposed panel without mutating workflow state."""
-    panel, _ = _validated_panel(context, selected_ids)
-    legacy_bound = MAX_ATTEMPTS + (1 if selected_swap is not None else 0)
-    if type(attempt_number) is not int or not 1 <= attempt_number <= legacy_bound:
-        raise ValueError("Objective attempt number is outside the accepted bound.")
-    basis = decision_basis.strip() if isinstance(decision_basis, str) else ""
-    if not basis or len(basis) > 240 or any(character in basis for character in "\r\n`"):
-        raise ValueError("Objective decision basis is invalid.")
-    measurement = measure_panel(context, panel)
-    if selected_swap is not None:
-        selected_swap_panel = _validated_selected_swap(context, selected_swap)
-        if set(panel) != set(selected_swap_panel):
-            raise ValueError("Objective selected swap does not match the selected panel.")
-    return ObjectiveAttempt(
-        attempt_number=attempt_number,
-        selected_ids=panel,
-        decision_basis=basis,
-        score=measurement.score,
-        score_key=measurement.score_key,
-        limiting_pair=measurement.limiting_pairs[0],
-        limiting_pairs=measurement.limiting_pairs,
-        constraints_passed=True,
-        achieved=measurement.achieved,
-        selected_swap=selected_swap,
-    )
-
-
-def rank_legal_swaps(
-    context: ObjectiveContext, current: ObjectiveAttempt
-) -> tuple[ObjectiveSwap, ...]:
-    """Rank legal one-ID panel swaps by their predicted objective improvement."""
-    if type(context) is not ObjectiveContext or type(current) is not ObjectiveAttempt:
-        raise ValueError("Objective swap ranking requires exact objective types.")
-    panel, _ = _validated_panel(context, current.selected_ids)
-    recomputed = measure_panel(context, panel)
-    if type(current.score) is not float or not np.isfinite(current.score):
-        raise ValueError(
-            "Objective attempt score must be a finite non-boolean built-in float."
-        )
-    if current.score != recomputed.score:
-        raise ValueError("Objective attempt score does not match its panel.")
-    if current.limiting_pair != recomputed.limiting_pairs[0]:
-        raise ValueError("Objective attempt limiting pair does not match its panel.")
-    if (
-        current.score_key != recomputed.score_key
-        or current.limiting_pairs != recomputed.limiting_pairs
-    ):
-        raise ValueError("Objective attempt evidence does not match its panel.")
-    if current.constraints_passed is not True:
-        raise ValueError("Objective attempt constraints must be passed.")
-    if current.achieved is not recomputed.achieved:
-        raise ValueError("Objective attempt achieved state is inconsistent.")
-    if current.achieved:
-        return ()
-
-    accepted_count = max(current.attempt_number - 1, 0)
-    return accepted_maxima(build_action_menu(context, recomputed, accepted_count))
 
 
 def _attempt_matches_policy(
@@ -930,87 +794,6 @@ def finalize_no_legal_swap(
         TerminationReason.NO_LEGAL_IMPROVING_SWAP,
         menu=menu,
     )
-
-
-def finalize_objective_run(
-    context: ObjectiveContext, attempts: tuple[ObjectiveAttempt, ...]
-) -> ObjectiveRun:
-    """Normalize the legacy baseline-first flow into authoritative substitutions."""
-    baseline, actual_benchmark, _target = _validated_context_scores(context)
-    if not attempts or len(attempts) > MAX_ATTEMPTS + 1:
-        raise ValueError("Objective run has an invalid accepted-attempt count.")
-    if all(attempt.state_id for attempt in attempts):
-        reason = (
-            TerminationReason.TARGET_ACHIEVED
-            if attempts[-1].achieved
-            else TerminationReason.ATTEMPT_LIMIT_REACHED
-        )
-        return terminal_objective_run(context, attempts, reason)
-
-    legacy_baseline = attempts[0]
-    if (
-        type(legacy_baseline) is not ObjectiveAttempt
-        or legacy_baseline.attempt_number != 1
-        or legacy_baseline.state_id
-        or legacy_baseline.selected_swap is not None
-        or legacy_baseline.measurement != baseline
-        or legacy_baseline.constraints_passed is not True
-    ):
-        raise ValueError(
-            "Legacy objective finalization requires the exact measured baseline Step 0."
-        )
-    if baseline.achieved:
-        if len(attempts) != 1:
-            raise ValueError("Objective run continued after measured baseline success.")
-        if baseline.score_key == actual_benchmark.score_key:
-            return baseline_terminal_run(context)
-        return terminal_objective_run(
-            context, (), TerminationReason.TARGET_ACHIEVED
-        )
-
-    normalized: list[ObjectiveAttempt] = []
-    current = baseline
-    for substitution_number, legacy in enumerate(attempts[1:], start=1):
-        if (
-            type(legacy) is not ObjectiveAttempt
-            or legacy.attempt_number != substitution_number + 1
-            or legacy.state_id
-            or legacy.selected_swap is None
-        ):
-            raise ValueError("Legacy objective revisions are not sequential substitutions.")
-        menu = build_action_menu(context, current, substitution_number - 1)
-        offered = next(
-            (
-                action
-                for action in menu.actions
-                if action.swap_id == legacy.selected_swap.swap_id
-            ),
-            None,
-        )
-        if offered is None or legacy.selected_swap != offered:
-            raise ValueError("Legacy objective revision is not in the exact current menu.")
-        if offered not in accepted_maxima(menu):
-            raise ValueError("Legacy objective revision is not an accepted maximum.")
-        measured = measure_panel(context, offered.resulting_ids)
-        if (
-            legacy.measurement != measured
-            or legacy.constraints_passed is not True
-        ):
-            raise ValueError("Legacy objective revision evidence is stale or mismatched.")
-        authoritative = evaluate_selected_swap(
-            context, menu, offered, substitution_number
-        )
-        normalized.append(authoritative)
-        current = authoritative.measurement
-
-    if not normalized:
-        raise ValueError("A below-target legacy baseline is not a terminal run.")
-    reason = (
-        TerminationReason.TARGET_ACHIEVED
-        if normalized[-1].achieved
-        else TerminationReason.ATTEMPT_LIMIT_REACHED
-    )
-    return terminal_objective_run(context, tuple(normalized), reason)
 
 
 def no_improvement_run(context: ObjectiveContext) -> ObjectiveRun:

@@ -1,4 +1,5 @@
 import json
+import inspect
 from copy import deepcopy
 from dataclasses import fields, replace
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from openai import AuthenticationError, PermissionDeniedError
 from rdkit import Chem
 
 import demo_agent
+import objective_challenge
 from chemistry_workflow import (
     EvidenceRecord,
     StageResult,
@@ -18,7 +20,7 @@ from chemistry_workflow import (
     WorkflowReport,
     WorkflowState,
 )
-from objective_challenge import accepted_maxima, build_action_menu, measure_panel, rank_legal_swaps
+from objective_challenge import ObjectiveAttempt, accepted_maxima, build_action_menu, measure_panel
 from objective_fixtures import (
     catalog,
     completed_terminal_controller,
@@ -26,6 +28,7 @@ from objective_fixtures import (
     finding_selection,
     evidence_report,
     quantized_baseline_target_context,
+    recurring_swap_context,
     two_revision_context,
 )
 
@@ -459,13 +462,6 @@ def completed_controller(objective_responses, *, baseline_optimal=False):
     return controller, completions
 
 
-def proposal(selected_ids, basis):
-    return response("select_diverse_panel", {
-        "selected_ids": selected_ids,
-        "decision_basis": basis,
-    })
-
-
 def initial_menu(controller):
     context = controller.objective_context
     assert context is not None
@@ -492,6 +488,23 @@ def assert_paired(messages):
         following = messages[index + 1]
         assert following["role"] == "tool"
         assert following["tool_call_id"] == message["tool_calls"][0]["id"]
+
+
+def assert_exact_action_table(payload, menu):
+    assert payload["state_id"] == menu.state_id
+    assert payload["candidate_actions"] == [
+        {
+            "limiting_pairs": [list(pair) for pair in action.limiting_pairs],
+            "predicted_score": action.predicted_score,
+            "replace_id": action.replace_id,
+            "replacement_id": action.replacement_id,
+            "resulting_ids": list(action.resulting_ids),
+            "score_delta": action.score_delta,
+            "swap_id": action.swap_id,
+            "target_status": action.target_status,
+        }
+        for action in menu.actions
+    ]
 
 
 def test_dynamic_objective_selection_schema_binds_exact_pending_state():
@@ -521,6 +534,34 @@ def test_dynamic_objective_selection_schema_binds_exact_pending_state():
     Draft202012Validator(parameters).validate(pending.model_dump(mode="json"))
 
 
+def test_initial_correction_and_subsequent_prompts_publish_exact_action_tables(monkeypatch):
+    controller, completions = completed_controller([])
+    context = two_revision_context()
+    monkeypatch.setattr(demo_agent, "build_objective_context", lambda _state: context)
+    controller.begin_objective_challenge()
+    initial = controller.pending_action_menu
+    assert_exact_action_table(json.loads(controller.session.messages[-1]["content"]), initial)
+
+    completions.responses.extend([
+        selection(initial, state_id="state-0000000000000000"),
+        selection(initial),
+    ])
+    pending = controller.request_objective_selection()
+    correction = next(
+        json.loads(message["content"])
+        for message in controller.session.messages
+        if message.get("role") == "user" and "remaining_rejections" in message["content"]
+    )
+    assert_exact_action_table(correction, initial)
+
+    controller.execute_objective_selection(pending)
+    subsequent = controller.pending_action_menu
+    assert subsequent is not None
+    assert_exact_action_table(
+        json.loads(controller.session.messages[-1]["content"]), subsequent
+    )
+
+
 def test_invalid_invalid_terminalizes_with_one_correction_and_no_chemistry():
     controller, completions = completed_controller([])
     controller.begin_objective_challenge()
@@ -545,7 +586,11 @@ def test_invalid_invalid_terminalizes_with_one_correction_and_no_chemistry():
         if item.get("role") == "user"
     ][-1])
     assert list(correction) == sorted(correction) == [
-        "candidate_actions", "current_limiting_pairs", "decision_rule", "remaining_rejections"
+        "candidate_actions",
+        "current_limiting_pairs",
+        "decision_rule",
+        "remaining_rejections",
+        "state_id",
     ]
     assert correction["remaining_rejections"] == 1
     assert_paired(controller.session.messages)
@@ -632,7 +677,7 @@ def test_two_transport_failures_terminalize_without_assistant_response():
         request_error(403, PermissionDeniedError),
     ],
 )
-def test_objective_auth_errors_bypass_transport_retry_and_terminal_evidence(hosted_error):
+def test_objective_auth_errors_terminalize_provider_failure_without_retry(hosted_error):
     controller, completions = completed_controller([hosted_error])
     controller.begin_objective_challenge()
 
@@ -647,8 +692,13 @@ def test_objective_auth_errors_bypass_transport_retry_and_terminal_evidence(host
     assert controller.accepted_attempt_count == 0
     assert controller.objective_transport_retry_pending is False
     assert controller.objective_transport_retry_used is False
-    assert controller.objective_run is None
-    assert controller.objective_evidence is None
+    assert controller.pending_objective is None
+    assert controller.objective_run.termination_reason == "objective_provider_failure"
+    assert controller.objective_evidence.key == "O01"
+    assert json.loads(controller.objective_evidence.payload_json)["termination_reason"] == (
+        "objective_provider_failure"
+    )
+    assert all(message.get("role") != "assistant" for message in controller.session.messages)
 
 
 @pytest.mark.parametrize(
@@ -658,7 +708,7 @@ def test_objective_auth_errors_bypass_transport_retry_and_terminal_evidence(host
         SimpleNamespace(choices=[]),
     ],
 )
-def test_nontransport_objective_failures_are_not_retryable_or_terminalized(
+def test_nontransport_objective_failures_terminalize_without_retry(
     nontransport_failure,
 ):
     controller, completions = completed_controller([nontransport_failure])
@@ -675,8 +725,42 @@ def test_nontransport_objective_failures_are_not_retryable_or_terminalized(
     assert controller.accepted_attempt_count == 0
     assert controller.objective_transport_retry_pending is False
     assert controller.objective_transport_retry_used is False
-    assert controller.objective_run is None
-    assert controller.objective_evidence is None
+    assert controller.pending_objective is None
+    assert controller.objective_run.termination_reason == "objective_provider_failure"
+    assert controller.objective_evidence.key == "O01"
+    assert json.loads(controller.objective_evidence.payload_json)["termination_reason"] == (
+        "objective_provider_failure"
+    )
+    assert all(message.get("role") != "assistant" for message in controller.session.messages)
+
+
+def test_objective_evaluation_error_is_not_misclassified_as_provider_failure(monkeypatch):
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    completions.responses.append(selection(menu))
+    pending = controller.request_objective_selection()
+    monkeypatch.setattr(
+        demo_agent,
+        "evaluate_selected_swap",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("local evaluator")),
+    )
+
+    with pytest.raises(demo_agent.ToolCallError):
+        controller.execute_objective_selection(pending)
+
+    assert controller.objective_run.termination_reason == "evaluation_not_completed"
+    assert controller.objective_evidence.key == "O01"
+    assert controller.objective_failure_reason == "evaluation_not_completed"
+    assert controller.accepted_attempt_count == 0
+
+
+def test_objective_domain_exposes_no_rationale_record_or_legacy_evaluator_api():
+    assert "decision_basis" not in {field.name for field in fields(ObjectiveAttempt)}
+    assert not hasattr(objective_challenge, "evaluate_diverse_panel")
+    assert not hasattr(objective_challenge, "rank_legal_swaps")
+    assert not hasattr(objective_challenge, "finalize_objective_run")
+    assert "decision_basis" not in inspect.getsource(objective_challenge)
 
 
 def test_objective_transport_retry_pending_is_read_only():
@@ -775,6 +859,45 @@ def test_actual_old_state_and_swap_are_rejected_twice_after_state_transition(mon
     assert_paired(controller.session.messages)
 
 
+def test_stale_state_wins_when_identical_swap_remains_valid_in_later_menu(monkeypatch):
+    controller, completions = completed_controller([])
+    context = recurring_swap_context()
+    monkeypatch.setattr(demo_agent, "build_objective_context", lambda _state: context)
+    controller.begin_objective_challenge()
+    old_menu = controller.pending_action_menu
+    chosen = accepted_maxima(old_menu)[0]
+    completions.responses.append(selection(old_menu, old_menu.actions.index(chosen)))
+
+    pending = controller.request_objective_selection()
+    controller.execute_objective_selection(pending)
+    current_menu = controller.pending_action_menu
+    assert current_menu is not None and current_menu.state_id != old_menu.state_id
+    recurring_swap_ids = (
+        {action.swap_id for action in old_menu.actions} - {chosen.swap_id}
+    ) & {action.swap_id for action in current_menu.actions}
+    assert len(recurring_swap_ids) == 1
+    recurring_swap_id = recurring_swap_ids.pop()
+    recurring_index = next(
+        index
+        for index, action in enumerate(current_menu.actions)
+        if action.swap_id == recurring_swap_id
+    )
+    completions.responses.extend([
+        selection(current_menu, recurring_index, state_id=old_menu.state_id),
+        selection(current_menu, recurring_index),
+    ])
+
+    controller.request_objective_selection()
+
+    rejected = [
+        json.loads(message["content"])
+        for message in controller.session.messages
+        if message.get("role") == "tool" and '"accepted":false' in message["content"]
+    ]
+    assert rejected[-1]["reason"] == "stale_objective_state"
+    assert controller.accepted_attempt_count == 1
+
+
 def test_provider_content_is_transcript_only_and_never_enters_attempt_or_o01():
     model_prose = "MODEL PRIVATE EXPLANATION MUST NOT BECOME FACT"
     controller, completions = completed_controller([])
@@ -796,7 +919,6 @@ def test_provider_content_is_transcript_only_and_never_enters_attempt_or_o01():
 
     assert controller.session.messages[-2]["content"] == model_prose
     assert model_prose not in repr(attempt)
-    assert model_prose not in attempt.decision_basis
     assert controller.objective_evidence is not None
     assert model_prose not in controller.objective_evidence.payload_json
     assert "decision_basis" not in controller.objective_evidence.payload_json

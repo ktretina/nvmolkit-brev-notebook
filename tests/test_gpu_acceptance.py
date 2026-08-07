@@ -83,10 +83,9 @@ def test_nvmolkit_gpu_workflow():
         accepted_maxima,
         build_action_menu,
         certify_argmax_reachability,
-        evaluate_diverse_panel,
+        evaluate_selected_swap,
         is_strict_improvement,
         measure_panel,
-        rank_legal_swaps,
         target_is_achieved,
     )
 
@@ -237,27 +236,21 @@ def test_nvmolkit_gpu_workflow():
     assert len(all_panels) == 70
     below_target = []
     for panel in all_panels:
-        first = evaluate_diverse_panel(
-            context,
-            panel,
-            attempt_number=1,
-            decision_basis="Qualify this bounded candidate panel.",
-        )
+        first = measure_panel(context, panel)
         if first.achieved:
             continue
         below_target.append(first)
-        first_suggestions = rank_legal_swaps(context, first)
+        first_menu = build_action_menu(context, first, 0)
+        first_suggestions = accepted_maxima(first_menu)
         assert first_suggestions
         for selected_swap in first_suggestions:
-            second = evaluate_diverse_panel(
-                context,
-                selected_swap.resulting_ids,
-                attempt_number=2,
-                decision_basis="Apply one ranked legal objective swap.",
-                selected_swap=selected_swap,
-            )
+            second = evaluate_selected_swap(
+                context, first_menu, selected_swap, 1
+            ).measurement
             if not second.achieved:
-                next_suggestions = rank_legal_swaps(context, second)
+                next_suggestions = accepted_maxima(
+                    build_action_menu(context, second, 1)
+                )
                 assert any(
                     target_is_achieved(
                         suggestion.predicted_score, context.target_score

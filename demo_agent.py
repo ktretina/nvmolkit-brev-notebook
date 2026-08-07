@@ -790,7 +790,10 @@ def _objective_action_payload(item: ObjectiveSwap) -> dict[str, Any]:
     return {
         "limiting_pairs": [list(pair) for pair in item.limiting_pairs],
         "predicted_score": item.predicted_score,
+        "replace_id": item.replace_id,
+        "replacement_id": item.replacement_id,
         "resulting_ids": list(item.resulting_ids),
+        "score_delta": item.score_delta,
         "swap_id": item.swap_id,
         "target_status": item.target_status,
     }
@@ -1774,7 +1777,9 @@ class BoundedWorkflowController:
             context, tuple(self.objective_attempts), reason, menu=menu
         )
         self.objective_evidence = build_objective_evidence(self.objective_run)
+        self.pending_action_menu = None
         self.pending_objective_selection = None
+        self._objective_transport_retry_pending = False
 
     def _check_objective_bounds(self) -> None:
         values = (
@@ -1883,6 +1888,7 @@ class BoundedWorkflowController:
             "current_limiting_pairs": [list(pair) for pair in menu.source.limiting_pairs],
             "decision_rule": "maximize_predicted_minimum_distance",
             "remaining_rejections": 1,
+            "state_id": menu.state_id,
         })})
         self.correction_prompts_sent += 1
 
@@ -1929,6 +1935,9 @@ class BoundedWorkflowController:
                 )
             except Exception as error:
                 if not isinstance(error, (httpx.TransportError, APIConnectionError)):
+                    self._terminalize_objective(
+                        TerminationReason.OBJECTIVE_PROVIDER_FAILURE
+                    )
                     _raise_request_error(error)
                 if self.objective_transport_retry_used:
                     self._terminalize_objective(TerminationReason.OBJECTIVE_PROVIDER_FAILURE)
@@ -1939,6 +1948,9 @@ class BoundedWorkflowController:
             try:
                 message = response.choices[0].message
             except (AttributeError, IndexError, TypeError) as error:
+                self._terminalize_objective(
+                    TerminationReason.OBJECTIVE_PROVIDER_FAILURE
+                )
                 _raise_request_error(error)
             self.selection_response_count += 1
             assistant = self._objective_assistant_payload(message)
