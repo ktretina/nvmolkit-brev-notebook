@@ -71,6 +71,15 @@ def raw_response(name, raw_arguments):
     )
 
 
+def content_response(content):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(
+            content=content,
+            tool_calls=None,
+        ))]
+    )
+
+
 def optimized_state(*, baseline_optimal=False):
     smiles = ("CC", "CCC", "CCCC", "CCO", "CCN", "CCCl", "CCF", "C1CC1")
     distance = np.full((8, 8), 0.80, dtype=float)
@@ -371,6 +380,80 @@ def test_non_object_json_objective_response_is_paired_and_corrected_safely(
     assert "RAW-NONOBJECT-SECRET" not in json.dumps(controller.session.messages)
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "[]",
+        "null",
+        '{"selected_ids":RAW-CONTENT-SECRET',
+        "RAW-CONTENT-SECRET plain text",
+    ],
+)
+def test_content_only_invalid_objective_response_is_immediately_paired_and_corrected(
+    content,
+):
+    controller, completions = completed_controller([
+        content_response(content),
+        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Use a tool call."),
+    ])
+    controller.begin_objective_challenge()
+
+    corrected = controller.request_objective_attempt()
+
+    assert corrected.selected_ids == ["mol-0", "mol-1", "mol-2", "mol-3"]
+    assert controller.objective_rejection_count == 1
+    assert len(completions.calls) == 2
+    rejected_assistant = controller.session.messages[-3]
+    rejected_tool = controller.session.messages[-2]
+    assert rejected_tool["tool_call_id"] == rejected_assistant["tool_calls"][0]["id"]
+    assert json.loads(rejected_tool["content"])["reason"] == "invalid_objective_proposal"
+    assert json.loads(
+        rejected_assistant["tool_calls"][0]["function"]["arguments"]
+    ) == {
+        "validation_issues": [
+            {"field": "arguments", "error_type": "invalid_objective_content"}
+        ]
+    }
+    assert "RAW-CONTENT-SECRET" not in json.dumps(controller.session.messages)
+
+
+def test_two_content_only_objective_responses_exhaust_global_correction_budget():
+    controller, completions = completed_controller([
+        content_response("RAW-FIRST-CONTENT"),
+        content_response('{"malformed":"RAW-SECOND-CONTENT"'),
+    ])
+    controller.begin_objective_challenge()
+
+    with pytest.raises(demo_agent.ToolCallError, match="correction limit"):
+        controller.request_objective_attempt()
+
+    assert controller.objective_rejection_count == 2
+    assert controller.objective_attempts == []
+    assert controller.pending_objective is None
+    assert len(completions.calls) == 2
+    assert controller.session.turn_count == 9
+    assert "RAW-FIRST-CONTENT" not in json.dumps(controller.session.messages)
+    assert "RAW-SECOND-CONTENT" not in json.dumps(controller.session.messages)
+
+
+def test_valid_content_only_objective_json_object_remains_compatible():
+    arguments = {
+        "selected_ids": ["mol-0", "mol-1", "mol-2", "mol-3"],
+        "decision_basis": "Use the valid JSON object fallback.",
+    }
+    controller, completions = completed_controller([
+        content_response(json.dumps(arguments)),
+    ])
+    controller.begin_objective_challenge()
+
+    pending = controller.request_objective_attempt()
+
+    assert pending.model_dump(mode="json") == arguments
+    assert controller.objective_rejection_count == 0
+    assert len(completions.calls) == 1
+    assert controller.session.messages[-1]["tool_calls"][0]["id"].startswith("compat-")
+
+
 def test_hosted_request_failure_does_not_consume_objective_correction_budget():
     controller, _ = completed_controller([])
     controller.begin_objective_challenge()
@@ -488,6 +571,68 @@ def test_value_equal_revision_cannot_replace_exact_pending_proposal_or_swap():
     assert len(controller.objective_attempts) == 1
     assert controller.pending_objective is pending
     assert controller.pending_objective_swap is pending_swap
+
+
+def test_ranking_failure_preserves_pending_objective_transaction(monkeypatch):
+    controller, _ = completed_controller([
+        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Measure the baseline panel."),
+    ])
+    controller.begin_objective_challenge()
+    pending = controller.request_objective_attempt()
+    suggestions = controller.objective_suggestions
+    original_rank = demo_agent.rank_legal_swaps
+
+    def fail_ranking(*_args):
+        raise RuntimeError("RAW-RANKING-SECRET")
+
+    monkeypatch.setattr(demo_agent, "rank_legal_swaps", fail_ranking)
+    with pytest.raises(demo_agent.ToolCallError, match="could not be ranked") as captured:
+        controller.execute_objective_attempt(pending)
+
+    assert controller.objective_attempts == []
+    assert controller.pending_objective is pending
+    assert controller.pending_objective_swap is None
+    assert controller.objective_suggestions is suggestions
+    assert controller.objective_run is None and controller.objective_evidence is None
+    assert controller.session.messages[-1]["role"] == "assistant"
+    assert "RAW-RANKING-SECRET" not in str(captured.value)
+
+    monkeypatch.setattr(demo_agent, "rank_legal_swaps", original_rank)
+    accepted = controller.execute_objective_attempt(pending)
+    assert accepted is controller.objective_attempts[0]
+
+
+def test_feedback_serialization_failure_preserves_revision_transaction(monkeypatch):
+    controller, _ = completed_controller([
+        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Measure the baseline panel."),
+        proposal(["mol-4", "mol-1", "mol-2", "mol-3"], "Use the ranked replacement."),
+    ])
+    controller.begin_objective_challenge()
+    initial = controller.request_objective_attempt()
+    controller.execute_objective_attempt(initial)
+    pending = controller.request_objective_attempt()
+    pending_swap = controller.pending_objective_swap
+    attempts = tuple(controller.objective_attempts)
+    suggestions = controller.objective_suggestions
+    original_serialize = demo_agent._serialize
+
+    def fail_serialization(_value):
+        raise demo_agent.ToolCallError("safe serialization failure")
+
+    monkeypatch.setattr(demo_agent, "_serialize", fail_serialization)
+    with pytest.raises(demo_agent.ToolCallError, match="serialization failure"):
+        controller.execute_objective_attempt(pending)
+
+    assert tuple(controller.objective_attempts) == attempts
+    assert controller.pending_objective is pending
+    assert controller.pending_objective_swap is pending_swap
+    assert controller.objective_suggestions is suggestions
+    assert controller.objective_run is None and controller.objective_evidence is None
+    assert controller.session.messages[-1]["role"] == "assistant"
+
+    monkeypatch.setattr(demo_agent, "_serialize", original_serialize)
+    accepted = controller.execute_objective_attempt(pending)
+    assert accepted.selected_swap is pending_swap
 
 
 def test_optimal_baseline_terminates_without_manufacturing_an_attempt():

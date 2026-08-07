@@ -140,6 +140,7 @@ class Controller:
         self.objective_attempts.append(attempt)
         self.pending_objective = None
         if achieved:
+            self.objective_suggestions = ()
             self.objective_run = SimpleNamespace(
                 context=self.objective_context,
                 attempts=tuple(self.objective_attempts),
@@ -149,6 +150,8 @@ class Controller:
                 final_score=attempt.score,
             )
             self.objective_evidence = SimpleNamespace(key="O01")
+        else:
+            self.objective_suggestions = ("listed-revision",)
         return attempt
 
     def request_synthesis(self):
@@ -455,6 +458,51 @@ def test_retry_objective_rechecks_pending_state_and_stops(monkeypatch):
     assert workflow.status == "stopped"
     assert workflow.retry_button is None
     assert controller.calls.count("objective_proposal") == before
+
+
+@pytest.mark.parametrize("mutation", ["pending_swap", "missing_suggestions"])
+def test_retry_objective_rejects_noncanonical_guidance_state(mutation):
+    controller = Controller()
+    original_request = controller.request_objective_attempt
+    failed_once = False
+
+    def fail_second_request_once():
+        nonlocal failed_once
+        if len(controller.objective_attempts) == 1 and not failed_once:
+            failed_once = True
+            controller.calls.append("objective_proposal")
+            raise ToolCallError("hosted objective proposal failed")
+        return original_request()
+
+    controller.request_objective_attempt = fail_second_request_once
+    workflow, _ = started(controller)
+    complete_six_stages(workflow)
+    workflow.objective_button.click()
+    assert workflow.status == "objective_failed"
+    before = controller.calls.count("objective_proposal")
+    if mutation == "pending_swap":
+        controller.pending_objective_swap = object()
+    else:
+        controller.objective_suggestions = ()
+
+    workflow.retry_button.click()
+
+    assert workflow.status == "stopped"
+    assert workflow.retry_button is None
+    assert controller.calls.count("objective_proposal") == before
+
+
+def test_initial_objective_retry_allows_empty_suggestions():
+    controller = Controller()
+    controller.objective_failures.append(ToolCallError("hosted objective proposal failed"))
+    workflow, _ = started(controller)
+    complete_six_stages(workflow)
+    workflow.objective_button.click()
+
+    assert controller.objective_attempts == []
+    assert controller.objective_suggestions == ()
+    assert workflow.status == "objective_failed"
+    assert workflow.retry_button.description == "Retry Objective Proposal"
 
 
 def test_known_synthesis_failure_has_guarded_retry(monkeypatch):

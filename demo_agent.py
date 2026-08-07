@@ -536,6 +536,17 @@ def _request_call(
                 candidate = None
             if isinstance(candidate, dict):
                 content_arguments = candidate
+        if (
+            no_calls
+            and isinstance(content, str)
+            and content_arguments is None
+            and expected_name == "select_diverse_panel"
+        ):
+            raise _HostedArgumentsValidationError(
+                expected_name,
+                (("arguments", "invalid_objective_content"),),
+                f"compat-rejected-{session.turn_count + 1}-{expected_name}",
+            )
         content = None
         if (
             no_calls
@@ -1113,18 +1124,28 @@ class BoundedWorkflowController:
             )
         except Exception:
             raise ToolCallError("The objective evaluator rejected the proposed panel.") from None
-        self.objective_attempts.append(attempt)
-        self.pending_objective = None
-        self.pending_objective_swap = None
-        if not attempt.achieved and len(self.objective_attempts) < MAX_ATTEMPTS:
+        prospective_attempts = (*self.objective_attempts, attempt)
+        if not attempt.achieved and len(prospective_attempts) < MAX_ATTEMPTS:
             try:
-                self.objective_suggestions = rank_legal_swaps(context, attempt)
+                prospective_suggestions = rank_legal_swaps(context, attempt)
             except Exception:
                 raise ToolCallError(
                     "The legal improving objective swaps could not be ranked."
                 ) from None
         else:
-            self.objective_suggestions = ()
+            prospective_suggestions = ()
+        prospective_run = None
+        prospective_evidence = None
+        if attempt.achieved or len(prospective_attempts) == MAX_ATTEMPTS:
+            try:
+                prospective_run = finalize_objective_run(
+                    context, prospective_attempts
+                )
+                prospective_evidence = build_objective_evidence(prospective_run)
+            except Exception:
+                raise ToolCallError(
+                    "The objective run could not be finalized safely."
+                ) from None
         feedback = {
             "accepted": True,
             "attempt_number": attempt.attempt_number,
@@ -1134,22 +1155,37 @@ class BoundedWorkflowController:
             "limiting_pair": list(attempt.limiting_pair),
             "constraints_passed": attempt.constraints_passed,
             "achieved": attempt.achieved,
-            "attempts_remaining": MAX_ATTEMPTS - len(self.objective_attempts),
+            "attempts_remaining": MAX_ATTEMPTS - len(prospective_attempts),
             "legal_improving_swaps": [
-                _swap_payload(item) for item in self.objective_suggestions
+                _swap_payload(item) for item in prospective_suggestions
             ],
         }
-        if self.objective_suggestions:
+        if prospective_suggestions:
             feedback["instruction"] = (
                 "Select exactly one listed resulting_ids panel and explain how its "
                 "limiting_pair and predicted_score compare with target_score."
             )
-        _append_tool_result(self.session, feedback)
-        if attempt.achieved or len(self.objective_attempts) == MAX_ATTEMPTS:
-            self.objective_run = finalize_objective_run(
-                context, tuple(self.objective_attempts)
-            )
-            self.objective_evidence = build_objective_evidence(self.objective_run)
+        serialized_feedback = _serialize(feedback)
+        try:
+            assistant = self.session.messages[-1]
+            tool_call_id = assistant["tool_calls"][0]["id"]
+        except (IndexError, KeyError, TypeError):
+            raise ToolCallError(
+                "The pending objective tool protocol was invalid."
+            ) from None
+        tool_message = {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": serialized_feedback,
+        }
+
+        self.objective_attempts.append(attempt)
+        self.pending_objective = None
+        self.pending_objective_swap = None
+        self.objective_suggestions = prospective_suggestions
+        self.objective_run = prospective_run
+        self.objective_evidence = prospective_evidence
+        self.session.messages.append(tool_message)
         return attempt
 
     def request_synthesis(self) -> WorkflowResult:

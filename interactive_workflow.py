@@ -219,9 +219,11 @@ class InteractiveWorkflow:
                 and self.controller.objective_run is None
                 and self.controller.objective_evidence is None
                 and self.controller.pending_objective is None
+                and self.controller.pending_objective_swap is None
                 and self.controller.objective_rejection_count
                 < demo_agent.MAX_OBJECTIVE_CORRECTIONS
                 and len(attempts) < MAX_ATTEMPTS
+                and (not attempts or bool(self.controller.objective_suggestions))
                 and tuple(attempt.attempt_number for attempt in attempts)
                 == tuple(range(1, len(attempts) + 1))
                 and self.controller.session.turn_count
