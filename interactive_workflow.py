@@ -912,11 +912,19 @@ class InteractiveWorkflow:
             executed_measurement = None
         if attempt is None:
             accent = "#6c757d"
+            explanation = (
+                "Controller explanation: Python validation: "
+                f"swap_id={selected.swap_id!r} replaces "
+                f"replace_id={selected.replace_id!r} with "
+                f"replacement_id={selected.replacement_id!r}; the action affects "
+                f"every prior co-limiting pair {menu.source.limiting_pairs!r}; "
+                f"it was {maximum_description}; evaluation was not completed, so no "
+                "measured improvement or target result is claimed."
+            )
             measure = (
                 "Evaluation not completed; selection validated but unmeasured. "
                 "No measurement is available.<br>"
-                f"<small>Controller explanation: Python validation: The selected action was {escape(maximum_description)}; "
-                "evaluation was not completed, so no measured improvement or target result is claimed.</small>"
+                f"<small>{escape(explanation)}</small>"
             )
             outcome = "Evaluation not completed"
         else:
@@ -964,9 +972,13 @@ class InteractiveWorkflow:
                 else "the target remains unmet"
             )
             explanation = (
-                "Controller explanation: Python validation: The selected action was "
-                f"{maximum_description}; measured D_min improved from "
-                f"{menu.source.score!r} to {attempt.score!r} "
+                "Controller explanation: Python validation: "
+                f"swap_id={selected.swap_id!r} replaces "
+                f"replace_id={selected.replace_id!r} with "
+                f"replacement_id={selected.replacement_id!r}; the action affects "
+                f"every prior co-limiting pair {menu.source.limiting_pairs!r}; "
+                f"it was {maximum_description}; measured D_min improved "
+                f"{menu.source.score!r} → {attempt.score!r} "
                 f"(delta {selected.score_delta!r}); {target_outcome}; "
                 f"{target_comparison}."
             )
@@ -990,9 +1002,9 @@ class InteractiveWorkflow:
             "<section aria-label='Deterministically evaluated candidate actions'>"
             f"<b>Deterministically evaluated candidate actions:</b>{candidate_html}</section>"
             "<section aria-label='Nemotron choice'><b>Nemotron choice:</b> "
-            f"<pre data-receipt='validated-selection'>{escape(validated_selection)}</pre></section>"
+            f"<pre data-receipt='validated-selection'>{escape(validated_selection)}</pre>"
+            f"<pre data-receipt='planned-command'>{escape(planned_command)}</pre></section>"
             "<section aria-label='Execute'><b>Execute:</b> "
-            f"<pre data-receipt='planned-command'>{escape(planned_command)}</pre>"
             f"<pre data-receipt='python-evaluation'>{escape(python_evaluation)}</pre></section>"
             f"<section aria-label='Measure'><b>Measure:</b> {measure}</section></div>"
         )

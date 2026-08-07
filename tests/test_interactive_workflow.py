@@ -773,6 +773,18 @@ def test_attempt_card_renders_complete_decision_ladder_without_rationale():
     assert receipt.validated_selection in unescaped
     assert receipt.planned_command in unescaped
     assert receipt.executed_measurement in unescaped
+    nemotron_section = re.search(
+        r"<section aria-label='Nemotron choice'>(.*?)</section>",
+        rendered,
+        re.DOTALL,
+    )
+    execute_section = re.search(
+        r"<section aria-label='Execute'>(.*?)</section>", rendered, re.DOTALL
+    )
+    assert nemotron_section is not None and execute_section is not None
+    assert receipt.planned_command in unescape(nemotron_section.group(1))
+    assert "select_next_panel_swap(" not in unescape(execute_section.group(1))
+    assert "evaluate_selected_swap(" in unescape(execute_section.group(1))
     maximum_count = sum(
         action.predicted_score_key
         == max(item.predicted_score_key for item in menu.actions)
@@ -784,9 +796,14 @@ def test_attempt_card_renders_complete_decision_ladder_without_rationale():
         else "the unique argmax at 1e-12 decision precision"
     )
     assert (
-        "Controller explanation: Python validation: The selected action was "
-        f"{maximum_description}; measured D_min improved from {menu.source.score!r} "
-        f"to {attempt.score!r} (delta {attempt.selected_swap.score_delta!r}); "
+        "Controller explanation: Python validation: "
+        f"swap_id={attempt.selected_swap.swap_id!r} replaces "
+        f"replace_id={attempt.selected_swap.replace_id!r} with "
+        f"replacement_id={attempt.selected_swap.replacement_id!r}; the action "
+        "affects every prior co-limiting pair "
+        f"{menu.source.limiting_pairs!r}; it was {maximum_description}; measured "
+        f"D_min improved {menu.source.score!r} → {attempt.score!r} "
+        f"(delta {attempt.selected_swap.score_delta!r}); "
         "the target remains unmet; "
         f"{InteractiveWorkflow._objective_target_status(attempt.score, context.target_score)}."
     ) in unescaped
