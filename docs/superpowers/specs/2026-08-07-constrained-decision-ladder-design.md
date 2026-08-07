@@ -1,7 +1,7 @@
 # Constrained Decision Ladder and Evidence-Controlled Conclusion
 
 **Date:** 2026-08-07
-**Status:** Approved direction; written specification awaiting user review
+**Status:** Approved; quantized Step-0 edge clarified during implementation
 
 ## Purpose
 
@@ -52,7 +52,7 @@ for a panel of four molecules. The baseline remains the first four eligible cand
 
 The baseline is displayed as **Step 0 — Measured baseline**. It is not counted as an LLM attempt. Before enabling the challenge, the controller runs the production action builder from the baseline, finds every accepted maximum in that exact offered set, and branches over every accepted `swap_id`. It repeats this process from each resulting panel for at most three accepted substitutions. The challenge is eligible only if every branch reaches the target within that bound. Canonical ordering controls traversal and display only; it never collapses accepted tied branches. Otherwise challenge construction stops with a specific eligibility message, and the target is never weakened after the model begins.
 
-The default Brev dataset and allowed upstream parameter path must pass this reachability certificate during acceptance. A baseline that is already optimal retains the existing explicit no-improvement outcome and makes no hosted objective call.
+The default Brev dataset and allowed upstream parameter path must pass this reachability certificate during acceptance. A baseline that is already optimal retains the existing explicit no-improvement outcome and makes no hosted objective call. A distinct numerical edge is also handled explicitly: if the measured baseline and derived target have the same shared score key even though the attainable benchmark has a larger key, the run terminates as `target_achieved` at Step 0 with zero accepted substitutions and no hosted objective call. It is not mislabeled `baseline_already_optimal`; the measured baseline itself satisfies the predefined target at the declared decision precision.
 
 ## Shared Numerical Semantics
 
@@ -100,7 +100,7 @@ Each offered action shows factual, controller-generated fields:
 
 These are exact evaluations of retained fingerprints, not model forecasts. The UI labels them **deterministically evaluated candidate actions** rather than experimental predictions.
 
-Every action menu also has an immutable `state_id`, computed from canonical JSON containing the current panel, current score key, canonical co-limiting pairs, accepted-attempt number, and exact ordered offered `swap_id` values. The controller stores one pending state revision before the hosted request. A response is eligible only while that exact revision remains pending and current; a repeated substitution from a later panel cannot validate against an earlier `state_id`.
+Every action menu also has an immutable `state_id`, computed from canonical JSON containing the current panel, current score key, canonical co-limiting pairs, accepted-attempt number, and exact ordered offered `swap_id` values. The controller stores one pending state revision before the hosted request. A response is eligible only while that exact revision remains pending and current; a repeated substitution from a later panel cannot validate against an earlier `state_id`. Because `swap_id` uses the literal `replace_id->replacement_id` form, candidate molecule IDs containing the reserved `->` delimiter are rejected during context construction so action identity remains injective.
 
 If fewer than three improving substitutions exist, all available substitutions are shown. If none exists before the target is reached, the challenge terminates truthfully as `no_legal_improving_swap`.
 

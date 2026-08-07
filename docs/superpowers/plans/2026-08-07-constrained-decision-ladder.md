@@ -304,6 +304,15 @@ def test_baseline_optimal_short_circuits_before_action_menu():
     assert run.attempts == ()
 
 
+def test_quantized_target_met_at_baseline_is_zero_attempt_target_success():
+    context = quantized_baseline_target_context()
+    run = terminal_objective_run(context, (), "target_achieved")
+    assert run.baseline.achieved is True
+    assert run.termination_reason == "target_achieved"
+    assert run.attempts == ()
+    assert run.final_ids == context.baseline_ids
+
+
 @pytest.mark.parametrize(("candidate", "current", "expected"), BOUNDARY_CASES)
 def test_action_inclusion_maximality_ordering_and_reachability_share_boundary(
     candidate, current, expected
@@ -437,8 +446,10 @@ def terminal_objective_run(
     expected_current = baseline if not attempts else attempts[-1].measurement
     if current != expected_current:
         raise ValueError("Objective terminal state must use the last measured panel.")
-    if reason == "target_achieved" and (not attempts or not current.achieved):
-        raise ValueError("Target success requires a measured successful attempt.")
+    if reason == "target_achieved" and (
+        (attempts and not current.achieved) or (not attempts and not baseline.achieved)
+    ):
+        raise ValueError("Target success requires a measured target-achieving state.")
     if reason == "baseline_already_optimal" and (
         attempts or baseline.score_key != score_key(context.benchmark_score)
     ):
@@ -676,6 +687,14 @@ def test_baseline_optimal_makes_no_hosted_objective_request():
     assert completions.calls == []
 
 
+def test_quantized_baseline_target_success_makes_no_hosted_objective_request():
+    controller, completions = completed_controller([], quantized_baseline_target=True)
+    controller.begin_objective_challenge()
+    assert controller.objective_run.termination_reason == "target_achieved"
+    assert controller.objective_run.attempts == ()
+    assert completions.calls == []
+
+
 def test_unreachable_policy_uses_specific_eligibility_error(monkeypatch):
     controller, completions = completed_controller([])
     monkeypatch.setattr(demo_agent, "build_objective_context", Mock(
@@ -764,7 +783,7 @@ objective_failure_reason: str | None = None
 
 `begin_objective_challenge()` measures the deterministic baseline and builds the first menu. `request_objective_selection()` checks all five counters before every request, increments provider attempts before calling the client, increments response count only after an assistant response, validates the exact pending revision and argmax, pairs every rejected call, sends only one correction prompt, and stops on the second rejection. The correction content is canonical JSON with exactly the four lexicographically ordered keys asserted above; `action_table_payload(menu)` contains only the same deterministically rendered action rows already shown to the model. State binding remains in the unchanged pending tool schema. The prompt includes no separate state field, rejection rationale, new ranking cue, model prose, or numerical field absent from the current menu. Do not reset rejection counts after accepted attempts.
 
-Map the exact reachability `RuntimeError` to `ObjectiveEligibilityError` without replacing its specific safe text. Short-circuit baseline optimal before building a menu. On correction/provider terminal states, construct `ObjectiveRun` and O01 immediately via `terminal_objective_run`; conclusion gating therefore sees an immutable terminal result even with zero measured attempts.
+Map the exact reachability `RuntimeError` to `ObjectiveEligibilityError` without replacing its specific safe text. Before building a menu, short-circuit either exact baseline optimality as `baseline_already_optimal` or a measured baseline whose score key already meets the derived target as zero-attempt `target_achieved`; neither path makes a hosted objective request. On correction/provider terminal states, construct `ObjectiveRun` and O01 immediately via `terminal_objective_run`; conclusion gating therefore sees an immutable terminal result even with zero measured attempts.
 
 - [ ] **Step 4: Run controller tests and verify GREEN**
 
