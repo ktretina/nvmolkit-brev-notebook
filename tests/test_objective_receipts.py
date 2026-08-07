@@ -1,9 +1,10 @@
-from dataclasses import FrozenInstanceError
+import inspect
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
 from demo_agent import ObjectiveProposal
-from objective_challenge import ObjectiveSwap
+from objective_challenge import ObjectiveAttempt, ObjectiveSwap, evaluate_diverse_panel
 from objective_receipts import ObjectiveReceipt, objective_receipt
 
 
@@ -32,6 +33,18 @@ def swapped_proposal() -> ObjectiveProposal:
     )
 
 
+def prior_attempt() -> ObjectiveAttempt:
+    return ObjectiveAttempt(
+        attempt_number=1,
+        selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
+        decision_basis="Measure the initial panel.",
+        score=0.35,
+        limiting_pair=("mol-0", "mol-1"),
+        constraints_passed=True,
+        achieved=False,
+    )
+
+
 def test_objective_receipt_displays_validated_ids_and_fixed_executor():
     receipt = objective_receipt(proposal())
 
@@ -42,16 +55,18 @@ def test_objective_receipt_displays_validated_ids_and_fixed_executor():
         validated_intervention=None,
         python_evaluation=(
             "result = evaluate_diverse_panel(\n"
-            "    selected_ids=proposal.selected_ids,\n"
-            "    candidate_pool=candidate_pool,\n"
-            "    similarity_matrix=similarity_matrix,\n"
+            "    context,\n"
+            "    tuple(proposal.selected_ids),\n"
+            "    attempt_number=1,\n"
+            "    decision_basis=proposal.decision_basis,\n"
+            "    selected_swap=None,\n"
             ")"
         ),
     )
 
 
 def test_objective_receipt_renders_exact_selected_intervention_without_scores_or_model_text():
-    receipt = objective_receipt(swapped_proposal(), selected_swap())
+    receipt = objective_receipt(swapped_proposal(), selected_swap(), prior_attempt())
 
     assert receipt.validated_intervention == (
         "replace molecule_id='mol-1' with molecule_id='mol-5'"
@@ -62,12 +77,47 @@ def test_objective_receipt_renders_exact_selected_intervention_without_scores_or
     assert "measured limiting pair" not in receipt.validated_intervention
 
 
+def test_objective_receipt_python_evaluation_matches_controller_evaluator_signature():
+    receipt = objective_receipt(proposal())
+    signature = inspect.signature(evaluate_diverse_panel)
+    keyword_names = {
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    }
+
+    assert "    context," in receipt.python_evaluation
+    assert "    tuple(proposal.selected_ids)," in receipt.python_evaluation
+    assert {"attempt_number", "decision_basis", "selected_swap"} == keyword_names
+    assert all(f"    {name}=" in receipt.python_evaluation for name in keyword_names)
+    assert "candidate_pool" not in receipt.python_evaluation
+    assert "similarity_matrix" not in receipt.python_evaluation
+
+
 def test_objective_receipt_rejects_wrong_exact_swap_type():
     class SwapSubclass(ObjectiveSwap):
         pass
 
-    with pytest.raises(ValueError, match="swap schema"):
-        objective_receipt(swapped_proposal(), SwapSubclass(**selected_swap().__dict__))
+    with pytest.raises(ValueError, match="exact swap"):
+        objective_receipt(
+            swapped_proposal(), SwapSubclass(**selected_swap().__dict__), prior_attempt()
+        )
+
+
+def test_objective_receipt_requires_a_canonical_prior_for_revisions():
+    class AttemptSubclass(ObjectiveAttempt):
+        pass
+
+    with pytest.raises(ValueError, match="prior"):
+        objective_receipt(swapped_proposal(), selected_swap())
+    with pytest.raises(ValueError, match="exact"):
+        objective_receipt(
+            swapped_proposal(), selected_swap(), AttemptSubclass(**prior_attempt().__dict__)
+        )
+    with pytest.raises(ValueError, match="prior"):
+        objective_receipt(
+            swapped_proposal(), selected_swap(), replace(prior_attempt(), achieved=True)
+        )
 
 
 @pytest.mark.parametrize(
@@ -93,7 +143,25 @@ def test_objective_receipt_rejects_wrong_exact_swap_type():
 )
 def test_objective_receipt_rejects_false_swap_panel_or_id_provenance(swap):
     with pytest.raises(ValueError, match="provenance"):
-        objective_receipt(swapped_proposal(), swap)
+        objective_receipt(swapped_proposal(), swap, prior_attempt())
+
+
+@pytest.mark.parametrize(
+    "swap, prior",
+    [
+        (
+            selected_swap(),
+            replace(
+                prior_attempt(),
+                selected_ids=("mol-0", "mol-4", "mol-2", "mol-3"),
+            ),
+        ),
+        (replace(selected_swap(), score_delta=0.40), prior_attempt()),
+    ],
+)
+def test_objective_receipt_rejects_forged_predecessor_or_score_delta(swap, prior):
+    with pytest.raises(ValueError, match="provenance"):
+        objective_receipt(swapped_proposal(), swap, prior)
 
 
 def test_objective_receipt_excludes_decision_text_and_is_deterministic():
@@ -101,7 +169,6 @@ def test_objective_receipt_excludes_decision_text_and_is_deterministic():
     second = objective_receipt(proposal())
 
     assert first == second
-    assert "decision_basis" not in repr(first)
     assert "Replace the limiting analogue" not in repr(first)
 
 

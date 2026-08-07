@@ -1,7 +1,9 @@
 import inspect
+from dataclasses import replace
 from types import SimpleNamespace
 
 import ipywidgets as widgets
+import numpy as np
 import pytest
 
 import demo_agent
@@ -10,7 +12,10 @@ from demo_agent import (
     ClusterArgs, EmbedArgs, FingerprintArgs, InspectionArgs, OptimizationArgs,
     ObjectiveProposal, SimilarityArgs, StageProposal, ToolCallError,
 )
-from objective_challenge import ObjectiveAttempt, ObjectiveSwap
+from objective_challenge import (
+    ObjectiveAttempt, ObjectiveCandidate, ObjectiveContext, ObjectiveSwap,
+    evaluate_diverse_panel, rank_legal_swaps,
+)
 from interactive_workflow import InteractiveWorkflow, controls_for
 
 
@@ -199,6 +204,38 @@ def complete_six_stages(workflow):
 def run_objective(workflow):
     complete_six_stages(workflow)
     workflow.objective_button.click()
+
+
+def evaluated_objective_records(candidate_ids=tuple(f"mol-{index}" for index in range(5))):
+    distance = np.full((5, 5), 0.80, dtype=float)
+    np.fill_diagonal(distance, 0.0)
+    distance[0, 1] = distance[1, 0] = 0.35
+    context = ObjectiveContext(
+        candidates=tuple(
+            ObjectiveCandidate(molecule_id, index, index, index)
+            for index, molecule_id in enumerate(candidate_ids)
+        ),
+        baseline_ids=candidate_ids[:4],
+        baseline_score=0.35,
+        benchmark_score=0.80,
+        target_score=0.71,
+        distance_matrix=distance,
+    )
+    first = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Measure the defined baseline panel.",
+    )
+    swap = rank_legal_swaps(context, first)[0]
+    second = evaluate_diverse_panel(
+        context,
+        swap.resulting_ids,
+        attempt_number=2,
+        decision_basis="Use the ranked one-ID replacement.",
+        selected_swap=swap,
+    )
+    return context, first, second
 
 
 def test_all_control_domains_and_parameter_free_stages():
@@ -525,6 +562,83 @@ def test_objective_attempt_row_uses_gray_amber_and_green_by_state():
     assert "#76B900" in InteractiveWorkflow._objective_attempt_row(
         context, initial_achieved
     )
+
+
+def test_objective_attempt_row_binds_evaluated_records_and_escapes_action_content():
+    context, first, second = evaluated_objective_records(
+        ("mol<0>", "mol-1", "mol-2", "mol-3", "mol&4")
+    )
+    adversarial = replace(second, decision_basis="<img src=x onerror=alert(1)>")
+
+    initial_row = InteractiveWorkflow._objective_attempt_row(context, first)
+    revision_row = InteractiveWorkflow._objective_attempt_row(context, adversarial, first)
+
+    assert "baseline D_min 0.350" in initial_row
+    assert "prior D_min 0.350" in revision_row
+    assert "limiting pair" in revision_row
+    assert "replace" in revision_row and "with" in revision_row
+    assert "mol&lt;0&gt;" in revision_row
+    assert "mol&amp;4" in revision_row
+    assert "mol<0>" not in revision_row
+    assert "&lt;img src=x onerror=alert(1)&gt;" in revision_row
+    assert "<img src=x" not in revision_row
+    assert "<b>Outcome:</b> Goal achieved" in revision_row
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda attempt: replace(attempt, attempt_number=4),
+        lambda attempt: replace(attempt, attempt_number=3),
+        lambda attempt: replace(attempt, selected_ids=("mol-0", "mol-1", "mol-2", "mol-3")),
+        lambda attempt: replace(attempt, score=0.79),
+        lambda attempt: replace(
+            attempt,
+            selected_swap=replace(attempt.selected_swap, score_delta=0.44),
+        ),
+    ],
+)
+def test_objective_attempt_row_rejects_forged_evaluated_transition_records(mutation):
+    context, first, second = evaluated_objective_records()
+
+    with pytest.raises(ValueError):
+        InteractiveWorkflow._objective_attempt_row(context, mutation(second), first)
+
+
+def test_objective_attempt_row_adapts_precision_without_erasing_near_threshold_delta():
+    context = SimpleNamespace(baseline_score=0.7096, target_score=0.7104)
+    prior = ObjectiveAttempt(
+        attempt_number=1,
+        selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
+        decision_basis="Measure the baseline.",
+        score=0.7096,
+        limiting_pair=("mol-0", "mol-1"),
+        constraints_passed=True,
+        achieved=False,
+    )
+    swap = ObjectiveSwap(
+        replace_id="mol-1",
+        replacement_id="mol-5",
+        resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
+        predicted_score=0.7100,
+        score_delta=0.0004,
+        limiting_pair=("mol-0", "mol-2"),
+    )
+    attempt = ObjectiveAttempt(
+        attempt_number=2,
+        selected_ids=swap.resulting_ids,
+        decision_basis="Use the narrow measured improvement.",
+        score=0.7100,
+        limiting_pair=swap.limiting_pair,
+        constraints_passed=True,
+        achieved=False,
+        selected_swap=swap,
+    )
+
+    row = InteractiveWorkflow._objective_attempt_row(context, attempt, prior)
+
+    assert "0.7100 &lt; 0.7104" in row
+    assert "Δ +0.0004" in row
 
 
 def test_known_objective_proposal_failure_after_measured_attempt_has_one_guarded_retry(monkeypatch):
