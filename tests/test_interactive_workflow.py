@@ -879,8 +879,12 @@ def test_step_zero_uses_visible_baseline_target_boundary_precision():
 
     summary = InteractiveWorkflow._objective_summary_html(context, ())
 
-    assert "0.500000000000" in summary
-    assert "0.500000000001" in summary
+    target_headline = summary.split("<p><b>Target:</b>", 1)[1].split("</p>", 1)[0]
+    baseline_strip = summary.split("<b>Baseline</b>", 1)[1].split("</span>", 1)[0]
+    assert "0.500000000001" in target_headline
+    assert "0.500000000000" in baseline_strip
+    assert "0.500000000000" not in target_headline
+    assert "0.500000000001" not in baseline_strip
     assert "below at 1e-12 decision precision" in summary
 
 

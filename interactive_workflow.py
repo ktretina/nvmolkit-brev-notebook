@@ -532,6 +532,15 @@ class InteractiveWorkflow:
             )
             for attempt in attempts
         )
+        if baseline.score_key != score_key(context.target_score):
+            display_values = (
+                InteractiveWorkflow._objective_display_values(
+                    baseline.score,
+                    context.target_score,
+                    context.target_score - baseline.score,
+                ),
+                *display_values,
+            )
         precision = max((values[3] for values in display_values), default=3)
         scientific = any(values[4] for values in display_values)
         score_items = [
@@ -858,7 +867,7 @@ class InteractiveWorkflow:
     @staticmethod
     def _objective_precision(score: float, target: float, delta: float) -> int:
         """Use the shortest honest fixed precision for one decision measurement."""
-        for precision in range(3, 7):
+        for precision in range(3, 16):
             score_text = f"{score:.{precision}f}"
             target_text = f"{target:.{precision}f}"
             delta_text = f"{delta:+.{precision}f}"
@@ -866,7 +875,7 @@ class InteractiveWorkflow:
             erased_delta = delta != 0.0 and float(delta_text) == 0.0
             if not indistinguishable_scores and not erased_delta:
                 return precision
-        return 6
+        return 15
 
     @staticmethod
     def _objective_display_values(
