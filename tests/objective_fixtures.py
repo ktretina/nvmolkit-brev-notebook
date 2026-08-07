@@ -1,4 +1,3 @@
-import itertools
 from dataclasses import replace
 
 import numpy as np
@@ -7,7 +6,7 @@ from rdkit import Chem
 from chemistry_workflow import WorkflowPhase, WorkflowState
 import objective_challenge
 from objective_challenge import CANDIDATE_COUNT, ObjectiveCandidate, ObjectiveContext
-from objective_challenge import SCORE_SCALE, score_key
+from objective_challenge import TARGET_FRACTION
 from objective_challenge import (
     TerminationReason,
     accepted_maxima,
@@ -77,7 +76,7 @@ def two_revision_context() -> ObjectiveContext:
         baseline_ids=("candidate-0", "candidate-1", "candidate-2", "candidate-3"),
         baseline_score=0.30,
         benchmark_score=0.90,
-        target_score=0.75,
+        target_score=0.78,
         distance_matrix=distance,
     )
 
@@ -91,7 +90,6 @@ def context_from_distance(
         "mol-2",
         "mol-3",
     ),
-    target_score: float = 0.75,
 ) -> ObjectiveContext:
     values = np.array(distance, dtype=np.float64, copy=True)
     values.setflags(write=False)
@@ -100,17 +98,16 @@ def context_from_distance(
         for index in range(CANDIDATE_COUNT)
     )
     provisional = ObjectiveContext(
-        candidates, baseline_ids, 0.0, 0.0, target_score, values
+        candidates, baseline_ids, 0.0, 0.0, 0.0, values
     )
     baseline = objective_challenge.measure_panel(provisional, baseline_ids).score
-    benchmark = max(
-        objective_challenge.measure_panel(provisional, panel).score
-        for panel in itertools.combinations(
-            tuple(item.molecule_id for item in candidates), 4
-        )
-    )
+    benchmark = objective_challenge.attainable_benchmark(provisional).score
+    target = float(baseline + TARGET_FRACTION * (benchmark - baseline))
     return replace(
-        provisional, baseline_score=baseline, benchmark_score=benchmark
+        provisional,
+        baseline_score=float(baseline),
+        benchmark_score=float(benchmark),
+        target_score=target,
     )
 
 
@@ -118,7 +115,6 @@ def controlled_context(
     *,
     distances: dict[tuple[str, str], float],
     default_distance: float,
-    target_score: float = 0.75,
 ) -> ObjectiveContext:
     matrix = np.full(
         (CANDIDATE_COUNT, CANDIDATE_COUNT), default_distance, dtype=np.float64
@@ -128,7 +124,7 @@ def controlled_context(
         first = int(first_id.removeprefix("mol-"))
         second = int(second_id.removeprefix("mol-"))
         matrix[first, second] = matrix[second, first] = value
-    return context_from_distance(matrix, target_score=target_score)
+    return context_from_distance(matrix)
 
 
 def controlled_context_with_ranked_swaps() -> ObjectiveContext:
@@ -144,15 +140,18 @@ def controlled_context_with_ranked_swaps() -> ObjectiveContext:
         for baseline in ("mol-0", "mol-1", "mol-2", "mol-3"):
             if baseline != blocked:
                 distances[(replacement, baseline)] = quality
-    return controlled_context(
-        distances=distances, default_distance=0.95, target_score=0.55
-    )
+    return controlled_context(distances=distances, default_distance=0.95)
 
 
 def controlled_context_without_improving_swaps() -> ObjectiveContext:
-    return controlled_context(
-        distances={}, default_distance=0.50, target_score=0.60
-    )
+    distances = {}
+    for first in range(4):
+        for second in range(first + 1, 4):
+            distances[(f"mol-{first}", f"mol-{second}")] = 0.50
+    for first in range(4):
+        for second in range(4, 8):
+            distances[(f"mol-{first}", f"mol-{second}")] = 0.50
+    return controlled_context(distances=distances, default_distance=0.90)
 
 
 def controlled_context_with_action_count(count: int) -> ObjectiveContext:
@@ -171,9 +170,7 @@ def controlled_context_with_action_count(count: int) -> ObjectiveContext:
         for baseline in ("mol-0", "mol-1", "mol-2", "mol-3"):
             if baseline != blocked:
                 distances[(replacement, baseline)] = effective_quality
-    return controlled_context(
-        distances=distances, default_distance=0.95, target_score=0.95
-    )
+    return controlled_context(distances=distances, default_distance=0.95)
 
 
 def boundary_policy_context(candidate: float, current: float) -> ObjectiveContext:
@@ -183,14 +180,7 @@ def boundary_policy_context(candidate: float, current: float) -> ObjectiveContex
         distances[(replacement, "mol-0")] = current
         for baseline in ("mol-1", "mol-2", "mol-3"):
             distances[(replacement, baseline)] = quality
-    target = (
-        candidate
-        if score_key(candidate) > score_key(current)
-        else (score_key(current) + 1) / SCORE_SCALE
-    )
-    return controlled_context(
-        distances=distances, default_distance=0.95, target_score=target
-    )
+    return controlled_context(distances=distances, default_distance=0.95)
 
 
 def controlled_context_with_tied_paths(all_paths_reach: bool) -> ObjectiveContext:
@@ -211,26 +201,24 @@ def controlled_context_with_tied_paths(all_paths_reach: bool) -> ObjectiveContex
         ("mol-4", "mol-6"): 0.90,
         ("mol-5", "mol-7"): 0.90 if all_paths_reach else 0.50,
     }
-    return controlled_context(
-        distances=distances, default_distance=0.90, target_score=0.80
-    )
+    return controlled_context(distances=distances, default_distance=0.90)
 
 
 def controlled_context_with_three_misses() -> ObjectiveContext:
     matrix = np.array(
         [
-            [0, .2, .4, .2, .2, .1, .4, .8],
-            [.2, 0, .8, .3, .1, .3, .4, .2],
-            [.4, .8, 0, .5, .6, .8, .6, .2],
-            [.2, .3, .5, 0, .6, .8, .7, .8],
-            [.2, .1, .6, .6, 0, .6, .6, .6],
-            [.1, .3, .8, .8, .6, 0, .2, .9],
-            [.4, .4, .6, .7, .6, .2, 0, .2],
-            [.8, .2, .2, .8, .6, .9, .2, 0],
+            [0, .70, .05, .90, .75, .40, .90, .65],
+            [.70, 0, .35, .15, .40, .75, .60, .50],
+            [.05, .35, 0, .90, .35, .80, .95, .15],
+            [.90, .15, .90, 0, .15, .80, .40, .20],
+            [.75, .40, .35, .15, 0, .10, .60, .50],
+            [.40, .75, .80, .80, .10, 0, .50, .35],
+            [.90, .60, .95, .40, .60, .50, 0, .70],
+            [.65, .50, .15, .20, .50, .35, .70, 0],
         ],
         dtype=np.float64,
     )
-    return context_from_distance(matrix, target_score=1.0)
+    return context_from_distance(matrix)
 
 
 def terminal_fixture(reason: str | TerminationReason, attempt_count: int):

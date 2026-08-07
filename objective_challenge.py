@@ -419,17 +419,33 @@ def attainable_benchmark(context: ObjectiveContext) -> PanelMeasurement:
     )
 
 
-def _validated_attainable_benchmark(context: ObjectiveContext) -> PanelMeasurement:
+def _validated_context_scores(
+    context: ObjectiveContext,
+) -> tuple[PanelMeasurement, PanelMeasurement, float]:
+    baseline = measure_panel(context, context.baseline_ids)
     benchmark = attainable_benchmark(context)
+    expected_target = float(
+        baseline.score
+        + TARGET_FRACTION * (benchmark.score - baseline.score)
+    )
     if (
-        type(context.benchmark_score) is not float
+        type(context.baseline_score) is not float
+        or not np.isfinite(context.baseline_score)
+        or context.baseline_score != baseline.score
+        or score_key(context.baseline_score) != baseline.score_key
+        or type(context.benchmark_score) is not float
+        or not np.isfinite(context.benchmark_score)
         or context.benchmark_score != benchmark.score
         or score_key(context.benchmark_score) != benchmark.score_key
+        or type(context.target_score) is not float
+        or not np.isfinite(context.target_score)
+        or context.target_score != expected_target
+        or score_key(context.target_score) != score_key(expected_target)
     ):
         raise ValueError(
-            "Stored objective benchmark does not match the exact attainable benchmark."
+            "Stored objective context scores do not match exact recomputation."
         )
-    return benchmark
+    return baseline, benchmark, expected_target
 
 
 def _validated_measurement(
@@ -449,6 +465,7 @@ def enumerate_legal_swaps(
     """Enumerate every canonical strict one-ID improvement before menu capping."""
     if type(context) is not ObjectiveContext:
         raise ValueError("Objective swap enumeration requires an exact context.")
+    _validated_context_scores(context)
     current = _validated_measurement(context, source)
     if current.achieved:
         return ()
@@ -517,6 +534,7 @@ def build_action_menu(
     accepted_attempt_count: int,
 ) -> ObjectiveActionMenu:
     """Build one immutable capped offer set for an exact measured state revision."""
+    _validated_context_scores(context)
     current = _validated_measurement(context, source)
     if (
         type(accepted_attempt_count) is not int
@@ -603,7 +621,7 @@ def certify_argmax_reachability(context: ObjectiveContext) -> bool:
     """Prove every displayed tied-maximum branch reaches target within the bound."""
     if type(context) is not ObjectiveContext:
         raise ValueError("Objective certification requires an exact context.")
-    baseline = measure_panel(context, context.baseline_ids)
+    baseline, _benchmark, _target = _validated_context_scores(context)
     if baseline.achieved or baseline.score_key == score_key(context.benchmark_score):
         return True
 
@@ -796,8 +814,7 @@ def terminal_objective_run(
         reason = TerminationReason(termination_reason)
     except ValueError as error:
         raise ValueError("Objective run has an invalid termination reason.") from error
-    baseline = measure_panel(context, context.baseline_ids)
-    actual_benchmark = attainable_benchmark(context)
+    baseline, actual_benchmark, _target = _validated_context_scores(context)
     current = baseline
     for accepted_count, attempt in enumerate(attempts):
         if current.achieved:
@@ -874,6 +891,7 @@ def finalize_objective_run(
     context: ObjectiveContext, attempts: tuple[ObjectiveAttempt, ...]
 ) -> ObjectiveRun:
     """Normalize the legacy baseline-first flow into authoritative substitutions."""
+    _validated_context_scores(context)
     if not attempts or len(attempts) > MAX_ATTEMPTS + 1:
         raise ValueError("Objective run has an invalid accepted-attempt count.")
     if all(attempt.state_id for attempt in attempts):
@@ -961,7 +979,7 @@ def build_objective_evidence(run: ObjectiveRun) -> EvidenceRecord:
     if type(run) is not ObjectiveRun:
         raise ValueError("Objective evidence requires an exact terminal run.")
     context = run.context
-    benchmark = _validated_attainable_benchmark(context)
+    baseline, benchmark, expected_target = _validated_context_scores(context)
     terminal_menu = None
     if run.termination_reason is TerminationReason.NO_LEGAL_IMPROVING_SWAP:
         current = (
@@ -1026,7 +1044,6 @@ def build_objective_evidence(run: ObjectiveRun) -> EvidenceRecord:
                 "selected_swap": selected_swap_payload,
             }
         )
-    baseline = measure_panel(context, context.baseline_ids)
     final = measure_panel(context, run.final_ids)
     if (
         run.baseline != baseline
@@ -1061,14 +1078,14 @@ def build_objective_evidence(run: ObjectiveRun) -> EvidenceRecord:
         "panel_size": PANEL_SIZE,
         "attempt_limit": MAX_ATTEMPTS,
         "baseline_ids": list(context.baseline_ids),
-        "baseline_score": context.baseline_score,
+        "baseline_score": baseline.score,
         "baseline_score_key": baseline.score_key,
         "baseline": measurement_payload(baseline),
-        "benchmark_score": context.benchmark_score,
+        "benchmark_score": benchmark.score,
         "benchmark_score_key": benchmark.score_key,
         "target_rule": "baseline plus 80 percent of attainable improvement",
-        "target_score": context.target_score,
-        "target_score_key": score_key(context.target_score),
+        "target_score": expected_target,
+        "target_score_key": score_key(expected_target),
         "attempts": attempt_payloads,
         "attempt_count": len(run.attempts),
         "termination_reason": run.termination_reason.value,

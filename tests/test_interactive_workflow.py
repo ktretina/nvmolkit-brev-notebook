@@ -14,7 +14,7 @@ from demo_agent import (
 )
 from objective_challenge import (
     ObjectiveAttempt, ObjectiveCandidate, ObjectiveContext, ObjectiveSwap,
-    evaluate_diverse_panel, rank_legal_swaps,
+    TARGET_FRACTION, evaluate_diverse_panel, rank_legal_swaps,
 )
 from interactive_workflow import InteractiveWorkflow, controls_for
 
@@ -113,7 +113,7 @@ class Controller:
             baseline_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
             baseline_score=0.35,
             benchmark_score=0.80,
-            target_score=0.71,
+            target_score=0.35 + TARGET_FRACTION * (0.80 - 0.35),
             candidates=tuple(
                 SimpleNamespace(molecule_id=f"mol-{index}", cluster_id=index)
                 for index in range(8)
@@ -218,7 +218,7 @@ def evaluated_objective_records(candidate_ids=tuple(f"mol-{index}" for index in 
         baseline_ids=candidate_ids[:4],
         baseline_score=0.35,
         benchmark_score=0.80,
-        target_score=0.71,
+        target_score=0.35 + TARGET_FRACTION * (0.80 - 0.35),
         distance_matrix=distance,
     )
     first = evaluate_diverse_panel(

@@ -8,7 +8,7 @@ import pytest
 from demo_agent import ObjectiveProposal
 from objective_challenge import (
     ObjectiveAttempt, ObjectiveCandidate, ObjectiveContext, ObjectiveSwap,
-    evaluate_diverse_panel, rank_legal_swaps,
+    TARGET_FRACTION, evaluate_diverse_panel, rank_legal_swaps,
 )
 from objective_receipts import ObjectiveReceipt, objective_receipt
 
@@ -63,7 +63,7 @@ def evaluator_records():
         baseline_ids=candidate_ids[:4],
         baseline_score=0.35,
         benchmark_score=0.80,
-        target_score=0.71,
+        target_score=0.35 + TARGET_FRACTION * (0.80 - 0.35),
         distance_matrix=distance,
     )
     first = evaluate_diverse_panel(

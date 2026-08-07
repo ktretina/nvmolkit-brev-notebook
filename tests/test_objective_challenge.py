@@ -226,7 +226,7 @@ def test_baseline_terminal_recomputes_attainable_best_instead_of_trusting_contex
     context = controlled_context_with_ranked_swaps()
     forged = replace(context, benchmark_score=context.baseline_score)
 
-    with pytest.raises(ValueError, match="actually optimal"):
+    with pytest.raises(ValueError, match="context scores"):
         baseline_terminal_run(forged)
 
 
@@ -254,8 +254,61 @@ def test_o01_rejects_every_incoherent_stored_benchmark(forgery):
         ),
     )
 
-    with pytest.raises(ValueError, match="benchmark"):
+    with pytest.raises(ValueError, match="context scores"):
         build_objective_evidence(forged_run)
+
+
+@pytest.mark.parametrize(
+    ("field", "forged_value"),
+    (
+        ("baseline_score", lambda context: float(np.nextafter(context.baseline_score, 1.0))),
+        ("target_score", lambda context: float(np.nextafter(context.target_score, 1.0))),
+    ),
+)
+def test_authoritative_policy_rejects_same_key_raw_context_score_forgery(
+    field, forged_value
+):
+    context = build_objective_context(optimized_state())
+    value = forged_value(context)
+    assert value != getattr(context, field)
+    assert objective_challenge.score_key(value) == objective_challenge.score_key(
+        getattr(context, field)
+    )
+    forged = replace(context, **{field: value})
+    source = objective_challenge.measure_panel(forged, forged.baseline_ids)
+
+    with pytest.raises(ValueError, match="context scores"):
+        build_action_menu(forged, source, 0)
+    with pytest.raises(ValueError, match="context scores"):
+        objective_challenge.certify_argmax_reachability(forged)
+
+
+def test_weaker_forged_target_is_rejected_by_every_authoritative_entry():
+    context = build_objective_context(optimized_state())
+    valid_run = terminal_objective_run(
+        context, (), TerminationReason.OBJECTIVE_PROVIDER_FAILURE
+    )
+    forged = replace(context, target_score=context.baseline_score)
+    forged_source = objective_challenge.measure_panel(forged, forged.baseline_ids)
+    forged_run = replace(valid_run, context=forged, baseline=forged_source)
+    assert forged_source.achieved is True
+
+    with pytest.raises(ValueError, match="context scores"):
+        build_action_menu(forged, forged_source, 0)
+    with pytest.raises(ValueError, match="context scores"):
+        terminal_objective_run(
+            forged, (), TerminationReason.OBJECTIVE_PROVIDER_FAILURE
+        )
+    with pytest.raises(ValueError, match="context scores"):
+        build_objective_evidence(forged_run)
+
+
+def test_exact_production_context_scores_pass_authoritative_validation():
+    context = build_objective_context(optimized_state())
+    source = objective_challenge.measure_panel(context, context.baseline_ids)
+
+    assert build_action_menu(context, source, 0).actions
+    assert objective_challenge.certify_argmax_reachability(context) is True
 
 
 def test_legacy_finalizer_rejects_arbitrary_target_panel_without_swap():
@@ -785,7 +838,6 @@ def test_o01_retains_every_recomputed_canonical_limiting_pair():
             ("mol-2", "mol-3"): 0.4,
         },
         default_distance=0.8,
-        target_score=0.9,
     )
     run = terminal_objective_run(
         context, (), TerminationReason.OBJECTIVE_PROVIDER_FAILURE
