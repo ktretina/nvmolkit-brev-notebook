@@ -33,11 +33,11 @@ EXPECTED_THEMES = (
 HEADLINE_FRAGMENTS = {
     TerminationReason.TARGET_ACHIEVED: "Target achieved",
     TerminationReason.BASELINE_ALREADY_OPTIMAL: "Baseline already optimal",
-    TerminationReason.ATTEMPT_LIMIT_REACHED: "Attempt limit reached",
-    TerminationReason.NO_LEGAL_IMPROVING_SWAP: "No legal improving swap",
-    TerminationReason.OBJECTIVE_CORRECTION_LIMIT: "Objective correction limit reached",
-    TerminationReason.OBJECTIVE_PROVIDER_FAILURE: "Objective provider failure",
-    TerminationReason.EVALUATION_NOT_COMPLETED: "Evaluation not completed",
+    TerminationReason.ATTEMPT_LIMIT_REACHED: "Objective not achieved within attempt limit",
+    TerminationReason.NO_LEGAL_IMPROVING_SWAP: "No legal improving substitution",
+    TerminationReason.OBJECTIVE_CORRECTION_LIMIT: "Objective selection stopped after invalid responses",
+    TerminationReason.OBJECTIVE_PROVIDER_FAILURE: "Objective provider unavailable",
+    TerminationReason.EVALUATION_NOT_COMPLETED: "Objective evaluation not completed",
 }
 
 
@@ -110,8 +110,11 @@ def test_measured_summary_exposes_workflow_counts_and_scope():
     report, run = report_and_run()
     summary = build_measured_summary(report, run)
 
-    assert (summary.raw_count, summary.valid_count, summary.invalid_count) == (256, 256, 0)
-    assert (summary.fingerprint_radius, summary.fingerprint_size_bits) == (2, 1024)
+    assert (summary.raw_count, summary.valid_molecule_count, summary.invalid_count) == (256, 256, 0)
+    assert (summary.fingerprint_radius, summary.fingerprint_size) == (2, 1024)
+    assert type(summary.facts) is tuple and summary.facts
+    assert not hasattr(summary, "valid_count")
+    assert not hasattr(summary, "fingerprint_size_bits")
     assert summary.similarity_quartiles == (0.071, 0.118, 0.184)
     assert summary.similarity_p90 == 0.291
     assert summary.most_similar_pair_ids == ("mol-17", "mol-203")
@@ -219,3 +222,41 @@ def test_mutated_snapshot_invalidates_previously_rendered_finding():
     )
     with pytest.raises(ValueError, match="deterministic"):
         validate_finding(finding, build_evidence_snapshot(mutated, run))
+
+
+@pytest.mark.parametrize(
+    ("key", "mutation", "message"),
+    (
+        (
+            "E03",
+            lambda payload: payload["most_similar_pair"].update(
+                molecule_ids=["mol-17", "mol-17"]
+            ),
+            "pair",
+        ),
+        (
+            "E04",
+            lambda payload: payload.update(
+                largest_cluster_sizes=[200] + payload["largest_cluster_sizes"][1:]
+            ),
+            "cluster",
+        ),
+        (
+            "E05",
+            lambda payload: payload.update(partial_embedding_ids=["mol-0"]),
+            "embedding",
+        ),
+        (
+            "E06",
+            lambda payload: payload["selected_conformer_records"].pop(),
+            "selected",
+        ),
+    ),
+)
+def test_snapshot_rejects_exact_impossible_cross_record_payloads(
+    key, mutation, message
+):
+    report, run = report_and_run()
+
+    with pytest.raises(ValueError, match=message):
+        build_evidence_snapshot(mutate_record(report, key, mutation), run)

@@ -41,11 +41,11 @@ class EvidenceFinding:
 @dataclass(frozen=True)
 class MeasuredSummary:
     raw_count: int
-    valid_count: int
+    valid_molecule_count: int
     invalid_count: int
     excluded_count: int
     fingerprint_radius: int
-    fingerprint_size_bits: int
+    fingerprint_size: int
     representation_name: str
     similarity_quartiles: tuple[float, float, float]
     similarity_p90: float
@@ -79,16 +79,17 @@ class MeasuredSummary:
     termination_reason: str
     achieved: bool
     headline: str
+    facts: tuple[str, ...]
 
 
 _HEADLINE_PREFIXES = {
     "target_achieved": "Target achieved",
     "baseline_already_optimal": "Baseline already optimal",
-    "attempt_limit_reached": "Attempt limit reached",
-    "no_legal_improving_swap": "No legal improving swap",
-    "objective_correction_limit": "Objective correction limit reached",
-    "objective_provider_failure": "Objective provider failure",
-    "evaluation_not_completed": "Evaluation not completed",
+    "attempt_limit_reached": "Objective not achieved within attempt limit",
+    "no_legal_improving_swap": "No legal improving substitution",
+    "objective_correction_limit": "Objective selection stopped after invalid responses",
+    "objective_provider_failure": "Objective provider unavailable",
+    "evaluation_not_completed": "Objective evaluation not completed",
 }
 
 
@@ -335,9 +336,11 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
         type(pair["molecule_ids"]) is not list
         or len(pair["molecule_ids"]) != 2
         or any(type(value) is not str or not value for value in pair["molecule_ids"])
+        or len(set(pair["molecule_ids"])) != 2
         or type(pair["source_rows"]) is not list
         or len(pair["source_rows"]) != 2
         or any(type(value) is not int or value < 0 for value in pair["source_rows"])
+        or len(set(pair["source_rows"])) != 2
         or _number(pair["similarity"], "E03 pair similarity") != similarities[-1]
     ):
         raise ValueError("E03 most-similar pair fields are contradictory.")
@@ -350,8 +353,10 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
         e04["singleton_fraction"], "E04 singleton fraction"
     )
     sizes = e04["largest_cluster_sizes"]
+    non_singleton_count = cluster_count - singletons
     if (
         assignments != valid
+        or cluster_count > assignments
         or singletons > cluster_count
         or not math.isclose(
             singleton_fraction,
@@ -366,6 +371,30 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
         or sizes != sorted(sizes, reverse=True)
     ):
         raise ValueError("E04 cluster count fields are contradictory.")
+    expected_largest_count = min(15, cluster_count)
+    if len(sizes) != expected_largest_count:
+        raise ValueError("E04 largest-cluster count is contradictory.")
+    listed_non_singletons = min(non_singleton_count, expected_largest_count)
+    expected_listed_singletons = expected_largest_count - listed_non_singletons
+    if (
+        sum(size > 1 for size in sizes) != listed_non_singletons
+        or sum(size == 1 for size in sizes) != expected_listed_singletons
+    ):
+        raise ValueError("E04 largest-cluster sizes are infeasible.")
+    remaining_non_singletons = non_singleton_count - listed_non_singletons
+    remaining_singletons = singletons - expected_listed_singletons
+    remaining_assignments = assignments - sum(sizes) - remaining_singletons
+    if remaining_non_singletons == 0:
+        feasible_largest_sizes = remaining_assignments == 0
+    else:
+        maximum_remaining_size = sizes[-1]
+        feasible_largest_sizes = (
+            2 * remaining_non_singletons
+            <= remaining_assignments
+            <= maximum_remaining_size * remaining_non_singletons
+        )
+    if not feasible_largest_sizes:
+        raise ValueError("E04 largest-cluster sizes are infeasible for assignments.")
 
     requested_reps = _integer(
         e05["requested_representative_count"], "E05 requested representatives"
@@ -382,6 +411,8 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
         e05["generated_conformer_count"], "E05 generated conformers"
     )
     representatives = e05["representatives"]
+    partial_embedding_ids = e05["partial_embedding_ids"]
+    zero_embedding_ids = e05["zero_embedding_ids"]
     if (
         requested_reps != selected_reps + shortfall
         or type(representatives) is not list
@@ -412,6 +443,28 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
         representative_by_id[molecule_id] = representative
     if len({item["cluster_id"] for item in representatives}) != selected_reps:
         raise ValueError("E05 representative cluster provenance is contradictory.")
+    representative_ids = set(representative_by_id)
+    if (
+        type(partial_embedding_ids) is not list
+        or type(zero_embedding_ids) is not list
+        or any(type(value) is not str for value in (*partial_embedding_ids, *zero_embedding_ids))
+        or len(set(partial_embedding_ids)) != len(partial_embedding_ids)
+        or len(set(zero_embedding_ids)) != len(zero_embedding_ids)
+        or not set(partial_embedding_ids).issubset(representative_ids)
+        or not set(zero_embedding_ids).issubset(representative_ids)
+        or set(partial_embedding_ids) & set(zero_embedding_ids)
+    ):
+        raise ValueError("E05 embedding ID accounting is contradictory.")
+    full_embedding_count = (
+        selected_reps - len(partial_embedding_ids) - len(zero_embedding_ids)
+    )
+    minimum_generated = full_embedding_count * per_rep + len(partial_embedding_ids)
+    maximum_generated = (
+        full_embedding_count * per_rep
+        + len(partial_embedding_ids) * max(0, per_rep - 1)
+    )
+    if not minimum_generated <= generated <= maximum_generated:
+        raise ValueError("E05 embedding counts are infeasible.")
 
     attempted = _integer(
         e06["attempted_conformer_count"], "E06 attempted conformers"
@@ -496,6 +549,36 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
         ):
             raise ValueError("E06 selected-conformer provenance is contradictory.")
         selected_ids.add(record["molecule_id"])
+    conformer_counts = {
+        molecule_id: sum(
+            key_molecule_id == molecule_id
+            for key_molecule_id, _ in conformers_by_key
+        )
+        for molecule_id in representative_by_id
+    }
+    actual_partial_ids = {
+        molecule_id
+        for molecule_id, count in conformer_counts.items()
+        if 0 < count < per_rep
+    }
+    actual_zero_ids = {
+        molecule_id for molecule_id, count in conformer_counts.items() if count == 0
+    }
+    if (
+        any(count > per_rep for count in conformer_counts.values())
+        or actual_partial_ids != set(partial_embedding_ids)
+        or actual_zero_ids != set(zero_embedding_ids)
+    ):
+        raise ValueError("E05 embedding IDs do not match E06 conformer records.")
+    molecules_with_converged_samples = {
+        molecule_id
+        for (molecule_id, _), record in conformers_by_key.items()
+        if record["converged"]
+    }
+    if selected_ids != molecules_with_converged_samples:
+        raise ValueError(
+            "E06 selected minima must cover exactly the molecules with converged samples."
+        )
 
     candidate_ids = o01["candidate_ids"]
     candidate_clusters = o01["candidate_cluster_ids"]
@@ -525,13 +608,29 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
     limiting_similarities = tuple(final_similarity for _ in limiting_pairs)
     reason = o01["termination_reason"]
     achieved = o01["achieved"]
+    headline = _headline(reason, final, target)
+    facts = (
+        f"{valid} valid molecules were retained from {raw} raw rows; {invalid} were excluded.",
+        f"Morgan fingerprints used radius {radius} and size {size} bits.",
+        (
+            "Tanimoto similarity quartiles were "
+            f"{similarities[0]:.3f}, {similarities[1]:.3f}, and {similarities[2]:.3f}."
+        ),
+        f"The library produced {cluster_count} clusters, including {singletons} singletons.",
+        f"MMFF94 converged {converged} of {attempted} sampled conformers.",
+        (
+            f"The final panel contains {final_panel_count} compounds from "
+            f"{final_cluster_count} distinct clusters."
+        ),
+        headline,
+    )
     return MeasuredSummary(
         raw_count=raw,
-        valid_count=valid,
+        valid_molecule_count=valid,
         invalid_count=invalid,
         excluded_count=invalid,
         fingerprint_radius=radius,
-        fingerprint_size_bits=size,
+        fingerprint_size=size,
         representation_name="Morgan radius-2 1024-bit fingerprints with Tanimoto similarity",
         similarity_quartiles=(similarities[0], similarities[1], similarities[2]),
         similarity_p90=similarities[3],
@@ -564,7 +663,8 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
         attempt_count=_integer(o01["attempt_count"], "O01 attempt count"),
         termination_reason=reason,
         achieved=achieved,
-        headline=_headline(reason, final, target),
+        headline=headline,
+        facts=facts,
     )
 
 
@@ -582,9 +682,9 @@ _FINDING_PREDICATES: dict[str, _FindingPredicate] = {
         "F01",
         "dataset_scope",
         ("E01",),
-        lambda summary: summary.valid_count > 0,
+        lambda summary: summary.valid_molecule_count > 0,
         lambda summary: (
-            f"The dataset contained {summary.valid_count} valid molecules from "
+            f"The dataset contained {summary.valid_molecule_count} valid molecules from "
             f"{summary.raw_count} raw rows."
         ),
     ),
@@ -610,7 +710,7 @@ _FINDING_PREDICATES: dict[str, _FindingPredicate] = {
         "molecular_representation",
         ("E02",),
         lambda summary: summary.fingerprint_radius == 2
-        and summary.fingerprint_size_bits == 1024,
+        and summary.fingerprint_size == 1024,
         lambda summary: f"Molecular structure was represented with {summary.representation_name}.",
     ),
     "representation_reuse": _FindingPredicate(
