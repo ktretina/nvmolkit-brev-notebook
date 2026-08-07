@@ -440,6 +440,7 @@ def terminal_objective_run(
     reason: TerminationReason,
 ) -> ObjectiveRun:
     baseline = measure_panel(context, context.baseline_ids)
+    benchmark = attainable_benchmark(context)
     numbers = tuple(item.attempt_number for item in attempts)
     if numbers != tuple(range(1, len(attempts) + 1)):
         raise ValueError("Objective attempts must be sequential.")
@@ -447,11 +448,18 @@ def terminal_objective_run(
     if current != expected_current:
         raise ValueError("Objective terminal state must use the last measured panel.")
     if reason == "target_achieved" and (
-        (attempts and not current.achieved) or (not attempts and not baseline.achieved)
+        (attempts and not current.achieved)
+        or (
+            not attempts
+            and (
+                not baseline.achieved
+                or baseline.score_key == benchmark.score_key
+            )
+        )
     ):
         raise ValueError("Target success requires a measured target-achieving state.")
     if reason == "baseline_already_optimal" and (
-        attempts or baseline.score_key != score_key(context.benchmark_score)
+        attempts or baseline.score_key != benchmark.score_key
     ):
         raise ValueError("Baseline-optimal termination is inconsistent.")
     if reason == "attempt_limit_reached" and (
