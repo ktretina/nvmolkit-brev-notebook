@@ -22,10 +22,14 @@ from objective_challenge import (
 
 
 class FakeTensor:
-    def __init__(self, values):
+    def __init__(self, values, *, device="cpu"):
         self.values = np.asarray(values, dtype=float)
+        self.device = device
 
     def cpu(self):
+        return self
+
+    def torch(self):
         return self
 
     def numpy(self):
@@ -33,11 +37,19 @@ class FakeTensor:
 
 
 class FakeGpuResult:
-    def __init__(self, values):
-        self.tensor = FakeTensor(values)
+    def __init__(self, values, *, device="cpu"):
+        self.tensor = FakeTensor(values, device=device)
 
     def torch(self):
         return self.tensor
+
+
+class FakeOptimizationResult:
+    def __init__(self):
+        self.energies = FakeTensor([1.0, 2.0, 3.0])
+        self.converged = FakeTensor([1, 1, 1])
+        self.mol_indices = FakeTensor([0, 1, 2])
+        self.conf_indices = FakeTensor([0, 0, 0])
 
 
 def optimized_state(baseline_optimal: bool = False) -> WorkflowState:
@@ -46,6 +58,19 @@ def optimized_state(baseline_optimal: bool = False) -> WorkflowState:
     np.fill_diagonal(distance, 0.0)
     if not baseline_optimal:
         distance[0, 1] = distance[1, 0] = 0.35
+    conformer_molecules = []
+    representative_records = []
+    for index in range(3):
+        molecule = Chem.AddHs(Chem.MolFromSmiles(smiles[index]))
+        molecule.AddConformer(Chem.Conformer(molecule.GetNumAtoms()))
+        conformer_molecules.append(molecule)
+        representative_records.append({
+            "molecule_id": f"mol-{index}",
+            "molecule_index": index,
+            "source_row": index,
+            "cluster_id": index,
+            "generated_conformer_count": 1,
+        })
     return WorkflowState(
         phase=WorkflowPhase.OPTIMIZED,
         records=[
@@ -53,8 +78,18 @@ def optimized_state(baseline_optimal: bool = False) -> WorkflowState:
             for index, value in enumerate(smiles)
         ],
         molecules=[Chem.MolFromSmiles(value) for value in smiles],
+        fingerprints=FakeGpuResult(
+            np.zeros((CANDIDATE_COUNT, 32), dtype=np.int32), device="cuda:0"
+        ),
+        fingerprint_parameters=(2, 1024),
         similarity=FakeGpuResult(1.0 - distance),
         clusters=[[index] for index in range(CANDIDATE_COUNT)],
+        cluster_cutoff=0.4,
+        representative_records=representative_records,
+        conformer_molecules=conformer_molecules,
+        optimization_result=FakeOptimizationResult(),
+        summaries={"fixture": {"status": "complete"}},
+        embedding_parameters=(3, "largest_clusters_first", 3),
     )
 
 

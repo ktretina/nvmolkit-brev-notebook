@@ -6,7 +6,7 @@ import json
 import hashlib
 import re
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
 
@@ -568,20 +568,9 @@ def _prepared_snapshot_digest(
     report: WorkflowReport,
     turn_count: int,
 ) -> str:
-    context = build_objective_context(state)
     payload = {
         "messages": _json_safe(messages),
-        "state": {
-            "phase": state.phase.value,
-            "records": _json_safe(state.records),
-            "clusters": _json_safe(state.clusters),
-            "candidates": [candidate.__dict__ for candidate in context.candidates],
-            "baseline_ids": list(context.baseline_ids),
-            "baseline_score": context.baseline_score,
-            "benchmark_score": context.benchmark_score,
-            "target_score": context.target_score,
-            "distance_matrix": context.distance_matrix.tolist(),
-        },
+        "state": _canonical_snapshot_value(state),
         "plan": plan.model_dump(mode="json"),
         "stage_results": [
             {
@@ -601,20 +590,81 @@ def _prepared_snapshot_digest(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _canonical_snapshot_value(value: Any) -> Any:
+    """Losslessly normalize retained mutable artifacts for tamper detection."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, BaseModel):
+        return _canonical_snapshot_value(value.model_dump(mode="python"))
+    if isinstance(value, bytes):
+        return {"__bytes__": value.hex()}
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_snapshot_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_snapshot_value(item) for item in value]
+    if is_dataclass(value):
+        return {
+            "__type__": f"{type(value).__module__}.{type(value).__qualname__}",
+            "fields": {
+                item.name: _canonical_snapshot_value(getattr(value, item.name))
+                for item in dataclass_fields(value)
+            },
+        }
+    to_binary = getattr(value, "ToBinary", None)
+    if callable(to_binary):
+        return {
+            "__type__": f"{type(value).__module__}.{type(value).__qualname__}",
+            "binary": bytes(to_binary()).hex(),
+        }
+    optimization_fields = ("energies", "converged", "mol_indices", "conf_indices")
+    if all(hasattr(value, name) for name in optimization_fields):
+        return {
+            "__type__": f"{type(value).__module__}.{type(value).__qualname__}",
+            "optimization_buffers": {
+                name: _canonical_snapshot_value(getattr(value, name))
+                for name in optimization_fields
+            },
+        }
+    as_tensor = getattr(value, "torch", None)
+    if callable(as_tensor):
+        tensor = as_tensor()
+        if tensor is not value:
+            return {
+                "__type__": f"{type(value).__module__}.{type(value).__qualname__}",
+                "tensor": _canonical_snapshot_value(tensor),
+            }
+    to_list = getattr(value, "tolist", None)
+    if callable(to_list):
+        return {
+            "__type__": f"{type(value).__module__}.{type(value).__qualname__}",
+            "shape": list(getattr(value, "shape", ())),
+            "dtype": str(getattr(value, "dtype", "")),
+            "device": str(getattr(value, "device", "")),
+            "values": _canonical_snapshot_value(to_list()),
+        }
+    if hasattr(value, "__dict__"):
+        return {
+            "__type__": f"{type(value).__module__}.{type(value).__qualname__}",
+            "attributes": _canonical_snapshot_value(vars(value)),
+        }
+    raise ValueError(
+        f"Prepared snapshot contains an unsupported artifact: {type(value).__qualname__}."
+    )
+
+
 def _validate_prepared_scientific_semantics(
     state: WorkflowState, report: WorkflowReport
 ) -> None:
-    payloads = {
-        record.key: json.loads(record.payload_json) for record in report.evidence
-    }
-    molecule_count = len(state.records)
-    if (
-        payloads["E01"].get("valid_count") != molecule_count
-        or payloads["E02"].get("molecule_count") != molecule_count
-        or payloads["E03"].get("matrix_shape") != [molecule_count, molecule_count]
-        or payloads["E04"].get("assignment_count") != molecule_count
-        or payloads["E04"].get("cluster_count") != len(state.clusters)
-    ):
+    try:
+        rebuilt_report = build_workflow_report(deepcopy(state))
+    except (RuntimeError, TypeError, ValueError) as error:
+        raise ValueError(
+            "Prepared state cannot rebuild the canonical E01-E06 report."
+        ) from error
+    if rebuilt_report != report:
         raise ValueError("Prepared state and E01-E06 report are inconsistent.")
     context = build_objective_context(state)
     current = measure_panel(context, context.baseline_ids)

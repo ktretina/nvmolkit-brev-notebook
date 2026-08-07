@@ -8,8 +8,13 @@ import httpx
 import pytest
 
 import demo_agent
-from chemistry_workflow import EvidenceRecord, StageResult, WorkflowPhase, WorkflowReport
-from objective_fixtures import evidence_report, optimized_state, report_and_run
+from chemistry_workflow import (
+    StageResult,
+    WorkflowPhase,
+    WorkflowReport,
+    build_workflow_report,
+)
+from objective_fixtures import evidence_report, optimized_state
 
 
 CANONICAL_REPORT_ROWS = (
@@ -45,37 +50,15 @@ def prepared_snapshot():
         demo_agent.PlanStage(stage=stage, rationale=f"Run {stage} safely.")
         for stage in demo_agent.STAGES
     ])
-    report, _run = report_and_run()
-    payloads = {record.key: json.loads(record.payload_json) for record in report.evidence}
-    payloads["E01"].update(raw_count=8, valid_count=8, preview_count=8)
-    payloads["E02"].update(molecule_count=8, packed_shape=[8, 32])
-    payloads["E03"].update(
-        matrix_shape=[8, 8], q1=0.2, median=0.2, q3=0.2, p90=0.2,
-        max_off_diagonal=0.65,
-        most_similar_pair={
-            "molecule_ids": ["mol-0", "mol-1"],
-            "source_rows": [0, 1], "similarity": 0.65,
-        },
-    )
-    payloads["E04"].update(
-        cluster_count=8, singleton_count=8, singleton_fraction=1.0,
-        largest_cluster_sizes=[1] * 8, assignment_count=8,
-    )
-    report = WorkflowReport(tuple(
-        EvidenceRecord(
-            record.key, record.label,
-            json.dumps(payloads[record.key], sort_keys=True, separators=(",", ":")),
-            record.provenance,
-        )
-        for record in report.evidence
-    ))
+    state = optimized_state()
+    report = build_workflow_report(state)
     stages = tuple(
         StageResult(stage, record.label, json.loads(record.payload_json))
         for stage, record in zip(demo_agent.STAGES, report.evidence, strict=True)
     )
     return demo_agent.PreparedScientificSnapshot(
         messages=tuple(messages),
-        state=optimized_state(),
+        state=state,
         plan=plan,
         stage_results=stages,
         report=report,
@@ -153,6 +136,29 @@ def test_prepared_snapshot_rejects_named_but_fabricated_evidence_payload():
         )
 
 
+def test_prepared_snapshot_requires_report_exactly_rebuilt_from_copied_state():
+    valid = prepared_snapshot()
+    records = list(valid.report.evidence)
+    payload = json.loads(records[0].payload_json)
+    payload["preview_count"] -= 1
+    records[0] = type(records[0])(
+        records[0].key,
+        records[0].label,
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        records[0].provenance,
+    )
+
+    with pytest.raises(ValueError, match="inconsistent"):
+        demo_agent.PreparedScientificSnapshot(
+            messages=valid.messages,
+            state=valid.state,
+            plan=valid.plan,
+            stage_results=valid.stage_results,
+            report=WorkflowReport(tuple(records)),
+            turn_count=valid.turn_count,
+        )
+
+
 def test_clone_prepared_controller_is_deep_isolated_and_objective_clean():
     snapshot = prepared_snapshot()
     executors = _prepared_executors(snapshot.report)
@@ -196,9 +202,13 @@ class _CurrentMaximumCompletions:
         self.controller = None
         self.fail_first = fail_first
         self.calls = []
+        self.schema_digests = []
 
     def create(self, **kwargs):
+        from scripts.run_objective_reliability import _canonical_tool_schema_digest
+
         self.calls.append(kwargs)
+        self.schema_digests.append(_canonical_tool_schema_digest(kwargs["tools"]))
         if self.fail_first:
             self.fail_first = False
             raise httpx.ConnectError("provider details must not leak")
@@ -345,7 +355,10 @@ class _EndToEndCompletions(_CurrentMaximumCompletions):
         name = kwargs["tool_choice"]["function"]["name"]
         if name == "select_next_panel_swap":
             return super().create(**kwargs)
+        from scripts.run_objective_reliability import _canonical_tool_schema_digest
+
         self.calls.append(kwargs)
+        self.schema_digests.append(_canonical_tool_schema_digest(kwargs["tools"]))
         if name == "submit_workflow_plan":
             arguments = {
                 "stages": [
@@ -505,6 +518,95 @@ def test_clone_rejects_snapshot_nested_tampering_after_construction():
             client=object(),
             executors=_prepared_executors(snapshot.report),
         )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "invalid_ids",
+        "fingerprint_parameters",
+        "fingerprints",
+        "molecules",
+        "cluster_cutoff",
+        "representative_records",
+        "conformer_molecules",
+        "embedding_parameters",
+        "summaries",
+        "optimization_result",
+    ),
+)
+def test_clone_rejects_every_omitted_authoritative_state_family(mutation):
+    snapshot = prepared_snapshot()
+    if mutation == "invalid_ids":
+        snapshot.state.invalid_ids = ("new-invalid",)
+    elif mutation == "fingerprint_parameters":
+        snapshot.state.fingerprint_parameters = (3, 1024)
+    elif mutation == "fingerprints":
+        snapshot.state.fingerprints.tensor.values[0, 0] = 1
+    elif mutation == "molecules":
+        snapshot.state.molecules.pop()
+    elif mutation == "cluster_cutoff":
+        snapshot.state.cluster_cutoff = 0.5
+    elif mutation == "representative_records":
+        snapshot.state.representative_records[0]["source_row"] = 99
+    elif mutation == "conformer_molecules":
+        snapshot.state.conformer_molecules.pop()
+    elif mutation == "embedding_parameters":
+        snapshot.state.embedding_parameters = (2, "largest_clusters_first", 1)
+    elif mutation == "summaries":
+        snapshot.state.summaries["external"] = {"changed": True}
+    else:
+        snapshot.state.optimization_result.energies.values[0] += 1.0
+
+    with pytest.raises(ValueError, match="tampered"):
+        demo_agent.clone_prepared_controller(
+            snapshot,
+            client=object(),
+            executors=_prepared_executors(snapshot.report),
+        )
+
+
+@pytest.mark.parametrize("phase", ("objective", "finding"))
+@pytest.mark.parametrize("mutation", ("type", "enum", "items", "constraint"))
+def test_request_audit_rejects_nested_schema_mutation(phase, mutation):
+    import scripts.run_objective_reliability as reliability
+
+    if phase == "objective":
+        factory = ScriptedControllerFactory(prepared_snapshot())
+        assert reliability.run_trials(factory, trials=1)[0]["completed"] is True
+        controller = factory.completions[0].controller
+        call = factory.completions[0].calls[0]
+        properties = call["tools"][0]["function"]["parameters"]["properties"]
+        if mutation == "type":
+            properties["state_id"]["type"] = "integer"
+        elif mutation == "enum":
+            properties["decision_rule"]["enum"] = ["tampered"]
+        elif mutation == "items":
+            properties["observed_limiting_pairs"]["items"] = {"type": "string"}
+        else:
+            properties["observed_limiting_pairs"]["minItems"] = 0
+        kind = "objective"
+    else:
+        controller = _fresh_end_to_end_controller()
+        assert reliability.run_end_to_end(lambda: controller, runs=1)[0]["completed"] is True
+        calls = controller.client.chat.completions.calls
+        call = next(
+            item for item in calls
+            if item["tool_choice"]["function"]["name"] == "select_evidence_findings"
+        )
+        properties = call["tools"][0]["function"]["parameters"]["properties"]
+        selected = properties["ordered_finding_ids"]
+        if mutation == "type":
+            selected["type"] = "string"
+        elif mutation == "enum":
+            selected["items"]["enum"] = ["F999"]
+        elif mutation == "items":
+            selected["items"] = {"type": "integer"}
+        else:
+            selected["minItems"] = 0
+        kind = "end_to_end"
+
+    assert reliability._calls_use_production_contract(controller, kind) is False
 
 
 def test_reliability_receipt_has_exact_frozen_fields_and_fail_closed_exit_code():

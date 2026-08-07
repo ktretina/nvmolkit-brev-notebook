@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+import hashlib
 import json
 import os
 import sys
@@ -40,14 +41,23 @@ QUALIFICATION_GOAL = (
 )
 
 
+def _canonical_tool_schema_digest(tools: object) -> str:
+    encoded = json.dumps(
+        tools, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class _AuditedCompletions:
     """Record only hosted request contract fields, never messages or responses."""
 
     def __init__(self, delegate: object) -> None:
         self._delegate = delegate
         self.calls: list[dict[str, object]] = []
+        self.schema_digests: list[str] = []
 
     def create(self, **kwargs: object) -> object:
+        self.schema_digests.append(_canonical_tool_schema_digest(kwargs.get("tools")))
         self.calls.append({
             "model": kwargs.get("model"),
             "temperature": kwargs.get("temperature"),
@@ -378,9 +388,15 @@ def _calls_use_production_contract(
 ) -> bool:
     completions = getattr(getattr(controller.client, "chat", None), "completions", None)
     calls = getattr(completions, "calls", None)
-    if type(calls) is not list or not calls:
+    schema_digests = getattr(completions, "schema_digests", None)
+    if (
+        type(calls) is not list
+        or not calls
+        or type(schema_digests) is not list
+        or len(schema_digests) != len(calls)
+    ):
         return False
-    for call in calls:
+    for call, trusted_schema_digest in zip(calls, schema_digests, strict=True):
         try:
             tools = call["tools"]
             choice = call["tool_choice"]
@@ -390,6 +406,11 @@ def _calls_use_production_contract(
         except (KeyError, IndexError, TypeError):
             return False
         if type(tools) is not list or len(tools) != 1:
+            return False
+        if (
+            type(trusted_schema_digest) is not str
+            or _canonical_tool_schema_digest(tools) != trusted_schema_digest
+        ):
             return False
         try:
             tool = tools[0]["function"]
