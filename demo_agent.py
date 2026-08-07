@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -559,6 +560,82 @@ def _validate_prepared_report(report: Any) -> None:
             raise ValueError("Prepared report evidence must be production-shaped.")
 
 
+def _prepared_snapshot_digest(
+    messages: tuple[dict[str, Any], ...],
+    state: WorkflowState,
+    plan: WorkflowPlan,
+    stage_results: tuple[StageResult, ...],
+    report: WorkflowReport,
+    turn_count: int,
+) -> str:
+    context = build_objective_context(state)
+    payload = {
+        "messages": _json_safe(messages),
+        "state": {
+            "phase": state.phase.value,
+            "records": _json_safe(state.records),
+            "clusters": _json_safe(state.clusters),
+            "candidates": [candidate.__dict__ for candidate in context.candidates],
+            "baseline_ids": list(context.baseline_ids),
+            "baseline_score": context.baseline_score,
+            "benchmark_score": context.benchmark_score,
+            "target_score": context.target_score,
+            "distance_matrix": context.distance_matrix.tolist(),
+        },
+        "plan": plan.model_dump(mode="json"),
+        "stage_results": [
+            {
+                "stage": item.stage,
+                "display_label": item.display_label,
+                "summary": _json_safe(item.summary),
+                "figure_types": [type(figure).__qualname__ for figure in item.figures],
+            }
+            for item in stage_results
+        ],
+        "report": [record.__dict__ for record in report.evidence],
+        "turn_count": turn_count,
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_prepared_scientific_semantics(
+    state: WorkflowState, report: WorkflowReport
+) -> None:
+    payloads = {
+        record.key: json.loads(record.payload_json) for record in report.evidence
+    }
+    molecule_count = len(state.records)
+    if (
+        payloads["E01"].get("valid_count") != molecule_count
+        or payloads["E02"].get("molecule_count") != molecule_count
+        or payloads["E03"].get("matrix_shape") != [molecule_count, molecule_count]
+        or payloads["E04"].get("assignment_count") != molecule_count
+        or payloads["E04"].get("cluster_count") != len(state.clusters)
+    ):
+        raise ValueError("Prepared state and E01-E06 report are inconsistent.")
+    context = build_objective_context(state)
+    current = measure_panel(context, context.baseline_ids)
+    attempts: list[ObjectiveAttempt] = []
+    while not target_is_achieved(current.score, context.target_score) and len(attempts) < 3:
+        menu = build_action_menu(context, current, len(attempts))
+        maxima = accepted_maxima(menu)
+        if not maxima:
+            raise ValueError("Prepared objective state has no certified argmax action.")
+        attempt = evaluate_selected_swap(context, menu, maxima[0], len(attempts) + 1)
+        attempts.append(attempt)
+        current = attempt.measurement
+    reason = (
+        TerminationReason.TARGET_ACHIEVED
+        if target_is_achieved(current.score, context.target_score)
+        else TerminationReason.ATTEMPT_LIMIT_REACHED
+    )
+    run = terminal_objective_run(context, tuple(attempts), reason)
+    build_evidence_snapshot(report, run)
+
+
 @dataclass(frozen=True)
 class PreparedScientificSnapshot:
     """A validated seven-turn scientific boundary reusable only by deep cloning."""
@@ -571,6 +648,16 @@ class PreparedScientificSnapshot:
     turn_count: int
 
     def __post_init__(self) -> None:
+        messages = tuple(deepcopy(self.messages))
+        state = deepcopy(self.state)
+        plan = WorkflowPlan.model_validate(deepcopy(self.plan.model_dump()))
+        stage_results = tuple(deepcopy(self.stage_results))
+        report = deepcopy(self.report)
+        object.__setattr__(self, "messages", messages)
+        object.__setattr__(self, "state", state)
+        object.__setattr__(self, "plan", plan)
+        object.__setattr__(self, "stage_results", stage_results)
+        object.__setattr__(self, "report", report)
         if self.turn_count != 7:
             raise ValueError("A prepared snapshot requires exactly seven hosted turns.")
         _validate_prepared_messages(self.messages)
@@ -592,6 +679,11 @@ class PreparedScientificSnapshot:
         ):
             raise ValueError("A prepared snapshot requires the exact six ordered stages.")
         _validate_prepared_report(self.report)
+        _validate_prepared_scientific_semantics(self.state, self.report)
+        object.__setattr__(self, "_canonical_digest", _prepared_snapshot_digest(
+            self.messages, self.state, self.plan, self.stage_results,
+            self.report, self.turn_count,
+        ))
 
 
 def _client(api_key: str) -> OpenAI:
@@ -2229,6 +2321,12 @@ def clone_prepared_controller(
     """Create one objective-clean controller from a deep-isolated scientific snapshot."""
     if type(snapshot) is not PreparedScientificSnapshot:
         raise TypeError("An exact prepared scientific snapshot is required.")
+    current_digest = _prepared_snapshot_digest(
+        snapshot.messages, snapshot.state, snapshot.plan,
+        snapshot.stage_results, snapshot.report, snapshot.turn_count,
+    )
+    if current_digest != getattr(snapshot, "_canonical_digest", None):
+        raise ValueError("Prepared scientific snapshot was tampered after construction.")
     PreparedScientificSnapshot(
         messages=snapshot.messages,
         state=snapshot.state,

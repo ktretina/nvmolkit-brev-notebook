@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 import demo_agent
-from chemistry_workflow import StageResult, WorkflowPhase, WorkflowReport
+from chemistry_workflow import EvidenceRecord, StageResult, WorkflowPhase, WorkflowReport
 from objective_fixtures import evidence_report, optimized_state, report_and_run
 
 
@@ -46,6 +46,29 @@ def prepared_snapshot():
         for stage in demo_agent.STAGES
     ])
     report, _run = report_and_run()
+    payloads = {record.key: json.loads(record.payload_json) for record in report.evidence}
+    payloads["E01"].update(raw_count=8, valid_count=8, preview_count=8)
+    payloads["E02"].update(molecule_count=8, packed_shape=[8, 32])
+    payloads["E03"].update(
+        matrix_shape=[8, 8], q1=0.2, median=0.2, q3=0.2, p90=0.2,
+        max_off_diagonal=0.65,
+        most_similar_pair={
+            "molecule_ids": ["mol-0", "mol-1"],
+            "source_rows": [0, 1], "similarity": 0.65,
+        },
+    )
+    payloads["E04"].update(
+        cluster_count=8, singleton_count=8, singleton_fraction=1.0,
+        largest_cluster_sizes=[1] * 8, assignment_count=8,
+    )
+    report = WorkflowReport(tuple(
+        EvidenceRecord(
+            record.key, record.label,
+            json.dumps(payloads[record.key], sort_keys=True, separators=(",", ":")),
+            record.provenance,
+        )
+        for record in report.evidence
+    ))
     stages = tuple(
         StageResult(stage, record.label, json.loads(record.payload_json))
         for stage, record in zip(demo_agent.STAGES, report.evidence, strict=True)
@@ -264,6 +287,27 @@ def test_successful_trial_fails_temperature_gate_when_request_settings_are_unobs
     assert trials[0]["production_temperature_zero"] is False
 
 
+@pytest.mark.parametrize("mutation", ("max_tokens", "stream", "schema", "phase"))
+def test_request_audit_rejects_each_control_or_phase_mutation(mutation):
+    import scripts.run_objective_reliability as reliability
+
+    factory = ScriptedControllerFactory(prepared_snapshot())
+    assert reliability.run_trials(factory, trials=1)[0]["completed"] is True
+    completions = factory.completions[0]
+    controller = completions.controller
+    call = completions.calls[0]
+    if mutation == "max_tokens":
+        call["max_tokens"] = 999
+    elif mutation == "stream":
+        call["stream"] = True
+    elif mutation == "schema":
+        call["tools"][0]["function"]["parameters"]["additionalProperties"] = True
+    else:
+        call["tool_choice"]["function"]["name"] = "submit_workflow_plan"
+        call["tools"][0]["function"]["name"] = "submit_workflow_plan"
+    assert reliability._calls_use_production_contract(controller, "objective") is False
+
+
 def test_failed_trial_retains_sanitized_controller_counters_and_pairing():
     from scripts.run_objective_reliability import run_trials
 
@@ -414,7 +458,56 @@ def test_end_to_end_missing_conclusion_is_incomplete_even_after_objective_succes
     assert "raw provider prose" not in json.dumps(records[0])
 
 
-def test_reliability_receipt_has_exact_frozen_fields_and_fail_closed_exit_code(monkeypatch):
+def test_end_to_end_rejects_forged_truthy_conclusion_object():
+    from scripts.run_objective_reliability import run_end_to_end
+
+    def factory():
+        controller = _fresh_end_to_end_controller()
+        real = controller.request_synthesis
+
+        def forged():
+            return replace(real(), conclusion=SimpleNamespace(
+                finding_selection_status="selected"
+            ))
+
+        controller.request_synthesis = forged
+        return controller
+
+    record = run_end_to_end(factory, runs=1)[0]
+    assert record["completed"] is False
+    assert record["claim_safety_passed"] is False
+    assert record["conclusion_status"] is None
+
+
+@pytest.mark.parametrize("mutation", ("orphan", "reordered", "bad_type", "duplicate"))
+def test_pairing_validator_is_an_immediate_strict_state_machine(mutation):
+    import scripts.run_objective_reliability as reliability
+
+    messages = list(copy.deepcopy(prepared_snapshot().messages))
+    if mutation == "orphan":
+        messages.insert(2, {"role": "tool", "tool_call_id": "orphan", "content": "{}"})
+    elif mutation == "reordered":
+        messages[2], messages[3] = messages[3], messages[2]
+    elif mutation == "bad_type":
+        messages[2]["tool_calls"][0]["type"] = "not-function"
+    else:
+        messages[4]["tool_calls"][0]["id"] = messages[2]["tool_calls"][0]["id"]
+        messages[5]["tool_call_id"] = messages[2]["tool_calls"][0]["id"]
+    assert reliability._messages_are_paired(messages) is False
+
+
+def test_clone_rejects_snapshot_nested_tampering_after_construction():
+    snapshot = prepared_snapshot()
+    snapshot.messages[0]["content"] = "tampered"
+    with pytest.raises(ValueError, match="tampered"):
+        demo_agent.clone_prepared_controller(
+            snapshot,
+            client=object(),
+            executors=_prepared_executors(snapshot.report),
+        )
+
+
+def test_reliability_receipt_has_exact_frozen_fields_and_fail_closed_exit_code():
     import scripts.run_objective_reliability as reliability
 
     assert [field.name for field in fields(reliability.ReliabilityReceipt)] == [
@@ -425,18 +518,9 @@ def test_reliability_receipt_has_exact_frozen_fields_and_fail_closed_exit_code(m
         "production_temperature_zero", "objective_trials", "end_to_end_runs",
         "failed_trials",
     ]
-    monkeypatch.setattr(reliability, "run_end_to_end", lambda factory, *, runs: tuple(
-        {
-            "run": index + 1, "completed": True, "argmax_success": True,
-            "message_pairing_passed": True, "claim_safety_passed": True,
-            "production_temperature_zero": True,
-            "conclusion_status": "selected",
-        }
-        for index in range(runs)
-    ))
     receipt = reliability.run_qualification(
         ScriptedControllerFactory(prepared_snapshot()),
-        ScriptedControllerFactory(prepared_snapshot()),
+        _fresh_end_to_end_controller,
         trials=2, end_to_end_runs=1,
     )
 
@@ -476,6 +560,44 @@ def test_run_qualification_covers_20_isolated_trials_and_3_fresh_runs(
     assert receipt.production_temperature_zero is True
     assert receipt.failed_trials == ()
     assert reliability.qualification_exit_code(receipt) == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("kind", "forged"), ("index", 999), ("model", "wrong/model"),
+        ("environment", "wrong"), ("accepted_attempt_count", 0),
+        ("accepted_attempt_count", 4), ("rejected_selection_count", 1),
+        ("correction_prompts_sent", 1), ("provider_request_attempt_count", 999),
+        ("retry_assisted", True), ("termination_reason", "attempt_limit_reached"),
+    ),
+)
+def test_exit_code_rejects_forged_objective_record_contract(field, value):
+    import scripts.run_objective_reliability as reliability
+
+    receipt = reliability.run_qualification(
+        ScriptedControllerFactory(prepared_snapshot()),
+        _fresh_end_to_end_controller,
+        trials=1, end_to_end_runs=1,
+    )
+    forged = {**receipt.objective_trials[0], field: value}
+    assert reliability.qualification_exit_code(
+        replace(receipt, objective_trials=(forged,))
+    ) == 1
+
+
+@pytest.mark.parametrize("value", (0, True, -1, 999))
+def test_exit_code_rejects_invalid_or_inconsistent_requested_counts(value):
+    import scripts.run_objective_reliability as reliability
+
+    receipt = reliability.run_qualification(
+        ScriptedControllerFactory(prepared_snapshot()),
+        _fresh_end_to_end_controller,
+        trials=1, end_to_end_runs=1,
+    )
+    assert reliability.qualification_exit_code(
+        replace(receipt, requested_trials=value)
+    ) == 1
 
 
 def test_completed_but_nonqualifying_trial_is_listed_as_failed(monkeypatch):
@@ -518,18 +640,12 @@ def test_completed_but_nonqualifying_trial_is_listed_as_failed(monkeypatch):
         {"retry_assisted_trials": 999},
     ),
 )
-def test_qualification_exit_code_directly_rejects_each_incomplete_gate(monkeypatch, change):
+def test_qualification_exit_code_directly_rejects_each_incomplete_gate(change):
     import scripts.run_objective_reliability as reliability
 
-    monkeypatch.setattr(reliability, "run_end_to_end", lambda factory, *, runs: ({
-        "kind": "end_to_end", "index": 1, "completed": True,
-        "argmax_success": True, "message_pairing_passed": True,
-        "claim_safety_passed": True, "production_temperature_zero": True,
-        "conclusion_status": "selected", "termination_reason": "target_achieved",
-    },))
     receipt = reliability.run_qualification(
         ScriptedControllerFactory(prepared_snapshot()),
-        ScriptedControllerFactory(prepared_snapshot()),
+        _fresh_end_to_end_controller,
         trials=2, end_to_end_runs=1,
     )
 
@@ -548,9 +664,21 @@ def test_cli_calls_run_qualification_and_writes_only_allowlisted_receipt(monkeyp
         classmethod(lambda cls, *args, **kwargs: object()),
     )
     called = {}
+    trial = {
+        "kind": "objective", "index": 1, "model": demo_agent.DEFAULT_MODEL,
+        "environment": "production_hosted_api", "completed": True,
+        "argmax_success": True, "accepted_attempt_count": 1,
+        "rejected_selection_count": 0, "correction_prompts_sent": 0,
+        "selection_response_count": 1, "provider_request_attempt_count": 1,
+        "retry_assisted": False, "baseline_score": 0.35,
+        "target_score": 0.71, "final_score": 0.8,
+        "termination_reason": "target_achieved", "message_pairing_passed": True,
+        "claim_safety_passed": True, "production_temperature_zero": True,
+        "conclusion_status": None,
+    }
     receipt = reliability.ReliabilityReceipt(
         1, 1, 1, 1, 0, 1, 1, 2, 2, True,
-        ({"completed": True},), ({"completed": True},), (),
+        (trial,), ({**trial, "kind": "end_to_end", "conclusion_status": "selected"},), (),
     )
 
     def fake_qualification(objective_factory, end_to_end_factory, *, trials, end_to_end_runs):
@@ -660,3 +788,40 @@ def test_write_reliability_receipt_rebuilds_explicit_allowlisted_json(
         "metadata",
     ):
         assert sentinel not in raw
+
+
+def test_writer_rejects_nested_values_in_every_allowlisted_trial_field_atomically(
+    receipt_with_sensitive_trial_metadata, tmp_path
+):
+    import scripts.run_objective_reliability as reliability
+
+    target = tmp_path / "existing.json"
+    target.write_text("ORIGINAL")
+    base = receipt_with_sensitive_trial_metadata.objective_trials[0]
+    for field in reliability._TRIAL_RECEIPT_FIELDS:
+        forged = {**base, field: {"api_key": f"SECRET-{field}"}}
+        receipt = replace(
+            receipt_with_sensitive_trial_metadata,
+            objective_trials=(forged,),
+        )
+        with pytest.raises((TypeError, ValueError)):
+            reliability.write_reliability_receipt(target, receipt)
+        assert target.read_text() == "ORIGINAL"
+        assert not list(tmp_path.glob(f".{target.name}.*.tmp"))
+
+
+def test_atomic_writer_preserves_existing_directory_target_and_cleans_temp(
+    receipt_with_sensitive_trial_metadata, tmp_path
+):
+    import scripts.run_objective_reliability as reliability
+
+    target = tmp_path / "target-directory"
+    target.mkdir()
+    marker = target / "marker"
+    marker.write_text("ORIGINAL")
+    with pytest.raises(OSError):
+        reliability.write_reliability_receipt(
+            target, receipt_with_sensitive_trial_metadata
+        )
+    assert marker.read_text() == "ORIGINAL"
+    assert not list(tmp_path.glob(f".{target.name}.*.tmp"))
