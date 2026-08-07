@@ -905,7 +905,7 @@ def finalize_objective_run(
     context: ObjectiveContext, attempts: tuple[ObjectiveAttempt, ...]
 ) -> ObjectiveRun:
     """Normalize the legacy baseline-first flow into authoritative substitutions."""
-    _validated_context_scores(context)
+    baseline, actual_benchmark, _target = _validated_context_scores(context)
     if not attempts or len(attempts) > MAX_ATTEMPTS + 1:
         raise ValueError("Objective run has an invalid accepted-attempt count.")
     if all(attempt.state_id for attempt in attempts):
@@ -916,7 +916,6 @@ def finalize_objective_run(
         )
         return terminal_objective_run(context, attempts, reason)
 
-    baseline = measure_panel(context, context.baseline_ids)
     legacy_baseline = attempts[0]
     if (
         type(legacy_baseline) is not ObjectiveAttempt
@@ -932,7 +931,11 @@ def finalize_objective_run(
     if baseline.achieved:
         if len(attempts) != 1:
             raise ValueError("Objective run continued after measured baseline success.")
-        return baseline_terminal_run(context)
+        if baseline.score_key == actual_benchmark.score_key:
+            return baseline_terminal_run(context)
+        return terminal_objective_run(
+            context, (), TerminationReason.TARGET_ACHIEVED
+        )
 
     normalized: list[ObjectiveAttempt] = []
     current = baseline

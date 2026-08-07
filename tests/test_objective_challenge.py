@@ -344,6 +344,43 @@ def test_zero_substitution_target_reason_does_not_replace_exact_baseline_optimal
         terminal_objective_run(context, (), TerminationReason.TARGET_ACHIEVED)
 
 
+def test_legacy_quantized_baseline_success_normalizes_to_zero_substitution_target():
+    context = quantized_baseline_target_context()
+    legacy_baseline = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Measure baseline Step 0.",
+    )
+
+    run = finalize_objective_run(context, (legacy_baseline,))
+    payload = json.loads(build_objective_evidence(run).payload_json)
+
+    assert legacy_baseline.achieved is True
+    assert legacy_baseline.score_key < objective_challenge.score_key(
+        context.benchmark_score
+    )
+    assert run.termination_reason == "target_achieved"
+    assert run.attempts == ()
+    assert payload["attempt_count"] == 0
+    assert payload["termination_reason"] == "target_achieved"
+
+
+def test_legacy_exact_baseline_optimal_normalizes_to_baseline_terminal_reason():
+    context = build_objective_context(optimized_state(baseline_optimal=True))
+    legacy_baseline = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Measure baseline Step 0.",
+    )
+
+    run = finalize_objective_run(context, (legacy_baseline,))
+
+    assert run.termination_reason == "baseline_already_optimal"
+    assert run.attempts == ()
+
+
 def test_legacy_finalizer_rejects_arbitrary_target_panel_without_swap():
     context = controlled_context_with_ranked_swaps()
     arbitrary = evaluate_diverse_panel(
