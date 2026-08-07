@@ -296,14 +296,13 @@ def _validated_selected_swap(
     predecessor_panel, _ = _validated_panel(context, predecessor_panel)
     predecessor = measure_panel(context, predecessor_panel)
     resulting = measure_panel(context, selected_swap_panel)
-    if not is_strict_improvement(resulting.score, predecessor.score) or not np.isclose(
-        selected_swap.score_delta,
-        resulting.score - predecessor.score,
-        rtol=0.0,
-        atol=SCORE_TOLERANCE,
+    expected_delta = resulting.score - predecessor.score
+    if (
+        not is_strict_improvement(resulting.score, predecessor.score)
+        or selected_swap.score_delta != expected_delta
     ):
         raise ValueError("Objective selected swap score delta is invalid.")
-    if score_key(selected_swap.predicted_score) != resulting.score_key:
+    if selected_swap.predicted_score != resulting.score:
         raise ValueError("Objective selected swap predicted score does not match the panel.")
     if selected_swap.limiting_pair != resulting.limiting_pairs[0]:
         raise ValueError("Objective selected swap limiting pair does not match the panel.")
@@ -352,13 +351,11 @@ def rank_legal_swaps(
         return ()
     panel, candidates = _validated_panel(context, current.selected_ids)
     recomputed = measure_panel(context, panel)
-    if isinstance(current.score, bool) or not isinstance(
-        current.score, (int, float, np.floating)
-    ) or not np.isfinite(
-        current.score
-    ):
-        raise ValueError("Objective attempt score must be a finite non-boolean number.")
-    if score_key(float(current.score)) != recomputed.score_key:
+    if type(current.score) is not float or not np.isfinite(current.score):
+        raise ValueError(
+            "Objective attempt score must be a finite non-boolean built-in float."
+        )
+    if current.score != recomputed.score:
         raise ValueError("Objective attempt score does not match its panel.")
     if current.limiting_pair != recomputed.limiting_pairs[0]:
         raise ValueError("Objective attempt limiting pair does not match its panel.")

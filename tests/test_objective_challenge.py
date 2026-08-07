@@ -378,6 +378,59 @@ def test_evaluate_panel_rejects_noncanonical_selected_swap_fields(mutate_swap):
         )
 
 
+def test_evaluate_panel_rejects_integer_selected_swap_scores():
+    context = build_objective_context(optimized_state())
+    current = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Measure the current policy baseline.",
+    )
+    selected = rank_legal_swaps(context, current)[0]
+
+    for forged in (
+        replace(selected, predicted_score=int(selected.predicted_score)),
+        replace(selected, score_delta=int(selected.score_delta)),
+    ):
+        with pytest.raises(ValueError, match="built-in floats"):
+            evaluate_diverse_panel(
+                context,
+                selected.resulting_ids,
+                attempt_number=2,
+                decision_basis="Reject integer raw score evidence.",
+                selected_swap=forged,
+            )
+
+
+@pytest.mark.parametrize("field", ("predicted_score", "score_delta"))
+def test_evaluate_panel_rejects_different_raw_swap_values_with_the_same_score_key(
+    field,
+):
+    context = build_objective_context(optimized_state())
+    current = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Measure the current policy baseline.",
+    )
+    selected = rank_legal_swaps(context, current)[0]
+    original = getattr(selected, field)
+    forged_raw = float(np.nextafter(original, 1.0))
+    assert forged_raw != original
+    assert objective_challenge.score_key(forged_raw) == objective_challenge.score_key(
+        original
+    )
+
+    with pytest.raises(ValueError, match="predicted score|score delta"):
+        evaluate_diverse_panel(
+            context,
+            selected.resulting_ids,
+            attempt_number=2,
+            decision_basis="Reject altered raw score evidence.",
+            selected_swap=replace(selected, **{field: forged_raw}),
+        )
+
+
 def test_o01_serializes_the_selected_intervention_without_hidden_answers():
     context = build_objective_context(optimized_state())
     first = evaluate_diverse_panel(
@@ -571,6 +624,34 @@ def test_rank_legal_swaps_rejects_boolean_current_scores_explicitly():
             context,
             forged_nonachieved_attempt(context, context.baseline_ids, score=True),
         )
+
+
+def test_rank_legal_swaps_rejects_integer_current_score_instead_of_coercing_it():
+    context = controlled_context(
+        distances={("mol-0", "mol-1"): 0.0},
+        default_distance=0.8,
+    )
+    forged = forged_nonachieved_attempt(
+        context, context.baseline_ids, score=0
+    )
+
+    with pytest.raises(ValueError, match="built-in float"):
+        rank_legal_swaps(context, forged)
+
+
+def test_rank_legal_swaps_rejects_different_raw_score_with_the_same_score_key():
+    context = build_objective_context(optimized_state())
+    forged_raw = float(np.nextafter(context.baseline_score, 1.0))
+    assert forged_raw != context.baseline_score
+    assert objective_challenge.score_key(forged_raw) == objective_challenge.score_key(
+        context.baseline_score
+    )
+    forged = forged_nonachieved_attempt(
+        context, context.baseline_ids, score=forged_raw
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        rank_legal_swaps(context, forged)
 
 
 def test_rank_legal_swaps_supports_two_revisions_and_preserves_panel_order():
