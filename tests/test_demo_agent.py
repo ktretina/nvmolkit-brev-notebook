@@ -647,6 +647,8 @@ def test_decision_basis_accepts_brief_nonempty_text():
         "decision_basis",
         "Selected IDs / selected-ids",
         "decision basis decision_basis",
+        "selected_ids and decision_basis",
+        "The selected IDs decision basis",
     ],
 )
 def test_objective_decision_basis_rejects_schema_field_placeholders(value):
@@ -657,6 +659,21 @@ def test_objective_decision_basis_rejects_schema_field_placeholders(value):
                 "decision_basis": value,
             }
         )
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["0.80 exceeds 0.71.", "Score 0.8 > 0.7."],
+)
+def test_objective_decision_basis_accepts_short_quantitative_reasons(value):
+    parsed = demo_agent.ObjectiveProposal.model_validate(
+        {
+            "selected_ids": ["mol-0", "mol-1", "mol-2", "mol-3"],
+            "decision_basis": value,
+        }
+    )
+
+    assert parsed.decision_basis == value
 
 
 def test_stage_decision_basis_does_not_inherit_objective_rationale_floor():

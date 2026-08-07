@@ -511,9 +511,33 @@ def test_strict_objective_schema_publishes_objective_rationale_bounds():
     function = completions.calls[0]["tools"][0]["function"]
     rationale_schema = function["parameters"]["properties"]["decision_basis"]
     assert function["strict"] is True
-    assert rationale_schema["minLength"] == 20
+    assert rationale_schema["minLength"] == 1
     assert rationale_schema["maxLength"] == 240
     assert rationale_schema["pattern"] == r"^[^\r\n`]+$"
+    assert rationale_schema["description"] == (
+        "Provide a concise measured quantitative reason for the selected panel. "
+        "For a revision, compare its limiting_pair and predicted_score with "
+        "target_score. Never repeat schema field names as the value."
+    )
+
+
+@pytest.mark.parametrize(
+    "valid_basis",
+    ["0.80 exceeds 0.71.", "Score 0.8 > 0.7."],
+)
+def test_short_quantitative_rationale_is_accepted_without_correction(valid_basis):
+    controller, completions = completed_controller([
+        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], valid_basis),
+    ])
+    controller.begin_objective_challenge()
+
+    pending = controller.request_objective_attempt()
+
+    assert pending.decision_basis == valid_basis
+    assert controller.pending_objective is pending
+    assert controller.objective_rejection_count == 0
+    assert controller.objective_attempts == []
+    assert len(completions.calls) == 1
 
 
 def test_malformed_json_objective_response_is_paired_and_corrected_safely():

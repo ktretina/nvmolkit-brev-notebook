@@ -150,7 +150,7 @@ ObjectiveDecisionBasis = Annotated[
     str,
     StringConstraints(
         strip_whitespace=True,
-        min_length=20,
+        min_length=1,
         max_length=240,
         pattern=r"^[^\r\n`]+$",
     ),
@@ -206,7 +206,13 @@ MoleculeId = Annotated[
 
 class ObjectiveProposal(_StrictModel):
     selected_ids: list[MoleculeId] = Field(min_length=4, max_length=4)
-    decision_basis: ObjectiveDecisionBasis
+    decision_basis: ObjectiveDecisionBasis = Field(
+        description=(
+            "Provide a concise measured quantitative reason for the selected panel. "
+            "For a revision, compare its limiting_pair and predicted_score with "
+            "target_score. Never repeat schema field names as the value."
+        )
+    )
 
     @field_validator("selected_ids")
     @classmethod
@@ -218,9 +224,26 @@ class ObjectiveProposal(_StrictModel):
     @field_validator("decision_basis")
     @classmethod
     def decision_basis_is_not_a_field_placeholder(cls, value: str) -> str:
-        normalized = re.sub(r"[^a-z0-9]+", "", value.casefold())
-        if re.fullmatch(
-            r"(?:(?:selectedids?)|(?:decisionbas(?:is|es)))+", normalized
+        connectors = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "is",
+            "are",
+            "of",
+            "for",
+            "field",
+            "value",
+        }
+        placeholder_tokens = {
+            "selected", "id", "ids", "decision", "basis", "bases",
+        }
+        tokens = re.findall(r"[a-z0-9]+", value.casefold())
+        meaningful_tokens = [token for token in tokens if token not in connectors]
+        if not meaningful_tokens or all(
+            token in placeholder_tokens for token in meaningful_tokens
         ):
             raise ValueError("Objective decision basis must be a rationale.")
         return value
