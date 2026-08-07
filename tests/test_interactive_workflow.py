@@ -378,10 +378,15 @@ def test_objective_attempts_render_as_observe_act_measure_decision_ladder(monkey
     assert "Observe" in summary
     assert "Agent action" in summary
     assert "Measure" in summary
+    assert "Outcome" in summary
     assert "replace mol-1" in summary
     assert "with mol-5" in summary
     assert "+0.450" in summary
     assert "0.800 ≥ 0.710" in summary
+    assert "<b>Outcome:</b> Revise" in summary
+    assert "<b>Outcome:</b> Goal achieved" in summary
+    assert "#6c757d" in summary
+    assert "#76B900" in summary
     assert "Validated intervention" in details
     assert "Goal achieved" in details
 
@@ -410,6 +415,116 @@ def test_objective_revision_without_prior_attempt_fails_closed():
             SimpleNamespace(baseline_score=0.35, target_score=0.71),
             attempt,
         )
+
+
+def test_objective_attempt_row_enforces_initial_and_revision_state_shapes():
+    context = SimpleNamespace(baseline_score=0.35, target_score=0.71)
+    swap = ObjectiveSwap(
+        replace_id="mol-1",
+        replacement_id="mol-5",
+        resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
+        predicted_score=0.80,
+        score_delta=0.45,
+        limiting_pair=("mol-0", "mol-2"),
+    )
+    initial = ObjectiveAttempt(
+        attempt_number=1,
+        selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
+        decision_basis="Measure the initial panel.",
+        score=0.35,
+        limiting_pair=("mol-0", "mol-1"),
+        constraints_passed=True,
+        achieved=False,
+    )
+    initial_with_swap = ObjectiveAttempt(
+        attempt_number=1,
+        selected_ids=swap.resulting_ids,
+        decision_basis="Incorrect initial provenance.",
+        score=0.80,
+        limiting_pair=swap.limiting_pair,
+        constraints_passed=True,
+        achieved=True,
+        selected_swap=swap,
+    )
+    revision_without_swap = ObjectiveAttempt(
+        attempt_number=2,
+        selected_ids=swap.resulting_ids,
+        decision_basis="Incorrect revision provenance.",
+        score=0.80,
+        limiting_pair=swap.limiting_pair,
+        constraints_passed=True,
+        achieved=True,
+    )
+    class SwapSubclass(ObjectiveSwap):
+        pass
+
+    revision_with_subclass = ObjectiveAttempt(
+        attempt_number=2,
+        selected_ids=swap.resulting_ids,
+        decision_basis="Incorrect subclass provenance.",
+        score=0.80,
+        limiting_pair=swap.limiting_pair,
+        constraints_passed=True,
+        achieved=True,
+        selected_swap=SwapSubclass(**swap.__dict__),
+    )
+
+    with pytest.raises(ValueError, match="initial"):
+        InteractiveWorkflow._objective_attempt_row(context, initial, initial)
+    with pytest.raises(ValueError, match="initial"):
+        InteractiveWorkflow._objective_attempt_row(context, initial_with_swap)
+    with pytest.raises(ValueError, match="revision"):
+        InteractiveWorkflow._objective_attempt_row(context, revision_without_swap, initial)
+    with pytest.raises(ValueError, match="exact"):
+        InteractiveWorkflow._objective_attempt_row(context, revision_with_subclass, initial)
+
+
+def test_objective_attempt_row_uses_gray_amber_and_green_by_state():
+    context = SimpleNamespace(baseline_score=0.35, target_score=0.71)
+    initial_miss = ObjectiveAttempt(
+        attempt_number=1,
+        selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
+        decision_basis="Measure the initial panel.",
+        score=0.35,
+        limiting_pair=("mol-0", "mol-1"),
+        constraints_passed=True,
+        achieved=False,
+    )
+    swap = ObjectiveSwap(
+        replace_id="mol-1",
+        replacement_id="mol-5",
+        resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
+        predicted_score=0.50,
+        score_delta=0.15,
+        limiting_pair=("mol-0", "mol-2"),
+    )
+    revision_miss = ObjectiveAttempt(
+        attempt_number=2,
+        selected_ids=swap.resulting_ids,
+        decision_basis="Use the measured replacement.",
+        score=0.50,
+        limiting_pair=swap.limiting_pair,
+        constraints_passed=True,
+        achieved=False,
+        selected_swap=swap,
+    )
+    initial_achieved = ObjectiveAttempt(
+        attempt_number=1,
+        selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
+        decision_basis="The initial panel meets target.",
+        score=0.80,
+        limiting_pair=("mol-0", "mol-1"),
+        constraints_passed=True,
+        achieved=True,
+    )
+
+    assert "#6c757d" in InteractiveWorkflow._objective_attempt_row(context, initial_miss)
+    assert "#D68A00" in InteractiveWorkflow._objective_attempt_row(
+        context, revision_miss, initial_miss
+    )
+    assert "#76B900" in InteractiveWorkflow._objective_attempt_row(
+        context, initial_achieved
+    )
 
 
 def test_known_objective_proposal_failure_after_measured_attempt_has_one_guarded_retry(monkeypatch):

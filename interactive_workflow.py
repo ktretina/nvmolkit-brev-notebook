@@ -11,7 +11,7 @@ from pydantic import BaseModel, ValidationError
 
 import demo_agent
 from command_receipts import CommandReceipt, command_receipt
-from objective_challenge import MAX_ATTEMPTS, objective_figures
+from objective_challenge import MAX_ATTEMPTS, ObjectiveSwap, objective_figures
 from objective_receipts import objective_receipt
 
 
@@ -524,12 +524,18 @@ class InteractiveWorkflow:
     def _objective_attempt_row(context, attempt, prior_attempt=None) -> str:
         """Render one measured decision step without exposing model rationale."""
         swap = attempt.selected_swap
-        if swap is None:
+        if type(attempt.attempt_number) is not int or attempt.attempt_number < 1:
+            raise ValueError("Objective attempt rows require positive integer attempt numbers.")
+        if attempt.attempt_number == 1:
+            if swap is not None or prior_attempt is not None:
+                raise ValueError("The initial objective attempt cannot carry revision state.")
             observation = "Initial agent proposal"
             action = "Initial panel"
             delta = attempt.score - context.baseline_score
-            accent = "#6c757d"
+            accent = "#76B900" if attempt.achieved else "#6c757d"
         else:
+            if type(swap) is not ObjectiveSwap:
+                raise ValueError("A revision requires an exact selected swap.")
             if prior_attempt is None:
                 raise ValueError("A guided revision requires its prior attempt.")
             observation = (
@@ -551,7 +557,8 @@ class InteractiveWorkflow:
             f"<b>Attempt {attempt.attempt_number}</b> · {escape(outcome)}<br>"
             f"<small><b>Observe:</b> {escape(observation)}</small><br>"
             f"<small><b>Agent action:</b> {escape(action)}</small><br>"
-            f"<small><b>Measure:</b> {escape(comparison)} · Δ {delta:+.3f}</small>"
+            f"<small><b>Measure:</b> {escape(comparison)} · Δ {delta:+.3f}</small><br>"
+            f"<small><b>Outcome:</b> {escape(outcome)}</small>"
             "</section>"
         )
 
