@@ -52,7 +52,7 @@ def objective_receipt(
     if resolved != action or action not in menu.actions:
         raise ValueError("Selection does not match the exact deterministic action menu.")
     executed_measurement = None
-    status = "validated"
+    status = "validated_selection"
     if result is not None:
         if type(result) is not ObjectiveAttempt:
             raise ValueError("Executed objective result must use the exact domain type.")
@@ -61,7 +61,7 @@ def objective_receipt(
         )
         if result != expected_result:
             raise ValueError("Executed objective result does not match the exact menu action.")
-        status = "executed"
+        status = "measured"
         executed_measurement = (
             "measurement = PanelMeasurement("
             f"selected_ids={result.selected_ids!r}, score={result.score!r}, "
@@ -71,13 +71,15 @@ def objective_receipt(
     return ObjectiveReceipt(
         status=status,
         validated_selection=(
-            "select_next_panel_swap("
+            "ObjectiveSelection("
             f"state_id={selection.state_id!r}, swap_id={selection.swap_id!r}, "
-            "decision_rule='maximize_predicted_minimum_distance')"
+            f"observed_limiting_pairs={menu.source.limiting_pairs!r}, "
+            f"decision_rule={selection.decision_rule!r})"
         ),
         planned_command=(
-            "selected_action = next(action for action in pending_action_menu.actions "
-            f"if action.swap_id == {action.swap_id!r})"
+            "select_next_panel_swap("
+            f"state_id={menu.state_id!r}, swap_id={action.swap_id!r}, "
+            "decision_rule='maximize_predicted_minimum_distance')"
         ),
         python_evaluation=(
             "result = evaluate_selected_swap(\n"

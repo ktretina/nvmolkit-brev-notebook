@@ -36,15 +36,17 @@ def test_objective_receipt_is_state_bound_rationale_free_and_deterministic():
     second = objective_receipt(_context, selection, menu, action)
 
     assert first == second == ObjectiveReceipt(
-        status="validated",
+        status="validated_selection",
         validated_selection=(
+            "ObjectiveSelection("
+            f"state_id={selection.state_id!r}, swap_id={selection.swap_id!r}, "
+            f"observed_limiting_pairs={menu.source.limiting_pairs!r}, "
+            f"decision_rule={selection.decision_rule!r})"
+        ),
+        planned_command=(
             "select_next_panel_swap("
             f"state_id={menu.state_id!r}, swap_id={action.swap_id!r}, "
             "decision_rule='maximize_predicted_minimum_distance')"
-        ),
-        planned_command=(
-            "selected_action = next(action for action in pending_action_menu.actions "
-            f"if action.swap_id == {action.swap_id!r})"
         ),
         python_evaluation=(
             "result = evaluate_selected_swap(\n"
@@ -68,7 +70,7 @@ def test_objective_receipt_validates_and_renders_exact_executed_measurement():
 
     receipt = objective_receipt(context, selection, menu, action, result)
 
-    assert receipt.status == "executed"
+    assert receipt.status == "measured"
     assert receipt.executed_measurement == (
         "measurement = PanelMeasurement("
         f"selected_ids={result.selected_ids!r}, score={result.score!r}, "

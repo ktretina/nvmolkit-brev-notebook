@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -1114,6 +1115,10 @@ def test_commit_snapshot_restores_plain_messages_and_every_objective_field(monke
     pending = controller.request_objective_selection()
     injected = FailOnceList(controller.session.messages)
     controller.session.messages = injected
+    snapshot = controller._capture_objective_commit_snapshot()
+
+    assert type(snapshot.messages) is tuple
+    assert snapshot.messages == tuple(deepcopy(list(injected)))
 
     with pytest.raises(demo_agent.ObjectiveEvaluationError):
         controller.execute_objective_selection(pending)

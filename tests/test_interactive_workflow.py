@@ -427,7 +427,7 @@ def test_objective_attempts_render_as_observe_act_measure_decision_ladder(monkey
     assert "#D68A00" in summary
     assert "#76B900" in summary
     assert "Planned deterministic command" in details
-    assert "if action.swap_id == &#x27;mol-0-&gt;mol-4&#x27;" in details
+    assert "select_next_panel_swap(" in details
     assert "Goal achieved" in details
 
 

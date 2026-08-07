@@ -981,15 +981,6 @@ def _emit_progress(callback: ProgressCallback | None, event: str, payload: Any) 
         raise ToolCallError("Local progress display failed.") from None
 
 
-def _plain_message_copy(value: Any) -> Any:
-    """Deep-copy transcript values while normalizing every list to a built-in list."""
-    if isinstance(value, dict):
-        return {deepcopy(key): _plain_message_copy(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_plain_message_copy(item) for item in value]
-    return deepcopy(value)
-
-
 @dataclass(frozen=True)
 class _ObjectiveTransition:
     attempt: ObjectiveAttempt
@@ -1012,7 +1003,7 @@ class _ObjectiveTransition:
 
 @dataclass(frozen=True)
 class _ObjectiveCommitSnapshot:
-    messages: list[Any]
+    messages: tuple[Any, ...]
     turn_count: int
     objective_required: bool
     objective_context: ObjectiveContext | None
@@ -1459,7 +1450,7 @@ class BoundedWorkflowController:
 
     def _capture_objective_commit_snapshot(self) -> _ObjectiveCommitSnapshot:
         return _ObjectiveCommitSnapshot(
-            messages=_plain_message_copy(list(self.session.messages)),
+            messages=tuple(deepcopy(list(self.session.messages))),
             turn_count=self.session.turn_count,
             objective_required=self.objective_required,
             objective_context=self.objective_context,
@@ -1482,9 +1473,7 @@ class BoundedWorkflowController:
     def _restore_objective_commit_snapshot(
         self, snapshot: _ObjectiveCommitSnapshot
     ) -> None:
-        self.session.messages = [
-            _plain_message_copy(item) for item in snapshot.messages
-        ]
+        self.session.messages = list(deepcopy(snapshot.messages))
         self.session.turn_count = snapshot.turn_count
         self.objective_required = snapshot.objective_required
         self.objective_context = snapshot.objective_context
