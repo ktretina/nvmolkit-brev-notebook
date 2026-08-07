@@ -641,6 +641,33 @@ def test_decision_basis_accepts_brief_nonempty_text():
 
 
 @pytest.mark.parametrize(
+    "value",
+    [
+        "selected_ids",
+        "decision_basis",
+        "Selected IDs / selected-ids",
+        "decision basis decision_basis",
+    ],
+)
+def test_objective_decision_basis_rejects_schema_field_placeholders(value):
+    with pytest.raises(ValidationError):
+        demo_agent.ObjectiveProposal.model_validate(
+            {
+                "selected_ids": ["mol-0", "mol-1", "mol-2", "mol-3"],
+                "decision_basis": value,
+            }
+        )
+
+
+def test_stage_decision_basis_does_not_inherit_objective_rationale_floor():
+    parsed = demo_agent.FingerprintArgs.model_validate(
+        {"radius": 2, "size": 1024, "decision_basis": "selected_ids"}
+    )
+
+    assert parsed.decision_basis == "selected_ids"
+
+
+@pytest.mark.parametrize(
     ("model", "arguments"),
     [
         ("InspectionArgs", {"extra": True}),

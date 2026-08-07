@@ -146,6 +146,15 @@ DecisionBasis = Annotated[
         pattern=r"^[^\r\n`]+$",
     ),
 ]
+ObjectiveDecisionBasis = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=20,
+        max_length=240,
+        pattern=r"^[^\r\n`]+$",
+    ),
+]
 
 
 class _StrictModel(BaseModel):
@@ -197,13 +206,23 @@ MoleculeId = Annotated[
 
 class ObjectiveProposal(_StrictModel):
     selected_ids: list[MoleculeId] = Field(min_length=4, max_length=4)
-    decision_basis: DecisionBasis
+    decision_basis: ObjectiveDecisionBasis
 
     @field_validator("selected_ids")
     @classmethod
     def selected_ids_are_unique(cls, value: list[str]) -> list[str]:
         if len(set(value)) != len(value):
             raise ValueError("Objective proposal molecule IDs must be unique.")
+        return value
+
+    @field_validator("decision_basis")
+    @classmethod
+    def decision_basis_is_not_a_field_placeholder(cls, value: str) -> str:
+        normalized = re.sub(r"[^a-z0-9]+", "", value.casefold())
+        if re.fullmatch(
+            r"(?:(?:selectedids?)|(?:decisionbas(?:is|es)))+", normalized
+        ):
+            raise ValueError("Objective decision basis must be a rationale.")
         return value
 
 
@@ -1271,10 +1290,12 @@ class BoundedWorkflowController:
                     _swap_payload(item) for item in self.objective_suggestions
                 ],
                 "instruction": (
-                    "Select exactly one listed resulting_ids panel and explain its "
-                    "limiting-pair rationale."
+                    "Select exactly one listed resulting_ids panel and provide a concise "
+                    "measured quantitative rationale comparing its limiting_pair and "
+                    "predicted_score with target_score."
                     if is_revision
-                    else "Select exactly four unique IDs from candidate_ids."
+                    else "Select exactly four unique IDs from candidate_ids and provide "
+                    "a concise measured quantitative rationale."
                 ),
             }
             if not is_revision:

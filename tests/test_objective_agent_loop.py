@@ -338,7 +338,10 @@ def test_revision_tool_schema_lists_exactly_current_legal_resulting_panels():
     accepted_panel = ["mol-0", "mol-1", "mol-2", "mol-3"]
     controller, completions = completed_controller([
         proposal(accepted_panel, "Measure the baseline panel."),
-        proposal(["mol-4", "mol-1", "mol-2", "mol-3"], "Use a legal swap."),
+        proposal(
+            ["mol-4", "mol-1", "mol-2", "mol-3"],
+            "Use the measured legal swap.",
+        ),
     ])
     controller.begin_objective_challenge()
     initial = controller.request_objective_attempt()
@@ -462,6 +465,57 @@ def test_pydantic_invalid_objective_response_is_paired_and_corrected_safely(
     assert secret not in rejected_tool["content"]
 
 
+def test_placeholder_initial_rationale_is_paired_and_corrected_without_attempt():
+    raw_placeholder = "selected_ids"
+    valid_basis = "Measure all six pairwise panel distances."
+    controller, completions = completed_controller([
+        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], raw_placeholder),
+        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], valid_basis),
+    ])
+    controller.begin_objective_challenge()
+
+    corrected = controller.request_objective_attempt()
+
+    assert corrected.decision_basis == valid_basis
+    assert controller.pending_objective is corrected
+    assert controller.objective_attempts == []
+    assert controller.objective_rejection_count == 1
+    assert len(completions.calls) == 2
+    rejected_assistant = controller.session.messages[-3]
+    rejected_tool = controller.session.messages[-2]
+    assert rejected_assistant["role"] == "assistant"
+    assert rejected_tool["role"] == "tool"
+    assert rejected_tool["tool_call_id"] == rejected_assistant["tool_calls"][0]["id"]
+    payload = json.loads(rejected_tool["content"])
+    assert payload["reason"] == "invalid_objective_proposal"
+    assert payload["instruction"] == (
+        "Select exactly four unique IDs from candidate_ids and provide a concise "
+        "measured quantitative rationale."
+    )
+    assert f'"decision_basis":"{raw_placeholder}"' not in json.dumps(
+        controller.session.messages, separators=(",", ":")
+    )
+
+
+def test_strict_objective_schema_publishes_objective_rationale_bounds():
+    controller, completions = completed_controller([
+        proposal(
+            ["mol-0", "mol-1", "mol-2", "mol-3"],
+            "Measure all six pairwise panel distances.",
+        ),
+    ])
+    controller.begin_objective_challenge()
+
+    controller.request_objective_attempt()
+
+    function = completions.calls[0]["tools"][0]["function"]
+    rationale_schema = function["parameters"]["properties"]["decision_basis"]
+    assert function["strict"] is True
+    assert rationale_schema["minLength"] == 20
+    assert rationale_schema["maxLength"] == 240
+    assert rationale_schema["pattern"] == r"^[^\r\n`]+$"
+
+
 def test_malformed_json_objective_response_is_paired_and_corrected_safely():
     secret = "RAW-MALFORMED-SECRET"
     controller, _ = completed_controller([
@@ -470,7 +524,10 @@ def test_malformed_json_objective_response_is_paired_and_corrected_safely():
             '{"selected_ids":["mol-0","mol-1","mol-2","mol-3"],'
             f'"decision_basis":"{secret}"',
         ),
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Use valid JSON."),
+        proposal(
+            ["mol-0", "mol-1", "mol-2", "mol-3"],
+            "Use the valid JSON panel proposal.",
+        ),
     ])
     controller.begin_objective_challenge()
 
@@ -491,7 +548,10 @@ def test_non_object_json_objective_response_is_paired_and_corrected_safely(
 ):
     controller, _ = completed_controller([
         raw_response("select_diverse_panel", raw_arguments),
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Use a JSON object."),
+        proposal(
+            ["mol-0", "mol-1", "mol-2", "mol-3"],
+            "Use the valid JSON object proposal.",
+        ),
     ])
     controller.begin_objective_challenge()
 
@@ -528,7 +588,10 @@ def test_content_only_invalid_objective_response_is_immediately_paired_and_corre
 ):
     controller, completions = completed_controller([
         content_response(content),
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Use a tool call."),
+        proposal(
+            ["mol-0", "mol-1", "mol-2", "mol-3"],
+            "Use the corrected objective tool call.",
+        ),
     ])
     controller.begin_objective_challenge()
 
@@ -665,7 +728,10 @@ def test_out_of_pool_initial_proposal_is_corrected_from_candidate_ids():
     payload = json.loads(controller.session.messages[-2]["content"])
     assert payload["reason"] == "out_of_pool_panel"
     assert payload["candidate_ids"] == [f"mol-{index}" for index in range(8)]
-    assert payload["instruction"] == "Select exactly four unique IDs from candidate_ids."
+    assert payload["instruction"] == (
+        "Select exactly four unique IDs from candidate_ids and provide a concise "
+        "measured quantitative rationale."
+    )
 
 
 def test_unlisted_in_pool_revision_is_rejected_then_listed_swap_is_retained():
@@ -686,8 +752,46 @@ def test_unlisted_in_pool_revision_is_rejected_then_listed_swap_is_retained():
     payload = json.loads(controller.session.messages[-2]["content"])
     assert payload["reason"] == "panel_not_in_legal_improving_swaps"
     assert payload["instruction"] == (
-        "Select exactly one listed resulting_ids panel and explain its limiting-pair rationale."
+        "Select exactly one listed resulting_ids panel and provide a concise measured "
+        "quantitative rationale comparing its limiting_pair and predicted_score with "
+        "target_score."
     )
+
+
+def test_placeholder_revision_rationale_is_corrected_with_exact_swap_provenance():
+    raw_placeholder = "decision basis decision_basis"
+    valid_basis = "Predicted score 0.80 exceeds the 0.71 target."
+    controller, completions = completed_controller([
+        proposal(
+            ["mol-0", "mol-1", "mol-2", "mol-3"],
+            "Measure the initial minimum pairwise distance.",
+        ),
+        proposal(["mol-5", "mol-1", "mol-2", "mol-3"], raw_placeholder),
+        proposal(["mol-5", "mol-1", "mol-2", "mol-3"], valid_basis),
+    ])
+    controller.begin_objective_challenge()
+    initial = controller.request_objective_attempt()
+    controller.execute_objective_attempt(initial)
+    selected_swap = controller.objective_suggestions[1]
+
+    corrected = controller.request_objective_attempt()
+
+    assert corrected.decision_basis == valid_basis
+    assert controller.pending_objective_swap is selected_swap
+    assert len(controller.objective_attempts) == 1
+    assert controller.objective_rejection_count == 1
+    assert len(completions.calls) == 3
+    rejected_assistant = controller.session.messages[-3]
+    rejected_tool = controller.session.messages[-2]
+    assert rejected_tool["tool_call_id"] == rejected_assistant["tool_calls"][0]["id"]
+    payload = json.loads(rejected_tool["content"])
+    assert payload["reason"] == "invalid_objective_proposal"
+    assert payload["instruction"] == (
+        "Select exactly one listed resulting_ids panel and provide a concise measured "
+        "quantitative rationale comparing its limiting_pair and predicted_score with "
+        "target_score."
+    )
+    assert raw_placeholder not in json.dumps(controller.session.messages)
 
 
 def test_revision_schema_allows_non_first_legal_panel_and_retains_exact_provenance():
