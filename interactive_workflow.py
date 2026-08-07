@@ -12,9 +12,9 @@ from pydantic import BaseModel, ValidationError
 import demo_agent
 from command_receipts import CommandReceipt, command_receipt
 from objective_challenge import (
-    MAX_ATTEMPTS, ObjectiveActionMenu, ObjectiveAttempt,
-    TerminationReason, build_action_menu, measure_panel, objective_figures,
-    score_key,
+    MAX_ATTEMPTS, ObjectiveActionMenu, ObjectiveAttempt, ObjectiveSwap,
+    TerminationReason, accepted_maxima, build_action_menu, measure_panel,
+    objective_figures, score_key,
 )
 from objective_receipts import objective_receipt
 
@@ -598,13 +598,33 @@ class InteractiveWorkflow:
         )
 
     @staticmethod
+    def _score_comparison(first: float, second: float) -> tuple[str, str, str]:
+        """Format a comparison with the same 1e-12 keys as the decision policy."""
+        first_key, second_key = score_key(first), score_key(second)
+        if first_key == second_key:
+            tied = f"{first_key / 10**12:.12f}"
+            return tied, tied, "tied at 1e-12 decision precision"
+        for precision in range(3, 16):
+            left, right = f"{first:.{precision}f}", f"{second:.{precision}f}"
+            if left != right and ((float(left) > float(right)) == (first_key > second_key)):
+                status = (
+                    "above at 1e-12 decision precision"
+                    if first_key > second_key
+                    else "below at 1e-12 decision precision"
+                )
+                return left, right, status
+        left, right = f"{first:.17e}", f"{second:.17e}"
+        status = (
+            "above at 1e-12 decision precision"
+            if first_key > second_key
+            else "below at 1e-12 decision precision"
+        )
+        return left, right, status
+
+    @staticmethod
     def _objective_target_status(score: float, target: float) -> str:
-        score_value, target_value = score_key(score), score_key(target)
-        if score_value == target_value:
-            return f"tied at shared 1e-12 score key {score_value}; target met"
-        if score_value > target_value:
-            return f"above target by shared 1e-12 score key ({score_value} > {target_value})"
-        return f"below target by shared 1e-12 score key ({score_value} < {target_value})"
+        left, right, status = InteractiveWorkflow._score_comparison(score, target)
+        return f"{left} vs target {right}: {status}"
 
     @staticmethod
     def _objective_action_menu_html(context, menu: ObjectiveActionMenu) -> str:
@@ -640,6 +660,36 @@ class InteractiveWorkflow:
         """Render one exact menu/selection/commit decision without model rationale."""
         if type(menu) is not ObjectiveActionMenu or type(selection) is not demo_agent.ObjectiveSelection:
             raise ValueError("Objective rows require exact public menu and selection types.")
+        source_ids = menu.source.selected_ids
+
+        def valid_panel(panel) -> bool:
+            return (
+                type(panel) is tuple
+                and len(panel) == 4
+                and len(set(panel)) == 4
+                and all(type(item) is str and item for item in panel)
+            )
+
+        def valid_pairs(pairs, panel) -> bool:
+            return (
+                type(pairs) is tuple
+                and bool(pairs)
+                and all(
+                    type(pair) is tuple
+                    and len(pair) == 2
+                    and pair[0] != pair[1]
+                    and all(type(item) is str and item in panel for item in pair)
+                    for pair in pairs
+                )
+            )
+
+        if (
+            not valid_panel(source_ids)
+            or menu.source.score_key != score_key(menu.source.score)
+            or not valid_pairs(menu.source.limiting_pairs, source_ids)
+            or any(type(action) is not ObjectiveSwap for action in menu.actions)
+        ):
+            raise ValueError("Objective menu source is not canonical measured evidence.")
         observed = tuple(tuple(pair) for pair in selection.observed_limiting_pairs)
         selected = next(
             (action for action in menu.actions if action.swap_id == selection.swap_id), None
@@ -649,8 +699,29 @@ class InteractiveWorkflow:
             or observed != menu.source.limiting_pairs
             or selection.decision_rule != "maximize_predicted_minimum_distance"
             or selected is None
+            or selected not in accepted_maxima(menu)
         ):
             raise ValueError("Objective selection does not match its displayed menu.")
+        if (
+            not valid_panel(selected.resulting_ids)
+            or selected.swap_id
+            != f"{selected.replace_id}->{selected.replacement_id}"
+            or selected.replace_id not in source_ids
+            or selected.replacement_id in source_ids
+            or set(selected.resulting_ids)
+            != (set(source_ids) - {selected.replace_id}) | {selected.replacement_id}
+            or selected.predicted_score_key != score_key(selected.predicted_score)
+            or selected.predicted_score_key <= menu.source.score_key
+            or selected.score_delta != selected.predicted_score - menu.source.score
+            or selected.score_delta <= 0.0
+            or not valid_pairs(selected.limiting_pairs, selected.resulting_ids)
+            or selected.limiting_pair != selected.limiting_pairs[0]
+            or selected.target_status not in {"below_target", "meets_target"}
+            or not all(
+                selected.replace_id in pair for pair in menu.source.limiting_pairs
+            )
+        ):
+            raise ValueError("Objective selected action is not canonical policy evidence.")
         action_rows = []
         for action in sorted(menu.actions, key=lambda item: item.swap_id):
             pairs = " · ".join(
@@ -689,6 +760,8 @@ class InteractiveWorkflow:
                 or attempt.selected_ids != selected.resulting_ids
                 or attempt.score != selected.predicted_score
                 or attempt.score_key != selected.predicted_score_key
+                or score_key(attempt.score) != attempt.score_key
+                or attempt.limiting_pair != selected.limiting_pair
                 or attempt.limiting_pairs != selected.limiting_pairs
                 or attempt.constraints_passed is not True
                 or attempt.achieved != (selected.target_status == "meets_target")
