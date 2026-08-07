@@ -621,7 +621,6 @@ def test_plan_requires_exact_dependency_order_and_nonempty_rationales():
         demo_agent.WorkflowPlan.model_validate(bad)
 
 
-'''LEGACY_OBJECTIVE_RATIONALE_TESTS_REMOVED
 @pytest.mark.parametrize(
     "value",
     ["", "valid rationale\ncontinued", "use `code` here", "x" * 241],
@@ -665,29 +664,30 @@ def test_decision_basis_accepts_brief_nonempty_text():
         "decision_basisselected_ids",
     ],
 )
-def test_objective_decision_basis_rejects_schema_field_placeholders(value):
+def test_objective_selection_rejects_schema_field_rationale_values(value):
     with pytest.raises(ValidationError):
-        demo_agent.ObjectiveProposal.model_validate(
-            {
-                "selected_ids": ["mol-0", "mol-1", "mol-2", "mol-3"],
-                "decision_basis": value,
-            }
-        )
+        demo_agent.ObjectiveSelection.model_validate({
+            "state_id": "state-0123456789abcdef",
+            "swap_id": "mol-0->mol-4",
+            "observed_limiting_pairs": [["mol-0", "mol-1"]],
+            "decision_rule": "maximize_predicted_minimum_distance",
+            "decision_basis": value,
+        })
 
 
 @pytest.mark.parametrize(
     "value",
     ["0.80 exceeds 0.71.", "Score 0.8 > 0.7."],
 )
-def test_objective_decision_basis_accepts_short_quantitative_reasons(value):
-    parsed = demo_agent.ObjectiveProposal.model_validate(
-        {
-            "selected_ids": ["mol-0", "mol-1", "mol-2", "mol-3"],
-            "decision_basis": value,
-        }
-    )
-
-    assert parsed.decision_basis == value
+def test_objective_selection_rejects_even_short_quantitative_model_reasons(value):
+    with pytest.raises(ValidationError):
+        demo_agent.ObjectiveSelection.model_validate({
+            "state_id": "state-0123456789abcdef",
+            "swap_id": "mol-0->mol-4",
+            "observed_limiting_pairs": [["mol-0", "mol-1"]],
+            "decision_rule": "maximize_predicted_minimum_distance",
+            "rationale": value,
+        })
 
 
 @pytest.mark.parametrize(
@@ -698,18 +698,15 @@ def test_objective_decision_basis_accepts_short_quantitative_reasons(value):
         "selectedidsdecisionbasisish is unrelated prose.",
     ],
 )
-def test_objective_placeholder_guard_does_not_match_real_compound_reasons(value):
-    parsed = demo_agent.ObjectiveProposal.model_validate(
-        {
-            "selected_ids": ["mol-0", "mol-1", "mol-2", "mol-3"],
-            "decision_basis": value,
-        }
-    )
-
-    assert parsed.decision_basis == value
-
-
-'''
+def test_objective_selection_rejects_arbitrary_model_prose(value):
+    with pytest.raises(ValidationError):
+        demo_agent.ObjectiveSelection.model_validate({
+            "state_id": "state-0123456789abcdef",
+            "swap_id": "mol-0->mol-4",
+            "observed_limiting_pairs": [["mol-0", "mol-1"]],
+            "decision_rule": "maximize_predicted_minimum_distance",
+            "model_prose": value,
+        })
 
 
 def test_stage_decision_basis_does_not_inherit_objective_rationale_floor():

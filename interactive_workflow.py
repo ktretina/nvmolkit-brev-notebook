@@ -13,8 +13,8 @@ from pydantic import BaseModel, ValidationError
 import demo_agent
 from command_receipts import CommandReceipt, command_receipt
 from objective_challenge import (
-    MAX_ATTEMPTS, ObjectiveAttempt, ObjectiveSwap, is_strict_improvement,
-    objective_figures, target_is_achieved,
+    MAX_ATTEMPTS, ObjectiveAttempt, ObjectiveSwap, build_action_menu,
+    is_strict_improvement, measure_panel, objective_figures, target_is_achieved,
 )
 from objective_receipts import objective_receipt
 
@@ -607,41 +607,53 @@ class InteractiveWorkflow:
         ):
             raise ValueError("Objective attempt rows require measured objective truth.")
         swap = attempt.selected_swap
-        if attempt.attempt_number == 1:
-            if swap is not None or prior_attempt is not None:
-                raise ValueError("The initial objective attempt cannot carry revision state.")
-            action = f"Initial panel — {attempt.decision_basis}"
+        baseline_view = attempt.attempt_number == 1 and swap is None
+        if baseline_view:
+            if prior_attempt is not None:
+                raise ValueError("The initial baseline cannot carry a prior attempt.")
+            action = "Measured Step-0 baseline"
             delta = attempt.score - context.baseline_score
             accent = "#76B900" if attempt.achieved else "#6c757d"
         else:
-            if type(swap) is not ObjectiveSwap:
-                raise ValueError("A revision requires an exact selected swap.")
-            if type(prior_attempt) is not ObjectiveAttempt:
-                raise ValueError("A revision requires its exact prior attempt.")
-            if prior_attempt.attempt_number != attempt.attempt_number - 1:
-                raise ValueError("A revision requires its consecutive prior attempt.")
+            if type(swap) is not ObjectiveSwap or not attempt.state_id:
+                raise ValueError("A measured substitution requires an exact state-bound swap.")
+            if attempt.attempt_number == 1:
+                if prior_attempt is not None:
+                    raise ValueError("The first substitution cannot carry a prior attempt.")
+                prior_ids = context.baseline_ids
+                prior_score = context.baseline_score
+                accent = "#76B900" if attempt.achieved else "#D68A00"
+            else:
+                if type(prior_attempt) is not ObjectiveAttempt:
+                    raise ValueError("A revision requires its exact prior attempt.")
+                if prior_attempt.attempt_number != attempt.attempt_number - 1:
+                    raise ValueError("A revision requires its consecutive prior attempt.")
+                prior_ids = prior_attempt.selected_ids
+                prior_score = prior_attempt.score
+                accent = "#76B900" if attempt.achieved else "#D68A00"
+                if (
+                    not InteractiveWorkflow._is_canonical_panel(prior_attempt.selected_ids)
+                    or not InteractiveWorkflow._is_finite_float(prior_attempt.score)
+                    or prior_attempt.constraints_passed is not True
+                    or prior_attempt.achieved is not False
+                    or not InteractiveWorkflow._is_canonical_pair(
+                        prior_attempt.limiting_pair, prior_attempt.selected_ids
+                    )
+                ):
+                    raise ValueError("A revision has invalid prior-attempt provenance.")
             if (
-                not InteractiveWorkflow._is_canonical_panel(prior_attempt.selected_ids)
-                or not InteractiveWorkflow._is_finite_float(prior_attempt.score)
-                or prior_attempt.constraints_passed is not True
-                or prior_attempt.achieved is not False
-                or not InteractiveWorkflow._is_canonical_pair(
-                    prior_attempt.limiting_pair, prior_attempt.selected_ids
-                )
-                or not InteractiveWorkflow._is_canonical_panel(swap.resulting_ids)
+                not InteractiveWorkflow._is_canonical_panel(swap.resulting_ids)
                 or not InteractiveWorkflow._is_canonical_pair(
                     swap.limiting_pair, swap.resulting_ids
                 )
                 or not InteractiveWorkflow._is_finite_float(swap.predicted_score)
                 or not InteractiveWorkflow._is_finite_float(swap.score_delta)
-                or not is_strict_improvement(
-                    swap.predicted_score, prior_attempt.score
-                )
+                or not is_strict_improvement(swap.predicted_score, prior_score)
                 or not InteractiveWorkflow._same_panel(swap.resulting_ids, attempt.selected_ids)
                 or swap.replacement_id not in swap.resulting_ids
                 or swap.replace_id in swap.resulting_ids
             ):
-                raise ValueError("A revision has invalid selected-swap provenance.")
+                raise ValueError("A substitution has invalid selected-swap provenance.")
             replacement_position = swap.resulting_ids.index(swap.replacement_id)
             predecessor = (
                 swap.resulting_ids[:replacement_position]
@@ -649,18 +661,14 @@ class InteractiveWorkflow:
                 + swap.resulting_ids[replacement_position + 1 :]
             )
             if (
-                not InteractiveWorkflow._same_panel(predecessor, prior_attempt.selected_ids)
+                not InteractiveWorkflow._same_panel(predecessor, prior_ids)
                 or attempt.score != swap.predicted_score
                 or attempt.limiting_pair != swap.limiting_pair
-                or swap.score_delta != attempt.score - prior_attempt.score
+                or swap.score_delta != attempt.score - prior_score
             ):
-                raise ValueError("A revision does not match its prior measurement.")
-            action = (
-                f"replace {swap.replace_id} with {swap.replacement_id} — "
-                f"{attempt.decision_basis}"
-            )
+                raise ValueError("A substitution does not match its prior measurement.")
+            action = f"swap {swap.swap_id} from state {attempt.state_id}"
             delta = swap.score_delta
-            accent = "#76B900" if attempt.achieved else "#D68A00"
         score_text, target_text, delta_text, precision, scientific = (
             InteractiveWorkflow._objective_display_values(
                 attempt.score, context.target_score, delta
@@ -670,7 +678,7 @@ class InteractiveWorkflow:
             observation = (
                 "baseline D_min "
                 f"{InteractiveWorkflow._objective_scalar(context.baseline_score, precision, scientific)}; "
-                f"current D_min {score_text}; initial agent proposal"
+                f"current D_min {score_text}; first measured substitution"
             )
         else:
             observation = (
@@ -837,7 +845,14 @@ class InteractiveWorkflow:
             if attempt.attempt_number > 1
             else None
         )
-        receipt = objective_receipt(proposal, attempt.selected_swap, prior_attempt)
+        context = self.controller.objective_context
+        source = (
+            measure_panel(context, context.baseline_ids)
+            if prior_attempt is None
+            else prior_attempt.measurement
+        )
+        menu = build_action_menu(context, source, attempt.attempt_number - 1)
+        receipt = objective_receipt(proposal, menu, attempt.selected_swap)
         result_label = "Goal achieved" if attempt.achieved else "Revise"
         intervention = ""
         if receipt.validated_intervention is not None:
@@ -846,7 +861,6 @@ class InteractiveWorkflow:
                 f"<pre>{escape(receipt.validated_intervention)}</pre>"
             )
         details = widgets.HTML(
-            f"<p><b>Decision summary:</b> {escape(attempt.decision_basis)}</p>"
             "<b>Validated Nemotron proposal</b>"
             f"<pre>{escape(receipt.validated_proposal)}</pre>"
             f"{intervention}"

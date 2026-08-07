@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -15,7 +16,11 @@ from chemistry_workflow import (
     WorkflowState,
 )
 from objective_challenge import accepted_maxima, build_action_menu, measure_panel, rank_legal_swaps
-from objective_fixtures import quantized_baseline_target_context, two_revision_context
+from objective_fixtures import (
+    controlled_context_with_ranked_swaps,
+    quantized_baseline_target_context,
+    two_revision_context,
+)
 
 
 class FakeTensor:
@@ -69,10 +74,10 @@ class FakeCompletions:
 AUTO_SELECTION = object()
 
 
-def response(name, arguments):
+def response(name, arguments, *, content=None):
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(
-            content=None,
+            content=content,
             tool_calls=[SimpleNamespace(
                 id=f"call-{name}",
                 type="function",
@@ -288,14 +293,14 @@ def test_invalid_selection_kinds_reject_before_chemistry_then_accept(invalid_res
     assert_paired(controller.session.messages)
 
 
-def test_displayed_nonmax_selection_is_rejected_when_menu_has_lower_option():
+def test_displayed_nonmax_selection_is_rejected_when_menu_has_lower_option(monkeypatch):
     controller, completions = completed_controller([])
+    context = controlled_context_with_ranked_swaps()
+    monkeypatch.setattr(demo_agent, "build_objective_context", lambda _state: context)
     controller.begin_objective_challenge()
     menu = controller.pending_action_menu
     maxima = accepted_maxima(menu)
-    lower = next((index for index, action in enumerate(menu.actions) if action not in maxima), None)
-    if lower is None:
-        pytest.skip("fixture menu contains only tied maxima")
+    lower = next(index for index, action in enumerate(menu.actions) if action not in maxima)
     completions.responses.extend([selection(menu, lower), selection(menu, menu.actions.index(maxima[0]))])
 
     controller.request_objective_selection()
@@ -372,6 +377,151 @@ def test_rejection_budget_never_resets_across_measured_attempts(monkeypatch, seq
     assert controller.objective_evidence.key == "O01"
     assert len(completions.calls) == 3
     assert_paired(controller.session.messages)
+
+
+def test_actual_old_state_and_swap_are_rejected_twice_after_state_transition(monkeypatch):
+    controller, completions = completed_controller([])
+    context = two_revision_context()
+    monkeypatch.setattr(demo_agent, "build_objective_context", lambda _state: context)
+    controller.begin_objective_challenge()
+    old_menu = controller.pending_action_menu
+    completions.responses.append(selection(old_menu))
+
+    pending = controller.request_objective_selection()
+    controller.execute_objective_selection(pending)
+    current_menu = controller.pending_action_menu
+    assert current_menu.state_id != old_menu.state_id
+    assert old_menu.actions[0].swap_id not in {action.swap_id for action in current_menu.actions}
+    completions.responses.extend([selection(old_menu), selection(old_menu)])
+
+    with pytest.raises(demo_agent.ObjectiveCorrectionLimitError):
+        controller.request_objective_selection()
+
+    assert controller.accepted_attempt_count == 1
+    assert controller.rejected_selection_count == 2
+    assert len(controller.objective_attempts) == 1
+    rejected_tools = [
+        json.loads(message["content"])
+        for message in controller.session.messages
+        if message.get("role") == "tool" and '"accepted":false' in message["content"]
+    ]
+    assert [item["reason"] for item in rejected_tools[-2:]] == [
+        "stale_objective_state",
+        "stale_objective_state",
+    ]
+    assert_paired(controller.session.messages)
+
+
+def test_provider_content_is_transcript_only_and_never_enters_attempt_or_o01():
+    model_prose = "MODEL PRIVATE EXPLANATION MUST NOT BECOME FACT"
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    action = accepted_maxima(menu)[0]
+    arguments = {
+        "state_id": menu.state_id,
+        "swap_id": action.swap_id,
+        "observed_limiting_pairs": [list(pair) for pair in menu.source.limiting_pairs],
+        "decision_rule": "maximize_predicted_minimum_distance",
+    }
+    completions.responses.append(
+        response("select_next_panel_swap", arguments, content=model_prose)
+    )
+
+    pending = controller.request_objective_selection()
+    attempt = controller.execute_objective_selection(pending)
+
+    assert controller.session.messages[-2]["content"] == model_prose
+    assert model_prose not in repr(attempt)
+    assert model_prose not in attempt.decision_basis
+    assert controller.objective_evidence is not None
+    assert model_prose not in controller.objective_evidence.payload_json
+    assert "decision_basis" not in controller.objective_evidence.payload_json
+
+
+@pytest.mark.parametrize(
+    "sequence_name",
+    [
+        "valid",
+        "nonmax-valid",
+        "wrong_pair-valid",
+        "wrong_tool-valid",
+        "malformed-valid",
+        "valid-invalid-invalid",
+        "invalid-valid-invalid",
+        "invalid-invalid",
+        "transport-valid",
+        "transport-transport",
+    ],
+)
+def test_objective_selection_transition_table(monkeypatch, sequence_name):
+    context = (
+        controlled_context_with_ranked_swaps()
+        if sequence_name == "nonmax-valid"
+        else two_revision_context()
+    )
+    controller, completions = completed_controller([])
+    monkeypatch.setattr(demo_agent, "build_objective_context", lambda _state: context)
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+
+    if sequence_name == "transport-transport":
+        completions.responses.extend([Exception("first"), Exception("second")])
+        with pytest.raises(demo_agent.ToolCallError):
+            controller.request_objective_selection()
+        with pytest.raises(demo_agent.ToolCallError):
+            controller.request_objective_selection(is_transport_retry=True)
+        assert controller.objective_run.termination_reason == "objective_provider_failure"
+        return
+    if sequence_name == "transport-valid":
+        completions.responses.extend([Exception("first"), selection(menu)])
+        with pytest.raises(demo_agent.ToolCallError):
+            controller.request_objective_selection()
+        pending = controller.request_objective_selection(is_transport_retry=True)
+        controller.execute_objective_selection(pending)
+        assert controller.selection_response_count == 1
+        return
+
+    invalid = selection(menu, state_id="state-0000000000000000")
+    if sequence_name == "nonmax-valid":
+        maxima = accepted_maxima(menu)
+        lower = next(i for i, action in enumerate(menu.actions) if action not in maxima)
+        completions.responses.extend([
+            selection(menu, lower), selection(menu, menu.actions.index(maxima[0]))
+        ])
+    elif sequence_name == "wrong_pair-valid":
+        completions.responses.extend([
+            selection(menu, observed_limiting_pairs=[[menu.source.selected_ids[0], menu.source.selected_ids[2]]]),
+            selection(menu),
+        ])
+    elif sequence_name == "wrong_tool-valid":
+        completions.responses.extend([
+            response("select_diverse_panel", {"legacy": True}), selection(menu)
+        ])
+    elif sequence_name == "malformed-valid":
+        completions.responses.extend([
+            raw_response("select_next_panel_swap", "{"), selection(menu)
+        ])
+    elif sequence_name in {"invalid-valid-invalid", "invalid-invalid"}:
+        completions.responses.extend([invalid, selection(menu)] if sequence_name == "invalid-valid-invalid" else [invalid, invalid])
+    else:
+        completions.responses.append(selection(menu))
+
+    if sequence_name == "invalid-invalid":
+        with pytest.raises(demo_agent.ObjectiveCorrectionLimitError):
+            controller.request_objective_selection()
+        assert controller.accepted_attempt_count == 0
+        return
+
+    pending = controller.request_objective_selection()
+    controller.execute_objective_selection(pending)
+    if sequence_name in {"valid-invalid-invalid", "invalid-valid-invalid"}:
+        next_menu = controller.pending_action_menu
+        stale = selection(next_menu, state_id="state-0000000000000000")
+        completions.responses.extend([stale, stale] if sequence_name == "valid-invalid-invalid" else [stale])
+        with pytest.raises(demo_agent.ObjectiveCorrectionLimitError):
+            controller.request_objective_selection()
+        assert controller.accepted_attempt_count == 1
 
 
 def safe_objective_proposals():
@@ -498,685 +648,178 @@ def test_non_objective_synthesis_tool_schema_is_unchanged():
     )["function"]["parameters"] == expected
 
 
-def _legacy_objective_tests_removed_after_bounded_selection_migration():
-    """Task 3 supersedes free-form panel proposal coverage below."""
-    return None
-
-
-'''LEGACY_OBJECTIVE_PROPOSAL_TESTS_REMOVED
-def test_objective_proposal_requires_four_unique_bounded_ids():
-    valid = demo_agent.ObjectiveProposal(
-        selected_ids=["mol-0", "mol-2", "mol-4", "mol-6"],
-        decision_basis="Remove the limiting analogue.",
-    )
-    assert valid.selected_ids == ["mol-0", "mol-2", "mol-4", "mol-6"]
-
-    with pytest.raises(Exception):
-        demo_agent.ObjectiveProposal(
-            selected_ids=["mol-0", "mol-0", "mol-4", "mol-6"],
-            decision_basis="Duplicates are invalid.",
-        )
-
-
-def test_controller_returns_each_objective_proposal_before_execution_and_stops_on_success():
-    controller, completions = completed_controller([
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Measure the baseline panel."),
-        proposal(["mol-4", "mol-1", "mol-2", "mol-3"], "Remove the limiting analogue."),
-    ])
-
-    context = controller.begin_objective_challenge()
-    first_proposal = controller.request_objective_attempt()
-    assert controller.objective_attempts == []
-    first = controller.execute_objective_attempt(first_proposal)
-    second_proposal = controller.request_objective_attempt()
-    selected_swap = controller.pending_objective_swap
-    second = controller.execute_objective_attempt(second_proposal)
-
-    assert context.baseline_score == pytest.approx(0.35)
-    assert first.achieved is False
-    assert first.selected_swap is None
-    assert second.achieved is True
-    assert second.selected_swap is selected_swap
-    assert controller.objective_run.termination_reason == "target_achieved"
-    assert controller.objective_evidence.key == "O01"
-    assert controller.session.turn_count == 9
-    assert len(completions.calls) == 2
-    assert controller.session.messages[-1]["role"] == "tool"
-    with pytest.raises(demo_agent.ToolCallError, match="already complete"):
-        controller.request_objective_attempt()
-
-
-def test_attempt_feedback_returns_score_target_and_limiting_pair_to_same_conversation():
-    controller, _ = completed_controller([
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Measure the baseline panel."),
-    ])
-    controller.begin_objective_challenge()
-    pending = controller.request_objective_attempt()
-    controller.execute_objective_attempt(pending)
-    payload = json.loads(controller.session.messages[-1]["content"])
-
-    assert payload["accepted"] is True
-    assert payload["score"] == pytest.approx(0.35)
-    assert payload["target_score"] == pytest.approx(0.71)
-    assert payload["limiting_pair"] == ["mol-0", "mol-1"]
-    assert payload["achieved"] is False
-    assert payload["instruction"] == (
-        "Select exactly one listed resulting_ids panel and explain how its limiting_pair "
-        "and predicted_score compare with target_score."
-    )
-    expected = [
-        {
-            "replace_id": item.replace_id,
-            "replacement_id": item.replacement_id,
-            "resulting_ids": list(item.resulting_ids),
-            "predicted_score": item.predicted_score,
-            "score_delta": item.score_delta,
-            "limiting_pair": list(item.limiting_pair),
-        }
-        for item in rank_legal_swaps(controller.objective_context, controller.objective_attempts[0])
-    ]
-    assert payload["legal_improving_swaps"] == expected
-    assert set(payload["legal_improving_swaps"][0]) == {
-        "replace_id",
-        "replacement_id",
-        "resulting_ids",
-        "predicted_score",
-        "score_delta",
-        "limiting_pair",
-    }
-
-
-def test_revision_tool_schema_lists_exactly_current_legal_resulting_panels():
-    accepted_panel = ["mol-0", "mol-1", "mol-2", "mol-3"]
-    controller, completions = completed_controller([
-        proposal(accepted_panel, "Measure the baseline panel."),
-        proposal(
-            ["mol-4", "mol-1", "mol-2", "mol-3"],
-            "Use the measured legal swap.",
-        ),
-    ])
-    controller.begin_objective_challenge()
-    initial = controller.request_objective_attempt()
-    controller.execute_objective_attempt(initial)
-    expected_panels = [
-        list(item.resulting_ids) for item in controller.objective_suggestions
-    ]
-
-    controller.request_objective_attempt()
-
-    initial_schema = completions.calls[0]["tools"][0]["function"]["parameters"]
-    revision_schema = completions.calls[1]["tools"][0]["function"]["parameters"]
-    assert "enum" not in initial_schema["properties"]["selected_ids"]
-    assert revision_schema["properties"]["selected_ids"]["enum"] == expected_panels
-    assert accepted_panel not in revision_schema["properties"]["selected_ids"]["enum"]
-
-
-def test_duplicate_revision_is_rejected_then_corrected_without_scientific_attempt():
-    controller, completions = completed_controller([
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Measure the baseline panel."),
-        proposal(["mol-3", "mol-2", "mol-1", "mol-0"], "Repeat the same panel."),
-        proposal(["mol-4", "mol-1", "mol-2", "mol-3"], "Use the ranked replacement."),
-    ])
-    controller.begin_objective_challenge()
-    first = controller.request_objective_attempt()
-    controller.execute_objective_attempt(first)
-
-    corrected = controller.request_objective_attempt()
-
-    assert corrected.selected_ids == ["mol-4", "mol-1", "mol-2", "mol-3"]
-    assert corrected is controller.pending_objective
-    assert controller.pending_objective_swap is controller.objective_suggestions[0]
-    assert controller.objective_rejection_count == 1
-    assert len(controller.objective_attempts) == 1
-    assert len(completions.calls) == 3
-    rejected = json.loads(controller.session.messages[-2]["content"])
-    assert rejected["accepted"] is False
-    assert rejected["reason"] == "duplicate_panel"
-    assert rejected["corrections_remaining"] == 1
-    assert "candidate_ids" not in rejected
-
-
-def test_two_invalid_responses_exhaust_global_correction_budget_without_attempt():
-    controller, _ = completed_controller([
-        proposal(["mol-0", "mol-2", "mol-4", "outside-a"], "First invalid panel."),
-        proposal(["mol-1", "mol-3", "mol-5", "outside-b"], "Second invalid panel."),
-    ])
-    controller.begin_objective_challenge()
-
-    with pytest.raises(
-        demo_agent.ObjectiveCorrectionLimitError, match="correction limit"
-    ):
-        controller.request_objective_attempt()
-
-    assert controller.objective_rejection_count == demo_agent.MAX_OBJECTIVE_CORRECTIONS
-    assert controller.pending_objective is None
-    assert controller.pending_objective_swap is None
-    assert controller.objective_attempts == []
-    payload = json.loads(controller.session.messages[-1]["content"])
-    assert payload["accepted"] is False
-    assert payload["reason"] == "out_of_pool_panel"
-    assert payload["corrections_remaining"] == 0
-
-
-def test_preexhausted_objective_correction_budget_uses_dedicated_safe_error():
-    controller, completions = completed_controller([])
-    controller.begin_objective_challenge()
-    controller.objective_rejection_count = demo_agent.MAX_OBJECTIVE_CORRECTIONS
-    hosted_calls_before = len(completions.calls)
-
-    with pytest.raises(
-        demo_agent.ObjectiveCorrectionLimitError, match="correction limit"
-    ):
-        controller.request_objective_attempt()
-
-    assert issubclass(
-        demo_agent.ObjectiveCorrectionLimitError, demo_agent.ToolCallError
-    )
-    assert len(completions.calls) == hosted_calls_before
-    assert controller.pending_objective is None
-    assert controller.objective_attempts == []
-
-
-@pytest.mark.parametrize(
-    "invalid_arguments",
-    [
-        {
-            "selected_ids": ["mol-0", "mol-1", "mol-2"],
-            "decision_basis": "RAW-SCHEMA-SECRET",
-        },
-        {
-            "selected_ids": ["mol-0", "mol-0", "mol-2", "mol-3"],
-            "decision_basis": "RAW-SCHEMA-SECRET",
-        },
-        {"decision_basis": "RAW-SCHEMA-SECRET"},
-        {"selected_ids": ["mol-0", "mol-1", "mol-2", "mol-3"]},
-    ],
-)
-def test_pydantic_invalid_objective_response_is_paired_and_corrected_safely(
-    invalid_arguments,
-):
-    secret = "RAW-SCHEMA-SECRET"
-    controller, _ = completed_controller([
-        response("select_diverse_panel", invalid_arguments),
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Use four candidates."),
-    ])
-    controller.begin_objective_challenge()
-
-    corrected = controller.request_objective_attempt()
-
-    assert corrected.selected_ids == ["mol-0", "mol-1", "mol-2", "mol-3"]
-    assert controller.objective_rejection_count == 1
-    rejected_assistant = controller.session.messages[-3]
-    rejected_tool = controller.session.messages[-2]
-    assert rejected_assistant["role"] == "assistant"
-    assert rejected_tool["role"] == "tool"
-    assert rejected_tool["tool_call_id"] == rejected_assistant["tool_calls"][0]["id"]
-    payload = json.loads(rejected_tool["content"])
-    assert payload["reason"] == "invalid_objective_proposal"
-    assert secret not in json.dumps(rejected_assistant)
-    assert secret not in rejected_tool["content"]
-
-
-def test_placeholder_initial_rationale_is_paired_and_corrected_without_attempt():
-    raw_placeholder = "selected_ids"
-    valid_basis = "Measure all six pairwise panel distances."
-    controller, completions = completed_controller([
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], raw_placeholder),
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], valid_basis),
-    ])
-    controller.begin_objective_challenge()
-
-    corrected = controller.request_objective_attempt()
-
-    assert corrected.decision_basis == valid_basis
-    assert controller.pending_objective is corrected
-    assert controller.objective_attempts == []
-    assert controller.objective_rejection_count == 1
-    assert len(completions.calls) == 2
-    rejected_assistant = controller.session.messages[-3]
-    rejected_tool = controller.session.messages[-2]
-    assert rejected_assistant["role"] == "assistant"
-    assert rejected_tool["role"] == "tool"
-    assert rejected_tool["tool_call_id"] == rejected_assistant["tool_calls"][0]["id"]
-    payload = json.loads(rejected_tool["content"])
-    assert payload["reason"] == "invalid_objective_proposal"
-    assert payload["instruction"] == (
-        "Select exactly four unique IDs from candidate_ids and provide a concise "
-        "measured quantitative rationale."
-    )
-    assert f'"decision_basis":"{raw_placeholder}"' not in json.dumps(
-        controller.session.messages, separators=(",", ":")
-    )
-
-
-def test_strict_objective_schema_publishes_objective_rationale_bounds():
-    controller, completions = completed_controller([
-        proposal(
-            ["mol-0", "mol-1", "mol-2", "mol-3"],
-            "Measure all six pairwise panel distances.",
-        ),
-    ])
-    controller.begin_objective_challenge()
-
-    controller.request_objective_attempt()
-
-    function = completions.calls[0]["tools"][0]["function"]
-    rationale_schema = function["parameters"]["properties"]["decision_basis"]
-    assert function["strict"] is True
-    assert rationale_schema["minLength"] == 1
-    assert rationale_schema["maxLength"] == 240
-    assert rationale_schema["pattern"] == r"^[^\r\n`]+$"
-    assert rationale_schema["description"] == (
-        "Provide a concise measured quantitative reason for the selected panel. "
-        "For a revision, compare its limiting_pair and predicted_score with "
-        "target_score. Never repeat schema field names as the value."
-    )
-
-
-@pytest.mark.parametrize(
-    "valid_basis",
-    ["0.80 exceeds 0.71.", "Score 0.8 > 0.7."],
-)
-def test_short_quantitative_rationale_is_accepted_without_correction(valid_basis):
-    controller, completions = completed_controller([
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], valid_basis),
-    ])
-    controller.begin_objective_challenge()
-
-    pending = controller.request_objective_attempt()
-
-    assert pending.decision_basis == valid_basis
-    assert controller.pending_objective is pending
-    assert controller.objective_rejection_count == 0
-    assert controller.objective_attempts == []
-    assert len(completions.calls) == 1
-
-
-def test_malformed_json_objective_response_is_paired_and_corrected_safely():
-    secret = "RAW-MALFORMED-SECRET"
-    controller, _ = completed_controller([
-        raw_response(
-            "select_diverse_panel",
-            '{"selected_ids":["mol-0","mol-1","mol-2","mol-3"],'
-            f'"decision_basis":"{secret}"',
-        ),
-        proposal(
-            ["mol-0", "mol-1", "mol-2", "mol-3"],
-            "Use the valid JSON panel proposal.",
-        ),
-    ])
-    controller.begin_objective_challenge()
-
-    corrected = controller.request_objective_attempt()
-
-    assert corrected.selected_ids == ["mol-0", "mol-1", "mol-2", "mol-3"]
-    assert controller.objective_rejection_count == 1
-    rejected_assistant = controller.session.messages[-3]
-    rejected_tool = controller.session.messages[-2]
-    assert rejected_tool["tool_call_id"] == rejected_assistant["tool_calls"][0]["id"]
-    assert json.loads(rejected_tool["content"])["reason"] == "invalid_objective_proposal"
-    assert secret not in json.dumps(controller.session.messages)
-
-
-@pytest.mark.parametrize("raw_arguments", ["[]", "null", '"RAW-NONOBJECT-SECRET"'])
-def test_non_object_json_objective_response_is_paired_and_corrected_safely(
-    raw_arguments,
-):
-    controller, _ = completed_controller([
-        raw_response("select_diverse_panel", raw_arguments),
-        proposal(
-            ["mol-0", "mol-1", "mol-2", "mol-3"],
-            "Use the valid JSON object proposal.",
-        ),
-    ])
-    controller.begin_objective_challenge()
-
-    corrected = controller.request_objective_attempt()
-
-    assert corrected.selected_ids == ["mol-0", "mol-1", "mol-2", "mol-3"]
-    assert controller.objective_rejection_count == 1
-    rejected_assistant = controller.session.messages[-3]
-    rejected_tool = controller.session.messages[-2]
-    assert rejected_tool["tool_call_id"] == rejected_assistant["tool_calls"][0]["id"]
-    assert json.loads(rejected_tool["content"])["reason"] == "invalid_objective_proposal"
-    sanitized = json.loads(
-        rejected_assistant["tool_calls"][0]["function"]["arguments"]
-    )
-    assert sanitized == {
-        "validation_issues": [
-            {"field": "arguments", "error_type": "non_object_json"}
-        ]
-    }
-    assert "RAW-NONOBJECT-SECRET" not in json.dumps(controller.session.messages)
-
-
-@pytest.mark.parametrize(
-    "content",
-    [
-        "[]",
-        "null",
-        '{"selected_ids":RAW-CONTENT-SECRET',
-        "RAW-CONTENT-SECRET plain text",
-    ],
-)
-def test_content_only_invalid_objective_response_is_immediately_paired_and_corrected(
-    content,
-):
-    controller, completions = completed_controller([
-        content_response(content),
-        proposal(
-            ["mol-0", "mol-1", "mol-2", "mol-3"],
-            "Use the corrected objective tool call.",
-        ),
-    ])
-    controller.begin_objective_challenge()
-
-    corrected = controller.request_objective_attempt()
-
-    assert corrected.selected_ids == ["mol-0", "mol-1", "mol-2", "mol-3"]
-    assert controller.objective_rejection_count == 1
-    assert len(completions.calls) == 2
-    rejected_assistant = controller.session.messages[-3]
-    rejected_tool = controller.session.messages[-2]
-    assert rejected_tool["tool_call_id"] == rejected_assistant["tool_calls"][0]["id"]
-    assert json.loads(rejected_tool["content"])["reason"] == "invalid_objective_proposal"
-    assert json.loads(
-        rejected_assistant["tool_calls"][0]["function"]["arguments"]
-    ) == {
-        "validation_issues": [
-            {"field": "arguments", "error_type": "invalid_objective_content"}
-        ]
-    }
-    assert "RAW-CONTENT-SECRET" not in json.dumps(controller.session.messages)
-
-
-def test_two_content_only_objective_responses_exhaust_global_correction_budget():
-    controller, completions = completed_controller([
-        content_response("RAW-FIRST-CONTENT"),
-        content_response('{"malformed":"RAW-SECOND-CONTENT"'),
-    ])
-    controller.begin_objective_challenge()
-
-    with pytest.raises(
-        demo_agent.ObjectiveCorrectionLimitError, match="correction limit"
-    ):
-        controller.request_objective_attempt()
-
-    assert controller.objective_rejection_count == 2
-    assert controller.objective_attempts == []
-    assert controller.pending_objective is None
-    assert len(completions.calls) == 2
-    assert controller.session.turn_count == 9
-    assert "RAW-FIRST-CONTENT" not in json.dumps(controller.session.messages)
-    assert "RAW-SECOND-CONTENT" not in json.dumps(controller.session.messages)
-
-
-def test_valid_content_only_objective_json_object_remains_compatible():
-    arguments = {
-        "selected_ids": ["mol-0", "mol-1", "mol-2", "mol-3"],
-        "decision_basis": "Use the valid JSON object fallback.",
-    }
-    controller, completions = completed_controller([
-        content_response(json.dumps(arguments)),
-    ])
-    controller.begin_objective_challenge()
-
-    pending = controller.request_objective_attempt()
-
-    assert pending.model_dump(mode="json") == arguments
-    assert controller.objective_rejection_count == 0
-    assert len(completions.calls) == 1
-    assert controller.session.messages[-1]["tool_calls"][0]["id"].startswith("compat-")
-
-
-def test_hosted_request_failure_does_not_consume_objective_correction_budget():
+def test_legacy_objective_proposal_shape_is_not_available_or_executable():
+    assert "ObjectiveProposal" not in vars(demo_agent)
     controller, _ = completed_controller([])
     controller.begin_objective_challenge()
-
-    with pytest.raises(demo_agent.ToolCallError, match="hosted Nemotron request failed"):
-        controller.request_objective_attempt()
-
-    assert controller.objective_rejection_count == 0
-    assert controller.pending_objective is None
-    assert controller.session.turn_count == 7
+    legacy = {"selected_ids": ["mol-0", "mol-1", "mol-2", "mol-3"], "decision_basis": "model prose"}
+    with pytest.raises((AttributeError, demo_agent.ToolCallError)):
+        controller.execute_objective_attempt(legacy)
 
 
-def test_objective_forced_call_normalizes_provider_metadata_and_decision_basis():
-    raw = {
-        "stage": "select_diverse_panel",
-        "summary": "provider compatibility metadata",
-        "selected_ids": ["mol-0", "mol-1", "mol-2", "mol-3"],
-        "decision_basis": "  Use `ranked`\n candidates.  " + ("detail " * 80),
+@pytest.mark.parametrize(
+    "extra_field",
+    ["selected_ids", "decision_basis", "rationale", "score", "delta", "summary"],
+)
+def test_objective_selection_forbids_legacy_or_model_authored_fields(extra_field):
+    controller, _ = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    payload = {
+        "state_id": menu.state_id,
+        "swap_id": accepted_maxima(menu)[0].swap_id,
+        "observed_limiting_pairs": [list(pair) for pair in menu.source.limiting_pairs],
+        "decision_rule": "maximize_predicted_minimum_distance",
+        extra_field: "forbidden",
     }
     with pytest.raises(Exception):
-        demo_agent.ObjectiveProposal.model_validate(raw)
-    controller, _ = completed_controller([
-        response("select_diverse_panel", raw),
-    ])
+        demo_agent.ObjectiveSelection.model_validate(payload)
+
+
+def test_valid_selection_stays_pending_until_exact_execution_and_then_pairs():
+    controller, completions = completed_controller([])
     controller.begin_objective_challenge()
-
-    pending = controller.request_objective_attempt()
-
-    assert pending is controller.pending_objective
-    assert controller.objective_rejection_count == 0
-    assert 1 <= len(pending.decision_basis) <= 240
-    assert "`" not in pending.decision_basis and "\n" not in pending.decision_basis
-    assert pending.decision_basis.endswith("...")
-    stored = json.loads(controller.session.messages[-1]["tool_calls"][0]["function"]["arguments"])
-    assert set(stored) == {"selected_ids", "decision_basis"}
-    assert stored["decision_basis"] == pending.decision_basis
-
-
-def test_correction_budget_remains_global_across_accepted_attempts():
-    controller, _ = completed_controller([
-        proposal(["mol-0", "mol-2", "mol-4", "outside"], "Correct the initial pool."),
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Measure a valid initial panel."),
-        proposal(["mol-0", "mol-2", "mol-4", "mol-6"], "Try an unlisted revision."),
-    ])
-    controller.begin_objective_challenge()
-    initial = controller.request_objective_attempt()
-    controller.execute_objective_attempt(initial)
-    accepted_before = tuple(controller.objective_attempts)
-
-    with pytest.raises(
-        demo_agent.ObjectiveCorrectionLimitError, match="correction limit"
-    ):
-        controller.request_objective_attempt()
-
-    assert controller.objective_rejection_count == 2
-    assert tuple(controller.objective_attempts) == accepted_before
-    assert controller.pending_objective is None
-    assert controller.pending_objective_swap is None
-
-
-def test_out_of_pool_initial_proposal_is_corrected_from_candidate_ids():
-    controller, _ = completed_controller([
-        proposal(["mol-0", "mol-2", "mol-4", "outside"], "Invalid outside candidate."),
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Use only candidates."),
-    ])
-    controller.begin_objective_challenge()
-
-    corrected = controller.request_objective_attempt()
-
-    assert corrected.selected_ids == ["mol-0", "mol-1", "mol-2", "mol-3"]
-    assert controller.objective_attempts == []
-    assert controller.objective_rejection_count == 1
-    payload = json.loads(controller.session.messages[-2]["content"])
-    assert payload["reason"] == "out_of_pool_panel"
-    assert payload["candidate_ids"] == [f"mol-{index}" for index in range(8)]
-    assert payload["instruction"] == (
-        "Select exactly four unique IDs from candidate_ids and provide a concise "
-        "measured quantitative rationale."
-    )
-
-
-def test_unlisted_in_pool_revision_is_rejected_then_listed_swap_is_retained():
-    controller, _ = completed_controller([
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Measure the baseline panel."),
-        proposal(["mol-0", "mol-2", "mol-4", "mol-6"], "Use an unlisted in-pool panel."),
-        proposal(["mol-5", "mol-1", "mol-2", "mol-3"], "Use one listed swap."),
-    ])
-    controller.begin_objective_challenge()
-    first = controller.request_objective_attempt()
-    controller.execute_objective_attempt(first)
-
-    corrected = controller.request_objective_attempt()
-
-    assert corrected.selected_ids == ["mol-5", "mol-1", "mol-2", "mol-3"]
-    assert controller.pending_objective_swap is controller.objective_suggestions[1]
-    assert len(controller.objective_attempts) == 1
-    payload = json.loads(controller.session.messages[-2]["content"])
-    assert payload["reason"] == "panel_not_in_legal_improving_swaps"
-    assert payload["instruction"] == (
-        "Select exactly one listed resulting_ids panel and provide a concise measured "
-        "quantitative rationale comparing its limiting_pair and predicted_score with "
-        "target_score."
-    )
-
-
-def test_placeholder_revision_rationale_is_corrected_with_exact_swap_provenance():
-    raw_placeholder = "decision basis decision_basis"
-    valid_basis = "Predicted score 0.80 exceeds the 0.71 target."
-    controller, completions = completed_controller([
-        proposal(
-            ["mol-0", "mol-1", "mol-2", "mol-3"],
-            "Measure the initial minimum pairwise distance.",
-        ),
-        proposal(["mol-5", "mol-1", "mol-2", "mol-3"], raw_placeholder),
-        proposal(["mol-5", "mol-1", "mol-2", "mol-3"], valid_basis),
-    ])
-    controller.begin_objective_challenge()
-    initial = controller.request_objective_attempt()
-    controller.execute_objective_attempt(initial)
-    selected_swap = controller.objective_suggestions[1]
-
-    corrected = controller.request_objective_attempt()
-
-    assert corrected.decision_basis == valid_basis
-    assert controller.pending_objective_swap is selected_swap
-    assert len(controller.objective_attempts) == 1
-    assert controller.objective_rejection_count == 1
-    assert len(completions.calls) == 3
-    rejected_assistant = controller.session.messages[-3]
-    rejected_tool = controller.session.messages[-2]
-    assert rejected_tool["tool_call_id"] == rejected_assistant["tool_calls"][0]["id"]
-    payload = json.loads(rejected_tool["content"])
-    assert payload["reason"] == "invalid_objective_proposal"
-    assert payload["instruction"] == (
-        "Select exactly one listed resulting_ids panel and provide a concise measured "
-        "quantitative rationale comparing its limiting_pair and predicted_score with "
-        "target_score."
-    )
-    assert raw_placeholder not in json.dumps(controller.session.messages)
-
-
-def test_revision_schema_allows_non_first_legal_panel_and_retains_exact_provenance():
-    controller, completions = completed_controller([
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Measure the baseline panel."),
-        proposal(["mol-5", "mol-1", "mol-2", "mol-3"], "Choose the second legal swap."),
-    ])
-    controller.begin_objective_challenge()
-    first = controller.request_objective_attempt()
-    controller.execute_objective_attempt(first)
-    selected_swap = controller.objective_suggestions[1]
-
-    revision = controller.request_objective_attempt()
-    accepted = controller.execute_objective_attempt(revision)
-
-    revision_schema = completions.calls[1]["tools"][0]["function"]["parameters"]
-    assert (
-        list(selected_swap.resulting_ids)
-        in revision_schema["properties"]["selected_ids"]["enum"]
-    )
-    assert accepted.selected_swap is selected_swap
-    assert accepted.selected_ids == selected_swap.resulting_ids
-
-
-def test_value_equal_revision_cannot_replace_exact_pending_proposal_or_swap():
-    controller, _ = completed_controller([
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Measure the baseline panel."),
-        proposal(["mol-4", "mol-1", "mol-2", "mol-3"], "Use the ranked replacement."),
-    ])
-    controller.begin_objective_challenge()
-    initial = controller.request_objective_attempt()
-    controller.execute_objective_attempt(initial)
-    pending = controller.request_objective_attempt()
-    pending_swap = controller.pending_objective_swap
-    copied = demo_agent.ObjectiveProposal.model_validate(pending.model_dump())
-    assert copied == pending and copied is not pending
-
+    menu = controller.pending_action_menu
+    completions.responses.append(selection(menu))
+    pending = controller.request_objective_selection()
+    assert controller.accepted_attempt_count == 0 and controller.objective_attempts == []
+    copied = demo_agent.ObjectiveSelection.model_validate(pending.model_dump())
     with pytest.raises(demo_agent.ToolCallError, match="exact pending"):
-        controller.execute_objective_attempt(copied)
+        controller.execute_objective_selection(copied)
+    attempt = controller.execute_objective_selection(pending)
+    assert attempt is controller.objective_attempts[0]
+    assert controller.accepted_attempt_count == 1
+    assert_paired(controller.session.messages)
 
-    assert len(controller.objective_attempts) == 1
-    assert controller.pending_objective is pending
-    assert controller.pending_objective_swap is pending_swap
 
-
-def test_ranking_failure_preserves_pending_objective_transaction(monkeypatch):
-    controller, _ = completed_controller([
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Measure the baseline panel."),
-    ])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"state_id": "state-0000000000000000"},
+        {"observed_limiting_pairs": [["mol-2", "mol-3"]]},
+        {"decision_rule": "wrong_rule"},
+        {"swap_id": "mol-0->outside"},
+    ],
+)
+def test_schema_or_state_invalid_selection_is_corrected_without_measurement(overrides):
+    controller, completions = completed_controller([])
     controller.begin_objective_challenge()
-    pending = controller.request_objective_attempt()
-    suggestions = controller.objective_suggestions
-    original_rank = demo_agent.rank_legal_swaps
+    menu = controller.pending_action_menu
+    completions.responses.extend([selection(menu, **overrides), selection(menu)])
+    pending = controller.request_objective_selection()
+    assert controller.rejected_selection_count == 1
+    assert controller.accepted_attempt_count == 0
+    controller.execute_objective_selection(pending)
+    assert controller.accepted_attempt_count == 1
 
-    def fail_ranking(*_args):
-        raise RuntimeError("RAW-RANKING-SECRET")
 
-    monkeypatch.setattr(demo_agent, "rank_legal_swaps", fail_ranking)
-    with pytest.raises(demo_agent.ToolCallError, match="could not be ranked") as captured:
-        controller.execute_objective_attempt(pending)
+@pytest.mark.parametrize("raw_arguments", ["{", "[]", "null", '"model prose"'])
+def test_malformed_with_real_call_id_is_preserved_and_paired(raw_arguments):
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    completions.responses.extend([
+        raw_response("select_next_panel_swap", raw_arguments),
+        selection(menu),
+    ])
+    controller.request_objective_selection()
+    rejected, tool = controller.session.messages[-4:-2]
+    assert rejected["tool_calls"][0]["function"]["arguments"] == raw_arguments
+    assert tool["tool_call_id"] == rejected["tool_calls"][0]["id"]
+    assert json.loads(tool["content"])["accepted"] is False
 
+
+@pytest.mark.parametrize("content", [None, "plain model prose", "{}", "[]"])
+def test_no_tool_assistant_is_preserved_without_phantom_pairing(content):
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    completions.responses.extend([content_response(content), selection(menu)])
+    controller.request_objective_selection()
+    rejected = controller.session.messages[-3]
+    assert rejected == {"role": "assistant", "content": content}
+    assert controller.session.messages[-2]["role"] == "user"
+    assert all(
+        not (item.get("role") == "tool" and item.get("tool_call_id") is None)
+        for item in controller.session.messages
+    )
+
+
+def test_missing_call_id_is_preserved_without_tool_result_then_corrected():
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    missing = response("select_next_panel_swap", {
+        "state_id": menu.state_id,
+        "swap_id": menu.actions[0].swap_id,
+        "observed_limiting_pairs": [list(pair) for pair in menu.source.limiting_pairs],
+        "decision_rule": "maximize_predicted_minimum_distance",
+    })
+    missing.choices[0].message.tool_calls[0].id = None
+    completions.responses.extend([missing, selection(menu)])
+    controller.request_objective_selection()
+    rejected = controller.session.messages[-3]
+    assert rejected["tool_calls"][0]["id"] is None
+    assert controller.session.messages[-2]["role"] == "user"
+
+
+def test_wrong_tool_with_real_id_is_preserved_and_paired():
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    wrong = response("select_diverse_panel", {"selected_ids": ["model", "prose"]})
+    completions.responses.extend([wrong, selection(menu)])
+    controller.request_objective_selection()
+    rejected, tool = controller.session.messages[-4:-2]
+    assert rejected["tool_calls"][0]["function"]["name"] == "select_diverse_panel"
+    assert tool["tool_call_id"] == rejected["tool_calls"][0]["id"]
+
+
+@pytest.mark.parametrize("drift", ["state", "source", "actions", "pairs", "rule"])
+def test_execute_revalidates_pending_selection_against_current_menu(drift):
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    completions.responses.append(selection(menu))
+    pending = controller.request_objective_selection()
+    if drift == "state":
+        controller.pending_action_menu = replace(menu, state_id="state-0000000000000000")
+    elif drift == "source":
+        controller.pending_action_menu = replace(menu, accepted_attempt_count=1)
+    elif drift == "actions":
+        controller.pending_action_menu = replace(menu, actions=menu.actions[1:])
+    elif drift == "pairs":
+        object.__setattr__(pending, "observed_limiting_pairs", [["mol-2", "mol-3"]])
+    else:
+        object.__setattr__(pending, "decision_rule", "wrong_rule")
+    with pytest.raises(demo_agent.ToolCallError):
+        controller.execute_objective_selection(pending)
+    assert controller.accepted_attempt_count == 0
     assert controller.objective_attempts == []
-    assert controller.pending_objective is pending
-    assert controller.pending_objective_swap is None
-    assert controller.objective_suggestions is suggestions
-    assert controller.objective_run is None and controller.objective_evidence is None
-    assert controller.session.messages[-1]["role"] == "assistant"
-    assert "RAW-RANKING-SECRET" not in str(captured.value)
-
-    monkeypatch.setattr(demo_agent, "rank_legal_swaps", original_rank)
-    accepted = controller.execute_objective_attempt(pending)
-    assert accepted is controller.objective_attempts[0]
 
 
-def test_feedback_serialization_failure_preserves_revision_transaction(monkeypatch):
-    controller, _ = completed_controller([
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Measure the baseline panel."),
-        proposal(["mol-4", "mol-1", "mol-2", "mol-3"], "Use the ranked replacement."),
-    ])
+def test_unreachable_policy_maps_specific_eligibility_error_without_provider(monkeypatch):
+    controller, completions = completed_controller([])
+    context = two_revision_context()
+    monkeypatch.setattr(demo_agent, "certify_argmax_reachability", lambda _context: False)
+    monkeypatch.setattr(demo_agent, "build_objective_context", lambda _state: context)
+    with pytest.raises(
+        demo_agent.ObjectiveEligibilityError,
+        match="not reachable under the bounded decision policy",
+    ):
+        controller.begin_objective_challenge()
+    assert completions.calls == []
+
+
+def test_no_legal_menu_terminalizes_without_provider(monkeypatch):
+    from objective_fixtures import controlled_context_without_improving_swaps
+    controller, completions = completed_controller([])
+    context = controlled_context_without_improving_swaps()
+    monkeypatch.setattr(demo_agent, "build_objective_context", lambda _state: context)
+    monkeypatch.setattr(demo_agent, "certify_argmax_reachability", lambda _context: True)
     controller.begin_objective_challenge()
-    initial = controller.request_objective_attempt()
-    controller.execute_objective_attempt(initial)
-    pending = controller.request_objective_attempt()
-    pending_swap = controller.pending_objective_swap
-    attempts = tuple(controller.objective_attempts)
-    suggestions = controller.objective_suggestions
-    original_serialize = demo_agent._serialize
-
-    def fail_serialization(_value):
-        raise demo_agent.ToolCallError("safe serialization failure")
-
-    monkeypatch.setattr(demo_agent, "_serialize", fail_serialization)
-    with pytest.raises(demo_agent.ToolCallError, match="serialization failure"):
-        controller.execute_objective_attempt(pending)
-
-    assert tuple(controller.objective_attempts) == attempts
-    assert controller.pending_objective is pending
-    assert controller.pending_objective_swap is pending_swap
-    assert controller.objective_suggestions is suggestions
-    assert controller.objective_run is None and controller.objective_evidence is None
-    assert controller.session.messages[-1]["role"] == "assistant"
-
-    monkeypatch.setattr(demo_agent, "_serialize", original_serialize)
-    accepted = controller.execute_objective_attempt(pending)
-    assert accepted.selected_swap is pending_swap
-
-
-'''
-
+    assert controller.objective_run.termination_reason == "no_legal_improving_swap"
+    assert completions.calls == []
 
 def test_optimal_baseline_terminates_without_manufacturing_an_attempt():
     controller, completions = completed_controller([], baseline_optimal=True)
@@ -1212,24 +855,19 @@ def test_objective_prompt_contains_bounded_evidence_but_not_benchmark_panel():
     assert "decision_basis" not in prompt and "rationale" not in prompt
 
 
-def _legacy_miss_without_legal_suggestions_test_removed():
-    '''
-def test_miss_without_legal_suggestions_fails_before_another_hosted_request():
-    controller, completions = completed_controller([
-        proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Measure the baseline panel."),
-    ])
+def test_empty_production_menu_stops_before_any_hosted_request(monkeypatch):
+    from objective_fixtures import controlled_context_without_improving_swaps
+
+    controller, completions = completed_controller([])
+    context = controlled_context_without_improving_swaps()
+    monkeypatch.setattr(demo_agent, "build_objective_context", lambda _state: context)
+    monkeypatch.setattr(demo_agent, "certify_argmax_reachability", lambda _context: True)
+
     controller.begin_objective_challenge()
-    pending = controller.request_objective_attempt()
-    controller.execute_objective_attempt(pending)
-    controller.objective_suggestions = ()
 
-    with pytest.raises(demo_agent.ToolCallError, match="legal improving"):
-        controller.request_objective_attempt()
-
-    assert len(controller.objective_attempts) == 1
-    assert controller.objective_run is None
-    assert len(completions.calls) == 1
-    '''
+    assert controller.objective_attempts == []
+    assert controller.objective_run.termination_reason == "no_legal_improving_swap"
+    assert completions.calls == []
 
 
 def test_objective_required_controller_blocks_conclusion_until_termination():

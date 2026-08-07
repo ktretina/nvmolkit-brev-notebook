@@ -234,18 +234,6 @@ class ObjectiveSelection(_StrictModel):
         return value
 
 
-class ObjectiveProposal(_StrictModel):
-    """Task-5 removal shim for older display-only notebook integrations."""
-    selected_ids: list[MoleculeId] = Field(min_length=4, max_length=4)
-    decision_basis: DecisionBasis
-
-    @field_validator("selected_ids")
-    @classmethod
-    def selected_ids_are_unique(cls, value: list[str]) -> list[str]:
-        if len(set(value)) != len(value):
-            raise ValueError("Objective proposal molecule IDs must be unique.")
-        return value
-
 class PlanStage(_StrictModel):
     stage: StageName
     rationale: DecisionBasis
@@ -602,8 +590,6 @@ def validate_objective_conclusion(
 def _tool_definition(
     name: str,
     model: type[BaseModel],
-    *,
-    _selected_ids_enum: tuple[tuple[str, ...], ...] | None = None,
 ) -> dict[str, Any]:
     parameters = model.model_json_schema()
     parameters["additionalProperties"] = False
@@ -635,32 +621,6 @@ def _tool_definition(
             "anyOf": section_branches
         }
         parameters.pop("$defs", None)
-    if _selected_ids_enum is not None:
-        if (
-            name != "select_diverse_panel"
-            or model is not ObjectiveProposal
-            or type(_selected_ids_enum) is not tuple
-            or not _selected_ids_enum
-        ):
-            raise ValueError("The revision panel schema constraint was invalid.")
-        panels: list[list[str]] = []
-        seen: set[tuple[str, ...]] = set()
-        for panel in _selected_ids_enum:
-            if (
-                type(panel) is not tuple
-                or len(panel) != 4
-                or any(type(item) is not str for item in panel)
-                or len(set(panel)) != 4
-                or panel in seen
-            ):
-                raise ValueError("The revision panel schema constraint was invalid.")
-            ObjectiveProposal(
-                selected_ids=list(panel),
-                decision_basis="Validate the revision tool schema.",
-            )
-            seen.add(panel)
-            panels.append(list(panel))
-        parameters["properties"]["selected_ids"]["enum"] = panels
     return {
         "type": "function",
         "function": {
@@ -687,7 +647,6 @@ def _request_call(
     *,
     _text_only_retries_remaining: int = 2,
     _max_turns: int = 8,
-    _selected_ids_enum: tuple[tuple[str, ...], ...] | None = None,
 ) -> BaseModel:
     """Request, validate, and append exactly one forced hosted call."""
     if session.turn_count >= _max_turns or (
@@ -704,7 +663,6 @@ def _request_call(
                 _tool_definition(
                     expected_name,
                     argument_model,
-                    _selected_ids_enum=_selected_ids_enum,
                 )
             ],
             tool_choice={
@@ -738,17 +696,6 @@ def _request_call(
                 candidate = None
             if isinstance(candidate, dict):
                 content_arguments = candidate
-        if (
-            no_calls
-            and isinstance(content, str)
-            and content_arguments is None
-            and expected_name == "select_diverse_panel"
-        ):
-            raise _HostedArgumentsValidationError(
-                expected_name,
-                (("arguments", "invalid_objective_content"),),
-                f"compat-rejected-{session.turn_count + 1}-{expected_name}",
-            )
         content = None
         if (
             no_calls
@@ -763,7 +710,6 @@ def _request_call(
                 model,
                 _text_only_retries_remaining=_text_only_retries_remaining - 1,
                 _max_turns=_max_turns,
-                _selected_ids_enum=_selected_ids_enum,
             )
         if content_arguments is not None:
             call_id = f"compat-{session.turn_count + 1}-{expected_name}"
@@ -1291,21 +1237,44 @@ class BoundedWorkflowController:
         })})
         return context
 
-    def _append_objective_assistant(self, call_id: str, name: str, arguments: Any) -> None:
-        self.session.messages.append({
+    @staticmethod
+    def _objective_assistant_payload(message: Any) -> dict[str, Any]:
+        """Preserve the provider's actual assistant shape without inventing calls."""
+        payload: dict[str, Any] = {
             "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": call_id,
-                "type": "function",
-                "function": {"name": name, "arguments": _serialize(arguments)},
-            }],
-        })
+            "content": getattr(message, "content", None),
+        }
+        calls = getattr(message, "tool_calls", None)
+        if isinstance(calls, (list, tuple)):
+            payload["tool_calls"] = [
+                {
+                    "id": getattr(call, "id", None),
+                    "type": getattr(call, "type", None),
+                    "function": {
+                        "name": getattr(getattr(call, "function", None), "name", None),
+                        "arguments": getattr(
+                            getattr(call, "function", None), "arguments", None
+                        ),
+                    },
+                }
+                for call in calls
+            ]
+        return payload
+
+    def _append_objective_assistant(self, payload: dict[str, Any]) -> None:
+        self.session.messages.append(payload)
         self.session.turn_count += 1
 
-    def _reject_objective_selection(self, call_id: str, name: str, reason: str) -> None:
-        self._append_objective_assistant(call_id, name, {"rejected": True})
-        _append_tool_result(self.session, {"accepted": False, "reason": reason})
+    def _reject_objective_selection(
+        self, assistant: dict[str, Any], call_id: str | None, reason: str
+    ) -> None:
+        self._append_objective_assistant(assistant)
+        if isinstance(call_id, str) and call_id.strip():
+            self.session.messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": _serialize({"accepted": False, "reason": reason}),
+            })
         self.rejected_selection_count += 1
         if self.rejected_selection_count == 2:
             self._terminalize_objective(TerminationReason.OBJECTIVE_CORRECTION_LIMIT)
@@ -1377,20 +1346,23 @@ class BoundedWorkflowController:
                     self._objective_transport_retry_pending = True
                 raise ToolCallError(_REQUEST_ERROR) from None
             self.selection_response_count += 1
-            call_id = f"compat-objective-{self.selection_response_count}"
-            name = "invalid_objective_response"
+            assistant = self._objective_assistant_payload(message)
+            call_id: str | None = None
             decoded: Any = None
             reason = "schema_invalid_selection"
             try:
                 calls = getattr(message, "tool_calls", None)
                 if not isinstance(calls, (list, tuple)) or len(calls) != 1:
+                    reason = "missing_objective_tool"
                     raise ValueError
                 call = calls[0]
-                call_id = getattr(call, "id", call_id)
+                call_id = getattr(call, "id", None)
                 if not isinstance(call_id, str) or not call_id.strip():
-                    call_id = f"compat-objective-{self.selection_response_count}"
+                    call_id = None
+                    reason = "missing_objective_call_id"
+                    raise ValueError
                 function = getattr(call, "function", None)
-                name = getattr(function, "name", "invalid_objective_response")
+                name = getattr(function, "name", None)
                 raw = getattr(function, "arguments", "")
                 if name != "select_next_panel_swap":
                     reason = "wrong_objective_tool"
@@ -1412,12 +1384,12 @@ class BoundedWorkflowController:
                 elif not all(action.replace_id in pair for pair in menu.source.limiting_pairs):
                     reason = "invalid_co_limiter_effect"
                 else:
-                    self._append_objective_assistant(call_id, name, selection.model_dump(mode="json"))
+                    self._append_objective_assistant(assistant)
                     self.pending_objective_selection = ObjectiveSelection.model_validate(selection.model_dump())
                     return self.pending_objective_selection
             except (ValidationError, ValueError, TypeError, AttributeError, IndexError, json.JSONDecodeError):
                 pass
-            self._reject_objective_selection(call_id, name, reason)
+            self._reject_objective_selection(assistant, call_id, reason)
             self._check_objective_bounds()
             if self.selection_response_count >= 5 or self.provider_request_attempt_count >= 6:
                 raise ToolCallError("The objective hosted request bound was reached.")
@@ -1431,9 +1403,17 @@ class BoundedWorkflowController:
             raise ToolCallError("The exact pending objective selection is required.")
         if context is None or menu is None or self.objective_run is not None:
             raise ToolCallError("The objective challenge is not awaiting evaluation.")
+        expected_pairs = [list(pair) for pair in menu.source.limiting_pairs]
         action = next((item for item in menu.actions if item.swap_id == selection.swap_id), None)
-        if action is None:
-            raise ToolCallError("The pending objective action is unavailable.")
+        if (
+            selection.state_id != menu.state_id
+            or selection.observed_limiting_pairs != expected_pairs
+            or selection.decision_rule != "maximize_predicted_minimum_distance"
+            or action is None
+            or action not in accepted_maxima(menu)
+            or not all(action.replace_id in pair for pair in menu.source.limiting_pairs)
+        ):
+            raise ToolCallError("The pending objective selection no longer matches the current menu.")
         try:
             attempt = evaluate_selected_swap(context, menu, action, self.accepted_attempt_count + 1)
         except Exception:

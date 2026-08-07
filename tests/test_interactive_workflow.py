@@ -10,11 +10,12 @@ import demo_agent
 from chemistry_workflow import StageResult
 from demo_agent import (
     ClusterArgs, EmbedArgs, FingerprintArgs, InspectionArgs, OptimizationArgs,
-    ObjectiveProposal, SimilarityArgs, StageProposal, ToolCallError,
+    ObjectiveSelection, SimilarityArgs, StageProposal, ToolCallError,
 )
 from objective_challenge import (
     ObjectiveAttempt, ObjectiveCandidate, ObjectiveContext, ObjectiveSwap,
-    TARGET_FRACTION, evaluate_diverse_panel, rank_legal_swaps,
+    TARGET_FRACTION, accepted_maxima, build_action_menu, evaluate_selected_swap,
+    measure_panel,
 )
 from interactive_workflow import InteractiveWorkflow, controls_for
 
@@ -62,16 +63,8 @@ class Controller:
         self.objective_run = None
         self.objective_evidence = None
         self.objective_prompt_appended = False
-        self.objective_proposals = [
-            ObjectiveProposal(
-                selected_ids=["mol-0", "mol-1", "mol-2", "mol-3"],
-                decision_basis="Measure the current policy baseline.",
-            ),
-            ObjectiveProposal(
-                selected_ids=["mol-0", "mol-5", "mol-2", "mol-3"],
-                decision_basis="Replace the member of the limiting pair.",
-            ),
-        ]
+        self.objective_proposals = []
+        self._objective_expected_attempts = []
         self.session = Session(self)
 
     def request_plan(self):
@@ -109,16 +102,21 @@ class Controller:
         self.calls.append("objective_begin")
         self.report = SimpleNamespace(evidence=())
         self.objective_prompt_appended = True
-        self.objective_context = SimpleNamespace(
-            baseline_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
-            baseline_score=0.35,
-            benchmark_score=0.80,
-            target_score=0.35 + TARGET_FRACTION * (0.80 - 0.35),
-            candidates=tuple(
-                SimpleNamespace(molecule_id=f"mol-{index}", cluster_id=index)
-                for index in range(8)
-            ),
-        )
+        self.objective_context, first, second = evaluated_objective_records()
+        self._objective_expected_attempts = [first, second]
+        current = measure_panel(self.objective_context, self.objective_context.baseline_ids)
+        self.objective_proposals = []
+        for attempt in self._objective_expected_attempts:
+            menu = build_action_menu(
+                self.objective_context, current, len(self.objective_proposals)
+            )
+            self.objective_proposals.append(ObjectiveSelection(
+                state_id=menu.state_id,
+                swap_id=attempt.selected_swap.swap_id,
+                observed_limiting_pairs=[list(pair) for pair in menu.source.limiting_pairs],
+                decision_rule="maximize_predicted_minimum_distance",
+            ))
+            current = attempt.measurement
         return self.objective_context
 
     def request_objective_attempt(self):
@@ -132,26 +130,8 @@ class Controller:
     def execute_objective_attempt(self, proposal):
         self.calls.append(("objective_execute", proposal))
         number = len(self.objective_attempts) + 1
-        achieved = number == len(self.objective_proposals)
-        attempt = ObjectiveAttempt(
-            attempt_number=number,
-            selected_ids=tuple(proposal.selected_ids),
-            decision_basis=proposal.decision_basis,
-            score=0.35 if number == 1 else 0.80,
-            limiting_pair=("mol-0", "mol-1") if number == 1 else ("mol-0", "mol-2"),
-            constraints_passed=True,
-            achieved=achieved,
-            selected_swap=(
-                None if number == 1 else ObjectiveSwap(
-                    replace_id="mol-1",
-                    replacement_id="mol-5",
-                    resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
-                    predicted_score=0.80,
-                    score_delta=0.80 - 0.35,
-                    limiting_pair=("mol-0", "mol-2"),
-                )
-            ),
-        )
+        attempt = self._objective_expected_attempts[number - 1]
+        achieved = attempt.achieved
         self.objective_attempts.append(attempt)
         self.pending_objective = None
         if achieved:
@@ -207,9 +187,10 @@ def run_objective(workflow):
 
 
 def evaluated_objective_records(candidate_ids=tuple(f"mol-{index}" for index in range(8))):
-    distance = np.full((8, 8), 0.80, dtype=float)
+    distance = np.full((8, 8), 0.90, dtype=float)
     np.fill_diagonal(distance, 0.0)
     distance[0, 1] = distance[1, 0] = 0.35
+    distance[2, 3] = distance[3, 2] = 0.45
     context = ObjectiveContext(
         candidates=tuple(
             ObjectiveCandidate(molecule_id, index, index, index)
@@ -217,24 +198,15 @@ def evaluated_objective_records(candidate_ids=tuple(f"mol-{index}" for index in 
         ),
         baseline_ids=candidate_ids[:4],
         baseline_score=0.35,
-        benchmark_score=0.80,
-        target_score=0.35 + TARGET_FRACTION * (0.80 - 0.35),
+        benchmark_score=0.90,
+        target_score=0.35 + TARGET_FRACTION * (0.90 - 0.35),
         distance_matrix=distance,
     )
-    first = evaluate_diverse_panel(
-        context,
-        context.baseline_ids,
-        attempt_number=1,
-        decision_basis="Measure the defined baseline panel.",
-    )
-    swap = rank_legal_swaps(context, first)[0]
-    second = evaluate_diverse_panel(
-        context,
-        swap.resulting_ids,
-        attempt_number=2,
-        decision_basis="Use the ranked one-ID replacement.",
-        selected_swap=swap,
-    )
+    baseline = measure_panel(context, context.baseline_ids)
+    first_menu = build_action_menu(context, baseline, 0)
+    first = evaluate_selected_swap(context, first_menu, accepted_maxima(first_menu)[0], 1)
+    second_menu = build_action_menu(context, first.measurement, 1)
+    second = evaluate_selected_swap(context, second_menu, accepted_maxima(second_menu)[0], 2)
     return context, first, second
 
 
@@ -393,14 +365,15 @@ def test_objective_card_retains_attempts_receipts_scores_and_limiting_pairs(monk
     assert len(workflow.objective_attempt_cards) == 2
     assert "Validated Nemotron proposal" in text
     assert "Evaluation executed by Python" in text
-    assert "select_diverse_panel" in text
-    assert "evaluate_diverse_panel" in text
+    assert "select_next_panel_swap" in text
+    assert "evaluate_selected_swap" in text
+    assert "decision_basis" not in text and "Decision summary" not in text
     assert "D_min" in text and "Limiting pair" in text
     assert "Revise" in text and "Goal achieved" in text
     assert "Baseline" in workflow.objective_summary.value
     assert "Attempt 1" in workflow.objective_summary.value
     assert "Attempt 2" in workflow.objective_summary.value
-    assert [attempt.score for attempt in controller.objective_attempts] == [0.35, 0.80]
+    assert [attempt.score for attempt in controller.objective_attempts] == [0.45, 0.90]
 
 
 def test_objective_attempts_render_as_observe_act_measure_decision_ladder(monkeypatch):
@@ -416,13 +389,13 @@ def test_objective_attempts_render_as_observe_act_measure_decision_ladder(monkey
     assert "Agent action" in summary
     assert "Measure" in summary
     assert "Outcome" in summary
-    assert "replace mol-1" in summary
-    assert "with mol-5" in summary
+    assert "swap mol-0-&gt;mol-4" in summary
+    assert "from state state-" in summary
     assert "+0.450" in summary
-    assert "0.800 ≥ 0.710" in summary
+    assert "0.900 ≥ 0.790" in summary
     assert "<b>Outcome:</b> Revise" in summary
     assert "<b>Outcome:</b> Goal achieved" in summary
-    assert "#6c757d" in summary
+    assert "#D68A00" in summary
     assert "#76B900" in summary
     assert "Validated intervention" in details
     assert "Goal achieved" in details
@@ -437,6 +410,7 @@ def test_objective_revision_without_prior_attempt_fails_closed():
         limiting_pair=("mol-0", "mol-2"),
         constraints_passed=True,
         achieved=True,
+        state_id="state-0123456789abcdef",
         selected_swap=ObjectiveSwap(
             replace_id="mol-1",
             replacement_id="mol-5",
@@ -481,6 +455,7 @@ def test_objective_attempt_row_enforces_initial_and_revision_state_shapes():
         limiting_pair=swap.limiting_pair,
         constraints_passed=True,
         achieved=True,
+        state_id="",
         selected_swap=swap,
     )
     revision_without_swap = ObjectiveAttempt(
@@ -503,14 +478,15 @@ def test_objective_attempt_row_enforces_initial_and_revision_state_shapes():
         limiting_pair=swap.limiting_pair,
         constraints_passed=True,
         achieved=True,
+        state_id="state-0123456789abcdef",
         selected_swap=SwapSubclass(**swap.__dict__),
     )
 
     with pytest.raises(ValueError, match="initial"):
         InteractiveWorkflow._objective_attempt_row(context, initial, initial)
-    with pytest.raises(ValueError, match="initial"):
+    with pytest.raises(ValueError, match="state-bound"):
         InteractiveWorkflow._objective_attempt_row(context, initial_with_swap)
-    with pytest.raises(ValueError, match="revision"):
+    with pytest.raises(ValueError, match="state-bound"):
         InteractiveWorkflow._objective_attempt_row(context, revision_without_swap, initial)
     with pytest.raises(ValueError, match="exact"):
         InteractiveWorkflow._objective_attempt_row(context, revision_with_subclass, initial)
@@ -543,6 +519,7 @@ def test_objective_attempt_row_uses_gray_amber_and_green_by_state():
         limiting_pair=swap.limiting_pair,
         constraints_passed=True,
         achieved=False,
+        state_id="state-0123456789abcdef",
         selected_swap=swap,
     )
     initial_achieved = ObjectiveAttempt(
@@ -577,13 +554,11 @@ def test_objective_attempt_row_binds_evaluated_records_and_escapes_action_conten
     revision_row = InteractiveWorkflow._objective_attempt_row(context, adversarial, first)
 
     assert "baseline D_min 0.350" in initial_row
-    assert "prior D_min 0.350" in revision_row
+    assert "prior D_min 0.450" in revision_row
     assert "limiting pair" in revision_row
-    assert "replace" in revision_row and "with" in revision_row
-    assert "mol&lt;0&gt;" in revision_row
-    assert "mol&amp;4" in revision_row
-    assert "mol<0>" not in revision_row
-    assert "&lt;img src=x onerror=alert(1)&gt;" in revision_row
+    assert "swap" in revision_row and "from state" in revision_row
+    assert "mol<0>" not in initial_row
+    assert "&lt;img src=x onerror=alert(1)&gt;" not in revision_row
     assert "<img src=x" not in revision_row
     assert "<b>Outcome:</b> Goal achieved" in revision_row
 
@@ -635,6 +610,7 @@ def test_objective_attempt_row_adapts_precision_without_erasing_near_threshold_d
         limiting_pair=swap.limiting_pair,
         constraints_passed=True,
         achieved=False,
+        state_id="state-0123456789abcdef",
         selected_swap=swap,
     )
 
@@ -736,6 +712,7 @@ def test_objective_attempt_row_uses_scientific_notation_when_six_decimals_hide_t
         limiting_pair=swap.limiting_pair,
         constraints_passed=True,
         achieved=False,
+        state_id="state-0123456789abcdef",
         selected_swap=swap,
     )
 
@@ -832,6 +809,7 @@ def test_objective_attempt_row_accepts_one_score_key_revision_below_old_toleranc
         limiting_pair=swap.limiting_pair,
         constraints_passed=True,
         achieved=True,
+        state_id="state-0123456789abcdef",
         selected_swap=swap,
     )
 
