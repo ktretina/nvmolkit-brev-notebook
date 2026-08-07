@@ -109,6 +109,22 @@ def content_response(content):
     )
 
 
+def envelope_response(calls, *, content=None):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(
+            content=content,
+            tool_calls=[SimpleNamespace(
+                id=call.get("id"),
+                type=call.get("type"),
+                function=SimpleNamespace(
+                    name=call.get("name"),
+                    arguments=call.get("arguments"),
+                ),
+            ) for call in calls],
+        ))]
+    )
+
+
 def optimized_state(*, baseline_optimal=False):
     smiles = ("CC", "CCC", "CCCC", "CCO", "CCN", "CCCl", "CCF", "C1CC1")
     distance = np.full((8, 8), 0.80, dtype=float)
@@ -773,6 +789,116 @@ def test_wrong_tool_with_real_id_is_preserved_and_paired():
     rejected, tool = controller.session.messages[-4:-2]
     assert rejected["tool_calls"][0]["function"]["name"] == "select_diverse_panel"
     assert tool["tool_call_id"] == rejected["tool_calls"][0]["id"]
+
+
+def test_two_tool_calls_preserve_and_pair_both_real_ids_before_one_correction():
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    valid_arguments = selection(menu).choices[0].message.tool_calls[0].function.arguments
+    multiple = envelope_response([
+        {"id": "call-first", "type": "function", "name": "select_next_panel_swap", "arguments": valid_arguments},
+        {"id": "call-second", "type": "function", "name": "select_next_panel_swap", "arguments": valid_arguments},
+    ], content="provider multi-call envelope")
+    completions.responses.extend([multiple, selection(menu)])
+
+    controller.request_objective_selection()
+
+    rejected, first_tool, second_tool, correction, accepted = controller.session.messages[-5:]
+    assert rejected["content"] == "provider multi-call envelope"
+    assert [call["id"] for call in rejected["tool_calls"]] == ["call-first", "call-second"]
+    assert [first_tool["tool_call_id"], second_tool["tool_call_id"]] == ["call-first", "call-second"]
+    assert first_tool["role"] == second_tool["role"] == "tool"
+    assert correction["role"] == "user"
+    assert accepted["role"] == "assistant"
+    assert controller.selection_response_count == 2
+    assert controller.rejected_selection_count == 1
+    assert controller.accepted_attempt_count == 0
+
+
+def test_multi_call_pairs_only_nonempty_actual_ids_before_correction():
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    valid_arguments = selection(menu).choices[0].message.tool_calls[0].function.arguments
+    multiple = envelope_response([
+        {"id": None, "type": "function", "name": "select_next_panel_swap", "arguments": valid_arguments},
+        {"id": "call-real", "type": "function", "name": "select_next_panel_swap", "arguments": valid_arguments},
+    ])
+    completions.responses.extend([multiple, selection(menu)])
+
+    controller.request_objective_selection()
+
+    rejected, tool, correction, accepted = controller.session.messages[-4:]
+    assert [call["id"] for call in rejected["tool_calls"]] == [None, "call-real"]
+    assert tool["role"] == "tool" and tool["tool_call_id"] == "call-real"
+    assert correction["role"] == "user" and accepted["role"] == "assistant"
+    assert controller.selection_response_count == 2
+    assert controller.rejected_selection_count == 1
+    assert all(
+        message.get("tool_call_id") is not None
+        for message in controller.session.messages
+        if message.get("role") == "tool"
+    )
+
+
+def test_single_non_function_call_is_rejected_paired_and_never_measured():
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    valid_arguments = selection(menu).choices[0].message.tool_calls[0].function.arguments
+    invalid = envelope_response([{
+        "id": "call-non-function",
+        "type": "custom",
+        "name": "select_next_panel_swap",
+        "arguments": valid_arguments,
+    }])
+    completions.responses.extend([invalid, selection(menu)])
+
+    pending = controller.request_objective_selection()
+
+    rejected, tool, correction, accepted = controller.session.messages[-4:]
+    assert rejected["tool_calls"][0]["type"] == "custom"
+    assert tool["tool_call_id"] == "call-non-function"
+    assert correction["role"] == "user" and accepted["role"] == "assistant"
+    assert controller.rejected_selection_count == 1
+    assert controller.accepted_attempt_count == 0
+    assert controller.objective_attempts == []
+    assert pending is controller.pending_objective_selection
+
+
+def test_two_invalid_envelopes_terminalize_without_extra_prompt_or_third_request():
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    valid_arguments = selection(menu).choices[0].message.tool_calls[0].function.arguments
+    completions.responses.extend([
+        envelope_response([
+            {"id": "call-a", "type": "function", "name": "select_next_panel_swap", "arguments": valid_arguments},
+            {"id": "call-b", "type": "function", "name": "select_next_panel_swap", "arguments": valid_arguments},
+        ]),
+        envelope_response([{
+            "id": "call-c",
+            "type": "custom",
+            "name": "select_next_panel_swap",
+            "arguments": valid_arguments,
+        }]),
+    ])
+
+    with pytest.raises(demo_agent.ObjectiveCorrectionLimitError):
+        controller.request_objective_selection()
+
+    assert len(completions.calls) == 2
+    assert controller.selection_response_count == 2
+    assert controller.rejected_selection_count == 2
+    assert controller.correction_prompts_sent == 1
+    assert controller.accepted_attempt_count == 0
+    assert controller.objective_attempts == []
+    assert controller.objective_run.termination_reason == "objective_correction_limit"
+    assert [message["role"] for message in controller.session.messages[-3:]] == [
+        "user", "assistant", "tool"
+    ]
+    assert controller.session.messages[-1]["tool_call_id"] == "call-c"
 
 
 @pytest.mark.parametrize("drift", ["state", "source", "actions", "pairs", "rule"])

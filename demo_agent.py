@@ -1266,10 +1266,10 @@ class BoundedWorkflowController:
         self.session.turn_count += 1
 
     def _reject_objective_selection(
-        self, assistant: dict[str, Any], call_id: str | None, reason: str
+        self, assistant: dict[str, Any], call_ids: tuple[str, ...], reason: str
     ) -> None:
         self._append_objective_assistant(assistant)
-        if isinstance(call_id, str) and call_id.strip():
+        for call_id in call_ids:
             self.session.messages.append({
                 "role": "tool",
                 "tool_call_id": call_id,
@@ -1347,18 +1347,25 @@ class BoundedWorkflowController:
                 raise ToolCallError(_REQUEST_ERROR) from None
             self.selection_response_count += 1
             assistant = self._objective_assistant_payload(message)
-            call_id: str | None = None
+            calls = getattr(message, "tool_calls", None)
+            call_ids = tuple(
+                call_id
+                for call in calls
+                if isinstance((call_id := getattr(call, "id", None)), str)
+                and call_id.strip()
+            ) if isinstance(calls, (list, tuple)) else ()
             decoded: Any = None
             reason = "schema_invalid_selection"
             try:
-                calls = getattr(message, "tool_calls", None)
                 if not isinstance(calls, (list, tuple)) or len(calls) != 1:
                     reason = "missing_objective_tool"
                     raise ValueError
                 call = calls[0]
+                if getattr(call, "type", None) != "function":
+                    reason = "wrong_objective_call_type"
+                    raise ValueError
                 call_id = getattr(call, "id", None)
                 if not isinstance(call_id, str) or not call_id.strip():
-                    call_id = None
                     reason = "missing_objective_call_id"
                     raise ValueError
                 function = getattr(call, "function", None)
@@ -1389,7 +1396,7 @@ class BoundedWorkflowController:
                     return self.pending_objective_selection
             except (ValidationError, ValueError, TypeError, AttributeError, IndexError, json.JSONDecodeError):
                 pass
-            self._reject_objective_selection(assistant, call_id, reason)
+            self._reject_objective_selection(assistant, call_ids, reason)
             self._check_objective_bounds()
             if self.selection_response_count >= 5 or self.provider_request_attempt_count >= 6:
                 raise ToolCallError("The objective hosted request bound was reached.")
