@@ -145,6 +145,17 @@ def controlled_context_with_ranked_swaps() -> ObjectiveContext:
     return controlled_context(distances=distances, default_distance=0.95)
 
 
+def target_achieved_context() -> ObjectiveContext:
+    """One-revision context matching the accepted live objective distance."""
+    final_distance = 0.8374999910593033
+    matrix = np.full(
+        (CANDIDATE_COUNT, CANDIDATE_COUNT), final_distance, dtype=np.float64
+    )
+    np.fill_diagonal(matrix, 0.0)
+    matrix[0, 1] = matrix[1, 0] = 0.76744
+    return context_from_distance(matrix)
+
+
 def controlled_context_without_improving_swaps() -> ObjectiveContext:
     distances = {}
     for first in range(4):
@@ -248,7 +259,7 @@ def terminal_fixture(reason: str | TerminationReason, attempt_count: int):
         return finalize_no_legal_swap(context, (), current, menu)
 
     context = (
-        controlled_context_with_ranked_swaps()
+        target_achieved_context()
         if reason is TerminationReason.TARGET_ACHIEVED
         else controlled_context_with_three_misses()
     )
@@ -367,7 +378,9 @@ def evidence_report() -> WorkflowReport:
     ))
 
 
-def report_and_run(reason: str | TerminationReason):
+def report_and_run(
+    reason: str | TerminationReason = TerminationReason.TARGET_ACHIEVED,
+):
     reason = TerminationReason(reason)
     attempt_count = {
         TerminationReason.TARGET_ACHIEVED: 1,
