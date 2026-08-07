@@ -251,6 +251,7 @@ class InteractiveWorkflow:
             attempts = tuple(self.controller.objective_attempts)
             return (
                 not self._objective_retry_used
+                and self.controller.objective_transport_retry_pending is True
                 and len(self.completed_cards) == len(demo_agent.STAGES)
                 and self.controller.plan is not None
                 and self.controller.pending is None

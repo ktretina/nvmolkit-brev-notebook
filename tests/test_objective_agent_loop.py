@@ -293,9 +293,11 @@ def test_transport_retry_counts_only_requests_then_valid_response():
 
     with pytest.raises(demo_agent.ToolCallError):
         controller.request_objective_selection()
+    assert controller.objective_transport_retry_pending is True
     pending = controller.request_objective_selection(is_transport_retry=True)
 
     assert pending is controller.pending_objective_selection
+    assert controller.objective_transport_retry_pending is False
     assert controller.provider_request_attempt_count == 2
     assert controller.selection_response_count == 1
     assert controller.rejected_selection_count == 0
@@ -377,7 +379,7 @@ def test_objective_auth_errors_bypass_transport_retry_and_terminal_evidence(host
     assert controller.rejected_selection_count == 0
     assert controller.correction_prompts_sent == 0
     assert controller.accepted_attempt_count == 0
-    assert controller._objective_transport_retry_pending is False
+    assert controller.objective_transport_retry_pending is False
     assert controller.objective_transport_retry_used is False
     assert controller.objective_run is None
     assert controller.objective_evidence is None
@@ -405,10 +407,18 @@ def test_nontransport_objective_failures_are_not_retryable_or_terminalized(
     assert controller.rejected_selection_count == 0
     assert controller.correction_prompts_sent == 0
     assert controller.accepted_attempt_count == 0
-    assert controller._objective_transport_retry_pending is False
+    assert controller.objective_transport_retry_pending is False
     assert controller.objective_transport_retry_used is False
     assert controller.objective_run is None
     assert controller.objective_evidence is None
+
+
+def test_objective_transport_retry_pending_is_read_only():
+    controller, _ = completed_controller([])
+
+    assert controller.objective_transport_retry_pending is False
+    with pytest.raises(AttributeError):
+        controller.objective_transport_retry_pending = True
 
 
 @pytest.mark.parametrize(

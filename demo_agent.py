@@ -1482,6 +1482,11 @@ class BoundedWorkflowController:
     def objective_rejection_count(self) -> int:
         return self.rejected_selection_count
 
+    @property
+    def objective_transport_retry_pending(self) -> bool:
+        """Report whether the controller classified the last failure as retryable transport."""
+        return self._objective_transport_retry_pending
+
     def request_synthesis(self) -> WorkflowResult:
         if (
             self.objective_required or self.objective_context is not None

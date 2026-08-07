@@ -2,9 +2,11 @@ import inspect
 from dataclasses import replace
 from types import SimpleNamespace
 
+import httpx
 import ipywidgets as widgets
 import numpy as np
 import pytest
+from openai import AuthenticationError
 
 import demo_agent
 from chemistry_workflow import StageResult
@@ -18,6 +20,21 @@ from objective_challenge import (
     measure_panel,
 )
 from interactive_workflow import InteractiveWorkflow, controls_for
+
+
+def connect_error(label="objective transport failure"):
+    return httpx.ConnectError(
+        label,
+        request=httpx.Request("POST", f"{demo_agent.NVIDIA_BASE_URL}/chat/completions"),
+    )
+
+
+def auth_error():
+    response = httpx.Response(
+        401,
+        request=httpx.Request("POST", f"{demo_agent.NVIDIA_BASE_URL}/chat/completions"),
+    )
+    return AuthenticationError("objective authorization failure", response=response, body=None)
 
 
 def proposals():
@@ -63,6 +80,7 @@ class Controller:
         self.objective_run = None
         self.objective_evidence = None
         self.objective_prompt_appended = False
+        self._objective_transport_retry_pending = False
         self.objective_proposals = []
         self._objective_expected_attempts = []
         self.session = Session(self)
@@ -122,10 +140,19 @@ class Controller:
     def request_objective_attempt(self):
         self.calls.append("objective_proposal")
         if self.objective_failures:
-            raise self.objective_failures.pop(0)
+            error = self.objective_failures.pop(0)
+            if isinstance(error, (httpx.TransportError, demo_agent.APIConnectionError)):
+                self._objective_transport_retry_pending = True
+                raise ToolCallError("hosted objective proposal failed") from None
+            demo_agent._raise_request_error(error)
+        self._objective_transport_retry_pending = False
         self.pending_objective = self.objective_proposals[len(self.objective_attempts)]
         self.session.turn_count += 1
         return self.pending_objective
+
+    @property
+    def objective_transport_retry_pending(self):
+        return self._objective_transport_retry_pending
 
     def execute_objective_attempt(self, proposal):
         self.calls.append(("objective_execute", proposal))
@@ -856,8 +883,8 @@ def test_known_objective_proposal_failure_after_measured_attempt_has_one_guarded
         nonlocal failed_once
         if len(controller.objective_attempts) == 1 and not failed_once:
             failed_once = True
-            controller.calls.append("objective_proposal")
-            raise ToolCallError("hosted objective proposal failed")
+            controller.objective_failures.append(connect_error())
+            return original_request()
         return original_request()
 
     controller.request_objective_attempt = fail_second_request_once
@@ -892,8 +919,8 @@ def test_objective_retry_invariant_counts_rejected_hosted_responses(monkeypatch)
             failed_once = True
             controller.objective_rejection_count = 1
             controller.session.turn_count += 1
-            controller.calls.append("objective_proposal")
-            raise ToolCallError("hosted objective proposal failed")
+            controller.objective_failures.append(connect_error())
+            return original_request()
         return original_request()
 
     controller.request_objective_attempt = fail_second_request_after_one_correction
@@ -1000,8 +1027,8 @@ def test_retry_objective_rechecks_pending_state_and_stops(monkeypatch):
         nonlocal failed_once
         if len(controller.objective_attempts) == 1 and not failed_once:
             failed_once = True
-            controller.calls.append("objective_proposal")
-            raise ToolCallError("hosted objective proposal failed")
+            controller.objective_failures.append(connect_error())
+            return original_request()
         return original_request()
 
     controller.request_objective_attempt = fail_second_request_once
@@ -1027,8 +1054,8 @@ def test_retry_objective_rejects_noncanonical_guidance_state(mutation):
         nonlocal failed_once
         if len(controller.objective_attempts) == 1 and not failed_once:
             failed_once = True
-            controller.calls.append("objective_proposal")
-            raise ToolCallError("hosted objective proposal failed")
+            controller.objective_failures.append(connect_error())
+            return original_request()
         return original_request()
 
     controller.request_objective_attempt = fail_second_request_once
@@ -1049,9 +1076,11 @@ def test_retry_objective_rejects_noncanonical_guidance_state(mutation):
     assert controller.calls.count("objective_proposal") == before
 
 
-def test_initial_objective_retry_allows_empty_suggestions():
+def test_real_connect_error_offers_exactly_one_initial_objective_retry(monkeypatch):
+    monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
+    monkeypatch.setattr("interactive_workflow.objective_figures", lambda run, state: ())
     controller = Controller()
-    controller.objective_failures.append(ToolCallError("hosted objective proposal failed"))
+    controller.objective_failures.append(connect_error())
     workflow, _ = started(controller)
     complete_six_stages(workflow)
     workflow.objective_button.click()
@@ -1059,7 +1088,41 @@ def test_initial_objective_retry_allows_empty_suggestions():
     assert controller.objective_attempts == []
     assert controller.objective_suggestions == ()
     assert workflow.status == "objective_failed"
-    assert workflow.retry_button.description == "Retry Objective Proposal"
+    assert controller.objective_transport_retry_pending is True
+    retry = workflow.retry_button
+    assert retry.description == "Retry Objective Proposal"
+
+    retry.click()
+    retry.click()
+
+    assert retry.disabled
+    assert workflow.status == "completed"
+    assert controller.calls.count("objective_proposal") == 3
+    assert controller.objective_transport_retry_pending is False
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        auth_error(),
+        ToolCallError("generic non-transport objective failure"),
+    ],
+)
+def test_auth_and_nontransport_objective_failures_offer_no_retry(failure):
+    controller = Controller()
+    controller.objective_failures.append(failure)
+    workflow, _ = started(controller)
+    complete_six_stages(workflow)
+
+    workflow.objective_button.click()
+
+    assert workflow.status == "stopped"
+    assert workflow.retry_button is None
+    assert controller.calls.count("objective_proposal") == 1
+    assert controller.objective_transport_retry_pending is False
+    assert controller.objective_attempts == []
+    assert controller.objective_run is None
+    assert controller.objective_evidence is None
 
 
 def test_known_synthesis_failure_has_guarded_retry(monkeypatch):
