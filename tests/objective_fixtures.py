@@ -1,9 +1,10 @@
 from dataclasses import replace
+import json
 
 import numpy as np
 from rdkit import Chem
 
-from chemistry_workflow import WorkflowPhase, WorkflowState
+from chemistry_workflow import EvidenceRecord, WorkflowPhase, WorkflowReport, WorkflowState
 import objective_challenge
 from objective_challenge import CANDIDATE_COUNT, ObjectiveCandidate, ObjectiveContext
 from objective_challenge import TARGET_FRACTION
@@ -16,6 +17,7 @@ from objective_challenge import (
     finalize_no_legal_swap,
     measure_panel,
     terminal_objective_run,
+    build_objective_evidence,
 )
 
 
@@ -258,6 +260,123 @@ def terminal_fixture(reason: str | TerminationReason, attempt_count: int):
         attempts.append(attempt)
         current = attempt.measurement
     return terminal_objective_run(context, tuple(attempts), reason)
+
+
+def evidence_report() -> WorkflowReport:
+    """Return complete production-shaped E01-E06 evidence for finding tests."""
+    representatives = [
+        {"molecule_id": f"mol-{index}", "source_row": index, "cluster_id": index}
+        for index in range(4)
+    ]
+    per_conformer_records = [
+        {
+            "molecule_id": f"mol-{molecule_index}",
+            "cluster_id": molecule_index,
+            "conformer_index": conformer_index,
+            "energy_kcal_mol": float(-10 * (molecule_index + 1) + conformer_index),
+            "converged": not (molecule_index == 3 and conformer_index == 4),
+        }
+        for molecule_index in range(4)
+        for conformer_index in range(5)
+    ]
+    selected_conformer_records = [
+        {
+            **next(
+                record
+                for record in per_conformer_records
+                if record["molecule_id"] == f"mol-{index}"
+                and record["conformer_index"] == 0
+            ),
+            "selected_conformer_id": f"mol-{index}:conf-0",
+        }
+        for index in range(4)
+    ]
+    payloads = (
+        ("E01", "Library inspection", {
+            "raw_count": 256,
+            "valid_count": 256,
+            "invalid_count": 0,
+            "invalid_ids": [],
+            "preview_count": 24,
+            "count_unit": "rows",
+        }, "RDKit input validation"),
+        ("E02", "Morgan fingerprints", {
+            "fingerprint_radius": 2,
+            "fingerprint_size_bits": 1024,
+            "packed_shape": [256, 32],
+            "molecule_count": 256,
+            "active_bits_min": 3,
+            "active_bits_median": 14.0,
+            "active_bits_max": 37,
+            "executor": "nvMolKit GPU",
+            "size_unit": "bits",
+        }, "MorganFingerprintGenerator"),
+        ("E03", "Tanimoto similarity", {
+            "matrix_shape": [256, 256],
+            "q1": 0.071,
+            "median": 0.118,
+            "q3": 0.184,
+            "p90": 0.291,
+            "max_off_diagonal": 0.873,
+            "most_similar_pair": {
+                "molecule_ids": ["mol-17", "mol-203"],
+                "source_rows": [17, 203],
+                "similarity": 0.873,
+            },
+            "similarity_unit": "Tanimoto coefficient",
+        }, "crossTanimotoSimilarity"),
+        ("E04", "Fused Butina clusters", {
+            "cutoff": 0.4,
+            "cluster_count": 70,
+            "singleton_count": 37,
+            "singleton_fraction": 37 / 256,
+            "largest_cluster_sizes": [15, 12, 11, 10, 9, 9, 9, 8, 8, 8, 7, 7, 7, 7, 7],
+            "assignment_count": 256,
+            "cutoff_unit": "Tanimoto distance",
+        }, "fused_butina"),
+        ("E05", "Representative embedding", {
+            "requested_representative_count": 4,
+            "selected_representative_count": 4,
+            "selection_shortfall": 0,
+            "representative_policy": "largest_clusters_first",
+            "representatives": representatives,
+            "requested_conformers_per_representative": 5,
+            "generated_conformer_count": 20,
+            "partial_embedding_ids": [],
+            "zero_embedding_ids": [],
+            "count_unit": "conformers",
+        }, "EmbedMolecules"),
+        ("E06", "MMFF94 optimization", {
+            "attempted_conformer_count": 20,
+            "converged_conformer_count": 19,
+            "unconverged_conformer_count": 1,
+            "per_conformer_records": per_conformer_records,
+            "selected_conformer_records": selected_conformer_records,
+            "energy_unit": "kcal/mol",
+            "comparison_scope": "within molecule only",
+        }, "MMFFOptimizeMoleculesConfs"),
+    )
+    return WorkflowReport(tuple(
+        EvidenceRecord(
+            key,
+            label,
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False),
+            provenance,
+        )
+        for key, label, payload, provenance in payloads
+    ))
+
+
+def report_and_run(reason: str | TerminationReason):
+    reason = TerminationReason(reason)
+    attempt_count = {
+        TerminationReason.TARGET_ACHIEVED: 1,
+        TerminationReason.ATTEMPT_LIMIT_REACHED: 3,
+    }.get(reason, 0)
+    run = terminal_fixture(reason, attempt_count)
+    # Exercise Task 2's canonical terminal validator before returning a fixture.
+    build_objective_evidence(run)
+    return evidence_report(), run
 
 
 BOUNDARY_CASES = (

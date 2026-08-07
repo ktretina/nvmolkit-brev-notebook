@@ -1152,6 +1152,18 @@ def build_objective_evidence(run: ObjectiveRun) -> EvidenceRecord:
     )
 
 
+def validate_objective_evidence(
+    record: EvidenceRecord, run: ObjectiveRun
+) -> EvidenceRecord:
+    """Reconstruct and validate an exact canonical O01 terminal record."""
+    if type(record) is not EvidenceRecord or type(run) is not ObjectiveRun:
+        raise ValueError("O01 validation requires an exact record and ObjectiveRun.")
+    expected = build_objective_evidence(run)
+    if record != expected:
+        raise ValueError("O01 does not reconstruct the supplied ObjectiveRun.")
+    return record
+
+
 def objective_figures(run: ObjectiveRun, state: WorkflowState) -> tuple[Any, ...]:
     """Render the compact attempt trajectory, final structures, and heatmap."""
     from matplotlib.figure import Figure

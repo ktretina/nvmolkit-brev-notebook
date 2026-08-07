@@ -23,6 +23,7 @@ from objective_challenge import (
     build_action_menu,
     build_objective_context,
     build_objective_evidence,
+    validate_objective_evidence,
     evaluate_diverse_panel,
     evaluate_selected_swap,
     enumerate_legal_swaps,
@@ -144,6 +145,17 @@ def test_baseline_terminal_run_is_exact_and_o01_has_no_model_rationale():
     assert payload["attempt_count"] == 0
     assert payload["baseline"]["score_key"] == payload["final_measurement"]["score_key"]
     assert "decision_basis" not in build_objective_evidence(run).payload_json
+
+
+def test_validate_objective_evidence_reuses_exact_terminal_reconstruction():
+    run = terminal_fixture(TerminationReason.TARGET_ACHIEVED, 1)
+    record = build_objective_evidence(run)
+
+    assert validate_objective_evidence(record, run) is record
+    with pytest.raises(ValueError, match="O01"):
+        validate_objective_evidence(
+            replace(record, payload_json=record.payload_json + " "), run
+        )
 
 
 @pytest.mark.parametrize("action_count", range(4))
