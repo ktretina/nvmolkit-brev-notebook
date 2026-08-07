@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 
-# Request up to 12 conformers (4 representatives × 3); require at least half to converge.
-MIN_CONVERGED = 6
+# Request up to 20 conformers (4 representatives × 5); require at least half to converge.
+MIN_CONVERGED = 10
 
 
 def test_gpu_acceptance_source_gates_default_objective_challenge():
@@ -18,6 +18,9 @@ def test_gpu_acceptance_source_gates_default_objective_challenge():
     for required in (
         "sample_molecules.csv",
         "objective_required=True",
+        '"cutoff": 0.4',
+        '"policy": "largest_clusters_first"',
+        '"conformers_per_representative": 5',
         "begin_objective_challenge",
         "benchmark_score > context.baseline_score",
         "objective_suggestions",
@@ -76,13 +79,13 @@ def test_nvmolkit_gpu_workflow():
         },
         "measure_tanimoto_similarity": {},
         "discover_fused_butina_clusters": {
-            "cutoff": 0.5,
+            "cutoff": 0.4,
             "decision_basis": "Use the qualification clustering cutoff.",
         },
         "embed_representative_conformers": {
             "representative_count": 4,
-            "policy": "include_singleton_if_available",
-            "conformers_per_representative": 3,
+            "policy": "largest_clusters_first",
+            "conformers_per_representative": 5,
             "decision_basis": "Use the qualification conformer sample size.",
         },
         "optimize_conformers_mmff94": {},
