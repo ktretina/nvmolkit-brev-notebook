@@ -5,7 +5,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from rdkit import Chem
 
 from chemistry_workflow import WorkflowPhase, WorkflowState
 import objective_challenge
@@ -25,67 +24,14 @@ from objective_challenge import (
     objective_figures,
     rank_legal_swaps,
 )
-
-
-class FakeTensor:
-    def __init__(self, values):
-        self.values = np.asarray(values, dtype=float)
-
-    def cpu(self):
-        return self
-
-    def numpy(self):
-        return self.values.copy()
-
-
-class FakeGpuResult:
-    def __init__(self, values):
-        self.tensor = FakeTensor(values)
-
-    def torch(self):
-        return self.tensor
-
-
-def optimized_state() -> WorkflowState:
-    smiles = ("CC", "CCC", "CCCC", "CCO", "CCN", "CCCl", "CCF", "C1CC1")
-    distance = np.full((CANDIDATE_COUNT, CANDIDATE_COUNT), 0.80, dtype=float)
-    np.fill_diagonal(distance, 0.0)
-    distance[0, 1] = distance[1, 0] = 0.35
-    return WorkflowState(
-        phase=WorkflowPhase.OPTIMIZED,
-        records=[
-            {"id": f"mol-{index}", "smiles": value, "source_row": index}
-            for index, value in enumerate(smiles)
-        ],
-        molecules=[Chem.MolFromSmiles(value) for value in smiles],
-        similarity=FakeGpuResult(1.0 - distance),
-        clusters=[[index] for index in range(CANDIDATE_COUNT)],
-    )
-
-
-def two_revision_context() -> ObjectiveContext:
-    candidates = tuple(
-        ObjectiveCandidate(
-            molecule_id=f"candidate-{index}",
-            molecule_index=index,
-            source_row=index,
-            cluster_id=index,
-        )
-        for index in range(CANDIDATE_COUNT)
-    )
-    distance = np.full((CANDIDATE_COUNT, CANDIDATE_COUNT), 0.90, dtype=float)
-    np.fill_diagonal(distance, 0.0)
-    distance[0, 1] = distance[1, 0] = 0.30
-    distance[2, 3] = distance[3, 2] = 0.40
-    distance.setflags(write=False)
-    return ObjectiveContext(
-        candidates=candidates,
-        baseline_ids=("candidate-0", "candidate-1", "candidate-2", "candidate-3"),
-        baseline_score=0.30,
-        benchmark_score=0.90,
-        target_score=0.75,
-        distance_matrix=distance,
-    )
+from objective_fixtures import (
+    BOUNDARY_CASES,
+    TARGET_BOUNDARY_CASES,
+    context_from_distance,
+    controlled_context,
+    optimized_state,
+    two_revision_context,
+)
 
 
 def forged_nonachieved_attempt(
@@ -128,6 +74,109 @@ def successful_run() -> tuple[WorkflowState, ObjectiveRun]:
 
 def test_constants_keep_the_challenge_visually_bounded():
     assert (CANDIDATE_COUNT, PANEL_SIZE, MAX_ATTEMPTS) == (8, 4, 3)
+
+
+def test_score_key_uses_one_trillion_half_up_units():
+    assert objective_challenge.score_key(0.5000000000004) == 500_000_000_000
+    assert objective_challenge.score_key(0.5000000000005) == 500_000_000_001
+    assert objective_challenge.score_key(np.float32(0.5)) == 500_000_000_000
+    with pytest.raises(ValueError):
+        objective_challenge.score_key(True)
+
+
+@pytest.mark.parametrize(
+    "invalid_score",
+    (0, "0.5", None, float("nan"), float("inf"), -0.1, 1.1),
+)
+def test_score_key_rejects_invalid_values_without_echoing_them(invalid_score):
+    with pytest.raises(
+        ValueError, match=r"^Objective score must be a finite float in \[0, 1\]\.$"
+    ):
+        objective_challenge.score_key(invalid_score)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        (0.4999999999994, 499_999_999_999),
+        (0.4999999999995, 500_000_000_000),
+        (0.4999999999996, 500_000_000_000),
+    ),
+)
+def test_score_key_is_exact_below_on_and_above_a_half_unit_boundary(value, expected):
+    assert objective_challenge.score_key(value) == expected
+
+
+def test_measure_panel_retains_every_canonical_co_limiting_pair():
+    context = controlled_context(
+        distances={
+            ("mol-0", "mol-1"): 0.4,
+            ("mol-2", "mol-3"): 0.4000000000001,
+        },
+        default_distance=0.8,
+    )
+
+    measurement = objective_challenge.measure_panel(
+        context, ("mol-3", "mol-2", "mol-1", "mol-0")
+    )
+
+    assert measurement.selected_ids == ("mol-3", "mol-2", "mol-1", "mol-0")
+    assert measurement.score == 0.4
+    assert measurement.score_key == objective_challenge.score_key(0.4)
+    assert measurement.limiting_pairs == (
+        ("mol-0", "mol-1"),
+        ("mol-2", "mol-3"),
+    )
+
+
+@pytest.mark.parametrize(("candidate", "current", "expected"), BOUNDARY_CASES)
+def test_improvement_uses_score_keys(candidate, current, expected):
+    assert objective_challenge.is_strict_improvement(candidate, current) is expected
+
+
+@pytest.mark.parametrize(("score", "target", "expected"), TARGET_BOUNDARY_CASES)
+def test_target_attainment_uses_the_same_score_key(score, target, expected):
+    assert objective_challenge.target_is_achieved(score, target) is expected
+
+
+def test_context_fixture_derives_scores_and_preserves_read_only_float64_matrix():
+    matrix = np.full((CANDIDATE_COUNT, CANDIDATE_COUNT), 0.8, dtype=np.float32)
+    np.fill_diagonal(matrix, 0.0)
+    matrix[0, 1] = matrix[1, 0] = 0.35
+
+    context = context_from_distance(matrix)
+
+    assert context.distance_matrix.dtype == np.dtype(np.float64)
+    assert context.distance_matrix.flags.writeable is False
+    assert context.baseline_score == pytest.approx(0.35)
+    assert context.benchmark_score == pytest.approx(0.8)
+
+
+@pytest.mark.parametrize("invalid_distance", (float("nan"), float("inf"), -0.1, 1.1))
+def test_panel_measurement_rejects_invalid_pair_distances(invalid_distance):
+    context = controlled_context(distances={}, default_distance=0.8)
+    invalid_matrix = np.array(context.distance_matrix, dtype=np.float64, copy=True)
+    invalid_matrix[0, 1] = invalid_matrix[1, 0] = invalid_distance
+    invalid_matrix.setflags(write=False)
+    invalid_context = replace(context, distance_matrix=invalid_matrix)
+
+    with pytest.raises(ValueError, match="distance"):
+        objective_challenge.measure_panel(
+            invalid_context, ("mol-0", "mol-1", "mol-2", "mol-3")
+        )
+
+
+def test_panel_measurement_reuses_fail_closed_panel_validation():
+    context = controlled_context(distances={}, default_distance=0.8)
+
+    with pytest.raises(ValueError, match="four unique molecule IDs"):
+        objective_challenge.measure_panel(
+            context, ("mol-0", "mol-0", "mol-2", "mol-3")
+        )
+    with pytest.raises(ValueError, match="out-of-pool"):
+        objective_challenge.measure_panel(
+            context, ("mol-0", "mol-1", "mol-2", "outside")
+        )
 
 
 def test_build_context_uses_eight_distinct_mmff_eligible_clusters():

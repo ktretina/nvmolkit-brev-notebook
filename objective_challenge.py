@@ -24,6 +24,27 @@ MAX_ATTEMPTS = 3
 TARGET_FRACTION = 0.8
 SUGGESTION_LIMIT = 3
 SCORE_TOLERANCE = 1e-12
+SCORE_SCALE = 10**12
+
+
+def score_key(value: float | np.floating) -> int:
+    """Return the canonical half-up quantized unit for a valid objective score."""
+    if isinstance(value, bool) or not isinstance(value, (float, np.floating)):
+        raise ValueError("Objective score must be a finite float in [0, 1].")
+    normalized = float(value)
+    if not np.isfinite(normalized) or not 0.0 <= normalized <= 1.0:
+        raise ValueError("Objective score must be a finite float in [0, 1].")
+    return int(np.floor(normalized * SCORE_SCALE + 0.5))
+
+
+def is_strict_improvement(candidate: float, current: float) -> bool:
+    """Return whether candidate is strictly better in canonical score units."""
+    return score_key(candidate) > score_key(current)
+
+
+def target_is_achieved(score: float, target: float) -> bool:
+    """Return whether score reaches target in canonical score units."""
+    return score_key(score) >= score_key(target)
 
 
 @dataclass(frozen=True)
@@ -42,6 +63,15 @@ class ObjectiveContext:
     benchmark_score: float
     target_score: float
     distance_matrix: np.ndarray = field(compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class PanelMeasurement:
+    selected_ids: tuple[str, ...]
+    score: float
+    score_key: int
+    limiting_pairs: tuple[tuple[str, str], ...]
+    achieved: bool
 
 
 @dataclass(frozen=True)
@@ -74,23 +104,6 @@ class ObjectiveRun:
     termination_reason: str
     final_ids: tuple[str, ...]
     final_score: float
-
-
-def _score_panel(
-    context: ObjectiveContext, selected_ids: tuple[str, ...]
-) -> tuple[float, tuple[str, str]]:
-    positions = {
-        candidate.molecule_id: position
-        for position, candidate in enumerate(context.candidates)
-    }
-    scored_pairs = []
-    for first_id, second_id in itertools.combinations(selected_ids, 2):
-        pair = tuple(sorted((first_id, second_id)))
-        distance = float(
-            context.distance_matrix[positions[first_id], positions[second_id]]
-        )
-        scored_pairs.append((distance, pair))
-    return min(scored_pairs, key=lambda item: (item[0], item[1]))
 
 
 def build_objective_context(state: WorkflowState) -> ObjectiveContext:
@@ -132,11 +145,20 @@ def build_objective_context(state: WorkflowState) -> ObjectiveContext:
         target_score=0.0,
         distance_matrix=distance_matrix,
     )
-    baseline_score, _pair = _score_panel(provisional, provisional.baseline_ids)
+    baseline = measure_panel(provisional, provisional.baseline_ids)
     panels = itertools.combinations(
         sorted(candidate.molecule_id for candidate in candidates), PANEL_SIZE
     )
-    benchmark_score = max(_score_panel(provisional, panel)[0] for panel in panels)
+    benchmark = max(
+        (measure_panel(provisional, panel) for panel in panels),
+        key=lambda measurement: (
+            measurement.score_key,
+            measurement.score,
+            measurement.selected_ids,
+        ),
+    )
+    baseline_score = baseline.score
+    benchmark_score = benchmark.score
     target_score = baseline_score + TARGET_FRACTION * (
         benchmark_score - baseline_score
     )
@@ -166,6 +188,66 @@ def _validated_panel(
     ):
         raise ValueError("Objective proposal must use four distinct clusters.")
     return panel, candidates
+
+
+def _panel_distances(
+    context: ObjectiveContext, panel: tuple[str, ...]
+):
+    """Yield the six validated pair distances for one structurally legal panel."""
+    positions = {
+        candidate.molecule_id: position
+        for position, candidate in enumerate(context.candidates)
+    }
+    for first_id, second_id in itertools.combinations(panel, 2):
+        try:
+            distance = float(
+                context.distance_matrix[
+                    positions[first_id], positions[second_id]
+                ]
+            )
+        except (IndexError, KeyError, TypeError, ValueError) as error:
+            raise ValueError("Objective pair distance is invalid.") from error
+        if not np.isfinite(distance) or not 0.0 <= distance <= 1.0:
+            raise ValueError(
+                "Objective pair distance must be finite and in [0, 1]."
+            )
+        yield first_id, second_id, distance
+
+
+def measure_panel(
+    context: ObjectiveContext,
+    selected_ids: tuple[str, ...] | list[str],
+) -> PanelMeasurement:
+    """Validate and measure one panel with canonical quantized score semantics."""
+    panel, _ = _validated_panel(context, selected_ids)
+    scored = tuple(
+        (
+            score_key(distance),
+            distance,
+            tuple(sorted((first_id, second_id))),
+        )
+        for first_id, second_id, distance in _panel_distances(context, panel)
+    )
+    minimum_key = min(item[0] for item in scored)
+    limiting_pairs = tuple(
+        sorted(item[2] for item in scored if item[0] == minimum_key)
+    )
+    raw_score = min(item[1] for item in scored if item[0] == minimum_key)
+    return PanelMeasurement(
+        selected_ids=panel,
+        score=raw_score,
+        score_key=minimum_key,
+        limiting_pairs=limiting_pairs,
+        achieved=target_is_achieved(raw_score, context.target_score),
+    )
+
+
+def _score_panel(
+    context: ObjectiveContext, selected_ids: tuple[str, ...]
+) -> tuple[float, tuple[str, str]]:
+    """Return the legacy singular-pair view of a canonical panel measurement."""
+    measurement = measure_panel(context, selected_ids)
+    return measurement.score, measurement.limiting_pairs[0]
 
 
 def _validated_selected_swap(
@@ -212,23 +294,18 @@ def _validated_selected_swap(
         + selected_swap_panel[replacement_position + 1 :]
     )
     predecessor_panel, _ = _validated_panel(context, predecessor_panel)
-    predecessor_score, _ = _score_panel(context, predecessor_panel)
-    resulting_score, resulting_limiting_pair = _score_panel(context, selected_swap_panel)
-    if selected_swap.score_delta <= 0.0 or not np.isclose(
+    predecessor = measure_panel(context, predecessor_panel)
+    resulting = measure_panel(context, selected_swap_panel)
+    if not is_strict_improvement(resulting.score, predecessor.score) or not np.isclose(
         selected_swap.score_delta,
-        resulting_score - predecessor_score,
+        resulting.score - predecessor.score,
         rtol=0.0,
         atol=SCORE_TOLERANCE,
     ):
         raise ValueError("Objective selected swap score delta is invalid.")
-    if not np.isclose(
-        selected_swap.predicted_score,
-        resulting_score,
-        rtol=0.0,
-        atol=SCORE_TOLERANCE,
-    ):
+    if score_key(selected_swap.predicted_score) != resulting.score_key:
         raise ValueError("Objective selected swap predicted score does not match the panel.")
-    if selected_swap.limiting_pair != resulting_limiting_pair:
+    if selected_swap.limiting_pair != resulting.limiting_pairs[0]:
         raise ValueError("Objective selected swap limiting pair does not match the panel.")
     return selected_swap_panel
 
@@ -248,7 +325,7 @@ def evaluate_diverse_panel(
     basis = decision_basis.strip() if isinstance(decision_basis, str) else ""
     if not basis or len(basis) > 240 or any(character in basis for character in "\r\n`"):
         raise ValueError("Objective decision basis is invalid.")
-    score, limiting_pair = _score_panel(context, panel)
+    measurement = measure_panel(context, panel)
     if selected_swap is not None:
         selected_swap_panel = _validated_selected_swap(context, selected_swap)
         if set(panel) != set(selected_swap_panel):
@@ -257,10 +334,10 @@ def evaluate_diverse_panel(
         attempt_number=attempt_number,
         selected_ids=panel,
         decision_basis=basis,
-        score=float(score),
-        limiting_pair=limiting_pair,
+        score=measurement.score,
+        limiting_pair=measurement.limiting_pairs[0],
         constraints_passed=True,
-        achieved=bool(score + SCORE_TOLERANCE >= context.target_score),
+        achieved=measurement.achieved,
         selected_swap=selected_swap,
     )
 
@@ -274,22 +351,20 @@ def rank_legal_swaps(
     if current.achieved:
         return ()
     panel, candidates = _validated_panel(context, current.selected_ids)
-    recomputed_score, recomputed_limiting_pair = _score_panel(context, panel)
+    recomputed = measure_panel(context, panel)
     if isinstance(current.score, bool) or not isinstance(
         current.score, (int, float, np.floating)
     ) or not np.isfinite(
         current.score
     ):
         raise ValueError("Objective attempt score must be a finite non-boolean number.")
-    if not np.isclose(
-        current.score, recomputed_score, rtol=0.0, atol=SCORE_TOLERANCE
-    ):
+    if score_key(float(current.score)) != recomputed.score_key:
         raise ValueError("Objective attempt score does not match its panel.")
-    if current.limiting_pair != recomputed_limiting_pair:
+    if current.limiting_pair != recomputed.limiting_pairs[0]:
         raise ValueError("Objective attempt limiting pair does not match its panel.")
     if current.constraints_passed is not True:
         raise ValueError("Objective attempt constraints must be passed.")
-    if recomputed_score + SCORE_TOLERANCE >= context.target_score:
+    if recomputed.achieved:
         raise ValueError("Objective attempt below-target state is inconsistent.")
 
     suggestions = []
@@ -307,24 +382,24 @@ def rank_legal_swaps(
                 resulting_ids, _ = _validated_panel(context, resulting_ids)
             except ValueError:
                 continue
-            predicted_score, limiting_pair = _score_panel(context, resulting_ids)
-            score_delta = predicted_score - recomputed_score
-            if score_delta <= SCORE_TOLERANCE:
+            predicted = measure_panel(context, resulting_ids)
+            score_delta = predicted.score - recomputed.score
+            if not is_strict_improvement(predicted.score, recomputed.score):
                 continue
             suggestions.append(
                 ObjectiveSwap(
                     replace_id=replace_id,
                     replacement_id=replacement.molecule_id,
                     resulting_ids=resulting_ids,
-                    predicted_score=float(predicted_score),
+                    predicted_score=predicted.score,
                     score_delta=float(score_delta),
-                    limiting_pair=limiting_pair,
+                    limiting_pair=predicted.limiting_pairs[0],
                 )
             )
 
     suggestions.sort(
         key=lambda suggestion: (
-            -suggestion.predicted_score,
+            -score_key(suggestion.predicted_score),
             suggestion.replace_id,
             suggestion.replacement_id,
             suggestion.resulting_ids,
@@ -333,7 +408,7 @@ def rank_legal_swaps(
     target_reaching = [
         suggestion
         for suggestion in suggestions
-        if suggestion.predicted_score + SCORE_TOLERANCE >= context.target_score
+        if target_is_achieved(suggestion.predicted_score, context.target_score)
     ]
     return tuple((target_reaching or suggestions)[:SUGGESTION_LIMIT])
 
@@ -354,7 +429,10 @@ def finalize_objective_run(
     achieved = bool(attempts[-1].achieved)
     if not achieved and len(attempts) != MAX_ATTEMPTS:
         raise ValueError("An unsuccessful objective run requires three attempts.")
-    best = max(attempts, key=lambda attempt: (attempt.score, -attempt.attempt_number))
+    best = max(
+        attempts,
+        key=lambda attempt: (score_key(attempt.score), -attempt.attempt_number),
+    )
     return ObjectiveRun(
         context=context,
         attempts=attempts,
@@ -367,12 +445,7 @@ def finalize_objective_run(
 
 def no_improvement_run(context: ObjectiveContext) -> ObjectiveRun:
     """Represent the explicit case where the current policy is already optimal."""
-    if not np.isclose(
-        context.baseline_score,
-        context.benchmark_score,
-        rtol=0.0,
-        atol=SCORE_TOLERANCE,
-    ):
+    if score_key(context.baseline_score) != score_key(context.benchmark_score):
         raise ValueError("A no-improvement run requires an optimal baseline.")
     return ObjectiveRun(
         context=context,
