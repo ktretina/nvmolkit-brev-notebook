@@ -292,6 +292,10 @@ class ToolCallError(RuntimeError):
     """A secret-safe failure in the bounded hosted or scientific loop."""
 
 
+class ObjectiveCorrectionLimitError(ToolCallError):
+    """The model exhausted its bounded objective-response correction budget."""
+
+
 class _HostedArgumentsValidationError(ToolCallError):
     def __init__(
         self,
@@ -1194,7 +1198,9 @@ class BoundedWorkflowController:
         if is_revision and not self.objective_suggestions:
             raise ToolCallError("No legal improving objective swaps remain.")
         if self.objective_rejection_count >= MAX_OBJECTIVE_CORRECTIONS:
-            raise ToolCallError("The objective correction limit was reached.")
+            raise ObjectiveCorrectionLimitError(
+                "The objective correction limit was reached."
+            )
 
         context = self.objective_context
         candidate_ids = tuple(candidate.molecule_id for candidate in context.candidates)
@@ -1275,7 +1281,9 @@ class BoundedWorkflowController:
                 rejection["candidate_ids"] = list(candidate_ids)
             _append_tool_result(self.session, rejection)
             if self.objective_rejection_count >= MAX_OBJECTIVE_CORRECTIONS:
-                raise ToolCallError("The objective correction limit was reached.")
+                raise ObjectiveCorrectionLimitError(
+                    "The objective correction limit was reached."
+                )
 
     def execute_objective_attempt(
         self, proposal: ObjectiveProposal

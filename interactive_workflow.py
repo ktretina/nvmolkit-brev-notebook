@@ -163,10 +163,12 @@ class InteractiveWorkflow:
             self.active_card.children = (*self.active_card.children, error_widget)
         self._set_body()
 
-    def _stop_objective(self, error: demo_agent.ToolCallError) -> None:
+    def _stop_objective(
+        self, error: demo_agent.ObjectiveCorrectionLimitError
+    ) -> None:
         """Render a truthful terminal state for a known objective-agent failure."""
-        if not isinstance(error, demo_agent.ToolCallError):
-            raise TypeError("Objective stops require a ToolCallError.")
+        if not isinstance(error, demo_agent.ObjectiveCorrectionLimitError):
+            raise TypeError("Objective stops require a correction-limit error.")
         attempts = tuple(self.controller.objective_attempts)
         if (
             self.objective_card is None
@@ -909,7 +911,7 @@ class InteractiveWorkflow:
                     "Retry Objective Proposal",
                     self._retry_objective,
                 )
-            elif isinstance(error, demo_agent.ToolCallError):
+            elif isinstance(error, demo_agent.ObjectiveCorrectionLimitError):
                 try:
                     self._stop_objective(error)
                 except Exception:

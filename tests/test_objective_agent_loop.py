@@ -388,7 +388,9 @@ def test_two_invalid_responses_exhaust_global_correction_budget_without_attempt(
     ])
     controller.begin_objective_challenge()
 
-    with pytest.raises(demo_agent.ToolCallError, match="correction limit"):
+    with pytest.raises(
+        demo_agent.ObjectiveCorrectionLimitError, match="correction limit"
+    ):
         controller.request_objective_attempt()
 
     assert controller.objective_rejection_count == demo_agent.MAX_OBJECTIVE_CORRECTIONS
@@ -399,6 +401,25 @@ def test_two_invalid_responses_exhaust_global_correction_budget_without_attempt(
     assert payload["accepted"] is False
     assert payload["reason"] == "out_of_pool_panel"
     assert payload["corrections_remaining"] == 0
+
+
+def test_preexhausted_objective_correction_budget_uses_dedicated_safe_error():
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    controller.objective_rejection_count = demo_agent.MAX_OBJECTIVE_CORRECTIONS
+    hosted_calls_before = len(completions.calls)
+
+    with pytest.raises(
+        demo_agent.ObjectiveCorrectionLimitError, match="correction limit"
+    ):
+        controller.request_objective_attempt()
+
+    assert issubclass(
+        demo_agent.ObjectiveCorrectionLimitError, demo_agent.ToolCallError
+    )
+    assert len(completions.calls) == hosted_calls_before
+    assert controller.pending_objective is None
+    assert controller.objective_attempts == []
 
 
 @pytest.mark.parametrize(
@@ -537,7 +558,9 @@ def test_two_content_only_objective_responses_exhaust_global_correction_budget()
     ])
     controller.begin_objective_challenge()
 
-    with pytest.raises(demo_agent.ToolCallError, match="correction limit"):
+    with pytest.raises(
+        demo_agent.ObjectiveCorrectionLimitError, match="correction limit"
+    ):
         controller.request_objective_attempt()
 
     assert controller.objective_rejection_count == 2
@@ -616,7 +639,9 @@ def test_correction_budget_remains_global_across_accepted_attempts():
     controller.execute_objective_attempt(initial)
     accepted_before = tuple(controller.objective_attempts)
 
-    with pytest.raises(demo_agent.ToolCallError, match="correction limit"):
+    with pytest.raises(
+        demo_agent.ObjectiveCorrectionLimitError, match="correction limit"
+    ):
         controller.request_objective_attempt()
 
     assert controller.objective_rejection_count == 2

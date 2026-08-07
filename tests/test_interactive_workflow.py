@@ -877,7 +877,7 @@ def test_objective_correction_exhaustion_stops_explicitly_without_fabricating_re
         controller.objective_rejection_count = demo_agent.MAX_OBJECTIVE_CORRECTIONS
         controller.session.turn_count += demo_agent.MAX_OBJECTIVE_CORRECTIONS
         controller.calls.append("objective_proposal")
-        raise ToolCallError(
+        raise demo_agent.ObjectiveCorrectionLimitError(
             "The objective correction limit was reached. <do-not-render-as-html>"
         )
 
@@ -911,6 +911,41 @@ def test_objective_correction_exhaustion_stops_explicitly_without_fabricating_re
     assert "<do-not-render-as-html>" not in rendered
     assert "local workflow error" not in workflow.transcript_text.lower()
     assert "O01" not in rendered and "O01" not in workflow.transcript_text
+
+
+@pytest.mark.parametrize(
+    "failure_message",
+    [
+        "The objective evaluator rejected the proposed panel.",
+        "The legal improving objective swaps could not be ranked.",
+        "The objective run could not be finalized safely.",
+        "The objective protocol result could not be appended safely.",
+    ],
+)
+def test_nonretryable_objective_tool_errors_remain_generic_without_false_receipt(
+    failure_message,
+):
+    controller = Controller()
+
+    def fail_objective_execution(proposal):
+        controller.calls.append(("objective_execute", proposal))
+        raise ToolCallError(failure_message)
+
+    controller.execute_objective_attempt = fail_objective_execution
+    workflow, _ = started(controller)
+    complete_six_stages(workflow)
+    workflow.objective_button.click()
+
+    assert workflow.status == "stopped"
+    assert workflow.retry_button is None
+    assert controller.objective_attempts == []
+    assert controller.objective_run is None
+    assert controller.objective_evidence is None
+    assert controller.calls.count("synthesis") == 0
+    assert failure_message not in workflow.transcript_text
+    assert "local workflow error" in workflow.transcript_text.lower()
+    assert "Accepted scientific attempts:" not in workflow.transcript_text
+    assert "No additional scientific attempt was executed." not in workflow.transcript_text
 
 
 def test_retry_objective_rechecks_pending_state_and_stops(monkeypatch):
