@@ -1,5 +1,6 @@
 import inspect
 from dataclasses import replace
+from html import escape
 from types import SimpleNamespace
 
 import httpx
@@ -16,9 +17,12 @@ from demo_agent import (
 )
 from objective_challenge import (
     ObjectiveAttempt, ObjectiveCandidate, ObjectiveContext, ObjectiveSwap,
+    TerminationReason,
     TARGET_FRACTION, accepted_maxima, build_action_menu, evaluate_selected_swap,
-    measure_panel,
+    measure_panel, score_key,
 )
+from objective_fixtures import controlled_context_with_action_count
+from objective_receipts import objective_receipt
 from interactive_workflow import InteractiveWorkflow, controls_for
 
 
@@ -72,8 +76,8 @@ class Controller:
         self.figures = ()
         self.stage_results = []
         self.objective_context = None
-        self.pending_objective = None
-        self.pending_objective_swap = None
+        self.pending_action_menu = None
+        self.pending_objective_selection = None
         self.objective_attempts = []
         self.objective_suggestions = ()
         self.objective_rejection_count = 0
@@ -81,8 +85,6 @@ class Controller:
         self.objective_evidence = None
         self.objective_prompt_appended = False
         self._objective_transport_retry_pending = False
-        self.objective_proposals = []
-        self._objective_expected_attempts = []
         self.session = Session(self)
 
     def request_plan(self):
@@ -120,21 +122,13 @@ class Controller:
         self.calls.append("objective_begin")
         self.report = SimpleNamespace(evidence=())
         self.objective_prompt_appended = True
-        self.objective_context, first, second = evaluated_objective_records()
-        self._objective_expected_attempts = [first, second]
-        current = measure_panel(self.objective_context, self.objective_context.baseline_ids)
-        self.objective_proposals = []
-        for attempt in self._objective_expected_attempts:
-            menu = build_action_menu(
-                self.objective_context, current, len(self.objective_proposals)
-            )
-            self.objective_proposals.append(ObjectiveSelection(
-                state_id=menu.state_id,
-                swap_id=attempt.selected_swap.swap_id,
-                observed_limiting_pairs=[list(pair) for pair in menu.source.limiting_pairs],
-                decision_rule="maximize_predicted_minimum_distance",
-            ))
-            current = attempt.measurement
+        self.objective_context, _first, _second = evaluated_objective_records()
+        baseline = measure_panel(
+            self.objective_context, self.objective_context.baseline_ids
+        )
+        self.pending_action_menu = build_action_menu(
+            self.objective_context, baseline, 0
+        )
         return self.objective_context
 
     def request_objective_attempt(self):
@@ -146,23 +140,37 @@ class Controller:
                 raise ToolCallError("hosted objective proposal failed") from None
             demo_agent._raise_request_error(error)
         self._objective_transport_retry_pending = False
-        self.pending_objective = self.objective_proposals[len(self.objective_attempts)]
+        menu = self.pending_action_menu
+        action = accepted_maxima(menu)[0]
+        self.pending_objective_selection = ObjectiveSelection(
+            state_id=menu.state_id,
+            swap_id=action.swap_id,
+            observed_limiting_pairs=[list(pair) for pair in menu.source.limiting_pairs],
+            decision_rule="maximize_predicted_minimum_distance",
+        )
         self.session.turn_count += 1
-        return self.pending_objective
+        return self.pending_objective_selection
 
     @property
     def objective_transport_retry_pending(self):
         return self._objective_transport_retry_pending
 
-    def execute_objective_attempt(self, proposal):
-        self.calls.append(("objective_execute", proposal))
+    def execute_objective_attempt(self, selection):
+        self.calls.append(("objective_execute", selection))
+        if selection is not self.pending_objective_selection:
+            raise ToolCallError("The exact pending objective selection is required.")
+        menu = self.pending_action_menu
+        action = next(item for item in menu.actions if item.swap_id == selection.swap_id)
         number = len(self.objective_attempts) + 1
-        attempt = self._objective_expected_attempts[number - 1]
+        attempt = evaluate_selected_swap(
+            self.objective_context, menu, action, number
+        )
         achieved = attempt.achieved
         self.objective_attempts.append(attempt)
-        self.pending_objective = None
+        self.pending_objective_selection = None
         if achieved:
             self.objective_suggestions = ()
+            self.pending_action_menu = None
             self.objective_run = SimpleNamespace(
                 context=self.objective_context,
                 attempts=tuple(self.objective_attempts),
@@ -173,7 +181,10 @@ class Controller:
             )
             self.objective_evidence = SimpleNamespace(key="O01")
         else:
-            self.objective_suggestions = ("listed-revision",)
+            self.pending_action_menu = build_action_menu(
+                self.objective_context, attempt.measurement, number
+            )
+            self.objective_suggestions = self.pending_action_menu.actions
         return attempt
 
     def request_synthesis(self):
@@ -183,7 +194,13 @@ class Controller:
         if self.synthesis_failures: raise self.synthesis_failures.pop(0)
         self.session.turn_count += 1
         return SimpleNamespace(
-            conclusion=SimpleNamespace(),
+            conclusion=SimpleNamespace(
+                headline="Measured objective conclusion",
+                sections=(SimpleNamespace(
+                    theme="objective_driven_selection",
+                    prose="The measured panel reached the bounded target. O01",
+                ),),
+            ),
             objective_run=self.objective_run,
             objective_evidence=self.objective_evidence,
         )
@@ -196,10 +213,38 @@ def html_text(widget):
     return " ".join(values)
 
 
+def combined_html(widget):
+    if isinstance(widget, widgets.HTML):
+        return widget.value
+    return " ".join(combined_html(child) for child in getattr(widget, "children", ()))
+
+
+def production_menu(action_count):
+    context = controlled_context_with_action_count(action_count)
+    source = measure_panel(context, context.baseline_ids)
+    menu = build_action_menu(context, source, 0)
+    assert len(menu.actions) == action_count
+    assert menu == build_action_menu(context, source, 0)
+    return context, menu
+
+
 def started(controller=None):
     controller = controller or Controller()
     workflow = InteractiveWorkflow(controller)
     workflow.start_button.click()
+    return workflow, controller
+
+
+def ready_workflow(controller=None):
+    workflow, controller = started(controller)
+    complete_six_stages(workflow)
+    return workflow, controller
+
+
+def completed_workflow(monkeypatch, controller=None):
+    monkeypatch.setattr("interactive_workflow.objective_figures", lambda run, state: ())
+    workflow, controller = ready_workflow(controller)
+    workflow._continue_objective_challenge()
     return workflow, controller
 
 
@@ -378,7 +423,168 @@ def test_six_stages_open_objective_challenge_then_gate_conclusion(monkeypatch):
     workflow.objective_button.click()
     assert controller.calls.count("synthesis") == 1
     assert workflow.status == "completed" and len(workflow.completed_cards) == 6
-    assert len(rendered) == 1 and "Evidence-Backed Conclusion" in html_text(workflow.active_card)
+    assert rendered == []
+    assert "Evidence-Backed Conclusion" in html_text(workflow.active_card)
+
+
+def test_ready_workflow_invokes_show_objective_challenge_exactly_once(monkeypatch):
+    workflow, controller = started()
+    calls = []
+    original = workflow._show_objective_challenge
+
+    def show_once():
+        calls.append("show")
+        original()
+
+    monkeypatch.setattr(workflow, "_show_objective_challenge", show_once)
+    complete_six_stages(workflow)
+
+    assert calls == ["show"]
+    assert controller.calls.count("objective_begin") == 1
+
+
+def test_baseline_step_zero_is_measured_before_any_attempt(monkeypatch):
+    workflow, controller = completed_workflow(monkeypatch)
+
+    summary = workflow.objective_summary.value
+    assert "Step 0" in summary
+    assert "Measured baseline" in summary
+    assert summary.index("Step 0") < summary.index("Attempt 1")
+    assert f"score_key={score_key(controller.objective_context.baseline_score)}" in summary
+
+
+def test_attempt_card_persists_complete_decision_ladder_without_model_rationale(monkeypatch):
+    workflow, _controller = completed_workflow(monkeypatch)
+
+    first = combined_html(workflow.objective_attempt_cards[0])
+    for label in ("Observe", "Candidate actions", "Nemotron choice", "Execute", "Measure"):
+        assert label in first
+    assert "select_next_panel_swap" in first
+    assert "decision_basis" not in first
+
+
+@pytest.mark.parametrize("action_count", [0, 1, 2, 3])
+def test_action_menu_renders_exact_ordered_cards_and_explicit_empty_state(action_count):
+    context, menu = production_menu(action_count)
+
+    rendered = InteractiveWorkflow._objective_action_menu_html(context, menu)
+
+    assert rendered.count("aria-label='Candidate action'") == action_count
+    positions = [rendered.index(escape(action.swap_id)) for action in menu.actions]
+    assert positions == sorted(positions)
+    assert ("No legal improving candidate actions." in rendered) is (action_count == 0)
+    if action_count:
+        assert "Deterministic score" in rendered
+        assert "Delta" in rendered
+        assert "Resulting co-limiting pairs" in rendered
+        assert "Target status" in rendered
+
+
+def test_boundary_display_uses_shared_score_key_and_names_tie_at_1e_12():
+    score = 0.5
+    tied_target = 0.5000000000004
+    missed_target = 0.5000000000011
+
+    tied = InteractiveWorkflow._objective_target_status(score, tied_target)
+    missed = InteractiveWorkflow._objective_target_status(score, missed_target)
+
+    assert score_key(score) == score_key(tied_target)
+    assert "tied at shared 1e-12 score key" in tied
+    assert str(score_key(score)) in tied
+    assert "below target" in missed
+
+
+def test_attempt_row_rejects_forged_selection_and_committed_attempt():
+    _context, menu = production_menu(3)
+    action = accepted_maxima(menu)[0]
+    selection = ObjectiveSelection(
+        state_id=menu.state_id,
+        swap_id=action.swap_id,
+        observed_limiting_pairs=[list(pair) for pair in menu.source.limiting_pairs],
+        decision_rule="maximize_predicted_minimum_distance",
+    )
+    attempt = evaluate_selected_swap(_context, menu, action, 1)
+
+    with pytest.raises(ValueError):
+        InteractiveWorkflow._objective_attempt_row(
+            menu, selection.model_copy(update={"state_id": "state-0000000000000000"}), attempt
+        )
+    with pytest.raises(ValueError):
+        InteractiveWorkflow._objective_attempt_row(
+            menu, selection, replace(attempt, score=attempt.score - 0.01)
+        )
+
+
+def test_attempt_and_menu_rows_escape_every_molecule_and_state_value():
+    context, first, _second = evaluated_objective_records(
+        ("mol<0>", "mol-1", "mol-2", "mol-3", "mol&4", "mol-5", "mol-6", "mol-7")
+    )
+    menu = build_action_menu(context, measure_panel(context, context.baseline_ids), 0)
+    selection = ObjectiveSelection(
+        state_id=menu.state_id,
+        swap_id=first.selected_swap.swap_id,
+        observed_limiting_pairs=[list(pair) for pair in menu.source.limiting_pairs],
+        decision_rule="maximize_predicted_minimum_distance",
+    )
+
+    rendered = (
+        InteractiveWorkflow._objective_action_menu_html(context, menu)
+        + InteractiveWorkflow._objective_attempt_row(menu, selection, first)
+    )
+
+    assert "mol<0>" not in rendered
+    assert "mol&4" not in rendered
+    assert "mol&lt;0&gt;" in rendered
+    assert "mol&amp;4" in rendered
+    assert escape(menu.state_id) in rendered
+
+
+def test_evaluation_failure_persists_neutral_unmeasured_selection_and_never_success(monkeypatch):
+    controller = Controller()
+
+    def fail_evaluation(selection):
+        controller.calls.append(("objective_execute", selection))
+        controller.objective_run = SimpleNamespace(
+            context=controller.objective_context,
+            attempts=tuple(controller.objective_attempts),
+            achieved=False,
+            termination_reason=TerminationReason.EVALUATION_NOT_COMPLETED,
+            final_ids=controller.objective_context.baseline_ids,
+            final_score=controller.objective_context.baseline_score,
+        )
+        controller.objective_evidence = SimpleNamespace(key="O01")
+        controller.objective_failure_reason = TerminationReason.EVALUATION_NOT_COMPLETED
+        controller.pending_action_menu = None
+        controller.pending_objective_selection = None
+        raise demo_agent.ObjectiveEvaluationError(
+            "The objective evaluation was not completed; no attempt was accepted."
+        )
+
+    controller.execute_objective_attempt = fail_evaluation
+    workflow, controller = ready_workflow(controller)
+    monkeypatch.setattr("interactive_workflow.objective_figures", lambda run, state: ())
+
+    workflow._continue_objective_challenge()
+
+    assert controller.objective_run.termination_reason is TerminationReason.EVALUATION_NOT_COMPLETED
+    assert controller.pending_action_menu is None
+    assert controller.pending_objective_selection is None
+    rendered = combined_html(workflow.objective_card)
+    assert "Evaluation not completed" in rendered
+    assert "validated but unmeasured" in rendered
+    assert "executed" not in rendered.lower()
+    assert "success" not in rendered.lower()
+    assert "Goal achieved" not in rendered
+    assert controller.calls.count("objective_proposal") == 1
+    assert len([call for call in controller.calls if isinstance(call, tuple) and call[0] == "objective_execute"]) == 1
+
+
+def test_conclusion_factual_text_persists_in_html_value(monkeypatch):
+    workflow, _controller = completed_workflow(monkeypatch)
+
+    assert "Schema-checked scientific conclusion" in combined_html(workflow.active_card)
+    assert "Measured objective conclusion" in combined_html(workflow.active_card)
+    assert not any(isinstance(child, widgets.Output) for child in workflow.active_card.children)
 
 
 def test_objective_card_retains_attempts_receipts_scores_and_limiting_pairs(monkeypatch):
@@ -397,7 +603,7 @@ def test_objective_card_retains_attempts_receipts_scores_and_limiting_pairs(monk
     assert "select_next_panel_swap" in text
     assert "evaluate_selected_swap" in text
     assert "decision_basis" not in text and "Decision summary" not in text
-    assert "D_min" in text and "Limiting pair" in text
+    assert "D_min" in text and "co-limiting pairs" in text
     assert "Revise" in text and "Goal achieved" in text
     assert "Baseline" in workflow.objective_summary.value
     assert "Attempt 1" in workflow.objective_summary.value
@@ -415,13 +621,13 @@ def test_objective_attempts_render_as_observe_act_measure_decision_ladder(monkey
     summary = workflow.objective_summary.value
     details = " ".join(html_text(card) for card in workflow.objective_attempt_cards)
     assert "Observe" in summary
-    assert "Agent action" in summary
+    assert "Candidate actions" in summary
+    assert "Nemotron choice" in summary
+    assert "Execute" in summary
     assert "Measure" in summary
     assert "Outcome" in summary
-    assert "swap mol-0-&gt;mol-4" in summary
-    assert "from state state-" in summary
-    assert "+0.450" in summary
-    assert "0.900 ≥ 0.790" in summary
+    assert "mol-0-&gt;mol-4" in summary
+    assert "state-" in summary
     assert "<b>Outcome:</b> Revise" in summary
     assert "<b>Outcome:</b> Goal achieved" in summary
     assert "#D68A00" in summary
@@ -436,465 +642,25 @@ def test_objective_receipt_render_failure_after_commit_never_reexecutes(monkeypa
     complete_six_stages(workflow)
     reached = []
 
+    real_receipt = objective_receipt
+
     def fail_receipt(*args, **kwargs):
         reached.append("render")
-        raise RuntimeError("injected receipt render failure")
+        if len(reached) == 1:
+            raise RuntimeError("injected receipt render failure")
+        return real_receipt(*args, **kwargs)
 
     monkeypatch.setattr("interactive_workflow.objective_receipt", fail_receipt)
     workflow.objective_button.click()
     workflow.objective_button.click()
 
-    assert reached == ["render"]
-    assert len(controller.objective_attempts) == 1
+    assert len(reached) == 4
+    assert len(controller.objective_attempts) == 2
     assert len([
         call for call in controller.calls
         if isinstance(call, tuple) and call[0] == "objective_execute"
-    ]) == 1
-    assert workflow.status == "stopped"
-
-
-def test_objective_revision_without_prior_attempt_fails_closed():
-    attempt = ObjectiveAttempt(
-        attempt_number=2,
-        selected_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
-        decision_basis="Revise the measured panel.",
-        score=0.80,
-        limiting_pair=("mol-0", "mol-2"),
-        constraints_passed=True,
-        achieved=True,
-        state_id="state-0123456789abcdef",
-        selected_swap=ObjectiveSwap(
-            replace_id="mol-1",
-            replacement_id="mol-5",
-            resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
-            predicted_score=0.80,
-            score_delta=0.80 - 0.35,
-            limiting_pair=("mol-0", "mol-2"),
-        ),
-    )
-
-    with pytest.raises(ValueError, match="prior attempt"):
-        InteractiveWorkflow._objective_attempt_row(
-            SimpleNamespace(baseline_score=0.35, target_score=0.71),
-            attempt,
-        )
-
-
-def test_objective_attempt_row_enforces_initial_and_revision_state_shapes():
-    context = SimpleNamespace(baseline_score=0.35, target_score=0.71)
-    swap = ObjectiveSwap(
-        replace_id="mol-1",
-        replacement_id="mol-5",
-        resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
-        predicted_score=0.80,
-        score_delta=0.80 - 0.35,
-        limiting_pair=("mol-0", "mol-2"),
-    )
-    initial = ObjectiveAttempt(
-        attempt_number=1,
-        selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
-        decision_basis="Measure the initial panel.",
-        score=0.35,
-        limiting_pair=("mol-0", "mol-1"),
-        constraints_passed=True,
-        achieved=False,
-    )
-    initial_with_swap = ObjectiveAttempt(
-        attempt_number=1,
-        selected_ids=swap.resulting_ids,
-        decision_basis="Incorrect initial provenance.",
-        score=0.80,
-        limiting_pair=swap.limiting_pair,
-        constraints_passed=True,
-        achieved=True,
-        state_id="",
-        selected_swap=swap,
-    )
-    revision_without_swap = ObjectiveAttempt(
-        attempt_number=2,
-        selected_ids=swap.resulting_ids,
-        decision_basis="Incorrect revision provenance.",
-        score=0.80,
-        limiting_pair=swap.limiting_pair,
-        constraints_passed=True,
-        achieved=True,
-    )
-    class SwapSubclass(ObjectiveSwap):
-        pass
-
-    revision_with_subclass = ObjectiveAttempt(
-        attempt_number=2,
-        selected_ids=swap.resulting_ids,
-        decision_basis="Incorrect subclass provenance.",
-        score=0.80,
-        limiting_pair=swap.limiting_pair,
-        constraints_passed=True,
-        achieved=True,
-        state_id="state-0123456789abcdef",
-        selected_swap=SwapSubclass(**swap.__dict__),
-    )
-
-    with pytest.raises(ValueError, match="initial"):
-        InteractiveWorkflow._objective_attempt_row(context, initial, initial)
-    with pytest.raises(ValueError, match="state-bound"):
-        InteractiveWorkflow._objective_attempt_row(context, initial_with_swap)
-    with pytest.raises(ValueError, match="state-bound"):
-        InteractiveWorkflow._objective_attempt_row(context, revision_without_swap, initial)
-    with pytest.raises(ValueError, match="exact"):
-        InteractiveWorkflow._objective_attempt_row(context, revision_with_subclass, initial)
-
-
-def test_objective_attempt_row_uses_gray_amber_and_green_by_state():
-    context = SimpleNamespace(baseline_score=0.35, target_score=0.71)
-    initial_miss = ObjectiveAttempt(
-        attempt_number=1,
-        selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
-        decision_basis="Measure the initial panel.",
-        score=0.35,
-        limiting_pair=("mol-0", "mol-1"),
-        constraints_passed=True,
-        achieved=False,
-    )
-    swap = ObjectiveSwap(
-        replace_id="mol-1",
-        replacement_id="mol-5",
-        resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
-        predicted_score=0.50,
-        score_delta=0.50 - 0.35,
-        limiting_pair=("mol-0", "mol-2"),
-    )
-    revision_miss = ObjectiveAttempt(
-        attempt_number=2,
-        selected_ids=swap.resulting_ids,
-        decision_basis="Use the measured replacement.",
-        score=0.50,
-        limiting_pair=swap.limiting_pair,
-        constraints_passed=True,
-        achieved=False,
-        state_id="state-0123456789abcdef",
-        selected_swap=swap,
-    )
-    initial_achieved = ObjectiveAttempt(
-        attempt_number=1,
-        selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
-        decision_basis="The initial panel meets target.",
-        score=0.80,
-        limiting_pair=("mol-0", "mol-1"),
-        constraints_passed=True,
-        achieved=True,
-    )
-
-    assert "#6c757d" in InteractiveWorkflow._objective_attempt_row(context, initial_miss)
-    assert "#D68A00" in InteractiveWorkflow._objective_attempt_row(
-        context, revision_miss, initial_miss
-    )
-    assert "#76B900" in InteractiveWorkflow._objective_attempt_row(
-        context, initial_achieved
-    )
-
-
-def test_objective_attempt_row_binds_evaluated_records_and_escapes_action_content():
-    context, first, second = evaluated_objective_records(
-        (
-            "mol<0>", "mol-1", "mol-2", "mol-3", "mol&4", "mol-5",
-            "mol-6", "mol-7",
-        )
-    )
-    adversarial = replace(second, decision_basis="<img src=x onerror=alert(1)>")
-
-    initial_row = InteractiveWorkflow._objective_attempt_row(context, first)
-    revision_row = InteractiveWorkflow._objective_attempt_row(context, adversarial, first)
-
-    assert "baseline D_min 0.350" in initial_row
-    assert "prior D_min 0.450" in revision_row
-    assert "limiting pair" in revision_row
-    assert "swap" in revision_row and "from state" in revision_row
-    assert "mol<0>" not in initial_row
-    assert "&lt;img src=x onerror=alert(1)&gt;" not in revision_row
-    assert "<img src=x" not in revision_row
-    assert "<b>Outcome:</b> Goal achieved" in revision_row
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        lambda attempt: replace(attempt, attempt_number=4),
-        lambda attempt: replace(attempt, attempt_number=3),
-        lambda attempt: replace(attempt, selected_ids=("mol-0", "mol-1", "mol-2", "mol-3")),
-        lambda attempt: replace(attempt, score=0.79),
-        lambda attempt: replace(
-            attempt,
-            selected_swap=replace(attempt.selected_swap, score_delta=0.44),
-        ),
-    ],
-)
-def test_objective_attempt_row_rejects_forged_evaluated_transition_records(mutation):
-    context, first, second = evaluated_objective_records()
-
-    with pytest.raises(ValueError):
-        InteractiveWorkflow._objective_attempt_row(context, mutation(second), first)
-
-
-def test_objective_attempt_row_adapts_precision_without_erasing_near_threshold_delta():
-    context = SimpleNamespace(baseline_score=0.7096, target_score=0.7104)
-    prior = ObjectiveAttempt(
-        attempt_number=1,
-        selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
-        decision_basis="Measure the baseline.",
-        score=0.7096,
-        limiting_pair=("mol-0", "mol-1"),
-        constraints_passed=True,
-        achieved=False,
-    )
-    swap = ObjectiveSwap(
-        replace_id="mol-1",
-        replacement_id="mol-5",
-        resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
-        predicted_score=0.7100,
-        score_delta=0.7100 - 0.7096,
-        limiting_pair=("mol-0", "mol-2"),
-    )
-    attempt = ObjectiveAttempt(
-        attempt_number=2,
-        selected_ids=swap.resulting_ids,
-        decision_basis="Use the narrow measured improvement.",
-        score=0.7100,
-        limiting_pair=swap.limiting_pair,
-        constraints_passed=True,
-        achieved=False,
-        state_id="state-0123456789abcdef",
-        selected_swap=swap,
-    )
-
-    row = InteractiveWorkflow._objective_attempt_row(context, attempt, prior)
-
-    assert "0.7100 &lt; 0.7104" in row
-    assert "Δ +0.0004" in row
-
-
-@pytest.mark.parametrize(
-    "attempt, prior, context",
-    [
-        (
-            lambda first, second: replace(first, constraints_passed=False),
-            lambda first, second: None,
-            lambda context: context,
-        ),
-        (
-            lambda first, second: replace(first, achieved=True),
-            lambda first, second: None,
-            lambda context: context,
-        ),
-        (
-            lambda first, second: replace(second, achieved=False),
-            lambda first, second: first,
-            lambda context: context,
-        ),
-        (
-            lambda first, second: second,
-            lambda first, second: replace(first, achieved=True),
-            lambda context: context,
-        ),
-        (
-            lambda first, second: replace(first, score=float("nan")),
-            lambda first, second: None,
-            lambda context: context,
-        ),
-        (
-            lambda first, second: first,
-            lambda first, second: None,
-            lambda context: SimpleNamespace(
-                baseline_score=float("inf"), target_score=context.target_score,
-            ),
-        ),
-    ],
-)
-def test_objective_attempt_row_rejects_false_domain_truth(attempt, prior, context):
-    objective_context, first, second = evaluated_objective_records()
-
-    with pytest.raises(ValueError):
-        InteractiveWorkflow._objective_attempt_row(
-            context(objective_context), attempt(first, second), prior(first, second)
-        )
-
-
-@pytest.mark.parametrize("delta", [0.0, -0.10])
-def test_objective_attempt_row_rejects_nonpositive_revision_delta(delta):
-    context, first, second = evaluated_objective_records()
-    no_op_swap = replace(
-        second.selected_swap,
-        predicted_score=first.score + delta,
-        score_delta=delta,
-    )
-    no_op = replace(
-        second,
-        score=first.score + delta,
-        achieved=False,
-        selected_swap=no_op_swap,
-    )
-
-    with pytest.raises(ValueError):
-        InteractiveWorkflow._objective_attempt_row(context, no_op, first)
-
-
-def test_objective_attempt_row_uses_scientific_notation_when_six_decimals_hide_truth():
-    context = SimpleNamespace(baseline_score=0.7099996, target_score=0.7100004)
-    prior = ObjectiveAttempt(
-        attempt_number=1,
-        selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
-        decision_basis="Measure the baseline.",
-        score=0.7099996,
-        limiting_pair=("mol-0", "mol-1"),
-        constraints_passed=True,
-        achieved=False,
-    )
-    swap = ObjectiveSwap(
-        replace_id="mol-1",
-        replacement_id="mol-5",
-        resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
-        predicted_score=0.7100000,
-        score_delta=0.7100000 - 0.7099996,
-        limiting_pair=("mol-0", "mol-2"),
-    )
-    attempt = ObjectiveAttempt(
-        attempt_number=2,
-        selected_ids=swap.resulting_ids,
-        decision_basis="Keep the measurable narrow improvement.",
-        score=0.7100000,
-        limiting_pair=swap.limiting_pair,
-        constraints_passed=True,
-        achieved=False,
-        state_id="state-0123456789abcdef",
-        selected_swap=swap,
-    )
-
-    row = InteractiveWorkflow._objective_attempt_row(context, attempt, prior)
-
-    assert "0.710000 &lt; 0.710000" not in row
-    assert "Δ +0.000000" not in row
-    assert "e-07" in row
-
-
-def test_objective_attempt_row_distinguishes_exact_quantized_tie_and_miss_outcomes():
-    target = 0.71
-
-    def initial(score, achieved):
-        return ObjectiveAttempt(
-            attempt_number=1,
-            selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
-            decision_basis="Measure the initial panel.",
-            score=score,
-            limiting_pair=("mol-0", "mol-1"),
-            constraints_passed=True,
-            achieved=achieved,
-        )
-
-    exact = InteractiveWorkflow._objective_attempt_row(
-        SimpleNamespace(baseline_score=target, target_score=target),
-        initial(target, True),
-    )
-    quantized_tie_score = float(np.nextafter(target, 0.0))
-    quantized_tie = InteractiveWorkflow._objective_attempt_row(
-        SimpleNamespace(
-            baseline_score=quantized_tie_score,
-            target_score=target,
-        ),
-        initial(quantized_tie_score, True),
-    )
-    miss = InteractiveWorkflow._objective_attempt_row(
-        SimpleNamespace(baseline_score=0.709, target_score=target),
-        initial(0.709, False),
-    )
-
-    assert "0.710 ≥ 0.710" in exact
-    assert "meets the quantized target" in quantized_tie
-    assert "<b>Outcome:</b> Goal achieved" in quantized_tie
-    assert "0.709 &lt; 0.710" in miss
-
-
-def test_objective_attempt_row_uses_score_keys_for_target_attainment():
-    score = 0.5
-    target = 0.50000000000075
-    attempt = ObjectiveAttempt(
-        attempt_number=1,
-        selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
-        decision_basis="Measure the initial panel.",
-        score=score,
-        limiting_pair=("mol-0", "mol-1"),
-        constraints_passed=True,
-        achieved=False,
-    )
-
-    row = InteractiveWorkflow._objective_attempt_row(
-        SimpleNamespace(baseline_score=score, target_score=target), attempt
-    )
-
-    assert "<b>Outcome:</b> Revise" in row
-
-
-def test_objective_attempt_row_accepts_one_score_key_revision_below_old_tolerance():
-    current = 0.5
-    improved = 0.5000000000005
-    delta = improved - current
-    prior = ObjectiveAttempt(
-        attempt_number=1,
-        selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
-        decision_basis="Measure the initial panel.",
-        score=current,
-        limiting_pair=("mol-0", "mol-1"),
-        constraints_passed=True,
-        achieved=False,
-    )
-    swap = ObjectiveSwap(
-        replace_id="mol-1",
-        replacement_id="mol-5",
-        resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
-        predicted_score=improved,
-        score_delta=delta,
-        limiting_pair=("mol-0", "mol-2"),
-    )
-    attempt = ObjectiveAttempt(
-        attempt_number=2,
-        selected_ids=swap.resulting_ids,
-        decision_basis="Use the one-key measured improvement.",
-        score=improved,
-        limiting_pair=swap.limiting_pair,
-        constraints_passed=True,
-        achieved=True,
-        state_id="state-0123456789abcdef",
-        selected_swap=swap,
-    )
-
-    row = InteractiveWorkflow._objective_attempt_row(
-        SimpleNamespace(baseline_score=current, target_score=improved),
-        attempt,
-        prior,
-    )
-
-    assert "<b>Outcome:</b> Goal achieved" in row
-
-
-@pytest.mark.parametrize(
-    "pair",
-    [
-        ("mol-9", "mol-0"),
-        ("mol-0", "mol-0"),
-        ("", "mol-0"),
-    ],
-)
-def test_objective_attempt_row_rejects_noncanonical_or_out_of_panel_limiting_pairs(pair):
-    context, first, second = evaluated_objective_records()
-    forged_swap = replace(second.selected_swap, limiting_pair=pair)
-    forged_second = replace(second, limiting_pair=pair, selected_swap=forged_swap)
-
-    with pytest.raises(ValueError):
-        InteractiveWorkflow._objective_attempt_row(
-            context, replace(first, limiting_pair=pair)
-        )
-    with pytest.raises(ValueError):
-        InteractiveWorkflow._objective_attempt_row(context, second, replace(first, limiting_pair=pair))
-    with pytest.raises(ValueError):
-        InteractiveWorkflow._objective_attempt_row(context, forged_second, first)
+    ]) == 2
+    assert workflow.status == "completed"
 
 
 def test_known_objective_proposal_failure_after_measured_attempt_has_one_guarded_retry(monkeypatch):
@@ -1061,7 +827,14 @@ def test_retry_objective_rechecks_pending_state_and_stops(monkeypatch):
     complete_six_stages(workflow)
     workflow.objective_button.click()
     before = controller.calls.count("objective_proposal")
-    controller.pending_objective = controller.objective_proposals[1]
+    controller.pending_objective_selection = ObjectiveSelection(
+        state_id=controller.pending_action_menu.state_id,
+        swap_id=controller.pending_action_menu.actions[0].swap_id,
+        observed_limiting_pairs=[
+            list(pair) for pair in controller.pending_action_menu.source.limiting_pairs
+        ],
+        decision_rule="maximize_predicted_minimum_distance",
+    )
     workflow.retry_button.click()
 
     assert workflow.status == "stopped"
@@ -1069,7 +842,7 @@ def test_retry_objective_rechecks_pending_state_and_stops(monkeypatch):
     assert controller.calls.count("objective_proposal") == before
 
 
-@pytest.mark.parametrize("mutation", ["pending_swap", "missing_suggestions"])
+@pytest.mark.parametrize("mutation", ["invalid_menu", "missing_suggestions"])
 def test_retry_objective_rejects_noncanonical_guidance_state(mutation):
     controller = Controller()
     original_request = controller.request_objective_attempt
@@ -1089,8 +862,8 @@ def test_retry_objective_rejects_noncanonical_guidance_state(mutation):
     workflow.objective_button.click()
     assert workflow.status == "objective_failed"
     before = controller.calls.count("objective_proposal")
-    if mutation == "pending_swap":
-        controller.pending_objective_swap = object()
+    if mutation == "invalid_menu":
+        controller.pending_action_menu = object()
     else:
         controller.objective_suggestions = ()
 
@@ -1281,7 +1054,7 @@ def test_conclusion_render_failure_retains_result_and_completion(monkeypatch):
     workflow.objective_button.click()
     assert workflow.status == "completed" and workflow.workflow_result is not None
     assert workflow.retry_button is None and controller.calls.count("synthesis") == 1
-    assert "Conclusion rendering unavailable in this notebook frontend." in html_text(workflow.active_card)
+    assert "Schema-checked scientific conclusion" in html_text(workflow.active_card)
     assert "CONCLUSION-SECRET" not in workflow.transcript_text
 
 

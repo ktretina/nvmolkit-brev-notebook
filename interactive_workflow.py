@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from math import isfinite
 from html import escape
 from typing import Any
 
@@ -13,8 +12,9 @@ from pydantic import BaseModel, ValidationError
 import demo_agent
 from command_receipts import CommandReceipt, command_receipt
 from objective_challenge import (
-    MAX_ATTEMPTS, ObjectiveAttempt, ObjectiveSwap, build_action_menu,
-    is_strict_improvement, measure_panel, objective_figures, target_is_achieved,
+    MAX_ATTEMPTS, ObjectiveActionMenu, ObjectiveAttempt,
+    TerminationReason, build_action_menu, measure_panel, objective_figures,
+    score_key,
 )
 from objective_receipts import objective_receipt
 
@@ -97,6 +97,10 @@ class InteractiveWorkflow:
         self.objective_button: widgets.Button | None = None
         self.objective_summary = widgets.HTML()
         self.objective_attempt_cards: tuple[widgets.Accordion, ...] = ()
+        self.objective_decisions: tuple[
+            tuple[ObjectiveActionMenu, demo_agent.ObjectiveSelection, ObjectiveAttempt | None],
+            ...,
+        ] = ()
         self.objective_attempt_box = widgets.VBox()
         self.objective_output = widgets.Output()
         self.workflow_result: Any | None = None
@@ -237,7 +241,8 @@ class InteractiveWorkflow:
                 and self.controller.synthesis_prompt_appended is True
                 and self.controller.objective_run is not None
                 and self.controller.objective_evidence is not None
-                and self.controller.pending_objective is None
+                and self.controller.pending_objective_selection is None
+                and self.controller.pending_action_menu is None
                 and self.controller.objective_prompt_appended is True
                 and 7
                 <= self.controller.session.turn_count
@@ -263,8 +268,9 @@ class InteractiveWorkflow:
                 and self.controller.objective_prompt_appended is True
                 and self.controller.objective_run is None
                 and self.controller.objective_evidence is None
-                and self.controller.pending_objective is None
-                and self.controller.pending_objective_swap is None
+                and self.controller.pending_objective_selection is None
+                and type(self.controller.pending_action_menu) is ObjectiveActionMenu
+                and bool(self.controller.pending_action_menu.actions)
                 and self.controller.objective_rejection_count
                 < demo_agent.MAX_OBJECTIVE_CORRECTIONS
                 and len(attempts) < MAX_ATTEMPTS
@@ -511,16 +517,14 @@ class InteractiveWorkflow:
                 self._line(placeholder)
 
     @staticmethod
-    def _objective_summary_html(context, attempts, run=None) -> str:
+    def _objective_summary_html(context, decisions, run=None) -> str:
+        baseline = measure_panel(context, context.baseline_ids)
+        attempts = tuple(
+            attempt for _menu, _selection, attempt in decisions if attempt is not None
+        )
         display_values = tuple(
             InteractiveWorkflow._objective_display_values(
-                attempt.score,
-                context.target_score,
-                (
-                    attempt.score - context.baseline_score
-                    if attempt.selected_swap is None
-                    else attempt.selected_swap.score_delta
-                ),
+                attempt.score, context.target_score, attempt.selected_swap.score_delta
             )
             for attempt in attempts
         )
@@ -551,13 +555,23 @@ class InteractiveWorkflow:
             )
             for label, score, status in score_items
         )
-        decision_ladder = "".join(
-            InteractiveWorkflow._objective_attempt_row(
-                context,
-                attempt,
-                attempts[index - 1] if index else None,
-            )
-            for index, attempt in enumerate(attempts)
+        baseline_pairs = " · ".join(
+            f"{escape(first)} / {escape(second)}"
+            for first, second in baseline.limiting_pairs
+        )
+        baseline_row = (
+            "<section style='border-left:3px solid #6c757d;padding:6px 10px;"
+            "margin:6px 0' aria-label='Objective baseline'>"
+            "<b>Step 0 · Measured baseline</b><br>"
+            f"<small><b>Observe:</b> supplied panel {escape(str(baseline.selected_ids))}</small><br>"
+            f"<small><b>Measure:</b> D_min {InteractiveWorkflow._objective_scalar(baseline.score, precision, scientific)} "
+            f"· score_key={baseline.score_key} · co-limiting pairs {baseline_pairs}</small><br>"
+            f"<small><b>Target status:</b> {escape(InteractiveWorkflow._objective_target_status(baseline.score, context.target_score))}</small>"
+            "</section>"
+        )
+        decision_ladder = baseline_row + "".join(
+            InteractiveWorkflow._objective_attempt_row(menu, selection, attempt)
+            for menu, selection, attempt in decisions
         )
         final = ""
         if run is not None:
@@ -568,6 +582,8 @@ class InteractiveWorkflow:
             )
             if run.termination_reason == "baseline_already_optimal":
                 label = "Baseline already optimal within the bounded pool"
+            if run.termination_reason == TerminationReason.EVALUATION_NOT_COMPLETED:
+                label = "Evaluation not completed; the validated selection remains unmeasured"
             final = f"<p><b>Outcome:</b> {escape(label)}</p>"
         return (
             "<p><b>Objective:</b> Select four MMFF94-parameter-eligible compounds "
@@ -577,135 +593,130 @@ class InteractiveWorkflow:
             "<p><b>Target:</b> D_min ≥ "
             f"{InteractiveWorkflow._objective_scalar(context.target_score, precision, scientific)} "
             "(80% of attainable improvement over baseline)</p>"
-            f"<div>{score_strip}</div>"
-            f"<div aria-label='Objective decision ladder'>{decision_ladder}</div>{final}"
+            f"<div aria-label='Objective decision ladder'>{decision_ladder}</div>"
+            f"<div>{score_strip}</div>{final}"
         )
 
     @staticmethod
-    def _objective_attempt_row(context, attempt, prior_attempt=None) -> str:
-        """Render one measured decision step without exposing model rationale."""
-        if (
-            not InteractiveWorkflow._is_finite_float(context.baseline_score)
-            or not InteractiveWorkflow._is_finite_float(context.target_score)
+    def _objective_target_status(score: float, target: float) -> str:
+        score_value, target_value = score_key(score), score_key(target)
+        if score_value == target_value:
+            return f"tied at shared 1e-12 score key {score_value}; target met"
+        if score_value > target_value:
+            return f"above target by shared 1e-12 score key ({score_value} > {target_value})"
+        return f"below target by shared 1e-12 score key ({score_value} < {target_value})"
+
+    @staticmethod
+    def _objective_action_menu_html(context, menu: ObjectiveActionMenu) -> str:
+        if type(menu) is not ObjectiveActionMenu or menu != build_action_menu(
+            context, menu.source, menu.accepted_attempt_count
         ):
-            raise ValueError("Objective attempt rows require finite context scores.")
-        if type(attempt) is not ObjectiveAttempt:
-            raise ValueError("Objective attempt rows require exact objective attempts.")
-        if type(attempt.attempt_number) is not int or not 1 <= attempt.attempt_number <= MAX_ATTEMPTS:
-            raise ValueError("Objective attempt rows require bounded integer attempt numbers.")
-        if not InteractiveWorkflow._is_canonical_panel(attempt.selected_ids):
-            raise ValueError("Objective attempt rows require canonical selected panels.")
-        if not InteractiveWorkflow._is_finite_float(attempt.score):
-            raise ValueError("Objective attempt rows require finite measured scores.")
-        if (
-            attempt.constraints_passed is not True
-            or type(attempt.achieved) is not bool
-            or attempt.achieved
-            != target_is_achieved(attempt.score, context.target_score)
-            or not InteractiveWorkflow._is_canonical_pair(
-                attempt.limiting_pair, attempt.selected_ids
+            raise ValueError("Candidate actions require the exact deterministic menu.")
+        if not menu.actions:
+            return "<p><b>Candidate actions:</b> No legal improving candidate actions.</p>"
+        rows = []
+        for action in sorted(menu.actions, key=lambda item: item.swap_id):
+            pairs = " · ".join(
+                f"{escape(first)} / {escape(second)}"
+                for first, second in action.limiting_pairs
             )
-        ):
-            raise ValueError("Objective attempt rows require measured objective truth.")
-        swap = attempt.selected_swap
-        baseline_view = attempt.attempt_number == 1 and swap is None
-        if baseline_view:
-            if prior_attempt is not None:
-                raise ValueError("The initial baseline cannot carry a prior attempt.")
-            action = "Measured Step-0 baseline"
-            delta = attempt.score - context.baseline_score
-            accent = "#76B900" if attempt.achieved else "#6c757d"
-        else:
-            if type(swap) is not ObjectiveSwap or not attempt.state_id:
-                raise ValueError("A measured substitution requires an exact state-bound swap.")
-            if attempt.attempt_number == 1:
-                if prior_attempt is not None:
-                    raise ValueError("The first substitution cannot carry a prior attempt.")
-                prior_ids = context.baseline_ids
-                prior_score = context.baseline_score
-                accent = "#76B900" if attempt.achieved else "#D68A00"
-            else:
-                if type(prior_attempt) is not ObjectiveAttempt:
-                    raise ValueError("A revision requires its exact prior attempt.")
-                if prior_attempt.attempt_number != attempt.attempt_number - 1:
-                    raise ValueError("A revision requires its consecutive prior attempt.")
-                prior_ids = prior_attempt.selected_ids
-                prior_score = prior_attempt.score
-                accent = "#76B900" if attempt.achieved else "#D68A00"
-                if (
-                    not InteractiveWorkflow._is_canonical_panel(prior_attempt.selected_ids)
-                    or not InteractiveWorkflow._is_finite_float(prior_attempt.score)
-                    or prior_attempt.constraints_passed is not True
-                    or prior_attempt.achieved is not False
-                    or not InteractiveWorkflow._is_canonical_pair(
-                        prior_attempt.limiting_pair, prior_attempt.selected_ids
-                    )
-                ):
-                    raise ValueError("A revision has invalid prior-attempt provenance.")
-            if (
-                not InteractiveWorkflow._is_canonical_panel(swap.resulting_ids)
-                or not InteractiveWorkflow._is_canonical_pair(
-                    swap.limiting_pair, swap.resulting_ids
-                )
-                or not InteractiveWorkflow._is_finite_float(swap.predicted_score)
-                or not InteractiveWorkflow._is_finite_float(swap.score_delta)
-                or not is_strict_improvement(swap.predicted_score, prior_score)
-                or not InteractiveWorkflow._same_panel(swap.resulting_ids, attempt.selected_ids)
-                or swap.replacement_id not in swap.resulting_ids
-                or swap.replace_id in swap.resulting_ids
-            ):
-                raise ValueError("A substitution has invalid selected-swap provenance.")
-            replacement_position = swap.resulting_ids.index(swap.replacement_id)
-            predecessor = (
-                swap.resulting_ids[:replacement_position]
-                + (swap.replace_id,)
-                + swap.resulting_ids[replacement_position + 1 :]
+            resulting = ", ".join(escape(item) for item in action.resulting_ids)
+            rows.append(
+                "<section aria-label='Candidate action' style='border:1px solid #aaa;"
+                "padding:6px 10px;margin:4px 0'>"
+                f"<b>{escape(action.swap_id)}</b><br>"
+                f"<small>State: {escape(menu.state_id)}</small><br>"
+                f"<small>Resulting panel: {resulting}</small><br>"
+                f"<small>Deterministic score: {action.predicted_score!r} "
+                f"(score_key={action.predicted_score_key}) · Delta: {action.score_delta!r}</small><br>"
+                f"<small>Resulting co-limiting pairs: {pairs}</small><br>"
+                f"<small>Target status: {escape(InteractiveWorkflow._objective_target_status(action.predicted_score, context.target_score))}</small>"
+                "</section>"
             )
-            if (
-                not InteractiveWorkflow._same_panel(predecessor, prior_ids)
-                or attempt.score != swap.predicted_score
-                or attempt.limiting_pair != swap.limiting_pair
-                or swap.score_delta != attempt.score - prior_score
-            ):
-                raise ValueError("A substitution does not match its prior measurement.")
-            action = f"swap {swap.swap_id} from state {attempt.state_id}"
-            delta = swap.score_delta
-        score_text, target_text, delta_text, precision, scientific = (
-            InteractiveWorkflow._objective_display_values(
-                attempt.score, context.target_score, delta
-            )
+        return "<div><b>Candidate actions</b>" + "".join(rows) + "</div>"
+
+    @staticmethod
+    def _objective_attempt_row(menu, selection, attempt=None) -> str:
+        """Render one exact menu/selection/commit decision without model rationale."""
+        if type(menu) is not ObjectiveActionMenu or type(selection) is not demo_agent.ObjectiveSelection:
+            raise ValueError("Objective rows require exact public menu and selection types.")
+        observed = tuple(tuple(pair) for pair in selection.observed_limiting_pairs)
+        selected = next(
+            (action for action in menu.actions if action.swap_id == selection.swap_id), None
         )
-        if attempt.attempt_number == 1:
-            observation = (
-                "baseline D_min "
-                f"{InteractiveWorkflow._objective_scalar(context.baseline_score, precision, scientific)}; "
-                f"current D_min {score_text}; first measured substitution"
+        if (
+            selection.state_id != menu.state_id
+            or observed != menu.source.limiting_pairs
+            or selection.decision_rule != "maximize_predicted_minimum_distance"
+            or selected is None
+        ):
+            raise ValueError("Objective selection does not match its displayed menu.")
+        action_rows = []
+        for action in sorted(menu.actions, key=lambda item: item.swap_id):
+            pairs = " · ".join(
+                f"{escape(first)} / {escape(second)}" for first, second in action.limiting_pairs
             )
+            action_rows.append(
+                "<li aria-label='Candidate action'>"
+                f"<b>{escape(action.swap_id)}</b>: score={action.predicted_score!r}; "
+                f"score_key={action.predicted_score_key}; delta={action.score_delta!r}; "
+                f"resulting co-limiting pairs={pairs}; target status={escape(action.target_status)}"
+                "</li>"
+            )
+        candidate_html = (
+            "<ul>" + "".join(action_rows) + "</ul>"
+            if action_rows
+            else "<p>No legal improving candidate actions.</p>"
+        )
+        source_pairs = " · ".join(
+            f"{escape(first)} / {escape(second)}" for first, second in menu.source.limiting_pairs
+        )
+        attempt_number = menu.accepted_attempt_count + 1
+        if attempt is None:
+            accent = "#6c757d"
+            measure = (
+                "<small><b>Measure:</b> Evaluation not completed; selection validated but unmeasured. "
+                "No measurement is available.</small><br>"
+                "<small><b>Outcome:</b> Evaluation not completed</small>"
+            )
+            outcome = "Evaluation not completed"
         else:
-            observation = (
-                "prior D_min "
-                f"{InteractiveWorkflow._objective_scalar(prior_attempt.score, precision, scientific)}; "
-                f"limiting pair {prior_attempt.limiting_pair[0]} / {prior_attempt.limiting_pair[1]}"
+            if (
+                type(attempt) is not ObjectiveAttempt
+                or attempt.attempt_number != attempt_number
+                or attempt.state_id != menu.state_id
+                or attempt.selected_swap != selected
+                or attempt.selected_ids != selected.resulting_ids
+                or attempt.score != selected.predicted_score
+                or attempt.score_key != selected.predicted_score_key
+                or attempt.limiting_pairs != selected.limiting_pairs
+                or attempt.constraints_passed is not True
+                or attempt.achieved != (selected.target_status == "meets_target")
+            ):
+                raise ValueError("Committed attempt does not match its menu-bound selection.")
+            accent = "#76B900" if attempt.achieved else "#D68A00"
+            outcome = "Goal achieved" if attempt.achieved else "Revise"
+            measured_pairs = " · ".join(
+                f"{escape(first)} / {escape(second)}" for first, second in attempt.limiting_pairs
             )
-        if attempt.achieved and attempt.score < context.target_score:
-            comparison = (
-                f"{score_text} meets the quantized target "
-                f"(shared score key ≥ {target_text})"
+            measure = (
+                f"<small><b>Measure:</b> D_min {attempt.score!r}; score_key={attempt.score_key}; "
+                f"delta={selected.score_delta!r}; co-limiting pairs={measured_pairs}; "
+                f"target status={escape(selected.target_status)}</small><br>"
+                f"<small><b>Outcome:</b> {escape(outcome)}</small>"
             )
-        elif attempt.achieved:
-            comparison = f"{score_text} ≥ {target_text}"
-        else:
-            comparison = f"{score_text} < {target_text}"
-        outcome = "Goal achieved" if attempt.achieved else "Revise"
         return (
             f"<section style='border-left:3px solid {accent};padding:6px 10px;"
             "margin:6px 0' aria-label='Objective attempt'>"
-            f"<b>Attempt {attempt.attempt_number}</b> · {escape(outcome)}<br>"
-            f"<small><b>Observe:</b> {escape(observation)}</small><br>"
-            f"<small><b>Agent action:</b> {escape(action)}</small><br>"
-            f"<small><b>Measure:</b> D_min {score_text} · Δ {delta_text} · {escape(comparison)}</small><br>"
-            f"<small><b>Outcome:</b> {escape(outcome)}</small>"
-            "</section>"
+            f"<b>Attempt {attempt_number}</b> · {escape(outcome)}<br>"
+            f"<small><b>Observe:</b> state {escape(menu.state_id)}; source D_min "
+            f"{menu.source.score!r}; score_key={menu.source.score_key}; co-limiting pairs {source_pairs}</small><br>"
+            f"<div><b>Candidate actions</b>{candidate_html}</div>"
+            f"<small><b>Nemotron choice:</b> {escape(selection.swap_id)} from state "
+            f"{escape(selection.state_id)} using {escape(selection.decision_rule)}</small><br>"
+            f"<small><b>Execute:</b> <code>select_next_panel_swap(state_id={escape(selection.state_id)!r}, "
+            f"swap_id={escape(selection.swap_id)!r})</code></small><br>"
+            f"{measure}</section>"
         )
 
     @staticmethod
@@ -774,33 +785,6 @@ class InteractiveWorkflow:
                 return precision
         return 17
 
-    @staticmethod
-    def _is_finite_float(value: object) -> bool:
-        return type(value) is float and isfinite(value)
-
-    @staticmethod
-    def _is_canonical_panel(value: object) -> bool:
-        return (
-            type(value) is tuple
-            and len(value) == 4
-            and len(set(value)) == len(value)
-            and all(type(molecule_id) is str for molecule_id in value)
-        )
-
-    @staticmethod
-    def _is_canonical_pair(value: object, panel: tuple[str, ...]) -> bool:
-        return (
-            type(value) is tuple
-            and len(value) == 2
-            and all(type(molecule_id) is str and molecule_id for molecule_id in value)
-            and value[0] != value[1]
-            and all(molecule_id in panel for molecule_id in value)
-        )
-
-    @staticmethod
-    def _same_panel(first: tuple[str, ...], second: tuple[str, ...]) -> bool:
-        return len(first) == len(second) and set(first) == set(second)
-
     def _show_objective_challenge(self) -> None:
         self.status = "objective_initializing"
         try:
@@ -811,7 +795,7 @@ class InteractiveWorkflow:
         self.objective_summary = widgets.HTML(
             self._objective_summary_html(
                 context,
-                tuple(self.controller.objective_attempts),
+                self.objective_decisions,
                 self.controller.objective_run,
             )
         )
@@ -821,6 +805,7 @@ class InteractiveWorkflow:
         button.on_click(self._run_objective_challenge)
         self.objective_button = button
         self.objective_attempt_cards = ()
+        self.objective_decisions = ()
         self.objective_attempt_box = widgets.VBox()
         self.objective_output = widgets.Output()
         self.objective_card = widgets.VBox(
@@ -840,54 +825,79 @@ class InteractiveWorkflow:
             button.disabled = True
             self._finish_objective_challenge()
 
-    def _append_objective_attempt(self, proposal, attempt) -> None:
-        prior_attempt = (
-            self.controller.objective_attempts[-2]
-            if attempt.attempt_number > 1
-            else None
-        )
+    def _render_objective_decisions(self) -> None:
         context = self.controller.objective_context
-        source = (
-            measure_panel(context, context.baseline_ids)
-            if prior_attempt is None
-            else prior_attempt.measurement
-        )
-        menu = build_action_menu(context, source, attempt.attempt_number - 1)
-        receipt = objective_receipt(
-            context, proposal, menu, attempt.selected_swap, attempt
-        )
-        result_label = "Goal achieved" if attempt.achieved else "Revise"
-        details = widgets.HTML(
-            "<b>Validated Nemotron selection</b>"
-            f"<pre>{escape(receipt.validated_selection)}</pre>"
-            "<b>Planned deterministic command</b>"
-            f"<pre>{escape(receipt.planned_command)}</pre>"
-            "<b>Evaluation executed by Python</b>"
-            f"<pre>{escape(receipt.python_evaluation)}</pre>"
-            "<b>Executed measurement</b>"
-            f"<pre>{escape(receipt.executed_measurement or '')}</pre>"
-            f"<p><b>D_min:</b> {attempt.score:.3f} &nbsp; "
-            f"<b>Limiting pair:</b> {escape(' / '.join(attempt.limiting_pair))} "
-            f"&nbsp; <b>Result:</b> {escape(result_label)}</p>"
-        )
-        for prior in self.objective_attempt_cards:
+        if context is None:
+            raise ValueError("Objective decision rendering requires controller context.")
+        cards = []
+        for menu, selection, attempt in self.objective_decisions:
+            row = self._objective_attempt_row(menu, selection, attempt)
+            if attempt is None:
+                result_label = "Evaluation not completed"
+                details_html = row
+            else:
+                receipt = objective_receipt(
+                    context, selection, menu, attempt.selected_swap, attempt
+                )
+                result_label = "Goal achieved" if attempt.achieved else "Revise"
+                details_html = (
+                    row
+                    + "<b>Validated Nemotron selection</b>"
+                    f"<pre>{escape(receipt.validated_selection)}</pre>"
+                    "<b>Planned deterministic command</b>"
+                    f"<pre>{escape(receipt.planned_command)}</pre>"
+                    "<b>Evaluation executed by Python</b>"
+                    f"<pre>{escape(receipt.python_evaluation)}</pre>"
+                    "<b>Executed measurement</b>"
+                    f"<pre>{escape(receipt.executed_measurement or '')}</pre>"
+                )
+            card = widgets.Accordion((widgets.HTML(details_html),))
+            card.set_title(
+                0, f"Attempt {menu.accepted_attempt_count + 1} — {result_label}"
+            )
+            card.selected_index = 0
+            cards.append(card)
+        for prior in cards[:-1]:
             prior.selected_index = None
-        card = widgets.Accordion((details,))
-        card.set_title(0, f"Attempt {attempt.attempt_number} — {result_label}")
-        card.selected_index = 0
-        self.objective_attempt_cards = (*self.objective_attempt_cards, card)
+        self.objective_attempt_cards = tuple(cards)
         self.objective_attempt_box.children = self.objective_attempt_cards
         self.objective_summary.value = self._objective_summary_html(
-            self.controller.objective_context,
-            tuple(self.controller.objective_attempts),
-            self.controller.objective_run,
-        )
-        self._line(
-            f"Objective attempt {attempt.attempt_number}: "
-            f"score={attempt.score:.3f}; limiting_pair={attempt.limiting_pair}; "
-            f"result={result_label}"
+            context, self.objective_decisions, self.controller.objective_run
         )
         self._set_body()
+
+    def _append_objective_attempt(self, menu, selection, attempt) -> None:
+        if (
+            type(menu) is not ObjectiveActionMenu
+            or type(selection) is not demo_agent.ObjectiveSelection
+            or type(attempt) is not ObjectiveAttempt
+            or not self.controller.objective_attempts
+            or self.controller.objective_attempts[-1] != attempt
+        ):
+            raise ValueError("Objective UI requires the exact committed controller attempt.")
+        self.objective_decisions = (
+            *self.objective_decisions,
+            (menu, selection, attempt),
+        )
+        try:
+            self._render_objective_decisions()
+        except Exception:
+            # Rebuild only the presentation from the retained controller-bound ledger.
+            self._render_objective_decisions()
+        result_label = "Goal achieved" if attempt.achieved else "Revise"
+        self._line(
+            f"Objective attempt {attempt.attempt_number}: score={attempt.score!r}; "
+            f"score_key={attempt.score_key}; limiting_pairs={attempt.limiting_pairs}; "
+            f"result={result_label}"
+        )
+
+    def _append_objective_evaluation_failure(self, menu, selection) -> None:
+        self.objective_decisions = (
+            *self.objective_decisions,
+            (menu, selection, None),
+        )
+        self._render_objective_decisions()
+        self._line("Objective evaluation not completed; validated selection was not measured.")
 
     def _run_objective_challenge(self, button: widgets.Button) -> None:
         if (
@@ -908,10 +918,29 @@ class InteractiveWorkflow:
         self.status = "objective_running"
         try:
             while self.controller.objective_run is None:
-                proposal = self.controller.request_objective_attempt()
-                attempt = self.controller.execute_objective_attempt(proposal)
-                self._append_objective_attempt(proposal, attempt)
+                menu = self.controller.pending_action_menu
+                if type(menu) is not ObjectiveActionMenu:
+                    raise ValueError("The controller has no exact pending action menu.")
+                selection = self.controller.request_objective_attempt()
+                attempt = self.controller.execute_objective_attempt(selection)
+                self._append_objective_attempt(menu, selection, attempt)
             self._finish_objective_challenge()
+        except demo_agent.ObjectiveEvaluationError:
+            try:
+                if (
+                    type(menu) is not ObjectiveActionMenu
+                    or type(selection) is not demo_agent.ObjectiveSelection
+                    or self.controller.objective_run is None
+                    or self.controller.objective_run.termination_reason
+                    != TerminationReason.EVALUATION_NOT_COMPLETED
+                    or self.controller.pending_action_menu is not None
+                    or self.controller.pending_objective_selection is not None
+                ):
+                    raise ValueError("Objective evaluation failure state is incomplete.")
+                self._append_objective_evaluation_failure(menu, selection)
+                self._finish_objective_challenge()
+            except Exception:
+                self._stop()
         except Exception as error:
             if self._known_failure(error) and self._objective_retryable():
                 self._retry_card(
@@ -958,7 +987,7 @@ class InteractiveWorkflow:
             raise RuntimeError("Objective challenge did not terminate.")
         self.objective_summary.value = self._objective_summary_html(
             self.controller.objective_context,
-            tuple(self.controller.objective_attempts),
+            self.objective_decisions,
             run,
         )
         try:
@@ -989,19 +1018,25 @@ class InteractiveWorkflow:
                 self._stop()
             return
         self.workflow_result = result
-        output = widgets.Output()
-        self.active_card = widgets.VBox((widgets.HTML("<h3>Evidence-Backed Conclusion</h3>"), output))
+        sections = "".join(
+            f"<h4>{escape(section.theme.replace('_', ' ').title())}</h4>"
+            f"<p>{escape(demo_agent._presentation_text(section.prose))}</p>"
+            for section in result.conclusion.sections
+        )
+        conclusion = widgets.HTML(
+            "<h3>Evidence-Backed Conclusion</h3>"
+            "<h3>Schema-checked scientific conclusion</h3>"
+            f"<h4>{escape(demo_agent._presentation_text(result.conclusion.headline))}</h4>"
+            "<p>Python checks the response structure before rendering; Nemotron's "
+            "qualitative interpretation is not automatically fact-verified.</p>"
+            "<p>Python-rendered methods: 3D conformers use ETKDGv3; energies use MMFF94.</p>"
+            f"{sections}"
+        )
+        self.active_card = widgets.VBox((conclusion,))
         self.status = "completed"
         self.retry_button = None
         self._line("Final synthesis complete")
         self._set_body()
-        try:
-            with output:
-                demo_agent._display_conclusion(result)
-        except Exception:
-            placeholder = "Conclusion rendering unavailable in this notebook frontend."
-            self.active_card.children = (*self.active_card.children, widgets.HTML(f"<p>{placeholder}</p>"))
-            self._line(placeholder)
 
     def _retry_synthesis(self, button: widgets.Button) -> None:
         if self._busy or self.status != "synthesis_failed" or button is not self.retry_button or button.disabled:
