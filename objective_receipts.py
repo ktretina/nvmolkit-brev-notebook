@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from math import isfinite
 
-from demo_agent import ObjectiveProposal
+from demo_agent import ObjectiveProposal, ObjectiveSelection
 from objective_challenge import ObjectiveAttempt, ObjectiveSwap, is_strict_improvement
 
 
@@ -15,11 +15,32 @@ class ObjectiveReceipt:
 
 
 def objective_receipt(
-    proposal: ObjectiveProposal,
+    proposal: ObjectiveProposal | ObjectiveSelection,
     selected_swap: ObjectiveSwap | None = None,
     prior_attempt: ObjectiveAttempt | None = None,
 ) -> ObjectiveReceipt:
     """Render the hosted proposal and the fixed evaluator without model prose."""
+    if type(proposal) is ObjectiveSelection:
+        if type(selected_swap) is not ObjectiveSwap or proposal.swap_id != selected_swap.swap_id:
+            raise ValueError("Selection does not match the deterministic objective action.")
+        return ObjectiveReceipt(
+            validated_proposal=(
+                "select_next_panel_swap("
+                f"state_id={proposal.state_id!r}, swap_id={proposal.swap_id!r})"
+            ),
+            validated_intervention=(
+                f"replace molecule_id={selected_swap.replace_id!r} "
+                f"with molecule_id={selected_swap.replacement_id!r}"
+            ),
+            python_evaluation=(
+                "result = evaluate_selected_swap(\n"
+                "    context,\n"
+                "    self.pending_action_menu,\n"
+                "    self.pending_objective_swap,\n"
+                "    self.accepted_attempt_count + 1,\n"
+                ")"
+            ),
+        )
     if type(proposal) is not ObjectiveProposal:
         raise ValueError("Proposal does not match the objective schema.")
     selected_ids = repr(list(proposal.selected_ids))

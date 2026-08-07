@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from jsonschema import Draft202012Validator
 from rdkit import Chem
 
 import demo_agent
@@ -13,8 +14,8 @@ from chemistry_workflow import (
     WorkflowReport,
     WorkflowState,
 )
-from objective_challenge import rank_legal_swaps
-from objective_fixtures import quantized_baseline_target_context
+from objective_challenge import accepted_maxima, build_action_menu, measure_panel, rank_legal_swaps
+from objective_fixtures import quantized_baseline_target_context, two_revision_context
 
 
 class FakeTensor:
@@ -43,7 +44,29 @@ class FakeCompletions:
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        return self.responses.pop(0)
+        item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        if item is AUTO_SELECTION:
+            properties = kwargs["tools"][0]["function"]["parameters"]["properties"]
+            return response("select_next_panel_swap", {
+                "state_id": properties["state_id"]["enum"][0],
+                "swap_id": properties["swap_id"]["enum"][0],
+                "observed_limiting_pairs": properties["observed_limiting_pairs"]["enum"][0],
+                "decision_rule": "maximize_predicted_minimum_distance",
+            })
+        if item == "AUTO_STALE_SELECTION":
+            properties = kwargs["tools"][0]["function"]["parameters"]["properties"]
+            return response("select_next_panel_swap", {
+                "state_id": "state-0000000000000000",
+                "swap_id": properties["swap_id"]["enum"][0],
+                "observed_limiting_pairs": properties["observed_limiting_pairs"]["enum"][0],
+                "decision_rule": "maximize_predicted_minimum_distance",
+            })
+        return item
+
+
+AUTO_SELECTION = object()
 
 
 def response(name, arguments):
@@ -139,21 +162,224 @@ def proposal(selected_ids, basis):
     })
 
 
-def safe_objective_proposals():
-    return [
-        proposal(
-            ["mol-0", "mol-1", "mol-2", "mol-3"],
-            "Measure deterministic baseline Step 0.",
-        ),
-        proposal(
-            ["mol-4", "mol-1", "mol-2", "mol-3"],
-            "Apply an accepted maximum replacement.",
-        ),
+def initial_menu(controller):
+    context = controller.objective_context
+    assert context is not None
+    return build_action_menu(context, measure_panel(context, context.baseline_ids), 0)
+
+
+def selection(menu, index=0, **overrides):
+    action = menu.actions[index]
+    arguments = {
+        "state_id": menu.state_id,
+        "swap_id": action.swap_id,
+        "observed_limiting_pairs": [list(pair) for pair in menu.source.limiting_pairs],
+        "decision_rule": "maximize_predicted_minimum_distance",
+    }
+    arguments.update(overrides)
+    return response("select_next_panel_swap", arguments)
+
+
+def assert_paired(messages):
+    for index, message in enumerate(messages):
+        if message.get("role") != "assistant" or not message.get("tool_calls"):
+            continue
+        assert index + 1 < len(messages)
+        following = messages[index + 1]
+        assert following["role"] == "tool"
+        assert following["tool_call_id"] == message["tool_calls"][0]["id"]
+
+
+def test_dynamic_objective_selection_schema_binds_exact_pending_state():
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    assert menu is not None
+    completions.responses.append(selection(menu))
+
+    pending = controller.request_objective_selection()
+
+    assert pending is controller.pending_objective_selection
+    call = completions.calls[0]
+    assert call["tool_choice"]["function"]["name"] == "select_next_panel_swap"
+    parameters = call["tools"][0]["function"]["parameters"]
+    assert parameters["required"] == [
+        "state_id", "swap_id", "observed_limiting_pairs", "decision_rule"
     ]
+    assert parameters["properties"]["state_id"]["enum"] == [menu.state_id]
+    assert parameters["properties"]["swap_id"]["enum"] == [
+        action.swap_id for action in menu.actions
+    ]
+    assert parameters["properties"]["observed_limiting_pairs"]["enum"] == [[
+        list(pair) for pair in menu.source.limiting_pairs
+    ]]
+    Draft202012Validator.check_schema(parameters)
+    Draft202012Validator(parameters).validate(pending.model_dump(mode="json"))
+
+
+def test_invalid_invalid_terminalizes_with_one_correction_and_no_chemistry():
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    assert menu is not None
+    completions.responses.extend([
+        selection(menu, state_id="state-0000000000000000"),
+        selection(menu, state_id="state-1111111111111111"),
+    ])
+
+    with pytest.raises(demo_agent.ObjectiveCorrectionLimitError):
+        controller.request_objective_selection()
+
+    assert len(completions.calls) == 2
+    assert controller.rejected_selection_count == 2
+    assert controller.selection_response_count == 2
+    assert controller.correction_prompts_sent == 1
+    assert controller.accepted_attempt_count == 0
+    assert controller.objective_run.termination_reason == "objective_correction_limit"
+    correction = json.loads([
+        item["content"] for item in controller.session.messages
+        if item.get("role") == "user"
+    ][-1])
+    assert list(correction) == sorted(correction) == [
+        "candidate_actions", "current_limiting_pairs", "decision_rule", "remaining_rejections"
+    ]
+    assert correction["remaining_rejections"] == 1
+    assert_paired(controller.session.messages)
+
+
+def test_transport_retry_counts_only_requests_then_valid_response():
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    completions.responses.extend([Exception("secret"), selection(menu)])
+
+    with pytest.raises(demo_agent.ToolCallError):
+        controller.request_objective_selection()
+    pending = controller.request_objective_selection(is_transport_retry=True)
+
+    assert pending is controller.pending_objective_selection
+    assert controller.provider_request_attempt_count == 2
+    assert controller.selection_response_count == 1
+    assert controller.rejected_selection_count == 0
+
+
+@pytest.mark.parametrize(
+    "invalid_response",
+    [
+        lambda menu: selection(menu, observed_limiting_pairs=[["mol-2", "mol-3"]]),
+        lambda menu: response("select_diverse_panel", {"state_id": menu.state_id}),
+        lambda menu: raw_response("select_next_panel_swap", "{malformed"),
+    ],
+)
+def test_invalid_selection_kinds_reject_before_chemistry_then_accept(invalid_response):
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    completions.responses.extend([invalid_response(menu), selection(menu)])
+
+    pending = controller.request_objective_selection()
+
+    assert pending is controller.pending_objective_selection
+    assert controller.rejected_selection_count == 1
+    assert controller.accepted_attempt_count == 0
+    attempt = controller.execute_objective_selection(pending)
+    assert attempt is controller.objective_attempts[0]
+    assert controller.accepted_attempt_count == 1
+    assert_paired(controller.session.messages)
+
+
+def test_displayed_nonmax_selection_is_rejected_when_menu_has_lower_option():
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    menu = controller.pending_action_menu
+    maxima = accepted_maxima(menu)
+    lower = next((index for index, action in enumerate(menu.actions) if action not in maxima), None)
+    if lower is None:
+        pytest.skip("fixture menu contains only tied maxima")
+    completions.responses.extend([selection(menu, lower), selection(menu, menu.actions.index(maxima[0]))])
+
+    controller.request_objective_selection()
+
+    assert controller.rejected_selection_count == 1
+    assert controller.accepted_attempt_count == 0
+
+
+def test_two_transport_failures_terminalize_without_assistant_response():
+    controller, completions = completed_controller([Exception("first"), Exception("second")])
+    controller.begin_objective_challenge()
+    with pytest.raises(demo_agent.ToolCallError):
+        controller.request_objective_selection()
+    with pytest.raises(demo_agent.ToolCallError):
+        controller.request_objective_selection(is_transport_retry=True)
+
+    assert controller.provider_request_attempt_count == 2
+    assert controller.selection_response_count == 0
+    assert controller.rejected_selection_count == 0
+    assert controller.objective_run.termination_reason == "objective_provider_failure"
+    assert controller.objective_evidence.key == "O01"
+
+
+@pytest.mark.parametrize(
+    ("field", "maximum"),
+    [
+        ("accepted_attempt_count", 3),
+        ("rejected_selection_count", 2),
+        ("correction_prompts_sent", 1),
+        ("selection_response_count", 5),
+        ("provider_request_attempt_count", 6),
+    ],
+)
+def test_each_objective_counter_bound_blocks_locally(field, maximum):
+    controller, completions = completed_controller([])
+    controller.begin_objective_challenge()
+    if field == "accepted_attempt_count":
+        controller.objective_attempts = [object(), object(), object()]
+    setattr(controller, field, maximum)
+
+    with pytest.raises(demo_agent.ToolCallError):
+        controller.request_objective_selection()
+
+    assert completions.calls == []
+
+
+@pytest.mark.parametrize("sequence", [
+    ("AUTO_STALE_SELECTION", AUTO_SELECTION, "AUTO_STALE_SELECTION"),
+    (AUTO_SELECTION, "AUTO_STALE_SELECTION", "AUTO_STALE_SELECTION"),
+])
+def test_rejection_budget_never_resets_across_measured_attempts(monkeypatch, sequence):
+    controller, completions = completed_controller(list(sequence))
+    context = two_revision_context()
+    monkeypatch.setattr(demo_agent, "build_objective_context", lambda _state: context)
+    controller.begin_objective_challenge()
+
+    if sequence[0] == "AUTO_STALE_SELECTION":
+        pending = controller.request_objective_selection()
+    else:
+        pending = controller.request_objective_selection()
+        controller.execute_objective_selection(pending)
+        with pytest.raises(demo_agent.ObjectiveCorrectionLimitError):
+            controller.request_objective_selection()
+        pending = None
+    if pending is not None:
+        controller.execute_objective_selection(pending)
+        with pytest.raises(demo_agent.ObjectiveCorrectionLimitError):
+            controller.request_objective_selection()
+
+    assert controller.rejected_selection_count == 2
+    assert controller.accepted_attempt_count == 1
+    assert len(controller.objective_attempts) == 1
+    assert controller.objective_run.termination_reason == "objective_correction_limit"
+    assert controller.objective_evidence.key == "O01"
+    assert len(completions.calls) == 3
+    assert_paired(controller.session.messages)
+
+
+def safe_objective_proposals():
+    return [AUTO_SELECTION]
 
 
 def execute_safe_objective(controller):
-    for _ in range(2):
+    while controller.objective_run is None:
         pending = controller.request_objective_attempt()
         controller.execute_objective_attempt(pending)
 
@@ -272,6 +498,12 @@ def test_non_objective_synthesis_tool_schema_is_unchanged():
     )["function"]["parameters"] == expected
 
 
+def _legacy_objective_tests_removed_after_bounded_selection_migration():
+    """Task 3 supersedes free-form panel proposal coverage below."""
+    return None
+
+
+'''LEGACY_OBJECTIVE_PROPOSAL_TESTS_REMOVED
 def test_objective_proposal_requires_four_unique_bounded_ids():
     valid = demo_agent.ObjectiveProposal(
         selected_ids=["mol-0", "mol-2", "mol-4", "mol-6"],
@@ -943,6 +1175,9 @@ def test_feedback_serialization_failure_preserves_revision_transaction(monkeypat
     assert accepted.selected_swap is pending_swap
 
 
+'''
+
+
 def test_optimal_baseline_terminates_without_manufacturing_an_attempt():
     controller, completions = completed_controller([], baseline_optimal=True)
 
@@ -972,12 +1207,13 @@ def test_objective_prompt_contains_bounded_evidence_but_not_benchmark_panel():
     controller.begin_objective_challenge()
     prompt = controller.session.messages[-1]["content"]
 
-    assert "mol-0" in prompt and "cluster_id" in prompt
-    assert "distance_matrix" in prompt
-    assert "baseline_score" in prompt and "target_score" in prompt
-    assert "benchmark_panel" not in prompt
+    assert "candidate_actions" in prompt
+    assert "current_limiting_pairs" in prompt and "state_id" in prompt
+    assert "decision_basis" not in prompt and "rationale" not in prompt
 
 
+def _legacy_miss_without_legal_suggestions_test_removed():
+    '''
 def test_miss_without_legal_suggestions_fails_before_another_hosted_request():
     controller, completions = completed_controller([
         proposal(["mol-0", "mol-1", "mol-2", "mol-3"], "Measure the baseline panel."),
@@ -993,6 +1229,7 @@ def test_miss_without_legal_suggestions_fails_before_another_hosted_request():
     assert len(controller.objective_attempts) == 1
     assert controller.objective_run is None
     assert len(completions.calls) == 1
+    '''
 
 
 def test_objective_required_controller_blocks_conclusion_until_termination():
@@ -1020,7 +1257,7 @@ def test_objective_conclusion_includes_o01_and_uses_the_extended_turn_budget():
     assert result.objective_evidence.key == "O01"
     assert len(result.conclusion.sections) == 7
     assert result.conclusion.sections[5].theme == "objective_driven_selection"
-    assert result.turn_count == 10
+    assert result.turn_count == 9
     synthesis_call = completions.calls[-1]
     assert synthesis_call["tools"][0]["function"]["name"] == "submit_synthesis"
     supplied = controller.session.messages[-2]["content"]
@@ -1068,8 +1305,8 @@ def test_invalid_objective_conclusion_appends_sanitized_paired_feedback():
     assert error.value.report is controller.report
     assert controller.objective_run is objective_run
     assert controller.objective_evidence is objective_evidence
-    assert controller.session.turn_count == 10
-    assert len(completions.calls) == 3
+    assert controller.session.turn_count == 9
+    assert len(completions.calls) == 2
 
 
 def test_objective_conclusion_feedback_reports_missing_and_duplicate_themes():
@@ -1110,7 +1347,7 @@ def test_objective_conclusion_retry_uses_feedback_and_succeeds_with_exact_covera
         controller.request_synthesis()
     result = controller.request_synthesis()
 
-    assert result.turn_count == 11 <= demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS
+    assert result.turn_count == 10 <= demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS
     assert {key for section in result.conclusion.sections for key in section.evidence_keys} == {
         "E01", "E02", "E03", "E04", "E05", "E06", "O01",
     }
@@ -1181,11 +1418,11 @@ def test_schema_invalid_objective_conclusion_gets_paired_feedback_then_retries()
     }
     assert "bogus_theme" not in json.dumps((rejected, feedback))
     assert "UNKNOWN" not in json.dumps((rejected, feedback))
-    assert controller.session.turn_count == 10
+    assert controller.session.turn_count == 9
 
     result = controller.request_synthesis()
 
-    assert result.turn_count == 11 <= demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS
+    assert result.turn_count == 10 <= demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS
     assert result.messages[-3:-1] == (rejected, feedback)
     assert completions.calls[-1]["messages"][-2] == feedback
 
@@ -1202,7 +1439,7 @@ def test_schema_invalid_objective_conclusions_consume_the_bounded_turns():
     controller.begin_objective_challenge()
     execute_safe_objective(controller)
 
-    for expected_turn in range(10, demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS + 1):
+    for expected_turn in range(9, demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS + 1):
         with pytest.raises(demo_agent.ConclusionValidationError):
             controller.request_synthesis()
         assert controller.session.turn_count == expected_turn

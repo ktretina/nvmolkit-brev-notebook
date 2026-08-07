@@ -621,6 +621,7 @@ def test_plan_requires_exact_dependency_order_and_nonempty_rationales():
         demo_agent.WorkflowPlan.model_validate(bad)
 
 
+'''LEGACY_OBJECTIVE_RATIONALE_TESTS_REMOVED
 @pytest.mark.parametrize(
     "value",
     ["", "valid rationale\ncontinued", "use `code` here", "x" * 241],
@@ -708,12 +709,37 @@ def test_objective_placeholder_guard_does_not_match_real_compound_reasons(value)
     assert parsed.decision_basis == value
 
 
+'''
+
+
 def test_stage_decision_basis_does_not_inherit_objective_rationale_floor():
     parsed = demo_agent.FingerprintArgs.model_validate(
         {"radius": 2, "size": 1024, "decision_basis": "selected_ids"}
     )
 
     assert parsed.decision_basis == "selected_ids"
+
+
+def test_objective_selection_schema_is_exact_bounded_and_contains_no_rationale():
+    assert list(demo_agent.ObjectiveSelection.model_fields) == [
+        "state_id",
+        "swap_id",
+        "observed_limiting_pairs",
+        "decision_rule",
+    ]
+    assert "ObjectiveDecisionBasis" not in vars(demo_agent)
+    parsed = demo_agent.ObjectiveSelection.model_validate({
+        "state_id": "state-0123456789abcdef",
+        "swap_id": "mol-0->mol-4",
+        "observed_limiting_pairs": [["mol-0", "mol-1"]],
+        "decision_rule": "maximize_predicted_minimum_distance",
+    })
+    assert parsed.swap_id == "mol-0->mol-4"
+    for bad in ("a->b->c", "a ->b", "a-> b", "a`->b"):
+        with pytest.raises(ValidationError):
+            demo_agent.ObjectiveSelection.model_validate({
+                **parsed.model_dump(), "swap_id": bad,
+            })
 
 
 @pytest.mark.parametrize(

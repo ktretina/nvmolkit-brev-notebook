@@ -36,18 +36,21 @@ from chemistry_workflow import (
 )
 from objective_challenge import (
     MAX_ATTEMPTS,
+    ObjectiveActionMenu,
     ObjectiveAttempt,
     ObjectiveContext,
     ObjectiveRun,
     ObjectiveSwap,
     TerminationReason,
+    accepted_maxima,
+    build_action_menu,
     build_objective_context,
     build_objective_evidence,
-    evaluate_diverse_panel,
-    finalize_objective_run,
+    certify_argmax_reachability,
+    evaluate_selected_swap,
+    finalize_no_legal_swap,
     measure_panel,
     no_improvement_run,
-    rank_legal_swaps,
     score_key,
     target_is_achieved,
     terminal_objective_run,
@@ -151,17 +154,6 @@ DecisionBasis = Annotated[
         pattern=r"^[^\r\n`]+$",
     ),
 ]
-ObjectiveDecisionBasis = Annotated[
-    str,
-    StringConstraints(
-        strip_whitespace=True,
-        min_length=1,
-        max_length=240,
-        pattern=r"^[^\r\n`]+$",
-    ),
-]
-
-
 class _StrictModel(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
@@ -209,15 +201,43 @@ MoleculeId = Annotated[
 ]
 
 
+DecisionRule = Literal["maximize_predicted_minimum_distance"]
+MoleculeSwapId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=3,
+        max_length=170,
+        pattern=r"^[^\s\r\n`]+->[^\s\r\n`]+$",
+    ),
+]
+
+
+class ObjectiveSelection(_StrictModel):
+    state_id: Annotated[str, StringConstraints(pattern=r"^state-[0-9a-f]{16}$")]
+    swap_id: MoleculeSwapId
+    observed_limiting_pairs: list[list[MoleculeId]] = Field(min_length=1, max_length=6)
+    decision_rule: DecisionRule
+
+    @field_validator("swap_id")
+    @classmethod
+    def swap_id_has_one_reserved_delimiter(cls, value: str) -> str:
+        if value.count("->") != 1:
+            raise ValueError("Objective swap ID must contain one reserved delimiter.")
+        return value
+
+    @field_validator("observed_limiting_pairs")
+    @classmethod
+    def pairs_are_exact_pairs(cls, value: list[list[str]]) -> list[list[str]]:
+        if any(len(pair) != 2 or pair[0] == pair[1] for pair in value):
+            raise ValueError("Objective limiting pairs must contain two distinct IDs.")
+        return value
+
+
 class ObjectiveProposal(_StrictModel):
+    """Task-5 removal shim for older display-only notebook integrations."""
     selected_ids: list[MoleculeId] = Field(min_length=4, max_length=4)
-    decision_basis: ObjectiveDecisionBasis = Field(
-        description=(
-            "Provide a concise measured quantitative reason for the selected panel. "
-            "For a revision, compare its limiting_pair and predicted_score with "
-            "target_score. Never repeat schema field names as the value."
-        )
-    )
+    decision_basis: DecisionBasis
 
     @field_validator("selected_ids")
     @classmethod
@@ -225,65 +245,6 @@ class ObjectiveProposal(_StrictModel):
         if len(set(value)) != len(value):
             raise ValueError("Objective proposal molecule IDs must be unique.")
         return value
-
-    @field_validator("decision_basis")
-    @classmethod
-    def decision_basis_is_not_a_field_placeholder(cls, value: str) -> str:
-        connectors = {
-            "the",
-            "a",
-            "an",
-            "and",
-            "or",
-            "is",
-            "are",
-            "of",
-            "for",
-            "field",
-            "value",
-        }
-        placeholder_tokens = {
-            "selected", "id", "ids", "decision", "basis", "bases",
-        }
-        compound_tokens = {
-            "selectedid": ("selected", "id"),
-            "selectedids": ("selected", "ids"),
-            "decisionbasis": ("decision", "basis"),
-            "decisionbases": ("decision", "bases"),
-        }
-        normalized = "".join(re.findall(r"[a-z0-9]+", value.casefold()))
-        segments = tuple(
-            [(compound, True) for compound in compound_tokens]
-            + [(connector, False) for connector in connectors]
-        )
-        reachable = {(0, False)}
-        for index in range(len(normalized) + 1):
-            for saw_placeholder in (False, True):
-                if (index, saw_placeholder) not in reachable:
-                    continue
-                for segment, is_placeholder in segments:
-                    if normalized.startswith(segment, index):
-                        reachable.add(
-                            (
-                                index + len(segment),
-                                saw_placeholder or is_placeholder,
-                            )
-                        )
-        is_placeholder_sequence = (len(normalized), True) in reachable
-        tokens = [
-            part
-            for token in re.findall(r"[a-z0-9]+", value.casefold())
-            for part in compound_tokens.get(token, (token,))
-        ]
-        meaningful_tokens = [token for token in tokens if token not in connectors]
-        if (
-            is_placeholder_sequence
-            or not meaningful_tokens
-            or all(token in placeholder_tokens for token in meaningful_tokens)
-        ):
-            raise ValueError("Objective decision basis must be a rationale.")
-        return value
-
 
 class PlanStage(_StrictModel):
     stage: StageName
@@ -361,7 +322,7 @@ TOOL_DESCRIPTIONS = {
     "discover_fused_butina_clusters": "Choose a bounded cutoff and run nvMolKit fused Butina clustering on the GPU.",
     "embed_representative_conformers": "Choose bounded sampling parameters and run nvMolKit conformer embedding on the GPU.",
     "optimize_conformers_mmff94": "Run nvMolKit MMFF94 conformer optimization on the GPU.",
-    "select_diverse_panel": "Select exactly four supplied candidate IDs to reach the maximin Tanimoto-distance objective.",
+    "select_next_panel_swap": "Select one state-bound tied-maximum action from the current deterministic menu.",
     "submit_synthesis": "Submit one grounded qualitative synthesis; keep evidence IDs only in evidence_keys fields.",
 }
 
@@ -372,6 +333,10 @@ class ToolCallError(RuntimeError):
 
 class ObjectiveCorrectionLimitError(ToolCallError):
     """The model exhausted its bounded objective-response correction budget."""
+
+
+class ObjectiveEligibilityError(ToolCallError):
+    """The measured workflow cannot enter the certified bounded policy."""
 
 
 class _HostedArgumentsValidationError(ToolCallError):
@@ -480,6 +445,43 @@ def _swap_payload(item: ObjectiveSwap) -> dict[str, Any]:
         "predicted_score": item.predicted_score,
         "score_delta": item.score_delta,
         "limiting_pair": list(item.limiting_pair),
+    }
+
+
+def _objective_action_payload(item: ObjectiveSwap) -> dict[str, Any]:
+    """Return the one canonical provider-visible action row."""
+    return {
+        "limiting_pairs": [list(pair) for pair in item.limiting_pairs],
+        "predicted_score": item.predicted_score,
+        "resulting_ids": list(item.resulting_ids),
+        "swap_id": item.swap_id,
+        "target_status": item.target_status,
+    }
+
+
+def _objective_selection_tool(menu: ObjectiveActionMenu) -> dict[str, Any]:
+    if type(menu) is not ObjectiveActionMenu or not menu.actions:
+        raise ToolCallError("The current objective action menu is invalid.")
+    parameters = ObjectiveSelection.model_json_schema()
+    properties = parameters["properties"]
+    properties["state_id"]["enum"] = [menu.state_id]
+    properties["swap_id"]["enum"] = [action.swap_id for action in menu.actions]
+    properties["observed_limiting_pairs"]["enum"] = [[
+        list(pair) for pair in menu.source.limiting_pairs
+    ]]
+    properties["decision_rule"]["enum"] = [
+        "maximize_predicted_minimum_distance"
+    ]
+    parameters["additionalProperties"] = False
+    parameters["required"] = list(ObjectiveSelection.model_fields)
+    return {
+        "type": "function",
+        "function": {
+            "name": "select_next_panel_swap",
+            "description": TOOL_DESCRIPTIONS["select_next_panel_swap"],
+            "strict": True,
+            "parameters": parameters,
+        },
     }
 
 
@@ -1040,11 +1042,17 @@ class BoundedWorkflowController:
     synthesis_prompt_appended: bool = False
     objective_required: bool = False
     objective_context: ObjectiveContext | None = None
-    pending_objective: ObjectiveProposal | None = None
-    pending_objective_swap: ObjectiveSwap | None = None
+    pending_action_menu: ObjectiveActionMenu | None = None
+    pending_objective_selection: ObjectiveSelection | None = None
     objective_attempts: list[ObjectiveAttempt] = field(default_factory=list)
-    objective_suggestions: tuple[ObjectiveSwap, ...] = ()
-    objective_rejection_count: int = 0
+    accepted_attempt_count: int = 0
+    rejected_selection_count: int = 0
+    correction_prompts_sent: int = 0
+    selection_response_count: int = 0
+    provider_request_attempt_count: int = 0
+    objective_transport_retry_used: bool = False
+    _objective_transport_retry_pending: bool = False
+    objective_failure_reason: TerminationReason | None = None
     objective_run: ObjectiveRun | None = None
     objective_evidence: EvidenceRecord | None = None
     objective_prompt_appended: bool = False
@@ -1211,48 +1219,52 @@ class BoundedWorkflowController:
             self.session.turn_count,
         )
 
+    def _terminalize_objective(self, reason: TerminationReason, *, menu=None) -> None:
+        context = self.objective_context
+        if context is None:
+            raise ToolCallError("The objective challenge has not been initialized.")
+        self.objective_failure_reason = reason if reason in {
+            TerminationReason.OBJECTIVE_CORRECTION_LIMIT,
+            TerminationReason.OBJECTIVE_PROVIDER_FAILURE,
+        } else None
+        self.objective_run = terminal_objective_run(
+            context, tuple(self.objective_attempts), reason, menu=menu
+        )
+        self.objective_evidence = build_objective_evidence(self.objective_run)
+        self.pending_objective_selection = None
+
+    def _check_objective_bounds(self) -> None:
+        values = (
+            (self.accepted_attempt_count, 0, 3),
+            (self.rejected_selection_count, 0, 2),
+            (self.correction_prompts_sent, 0, 1),
+            (self.selection_response_count, 0, 5),
+            (self.provider_request_attempt_count, 0, 6),
+        )
+        if any(type(value) is not int or not low <= value <= high for value, low, high in values):
+            raise ToolCallError("The objective controller counters are invalid.")
+        if self.accepted_attempt_count != len(self.objective_attempts):
+            raise ToolCallError("The objective accepted-attempt ledger is inconsistent.")
+        if self.correction_prompts_sent != min(self.rejected_selection_count, 1):
+            raise ToolCallError("The objective correction-prompt ledger is inconsistent.")
+
     def begin_objective_challenge(self) -> ObjectiveContext:
-        """Initialize the post-workflow objective from immutable scientific evidence."""
+        """Measure Step 0 and publish the first certified production action menu."""
         self.scientific_result()
         if self.objective_context is not None or self.objective_prompt_appended:
             raise ToolCallError("The objective challenge can be initialized exactly once.")
         try:
             context = build_objective_context(self.session.state)
+            if not certify_argmax_reachability(context):
+                raise RuntimeError(
+                    "Objective target is not reachable under the bounded decision policy."
+                )
+        except RuntimeError as error:
+            if str(error) == "Objective target is not reachable under the bounded decision policy.":
+                raise ObjectiveEligibilityError(str(error)) from None
+            raise ToolCallError("The objective challenge could not be constructed.") from None
         except Exception:
             raise ToolCallError("The objective challenge could not be constructed.") from None
-        candidates = [
-            {
-                "molecule_id": candidate.molecule_id,
-                "cluster_id": candidate.cluster_id,
-            }
-            for candidate in context.candidates
-        ]
-        prompt_payload = {
-            "objective": "Select four candidates that maximize the minimum pairwise Morgan/Tanimoto distance.",
-            "candidate_pool": candidates,
-            "distance_matrix": context.distance_matrix.tolist(),
-            "distance_matrix_order": [
-                candidate.molecule_id for candidate in context.candidates
-            ],
-            "baseline_ids": list(context.baseline_ids),
-            "baseline_score": context.baseline_score,
-            "benchmark_score": context.benchmark_score,
-            "target_score": context.target_score,
-            "target_rule": "baseline plus 80 percent of attainable improvement",
-            "constraints": [
-                "exactly four unique supplied molecule IDs",
-                "one molecule per fused Butina cluster",
-                "all candidates are RDKit MMFF94-parameter eligible",
-                "at most three accepted attempts",
-            ],
-            "instruction": (
-                "Call select_diverse_panel with one panel and a concise decision summary. "
-                "Use measured limiting-pair feedback to revise if the target is missed."
-            ),
-        }
-        self.session.messages.append(
-            {"role": "user", "content": _serialize(prompt_payload)}
-        )
         self.objective_context = context
         self.objective_prompt_appended = True
         baseline = measure_panel(context, context.baseline_ids)
@@ -1264,197 +1276,225 @@ class BoundedWorkflowController:
                     context, (), TerminationReason.TARGET_ACHIEVED
                 )
             self.objective_evidence = build_objective_evidence(self.objective_run)
+            return context
+        menu = build_action_menu(context, baseline, 0)
+        if not menu.actions:
+            self.pending_action_menu = menu
+            self._terminalize_objective(TerminationReason.NO_LEGAL_IMPROVING_SWAP, menu=menu)
+            return context
+        self.pending_action_menu = menu
+        self.session.messages.append({"role": "user", "content": _serialize({
+            "candidate_actions": [_objective_action_payload(item) for item in menu.actions],
+            "current_limiting_pairs": [list(pair) for pair in menu.source.limiting_pairs],
+            "decision_rule": "maximize_predicted_minimum_distance",
+            "state_id": menu.state_id,
+        })})
         return context
 
-    def request_objective_attempt(self) -> ObjectiveProposal:
-        """Request one strict panel proposal without evaluating it."""
-        if self.objective_context is None or not self.objective_prompt_appended:
+    def _append_objective_assistant(self, call_id: str, name: str, arguments: Any) -> None:
+        self.session.messages.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": _serialize(arguments)},
+            }],
+        })
+        self.session.turn_count += 1
+
+    def _reject_objective_selection(self, call_id: str, name: str, reason: str) -> None:
+        self._append_objective_assistant(call_id, name, {"rejected": True})
+        _append_tool_result(self.session, {"accepted": False, "reason": reason})
+        self.rejected_selection_count += 1
+        if self.rejected_selection_count == 2:
+            self._terminalize_objective(TerminationReason.OBJECTIVE_CORRECTION_LIMIT)
+            raise ObjectiveCorrectionLimitError("The objective correction limit was reached.")
+        menu = self.pending_action_menu
+        assert menu is not None
+        self.session.messages.append({"role": "user", "content": _serialize({
+            "candidate_actions": [_objective_action_payload(item) for item in menu.actions],
+            "current_limiting_pairs": [list(pair) for pair in menu.source.limiting_pairs],
+            "decision_rule": "maximize_predicted_minimum_distance",
+            "remaining_rejections": 1,
+        })})
+        self.correction_prompts_sent += 1
+
+    def request_objective_selection(self, *, is_transport_retry: bool = False) -> ObjectiveSelection:
+        """Request one state-bound deterministic argmax action selection."""
+        self._check_objective_bounds()
+        menu = self.pending_action_menu
+        context = self.objective_context
+        if context is None or not self.objective_prompt_appended:
             raise ToolCallError("The objective challenge has not been initialized.")
         if self.objective_run is not None:
             raise ToolCallError("The objective challenge is already complete.")
-        if self.pending_objective is not None:
-            raise ToolCallError("An objective proposal is already pending evaluation.")
-        if self.pending_objective_swap is not None:
-            raise ToolCallError("The objective swap state is out of phase.")
-        accepted_substitutions = max(len(self.objective_attempts) - 1, 0)
-        if accepted_substitutions >= MAX_ATTEMPTS:
+        if menu is None or not menu.actions:
+            raise ToolCallError("No current objective action menu is available.")
+        if self.pending_objective_selection is not None:
+            raise ToolCallError("An objective selection is already pending evaluation.")
+        if self.accepted_attempt_count >= 3:
             raise ToolCallError("The objective attempt limit was reached.")
-        is_revision = bool(self.objective_attempts)
-        if is_revision and not self.objective_suggestions:
-            raise ToolCallError("No legal improving objective swaps remain.")
-        if self.objective_rejection_count >= MAX_OBJECTIVE_CORRECTIONS:
-            raise ObjectiveCorrectionLimitError(
-                "The objective correction limit was reached."
-            )
+        if self.rejected_selection_count >= 2:
+            self._terminalize_objective(TerminationReason.OBJECTIVE_CORRECTION_LIMIT)
+            raise ObjectiveCorrectionLimitError("The objective correction limit was reached.")
+        if self.selection_response_count >= 5:
+            raise ToolCallError("The objective response limit was reached.")
+        if self.provider_request_attempt_count >= 6:
+            raise ToolCallError("The objective provider request limit was reached.")
+        if is_transport_retry != self._objective_transport_retry_pending:
+            raise ToolCallError("The objective transport retry state is invalid.")
+        if is_transport_retry:
+            self._objective_transport_retry_pending = False
+            self.objective_transport_retry_used = True
 
-        context = self.objective_context
-        candidate_ids = tuple(candidate.molecule_id for candidate in context.candidates)
-        candidate_id_set = set(candidate_ids)
-        prior_panel_keys = {
-            _panel_key(attempt.selected_ids) for attempt in self.objective_attempts
-        }
         while True:
-            matching_swaps: tuple[ObjectiveSwap, ...] = ()
+            self.provider_request_attempt_count += 1
             try:
-                proposal = _request_call(
-                    self.session,
-                    self.client,
-                    "select_diverse_panel",
-                    ObjectiveProposal,
-                    DEFAULT_MODEL,
-                    _max_turns=MAX_OBJECTIVE_HOSTED_TURNS,
-                    _selected_ids_enum=(
-                        tuple(item.resulting_ids for item in self.objective_suggestions)
-                        if is_revision
-                        else None
-                    ),
+                response = self.client.chat.completions.create(
+                    model=DEFAULT_MODEL,
+                    messages=self.session.messages,
+                    tools=[_objective_selection_tool(menu)],
+                    tool_choice={"type": "function", "function": {"name": "select_next_panel_swap"}},
+                    extra_body=NEMOTRON_TOOL_EXTRA_BODY,
+                    temperature=0.0,
+                    max_tokens=400,
+                    stream=False,
                 )
-            except _HostedArgumentsValidationError as error:
-                _append_rejected_hosted_call(self.session, error)
-                reason = "invalid_objective_proposal"
-                proposal = None
-            else:
-                panel_key = _panel_key(proposal.selected_ids)
-                matching_swaps = tuple(
-                    item
-                    for item in self.objective_suggestions
-                    if _panel_key(item.resulting_ids) == panel_key
-                )
-                reason = None
-                if panel_key in prior_panel_keys:
-                    reason = "duplicate_panel"
-                elif any(item not in candidate_id_set for item in proposal.selected_ids):
-                    reason = "out_of_pool_panel"
-                elif is_revision and len(matching_swaps) != 1:
-                    reason = "panel_not_in_legal_improving_swaps"
-                elif not is_revision:
-                    clusters = {
-                        candidate.molecule_id: candidate.cluster_id
-                        for candidate in context.candidates
-                    }
-                    if len({clusters[item] for item in proposal.selected_ids}) != len(
-                        proposal.selected_ids
-                    ):
-                        reason = "cluster_duplicate_panel"
+            except Exception:
+                if self.objective_transport_retry_used:
+                    self._terminalize_objective(TerminationReason.OBJECTIVE_PROVIDER_FAILURE)
+                else:
+                    self._objective_transport_retry_pending = True
+                raise ToolCallError(_REQUEST_ERROR) from None
 
-            if reason is None:
-                assert proposal is not None
-                self.pending_objective = ObjectiveProposal.model_validate(
-                    proposal.model_dump()
-                )
-                self.pending_objective_swap = matching_swaps[0] if is_revision else None
-                return self.pending_objective
+            try:
+                message = response.choices[0].message
+            except (AttributeError, IndexError, TypeError):
+                if self.objective_transport_retry_used:
+                    self._terminalize_objective(TerminationReason.OBJECTIVE_PROVIDER_FAILURE)
+                else:
+                    self._objective_transport_retry_pending = True
+                raise ToolCallError(_REQUEST_ERROR) from None
+            self.selection_response_count += 1
+            call_id = f"compat-objective-{self.selection_response_count}"
+            name = "invalid_objective_response"
+            decoded: Any = None
+            reason = "schema_invalid_selection"
+            try:
+                calls = getattr(message, "tool_calls", None)
+                if not isinstance(calls, (list, tuple)) or len(calls) != 1:
+                    raise ValueError
+                call = calls[0]
+                call_id = getattr(call, "id", call_id)
+                if not isinstance(call_id, str) or not call_id.strip():
+                    call_id = f"compat-objective-{self.selection_response_count}"
+                function = getattr(call, "function", None)
+                name = getattr(function, "name", "invalid_objective_response")
+                raw = getattr(function, "arguments", "")
+                if name != "select_next_panel_swap":
+                    reason = "wrong_objective_tool"
+                    raise ValueError
+                decoded = json.loads(raw)
+                selection = ObjectiveSelection.model_validate(decoded)
+                expected_pairs = [list(pair) for pair in menu.source.limiting_pairs]
+                action = next((item for item in menu.actions if item.swap_id == selection.swap_id), None)
+                if selection.state_id != menu.state_id:
+                    reason = "stale_objective_state"
+                elif selection.observed_limiting_pairs != expected_pairs:
+                    reason = "wrong_limiting_pairs"
+                elif selection.decision_rule != "maximize_predicted_minimum_distance":
+                    reason = "wrong_decision_rule"
+                elif action is None:
+                    reason = "unavailable_objective_swap"
+                elif action not in accepted_maxima(menu):
+                    reason = "nonmax_objective_swap"
+                elif not all(action.replace_id in pair for pair in menu.source.limiting_pairs):
+                    reason = "invalid_co_limiter_effect"
+                else:
+                    self._append_objective_assistant(call_id, name, selection.model_dump(mode="json"))
+                    self.pending_objective_selection = ObjectiveSelection.model_validate(selection.model_dump())
+                    return self.pending_objective_selection
+            except (ValidationError, ValueError, TypeError, AttributeError, IndexError, json.JSONDecodeError):
+                pass
+            self._reject_objective_selection(call_id, name, reason)
+            self._check_objective_bounds()
+            if self.selection_response_count >= 5 or self.provider_request_attempt_count >= 6:
+                raise ToolCallError("The objective hosted request bound was reached.")
 
-            self.objective_rejection_count += 1
-            rejection = {
-                "accepted": False,
-                "reason": reason,
-                "corrections_remaining": (
-                    MAX_OBJECTIVE_CORRECTIONS - self.objective_rejection_count
-                ),
-                "legal_improving_swaps": [
-                    _swap_payload(item) for item in self.objective_suggestions
-                ],
-                "instruction": (
-                    "Select exactly one listed resulting_ids panel and provide a concise "
-                    "measured quantitative rationale comparing its limiting_pair and "
-                    "predicted_score with target_score."
-                    if is_revision
-                    else "Select exactly four unique IDs from candidate_ids and provide "
-                    "a concise measured quantitative rationale."
-                ),
-            }
-            if not is_revision:
-                rejection["candidate_ids"] = list(candidate_ids)
-            _append_tool_result(self.session, rejection)
-            if self.objective_rejection_count >= MAX_OBJECTIVE_CORRECTIONS:
-                raise ObjectiveCorrectionLimitError(
-                    "The objective correction limit was reached."
-                )
-
-    def execute_objective_attempt(
-        self, proposal: ObjectiveProposal
-    ) -> ObjectiveAttempt:
-        """Evaluate the exact pending proposal and append its measured feedback."""
-        if proposal is not self.pending_objective or type(proposal) is not ObjectiveProposal:
-            raise ToolCallError("The exact pending objective proposal is required.")
+    def execute_objective_selection(self, selection: ObjectiveSelection) -> ObjectiveAttempt:
+        """Measure and commit the exact pending state-bound selection."""
+        self._check_objective_bounds()
+        menu = self.pending_action_menu
         context = self.objective_context
-        if context is None or self.objective_run is not None:
+        if selection is not self.pending_objective_selection or type(selection) is not ObjectiveSelection:
+            raise ToolCallError("The exact pending objective selection is required.")
+        if context is None or menu is None or self.objective_run is not None:
             raise ToolCallError("The objective challenge is not awaiting evaluation.")
+        action = next((item for item in menu.actions if item.swap_id == selection.swap_id), None)
+        if action is None:
+            raise ToolCallError("The pending objective action is unavailable.")
         try:
-            attempt = evaluate_diverse_panel(
-                context,
-                tuple(proposal.selected_ids),
-                attempt_number=len(self.objective_attempts) + 1,
-                decision_basis=proposal.decision_basis,
-                selected_swap=self.pending_objective_swap,
-            )
+            attempt = evaluate_selected_swap(context, menu, action, self.accepted_attempt_count + 1)
         except Exception:
-            raise ToolCallError("The objective evaluator rejected the proposed panel.") from None
-        prospective_attempts = (*self.objective_attempts, attempt)
-        substitution_count = len(prospective_attempts) - 1
-        if not attempt.achieved and substitution_count < MAX_ATTEMPTS:
-            try:
-                prospective_suggestions = rank_legal_swaps(context, attempt)
-            except Exception:
-                raise ToolCallError(
-                    "The legal improving objective swaps could not be ranked."
-                ) from None
-        else:
-            prospective_suggestions = ()
-        prospective_run = None
-        prospective_evidence = None
-        if attempt.achieved or substitution_count == MAX_ATTEMPTS:
-            try:
-                prospective_run = finalize_objective_run(
-                    context, prospective_attempts
-                )
-                prospective_evidence = build_objective_evidence(prospective_run)
-            except Exception:
-                raise ToolCallError(
-                    "The objective run could not be finalized safely."
-                ) from None
-        feedback = {
+            raise ToolCallError("The objective evaluator rejected the selected swap.") from None
+        _append_tool_result(self.session, {
             "accepted": True,
-            "attempt_number": attempt.attempt_number,
-            "selected_ids": list(attempt.selected_ids),
-            "score": attempt.score,
-            "target_score": context.target_score,
-            "limiting_pair": list(attempt.limiting_pair),
-            "constraints_passed": attempt.constraints_passed,
             "achieved": attempt.achieved,
-            "attempts_remaining": MAX_ATTEMPTS - substitution_count,
-            "legal_improving_swaps": [
-                _swap_payload(item) for item in prospective_suggestions
-            ],
-        }
-        if prospective_suggestions:
-            feedback["instruction"] = (
-                "Select exactly one listed resulting_ids panel and explain how its "
-                "limiting_pair and predicted_score compare with target_score."
-            )
-        serialized_feedback = _serialize(feedback)
-        try:
-            assistant = self.session.messages[-1]
-            tool_call_id = assistant["tool_calls"][0]["id"]
-        except (IndexError, KeyError, TypeError):
-            raise ToolCallError(
-                "The pending objective tool protocol was invalid."
-            ) from None
-        tool_message = {
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": serialized_feedback,
-        }
-
+            "attempt_number": attempt.attempt_number,
+            "limiting_pairs": [list(pair) for pair in attempt.limiting_pairs],
+            "score": attempt.score,
+            "selected_ids": list(attempt.selected_ids),
+        })
         self.objective_attempts.append(attempt)
-        self.pending_objective = None
-        self.pending_objective_swap = None
-        self.objective_suggestions = prospective_suggestions
-        self.objective_run = prospective_run
-        self.objective_evidence = prospective_evidence
-        self.session.messages.append(tool_message)
+        self.accepted_attempt_count += 1
+        self.pending_objective_selection = None
+        if attempt.achieved:
+            self._terminalize_objective(TerminationReason.TARGET_ACHIEVED)
+        elif self.accepted_attempt_count == MAX_ATTEMPTS:
+            self._terminalize_objective(TerminationReason.ATTEMPT_LIMIT_REACHED)
+        else:
+            next_menu = build_action_menu(context, attempt.measurement, self.accepted_attempt_count)
+            self.pending_action_menu = next_menu
+            if not next_menu.actions:
+                self._terminalize_objective(TerminationReason.NO_LEGAL_IMPROVING_SWAP, menu=next_menu)
+            else:
+                self.session.messages.append({"role": "user", "content": _serialize({
+                    "candidate_actions": [_objective_action_payload(item) for item in next_menu.actions],
+                    "current_limiting_pairs": [list(pair) for pair in next_menu.source.limiting_pairs],
+                    "decision_rule": "maximize_predicted_minimum_distance",
+                    "state_id": next_menu.state_id,
+                })})
         return attempt
+
+    # Task-5 compatibility aliases: deterministic selection only, no hosted rationale.
+    def request_objective_attempt(self) -> ObjectiveSelection:
+        return self.request_objective_selection(
+            is_transport_retry=self._objective_transport_retry_pending
+        )
+
+    def execute_objective_attempt(self, selection: ObjectiveSelection) -> ObjectiveAttempt:
+        return self.execute_objective_selection(selection)
+
+    @property
+    def pending_objective(self) -> ObjectiveSelection | None:
+        return self.pending_objective_selection
+
+    @property
+    def pending_objective_swap(self) -> ObjectiveSwap | None:
+        menu = self.pending_action_menu
+        selection = self.pending_objective_selection
+        if menu is None or selection is None:
+            return None
+        return next((item for item in menu.actions if item.swap_id == selection.swap_id), None)
+
+    @property
+    def objective_suggestions(self) -> tuple[ObjectiveSwap, ...]:
+        return () if self.pending_action_menu is None else self.pending_action_menu.actions
+
+    @property
+    def objective_rejection_count(self) -> int:
+        return self.rejected_selection_count
 
     def request_synthesis(self) -> WorkflowResult:
         if (
