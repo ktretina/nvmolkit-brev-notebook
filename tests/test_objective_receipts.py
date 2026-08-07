@@ -26,7 +26,7 @@ def selected_swap() -> ObjectiveSwap:
         replacement_id="mol-5",
         resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
         predicted_score=0.80,
-        score_delta=0.45,
+        score_delta=0.80 - 0.35,
         limiting_pair=("mol-0", "mol-2"),
     )
 
@@ -51,8 +51,8 @@ def prior_attempt() -> ObjectiveAttempt:
 
 
 def evaluator_records():
-    candidate_ids = tuple(f"mol-{index}" for index in range(5))
-    distance = np.full((5, 5), 0.80, dtype=float)
+    candidate_ids = tuple(f"mol-{index}" for index in range(8))
+    distance = np.full((8, 8), 0.80, dtype=float)
     np.fill_diagonal(distance, 0.0)
     distance[0, 1] = distance[1, 0] = 0.35
     context = ObjectiveContext(
@@ -112,6 +112,31 @@ def test_objective_receipt_renders_exact_selected_intervention_without_scores_or
     assert "0.45" not in receipt.validated_intervention
     assert "limiting" not in receipt.validated_intervention
     assert "measured limiting pair" not in receipt.validated_intervention
+
+
+def test_objective_receipt_accepts_one_score_key_improvement_below_old_tolerance():
+    current = 0.5
+    improved = 0.5000000000005
+    delta = improved - current
+    assert 0.0 < delta <= 1e-12
+    swap = replace(
+        selected_swap(), predicted_score=improved, score_delta=delta
+    )
+    prior = replace(prior_attempt(), score=current)
+
+    receipt = objective_receipt(swapped_proposal(), swap, prior)
+
+    assert receipt.validated_intervention is not None
+
+
+def test_objective_receipt_rejects_inexact_raw_delta_even_within_old_tolerance():
+    swap = selected_swap()
+    forged_delta = float(np.nextafter(swap.score_delta, 1.0))
+
+    with pytest.raises(ValueError, match="prior measurement"):
+        objective_receipt(
+            swapped_proposal(), replace(swap, score_delta=forged_delta), prior_attempt()
+        )
 
 
 def test_objective_receipt_python_evaluation_matches_controller_evaluator_signature():

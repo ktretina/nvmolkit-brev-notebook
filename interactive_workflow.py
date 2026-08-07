@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from math import isclose, isfinite
+from math import isfinite
 from html import escape
 from typing import Any
 
@@ -13,8 +13,8 @@ from pydantic import BaseModel, ValidationError
 import demo_agent
 from command_receipts import CommandReceipt, command_receipt
 from objective_challenge import (
-    MAX_ATTEMPTS, SCORE_TOLERANCE, ObjectiveAttempt, ObjectiveSwap,
-    objective_figures,
+    MAX_ATTEMPTS, ObjectiveAttempt, ObjectiveSwap, is_strict_improvement,
+    objective_figures, target_is_achieved,
 )
 from objective_receipts import objective_receipt
 
@@ -599,9 +599,8 @@ class InteractiveWorkflow:
         if (
             attempt.constraints_passed is not True
             or type(attempt.achieved) is not bool
-            or attempt.achieved != (
-                attempt.score + SCORE_TOLERANCE >= context.target_score
-            )
+            or attempt.achieved
+            != target_is_achieved(attempt.score, context.target_score)
             or not InteractiveWorkflow._is_canonical_pair(
                 attempt.limiting_pair, attempt.selected_ids
             )
@@ -635,7 +634,9 @@ class InteractiveWorkflow:
                 )
                 or not InteractiveWorkflow._is_finite_float(swap.predicted_score)
                 or not InteractiveWorkflow._is_finite_float(swap.score_delta)
-                or swap.score_delta <= SCORE_TOLERANCE
+                or not is_strict_improvement(
+                    swap.predicted_score, prior_attempt.score
+                )
                 or not InteractiveWorkflow._same_panel(swap.resulting_ids, attempt.selected_ids)
                 or swap.replacement_id not in swap.resulting_ids
                 or swap.replace_id in swap.resulting_ids
@@ -649,14 +650,9 @@ class InteractiveWorkflow:
             )
             if (
                 not InteractiveWorkflow._same_panel(predecessor, prior_attempt.selected_ids)
-                or not isclose(attempt.score, swap.predicted_score, rel_tol=0.0, abs_tol=1e-12)
+                or attempt.score != swap.predicted_score
                 or attempt.limiting_pair != swap.limiting_pair
-                or not isclose(
-                    swap.score_delta,
-                    attempt.score - prior_attempt.score,
-                    rel_tol=0.0,
-                    abs_tol=1e-12,
-                )
+                or swap.score_delta != attempt.score - prior_attempt.score
             ):
                 raise ValueError("A revision does not match its prior measurement.")
             action = (
@@ -684,8 +680,8 @@ class InteractiveWorkflow:
             )
         if attempt.achieved and attempt.score < context.target_score:
             comparison = (
-                f"{score_text} meets target within 1e-12 tolerance "
-                f"(score + 1e-12 ≥ {target_text})"
+                f"{score_text} meets the quantized target "
+                f"(shared score key ≥ {target_text})"
             )
         elif attempt.achieved:
             comparison = f"{score_text} ≥ {target_text}"

@@ -13,7 +13,7 @@ from demo_agent import (
     ObjectiveProposal, SimilarityArgs, StageProposal, ToolCallError,
 )
 from objective_challenge import (
-    SCORE_TOLERANCE, ObjectiveAttempt, ObjectiveCandidate, ObjectiveContext, ObjectiveSwap,
+    ObjectiveAttempt, ObjectiveCandidate, ObjectiveContext, ObjectiveSwap,
     evaluate_diverse_panel, rank_legal_swaps,
 )
 from interactive_workflow import InteractiveWorkflow, controls_for
@@ -147,7 +147,7 @@ class Controller:
                     replacement_id="mol-5",
                     resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
                     predicted_score=0.80,
-                    score_delta=0.45,
+                    score_delta=0.80 - 0.35,
                     limiting_pair=("mol-0", "mol-2"),
                 )
             ),
@@ -206,8 +206,8 @@ def run_objective(workflow):
     workflow.objective_button.click()
 
 
-def evaluated_objective_records(candidate_ids=tuple(f"mol-{index}" for index in range(5))):
-    distance = np.full((5, 5), 0.80, dtype=float)
+def evaluated_objective_records(candidate_ids=tuple(f"mol-{index}" for index in range(8))):
+    distance = np.full((8, 8), 0.80, dtype=float)
     np.fill_diagonal(distance, 0.0)
     distance[0, 1] = distance[1, 0] = 0.35
     context = ObjectiveContext(
@@ -442,7 +442,7 @@ def test_objective_revision_without_prior_attempt_fails_closed():
             replacement_id="mol-5",
             resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
             predicted_score=0.80,
-            score_delta=0.45,
+            score_delta=0.80 - 0.35,
             limiting_pair=("mol-0", "mol-2"),
         ),
     )
@@ -461,7 +461,7 @@ def test_objective_attempt_row_enforces_initial_and_revision_state_shapes():
         replacement_id="mol-5",
         resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
         predicted_score=0.80,
-        score_delta=0.45,
+        score_delta=0.80 - 0.35,
         limiting_pair=("mol-0", "mol-2"),
     )
     initial = ObjectiveAttempt(
@@ -532,7 +532,7 @@ def test_objective_attempt_row_uses_gray_amber_and_green_by_state():
         replacement_id="mol-5",
         resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
         predicted_score=0.50,
-        score_delta=0.15,
+        score_delta=0.50 - 0.35,
         limiting_pair=("mol-0", "mol-2"),
     )
     revision_miss = ObjectiveAttempt(
@@ -566,7 +566,10 @@ def test_objective_attempt_row_uses_gray_amber_and_green_by_state():
 
 def test_objective_attempt_row_binds_evaluated_records_and_escapes_action_content():
     context, first, second = evaluated_objective_records(
-        ("mol<0>", "mol-1", "mol-2", "mol-3", "mol&4")
+        (
+            "mol<0>", "mol-1", "mol-2", "mol-3", "mol&4", "mol-5",
+            "mol-6", "mol-7",
+        )
     )
     adversarial = replace(second, decision_basis="<img src=x onerror=alert(1)>")
 
@@ -621,7 +624,7 @@ def test_objective_attempt_row_adapts_precision_without_erasing_near_threshold_d
         replacement_id="mol-5",
         resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
         predicted_score=0.7100,
-        score_delta=0.0004,
+        score_delta=0.7100 - 0.7096,
         limiting_pair=("mol-0", "mol-2"),
     )
     attempt = ObjectiveAttempt(
@@ -722,7 +725,7 @@ def test_objective_attempt_row_uses_scientific_notation_when_six_decimals_hide_t
         replacement_id="mol-5",
         resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
         predicted_score=0.7100000,
-        score_delta=0.0000004,
+        score_delta=0.7100000 - 0.7099996,
         limiting_pair=("mol-0", "mol-2"),
     )
     attempt = ObjectiveAttempt(
@@ -743,7 +746,7 @@ def test_objective_attempt_row_uses_scientific_notation_when_six_decimals_hide_t
     assert "e-07" in row
 
 
-def test_objective_attempt_row_distinguishes_exact_tolerance_and_miss_outcomes():
+def test_objective_attempt_row_distinguishes_exact_quantized_tie_and_miss_outcomes():
     target = 0.71
 
     def initial(score, achieved):
@@ -761,12 +764,13 @@ def test_objective_attempt_row_distinguishes_exact_tolerance_and_miss_outcomes()
         SimpleNamespace(baseline_score=target, target_score=target),
         initial(target, True),
     )
-    tolerance = InteractiveWorkflow._objective_attempt_row(
+    quantized_tie_score = float(np.nextafter(target, 0.0))
+    quantized_tie = InteractiveWorkflow._objective_attempt_row(
         SimpleNamespace(
-            baseline_score=target - 0.5 * SCORE_TOLERANCE,
+            baseline_score=quantized_tie_score,
             target_score=target,
         ),
-        initial(target - 0.5 * SCORE_TOLERANCE, True),
+        initial(quantized_tie_score, True),
     )
     miss = InteractiveWorkflow._objective_attempt_row(
         SimpleNamespace(baseline_score=0.709, target_score=target),
@@ -774,9 +778,70 @@ def test_objective_attempt_row_distinguishes_exact_tolerance_and_miss_outcomes()
     )
 
     assert "0.710 ≥ 0.710" in exact
-    assert "meets target within 1e-12 tolerance" in tolerance
-    assert "<b>Outcome:</b> Goal achieved" in tolerance
+    assert "meets the quantized target" in quantized_tie
+    assert "<b>Outcome:</b> Goal achieved" in quantized_tie
     assert "0.709 &lt; 0.710" in miss
+
+
+def test_objective_attempt_row_uses_score_keys_for_target_attainment():
+    score = 0.5
+    target = 0.50000000000075
+    attempt = ObjectiveAttempt(
+        attempt_number=1,
+        selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
+        decision_basis="Measure the initial panel.",
+        score=score,
+        limiting_pair=("mol-0", "mol-1"),
+        constraints_passed=True,
+        achieved=False,
+    )
+
+    row = InteractiveWorkflow._objective_attempt_row(
+        SimpleNamespace(baseline_score=score, target_score=target), attempt
+    )
+
+    assert "<b>Outcome:</b> Revise" in row
+
+
+def test_objective_attempt_row_accepts_one_score_key_revision_below_old_tolerance():
+    current = 0.5
+    improved = 0.5000000000005
+    delta = improved - current
+    prior = ObjectiveAttempt(
+        attempt_number=1,
+        selected_ids=("mol-0", "mol-1", "mol-2", "mol-3"),
+        decision_basis="Measure the initial panel.",
+        score=current,
+        limiting_pair=("mol-0", "mol-1"),
+        constraints_passed=True,
+        achieved=False,
+    )
+    swap = ObjectiveSwap(
+        replace_id="mol-1",
+        replacement_id="mol-5",
+        resulting_ids=("mol-0", "mol-5", "mol-2", "mol-3"),
+        predicted_score=improved,
+        score_delta=delta,
+        limiting_pair=("mol-0", "mol-2"),
+    )
+    attempt = ObjectiveAttempt(
+        attempt_number=2,
+        selected_ids=swap.resulting_ids,
+        decision_basis="Use the one-key measured improvement.",
+        score=improved,
+        limiting_pair=swap.limiting_pair,
+        constraints_passed=True,
+        achieved=True,
+        selected_swap=swap,
+    )
+
+    row = InteractiveWorkflow._objective_attempt_row(
+        SimpleNamespace(baseline_score=current, target_score=improved),
+        attempt,
+        prior,
+    )
+
+    assert "<b>Outcome:</b> Goal achieved" in row
 
 
 @pytest.mark.parametrize(

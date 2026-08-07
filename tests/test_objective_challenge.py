@@ -1,6 +1,7 @@
 import itertools
 import json
 from dataclasses import replace
+from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
 
 import numpy as np
@@ -40,15 +41,13 @@ def forged_nonachieved_attempt(
     *,
     score: float | bool | None = None,
 ) -> ObjectiveAttempt:
-    computed_score, limiting_pair = objective_challenge._score_panel(
-        context, selected_ids
-    )
+    measurement = objective_challenge.measure_panel(context, selected_ids)
     return ObjectiveAttempt(
         attempt_number=1,
         selected_ids=selected_ids,
         decision_basis="Forged state used to verify ranker validation.",
-        score=computed_score if score is None else score,
-        limiting_pair=limiting_pair,
+        score=measurement.score if score is None else score,
+        limiting_pair=measurement.limiting_pairs[0],
         constraints_passed=True,
         achieved=False,
     )
@@ -107,6 +106,29 @@ def test_score_key_is_exact_below_on_and_above_a_half_unit_boundary(value, expec
     assert objective_challenge.score_key(value) == expected
 
 
+@pytest.mark.parametrize(
+    "value",
+    (
+        0.9000000000005,
+        float(np.nextafter(0.9000000000005, 0.0)),
+        float(np.nextafter(0.9000000000005, 1.0)),
+        np.float32(0.1),
+        np.nextafter(np.float32(0.5), np.float32(0.0)),
+        np.nextafter(np.float32(0.5), np.float32(1.0)),
+    ),
+)
+def test_score_key_matches_exact_binary_float_half_up_reference(value):
+    normalized = float(value)
+    exact_reference = int(
+        (
+            Decimal.from_float(normalized) * Decimal(10**12)
+            + Decimal("0.5")
+        ).to_integral_value(rounding=ROUND_FLOOR)
+    )
+
+    assert objective_challenge.score_key(value) == exact_reference
+
+
 def test_measure_panel_retains_every_canonical_co_limiting_pair():
     context = controlled_context(
         distances={
@@ -152,18 +174,80 @@ def test_context_fixture_derives_scores_and_preserves_read_only_float64_matrix()
     assert context.benchmark_score == pytest.approx(0.8)
 
 
+def _context_with_matrix(distance_matrix) -> ObjectiveContext:
+    valid = controlled_context(distances={}, default_distance=0.8)
+    return replace(valid, distance_matrix=distance_matrix)
+
+
+@pytest.mark.parametrize(
+    ("distance_matrix", "message"),
+    (
+        (np.full((8, 8), "0.0", dtype=str), "numeric"),
+        (np.zeros((8, 9), dtype=float), "shape"),
+        (
+            np.array(
+                [
+                    [0.0 if row == column else (0.7 if (row, column) == (0, 1) else 0.8)
+                    for column in range(8)]
+                    for row in range(8)
+                ],
+                dtype=float,
+            ),
+            "symmetric",
+        ),
+        (np.eye(8, dtype=float), "diagonal"),
+        (
+            np.where(
+                np.indices((8, 8))[0] == np.indices((8, 8))[1],
+                0.0,
+                np.nan,
+            ),
+            "finite",
+        ),
+        (
+            np.where(
+                np.indices((8, 8))[0] == np.indices((8, 8))[1],
+                0.0,
+                1.1,
+            ),
+            r"\[0, 1\]",
+        ),
+    ),
+)
+def test_objective_context_rejects_malformed_distance_matrices(
+    distance_matrix, message
+):
+    with pytest.raises(ValueError, match=message):
+        _context_with_matrix(distance_matrix)
+
+
+def test_objective_context_owns_a_read_only_float64_distance_matrix():
+    source = np.full((8, 8), 0.8, dtype=np.float32)
+    np.fill_diagonal(source, 0.0)
+    context = _context_with_matrix(source)
+    original = objective_challenge.measure_panel(
+        context, context.baseline_ids
+    )
+
+    source[0, 1] = source[1, 0] = 0.1
+
+    assert context.distance_matrix.dtype == np.dtype(np.float64)
+    assert context.distance_matrix.flags.owndata is True
+    assert context.distance_matrix.flags.writeable is False
+    assert objective_challenge.measure_panel(context, context.baseline_ids) == original
+    with pytest.raises(ValueError):
+        context.distance_matrix[0, 1] = 0.1
+
+
 @pytest.mark.parametrize("invalid_distance", (float("nan"), float("inf"), -0.1, 1.1))
 def test_panel_measurement_rejects_invalid_pair_distances(invalid_distance):
     context = controlled_context(distances={}, default_distance=0.8)
     invalid_matrix = np.array(context.distance_matrix, dtype=np.float64, copy=True)
     invalid_matrix[0, 1] = invalid_matrix[1, 0] = invalid_distance
     invalid_matrix.setflags(write=False)
-    invalid_context = replace(context, distance_matrix=invalid_matrix)
 
     with pytest.raises(ValueError, match="distance"):
-        objective_challenge.measure_panel(
-            invalid_context, ("mol-0", "mol-1", "mol-2", "mol-3")
-        )
+        replace(context, distance_matrix=invalid_matrix)
 
 
 def test_panel_measurement_reuses_fail_closed_panel_validation():
@@ -282,6 +366,33 @@ def test_o01_is_canonical_and_does_not_expose_the_hidden_benchmark_panel():
     assert payload["achieved"] is True
     assert payload["attempts"][0]["limiting_pair"] == ["mol-0", "mol-1"]
     assert json.dumps(payload, sort_keys=True, separators=(",", ":")) == record.payload_json
+
+
+def test_o01_retains_every_recomputed_canonical_limiting_pair():
+    context = controlled_context(
+        distances={
+            ("mol-0", "mol-1"): 0.4,
+            ("mol-2", "mol-3"): 0.4,
+        },
+        default_distance=0.8,
+        target_score=0.4,
+    )
+    attempt = evaluate_diverse_panel(
+        context,
+        context.baseline_ids,
+        attempt_number=1,
+        decision_basis="Measure the tied deterministic panel.",
+    )
+
+    payload = json.loads(
+        build_objective_evidence(finalize_objective_run(context, (attempt,))).payload_json
+    )
+
+    assert payload["attempts"][0]["limiting_pairs"] == [
+        ["mol-0", "mol-1"],
+        ["mol-2", "mol-3"],
+    ]
+    assert payload["attempts"][0]["limiting_pair"] == ["mol-0", "mol-1"]
 
 
 def test_evaluate_panel_records_only_an_exact_selected_swap():
@@ -460,6 +571,12 @@ def test_o01_serializes_the_selected_intervention_without_hidden_answers():
         "predicted_score": selected.predicted_score,
         "score_delta": selected.score_delta,
         "limiting_pair": list(selected.limiting_pair),
+        "limiting_pairs": [
+            list(pair)
+            for pair in objective_challenge.measure_panel(
+                context, selected.resulting_ids
+            ).limiting_pairs
+        ],
     }
     assert "benchmark_panel" not in payload
 

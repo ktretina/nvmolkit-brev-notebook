@@ -34,7 +34,8 @@ def score_key(value: float | np.floating) -> int:
     normalized = float(value)
     if not np.isfinite(normalized) or not 0.0 <= normalized <= 1.0:
         raise ValueError("Objective score must be a finite float in [0, 1].")
-    return int(np.floor(normalized * SCORE_SCALE + 0.5))
+    numerator, denominator = normalized.as_integer_ratio()
+    return (2 * numerator * SCORE_SCALE + denominator) // (2 * denominator)
 
 
 def is_strict_improvement(candidate: float, current: float) -> bool:
@@ -63,6 +64,31 @@ class ObjectiveContext:
     benchmark_score: float
     target_score: float
     distance_matrix: np.ndarray = field(compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        try:
+            source = np.asarray(self.distance_matrix)
+            if not np.issubdtype(source.dtype, np.number) or np.issubdtype(
+                source.dtype, np.complexfloating
+            ):
+                raise ValueError
+            distance_matrix = np.array(
+                source, dtype=np.float64, copy=True
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("Objective distance matrix must be numeric.") from error
+        if distance_matrix.shape != (CANDIDATE_COUNT, CANDIDATE_COUNT):
+            raise ValueError("Objective distance matrix has an invalid shape.")
+        if not np.isfinite(distance_matrix).all():
+            raise ValueError("Objective distance matrix must contain finite values.")
+        if np.any((distance_matrix < 0.0) | (distance_matrix > 1.0)):
+            raise ValueError("Objective distance matrix values must be in [0, 1].")
+        if not np.array_equal(distance_matrix, distance_matrix.T):
+            raise ValueError("Objective distance matrix must be symmetric.")
+        if np.any(np.diag(distance_matrix) != 0.0):
+            raise ValueError("Objective distance matrix must have a zero diagonal.")
+        distance_matrix.setflags(write=False)
+        object.__setattr__(self, "distance_matrix", distance_matrix)
 
 
 @dataclass(frozen=True)
@@ -461,6 +487,39 @@ def _canonical_json(payload: dict[str, Any]) -> str:
 def build_objective_evidence(run: ObjectiveRun) -> EvidenceRecord:
     """Build immutable O01 without exposing the hidden benchmark panel."""
     context = run.context
+    attempt_payloads = []
+    for attempt in run.attempts:
+        measurement = measure_panel(context, attempt.selected_ids)
+        selected_swap_payload = None
+        if attempt.selected_swap is not None:
+            selected_swap = attempt.selected_swap
+            swap_measurement = measure_panel(context, selected_swap.resulting_ids)
+            selected_swap_payload = {
+                "replace_id": selected_swap.replace_id,
+                "replacement_id": selected_swap.replacement_id,
+                "resulting_ids": list(selected_swap.resulting_ids),
+                "predicted_score": selected_swap.predicted_score,
+                "score_delta": selected_swap.score_delta,
+                "limiting_pair": list(swap_measurement.limiting_pairs[0]),
+                "limiting_pairs": [
+                    list(pair) for pair in swap_measurement.limiting_pairs
+                ],
+            }
+        attempt_payloads.append(
+            {
+                "attempt_number": attempt.attempt_number,
+                "selected_ids": list(attempt.selected_ids),
+                "decision_basis": attempt.decision_basis,
+                "score": attempt.score,
+                "limiting_pair": list(measurement.limiting_pairs[0]),
+                "limiting_pairs": [
+                    list(pair) for pair in measurement.limiting_pairs
+                ],
+                "constraints_passed": attempt.constraints_passed,
+                "achieved": attempt.achieved,
+                "selected_swap": selected_swap_payload,
+            }
+        )
     payload = {
         "objective": "maximize minimum pairwise Morgan/Tanimoto distance",
         "score_definition": "D_min=min(1-Tanimoto(i,j)) over selected pairs",
@@ -474,30 +533,7 @@ def build_objective_evidence(run: ObjectiveRun) -> EvidenceRecord:
         "benchmark_score": context.benchmark_score,
         "target_rule": "baseline plus 80 percent of attainable improvement",
         "target_score": context.target_score,
-        "attempts": [
-            {
-                "attempt_number": attempt.attempt_number,
-                "selected_ids": list(attempt.selected_ids),
-                "decision_basis": attempt.decision_basis,
-                "score": attempt.score,
-                "limiting_pair": list(attempt.limiting_pair),
-                "constraints_passed": attempt.constraints_passed,
-                "achieved": attempt.achieved,
-                "selected_swap": (
-                    None
-                    if attempt.selected_swap is None
-                    else {
-                        "replace_id": attempt.selected_swap.replace_id,
-                        "replacement_id": attempt.selected_swap.replacement_id,
-                        "resulting_ids": list(attempt.selected_swap.resulting_ids),
-                        "predicted_score": attempt.selected_swap.predicted_score,
-                        "score_delta": attempt.selected_swap.score_delta,
-                        "limiting_pair": list(attempt.selected_swap.limiting_pair),
-                    }
-                ),
-            }
-            for attempt in run.attempts
-        ],
+        "attempts": attempt_payloads,
         "termination_reason": run.termination_reason,
         "final_ids": list(run.final_ids),
         "final_score": run.final_score,

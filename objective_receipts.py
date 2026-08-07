@@ -1,10 +1,10 @@
 """Deterministic display receipts for validated objective proposals."""
 
 from dataclasses import dataclass
-from math import isclose, isfinite
+from math import isfinite
 
 from demo_agent import ObjectiveProposal
-from objective_challenge import SCORE_TOLERANCE, ObjectiveAttempt, ObjectiveSwap
+from objective_challenge import ObjectiveAttempt, ObjectiveSwap, is_strict_improvement
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,9 @@ def objective_receipt(
             or not _is_canonical_panel(selected_swap.resulting_ids)
             or not _is_finite_float(selected_swap.predicted_score)
             or not _is_finite_float(selected_swap.score_delta)
-            or selected_swap.score_delta <= SCORE_TOLERANCE
+            or not is_strict_improvement(
+                selected_swap.predicted_score, prior_attempt.score
+            )
         ):
             raise ValueError("Intervention provenance has invalid canonical values.")
         resulting_ids = selected_swap.resulting_ids
@@ -66,12 +68,8 @@ def objective_receipt(
         )
         if (
             not _same_panel(predecessor, prior_attempt.selected_ids)
-            or not isclose(
-                selected_swap.score_delta,
-                selected_swap.predicted_score - prior_attempt.score,
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
+            or selected_swap.score_delta
+            != selected_swap.predicted_score - prior_attempt.score
         ):
             raise ValueError("Intervention provenance does not match the prior measurement.")
         intervention = (
