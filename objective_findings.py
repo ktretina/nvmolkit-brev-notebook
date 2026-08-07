@@ -11,6 +11,7 @@ from chemistry_workflow import EvidenceRecord, WorkflowReport
 from objective_challenge import (
     ObjectiveRun,
     build_objective_evidence,
+    score_key,
     validate_objective_evidence,
 )
 
@@ -27,6 +28,14 @@ CONCLUSION_THEMES = (
 
 _WORKFLOW_KEYS = tuple(f"E0{index}" for index in range(1, 7))
 _ALL_KEYS = (*_WORKFLOW_KEYS, "O01")
+_CANONICAL_RECORD_METADATA = {
+    "E01": ("Library inspection", "RDKit input validation"),
+    "E02": ("Morgan fingerprints", "MorganFingerprintGenerator"),
+    "E03": ("Tanimoto similarity", "crossTanimotoSimilarity"),
+    "E04": ("Fused Butina clusters", "fused_butina"),
+    "E05": ("Representative embedding", "EmbedMolecules"),
+    "E06": ("MMFF94 optimization", "MMFFOptimizeMoleculesConfs"),
+}
 
 
 @dataclass(frozen=True)
@@ -182,6 +191,12 @@ class EvidenceSnapshot:
         payloads: dict[str, dict[str, Any]] = {}
         for key in _ALL_KEYS:
             record = by_key[key]
+            if key in _CANONICAL_RECORD_METADATA:
+                expected_label, expected_provenance = _CANONICAL_RECORD_METADATA[key]
+                if record.label != expected_label:
+                    raise ValueError(f"{key} label is not canonical.")
+                if record.provenance != expected_provenance:
+                    raise ValueError(f"{key} provenance is not canonical.")
             try:
                 payload = json.loads(record.payload_json)
             except (TypeError, json.JSONDecodeError) as error:
@@ -200,11 +215,14 @@ class EvidenceSnapshot:
         validate_objective_evidence(by_key["O01"], run)
         return cls(
             tuple(by_key[key] for key in _ALL_KEYS),
-            _build_summary(payloads),
+            _build_summary(payloads, run),
         )
 
 
-def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary:
+def _build_summary(
+    payloads: Mapping[str, Mapping[str, Any]],
+    run: ObjectiveRun,
+) -> MeasuredSummary:
     e01, e02, e03 = payloads["E01"], payloads["E02"], payloads["E03"]
     e04, e05, e06, o01 = (
         payloads["E04"],
@@ -305,6 +323,8 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
         or len(e01["invalid_ids"]) != invalid
     ):
         raise ValueError("E01 count fields are contradictory.")
+    if e01["count_unit"] != "rows":
+        raise ValueError("E01 count unit is not canonical.")
 
     radius = _integer(e02["fingerprint_radius"], "E02 fingerprint radius")
     size = _integer(
@@ -313,6 +333,12 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
     molecule_count = _integer(e02["molecule_count"], "E02 molecule count")
     if molecule_count != valid or e02["packed_shape"] != [valid, size // 32]:
         raise ValueError("E02 count and packed-shape fields are contradictory.")
+    if radius not in (2, 3) or size not in (1024, 2048):
+        raise ValueError("E02 fingerprint parameters are unsupported.")
+    if e02["executor"] != "nvMolKit GPU":
+        raise ValueError("E02 executor is not canonical.")
+    if e02["size_unit"] != "bits":
+        raise ValueError("E02 size unit is not canonical.")
     active_bits = tuple(
         _number(e02[name], f"E02 {name}", upper=float(size))
         for name in ("active_bits_min", "active_bits_median", "active_bits_max")
@@ -326,6 +352,8 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
     )
     if tuple(sorted(similarities)) != similarities or e03["matrix_shape"] != [valid, valid]:
         raise ValueError("E03 similarity fields are contradictory.")
+    if e03["similarity_unit"] != "Tanimoto coefficient":
+        raise ValueError("E03 similarity unit must be the Tanimoto coefficient.")
     pair = e03["most_similar_pair"]
     _exact_keys(
         "E03 most_similar_pair",
@@ -346,6 +374,10 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
         raise ValueError("E03 most-similar pair fields are contradictory.")
 
     cutoff = _number(e04["cutoff"], "E04 cutoff")
+    if not 0.40 <= cutoff <= 0.60:
+        raise ValueError("E04 cutoff is outside the supported range.")
+    if e04["cutoff_unit"] != "Tanimoto distance":
+        raise ValueError("E04 cutoff unit is not canonical.")
     cluster_count = _integer(e04["cluster_count"], "E04 cluster count", minimum=1)
     singletons = _integer(e04["singleton_count"], "E04 singleton count")
     assignments = _integer(e04["assignment_count"], "E04 assignment count")
@@ -420,6 +452,13 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
         or generated > selected_reps * per_rep
     ):
         raise ValueError("E05 representative count fields are contradictory.")
+    if e05["count_unit"] != "conformers":
+        raise ValueError("E05 count unit is not canonical.")
+    if e05["representative_policy"] not in {
+        "largest_clusters_first",
+        "include_singleton_if_available",
+    }:
+        raise ValueError("E05 representative policy is unsupported.")
     representative_by_id: dict[str, Mapping[str, Any]] = {}
     for representative in representatives:
         if type(representative) is not dict:
@@ -492,6 +531,8 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
         raise ValueError(
             "E06 conformer count or comparison-scope fields are contradictory."
         )
+    if e06["energy_unit"] != "kcal/mol":
+        raise ValueError("E06 energy unit is not canonical.")
     conformer_keys = {
         "molecule_id",
         "cluster_id",
@@ -570,6 +611,14 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
         or actual_zero_ids != set(zero_embedding_ids)
     ):
         raise ValueError("E05 embedding IDs do not match E06 conformer records.")
+    for molecule_id, count in conformer_counts.items():
+        indices = sorted(
+            conformer_index
+            for key_molecule_id, conformer_index in conformers_by_key
+            if key_molecule_id == molecule_id
+        )
+        if indices != list(range(count)):
+            raise ValueError("E06 conformer indices must be contiguous per molecule.")
     molecules_with_converged_samples = {
         molecule_id
         for (molecule_id, _), record in conformers_by_key.items()
@@ -579,6 +628,26 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
         raise ValueError(
             "E06 selected minima must cover exactly the molecules with converged samples."
         )
+    selected_by_id = {record["molecule_id"]: record for record in selected}
+    for molecule_id in molecules_with_converged_samples:
+        canonical = min(
+            (
+                record
+                for (key_molecule_id, _), record in conformers_by_key.items()
+                if key_molecule_id == molecule_id and record["converged"]
+            ),
+            key=lambda record: (
+                float(record["energy_kcal_mol"]),
+                record["conformer_index"],
+            ),
+        )
+        selected_record = selected_by_id[molecule_id]
+        if (
+            selected_record["conformer_index"] != canonical["conformer_index"]
+            or float(selected_record["energy_kcal_mol"])
+            != float(canonical["energy_kcal_mol"])
+        ):
+            raise ValueError("E06 selected conformer is not the canonical minimum.")
 
     candidate_ids = o01["candidate_ids"]
     candidate_clusters = o01["candidate_cluster_ids"]
@@ -592,6 +661,14 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
             for molecule_id in final_ids
         }
     )
+    if (
+        len(candidate_clusters) != candidate_pool_count
+        or any(type(cluster_id) is not int for cluster_id in candidate_clusters)
+        or any(not 0 <= cluster_id < cluster_count for cluster_id in candidate_clusters)
+        or candidate_cluster_count > cluster_count
+        or final_cluster_count > cluster_count
+    ):
+        raise ValueError("O01 cluster IDs are outside the E04 cluster domain.")
     baseline = _number(o01["baseline_score"], "O01 baseline score")
     benchmark = _number(o01["benchmark_score"], "O01 benchmark score")
     target = _number(o01["target_score"], "O01 target score")
@@ -604,8 +681,24 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
         for pair in limiting_pairs
     ):
         raise ValueError("O01 limiting pairs are malformed.")
-    final_similarity = round(1.0 - final, 16)
-    limiting_similarities = tuple(final_similarity for _ in limiting_pairs)
+    candidate_positions = {
+        candidate.molecule_id: position
+        for position, candidate in enumerate(run.context.candidates)
+    }
+    limiting_distances = []
+    for first_id, second_id in limiting_pairs:
+        if first_id not in final_ids or second_id not in final_ids:
+            raise ValueError("O01 limiting pair is outside the final panel.")
+        distance = float(
+            run.context.distance_matrix[
+                candidate_positions[first_id], candidate_positions[second_id]
+            ]
+        )
+        if score_key(distance) != final_measurement["score_key"]:
+            raise ValueError("O01 limiting pair does not have the final score key.")
+        limiting_distances.append(distance)
+    limiting_similarities = tuple(1.0 - distance for distance in limiting_distances)
+    final_similarity = max(limiting_similarities)
     reason = o01["termination_reason"]
     achieved = o01["achieved"]
     headline = _headline(reason, final, target)
@@ -631,7 +724,9 @@ def _build_summary(payloads: Mapping[str, Mapping[str, Any]]) -> MeasuredSummary
         excluded_count=invalid,
         fingerprint_radius=radius,
         fingerprint_size=size,
-        representation_name="Morgan radius-2 1024-bit fingerprints with Tanimoto similarity",
+        representation_name=(
+            f"Morgan radius-{radius} {size}-bit fingerprints with Tanimoto similarity"
+        ),
         similarity_quartiles=(similarities[0], similarities[1], similarities[2]),
         similarity_p90=similarities[3],
         similarity_max=similarities[4],
@@ -709,15 +804,16 @@ _FINDING_PREDICATES: dict[str, _FindingPredicate] = {
         "F03",
         "molecular_representation",
         ("E02",),
-        lambda summary: summary.fingerprint_radius == 2
-        and summary.fingerprint_size == 1024,
+        lambda summary: summary.fingerprint_radius in (2, 3)
+        and summary.fingerprint_size in (1024, 2048),
         lambda summary: f"Molecular structure was represented with {summary.representation_name}.",
     ),
     "representation_reuse": _FindingPredicate(
         "F04",
         "molecular_representation",
         ("E02", "E03", "O01"),
-        lambda summary: summary.fingerprint_radius == 2,
+        lambda summary: summary.fingerprint_radius in (2, 3)
+        and summary.fingerprint_size in (1024, 2048),
         lambda summary: (
             "The same Morgan/Tanimoto representation was reused for similarity, "
             "clustering evidence, and objective scoring."
@@ -752,7 +848,7 @@ _FINDING_PREDICATES: dict[str, _FindingPredicate] = {
         ("E04",),
         lambda summary: summary.cluster_count > 0,
         lambda summary: (
-            f"A {summary.cluster_cutoff:.1f} Tanimoto-distance cutoff produced "
+            f"A {summary.cluster_cutoff!r} Tanimoto-distance cutoff produced "
             f"{summary.cluster_count} clusters, including "
             f"{summary.singleton_count} singletons."
         ),
