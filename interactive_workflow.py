@@ -14,7 +14,7 @@ from command_receipts import CommandReceipt, command_receipt
 from objective_challenge import (
     MAX_ATTEMPTS, ObjectiveActionMenu, ObjectiveAttempt, ObjectiveSwap,
     TerminationReason, accepted_maxima, build_action_menu, measure_panel,
-    objective_figures, score_key,
+    objective_figures, score_key, target_is_achieved,
 )
 from objective_receipts import objective_receipt
 
@@ -519,6 +519,10 @@ class InteractiveWorkflow:
     @staticmethod
     def _objective_summary_html(context, decisions, run=None) -> str:
         baseline = measure_panel(context, context.baseline_ids)
+        for menu, selection, attempt in decisions:
+            InteractiveWorkflow._validate_objective_decision(
+                context, menu, selection, attempt
+            )
         attempts = tuple(
             attempt for _menu, _selection, attempt in decisions if attempt is not None
         )
@@ -559,31 +563,67 @@ class InteractiveWorkflow:
             f"{escape(first)} / {escape(second)}"
             for first, second in baseline.limiting_pairs
         )
+        baseline_text, target_text, baseline_status = (
+            InteractiveWorkflow._score_comparison(
+                baseline.score, context.target_score
+            )
+        )
         baseline_row = (
             "<section style='border-left:3px solid #6c757d;padding:6px 10px;"
             "margin:6px 0' aria-label='Objective baseline'>"
             "<b>Step 0 · Measured baseline</b><br>"
             f"<small><b>Observe:</b> supplied panel {escape(str(baseline.selected_ids))}</small><br>"
-            f"<small><b>Measure:</b> D_min {InteractiveWorkflow._objective_scalar(baseline.score, precision, scientific)} "
+            f"<small><b>Measure:</b> D_min {baseline_text} vs target {target_text} "
             f"· score_key={baseline.score_key} · co-limiting pairs {baseline_pairs}</small><br>"
-            f"<small><b>Target status:</b> {escape(InteractiveWorkflow._objective_target_status(baseline.score, context.target_score))}</small>"
+            f"<small><b>Target status:</b> {escape(baseline_status)}</small>"
             "</section>"
         )
         decision_ladder = baseline_row + "".join(
             InteractiveWorkflow._objective_attempt_row(menu, selection, attempt)
             for menu, selection, attempt in decisions
         )
+        terminal_actions = ""
         final = ""
         if run is not None:
-            label = (
-                "Goal achieved"
-                if run.achieved
-                else "Objective not achieved within attempt limit"
-            )
-            if run.termination_reason == "baseline_already_optimal":
-                label = "Baseline already optimal within the bounded pool"
-            if run.termination_reason == TerminationReason.EVALUATION_NOT_COMPLETED:
-                label = "Evaluation not completed; the validated selection remains unmeasured"
+            reason = TerminationReason(run.termination_reason)
+            labels = {
+                TerminationReason.TARGET_ACHIEVED: "Goal achieved; target achieved.",
+                TerminationReason.BASELINE_ALREADY_OPTIMAL: (
+                    "Baseline already optimal within the bounded pool."
+                ),
+                TerminationReason.ATTEMPT_LIMIT_REACHED: (
+                    "Attempt limit reached before the target was achieved."
+                ),
+                TerminationReason.NO_LEGAL_IMPROVING_SWAP: (
+                    "No legal improving swap remains in the deterministic action menu."
+                ),
+                TerminationReason.OBJECTIVE_CORRECTION_LIMIT: (
+                    "Objective correction limit reached; no further selection was accepted."
+                ),
+                TerminationReason.OBJECTIVE_PROVIDER_FAILURE: (
+                    "Objective provider failure; no further evaluation was performed."
+                ),
+                TerminationReason.EVALUATION_NOT_COMPLETED: (
+                    "Evaluation not completed; the validated selection remains unmeasured."
+                ),
+            }
+            label = labels[reason]
+            if reason is TerminationReason.NO_LEGAL_IMPROVING_SWAP:
+                source = baseline if not attempts else attempts[-1].measurement
+                empty_menu = build_action_menu(
+                    context, source, len(attempts)
+                )
+                if empty_menu.actions:
+                    raise ValueError(
+                        "No-legal terminal state rebuilt a nonempty action menu."
+                    )
+                terminal_actions = (
+                    "<div aria-label='Terminal candidate actions'>"
+                    + InteractiveWorkflow._objective_action_menu_html(
+                        context, empty_menu
+                    )
+                    + "</div>"
+                )
             final = f"<p><b>Outcome:</b> {escape(label)}</p>"
         return (
             "<p><b>Objective:</b> Select four MMFF94-parameter-eligible compounds "
@@ -594,8 +634,31 @@ class InteractiveWorkflow:
             f"{InteractiveWorkflow._objective_scalar(context.target_score, precision, scientific)} "
             "(80% of attainable improvement over baseline)</p>"
             f"<div aria-label='Objective decision ladder'>{decision_ladder}</div>"
-            f"<div>{score_strip}</div>{final}"
+            f"{terminal_actions}<div>{score_strip}</div>{final}"
         )
+
+    @staticmethod
+    def _validate_objective_decision(context, menu, selection, attempt) -> None:
+        if type(menu) is not ObjectiveActionMenu or menu != build_action_menu(
+            context, menu.source, menu.accepted_attempt_count
+        ):
+            raise ValueError(
+                "Displayed objective menu does not match deterministic controller state."
+            )
+        InteractiveWorkflow._objective_attempt_row(menu, selection, attempt)
+        if attempt is None:
+            return
+        measured = measure_panel(context, attempt.selected_ids)
+        if (
+            attempt.measurement != measured
+            or attempt.achieved
+            != target_is_achieved(measured.score, context.target_score)
+            or attempt.selected_swap.target_status
+            != ("meets_target" if measured.achieved else "below_target")
+        ):
+            raise ValueError(
+                "Displayed objective attempt does not match independent measurement."
+            )
 
     @staticmethod
     def _score_comparison(first: float, second: float) -> tuple[str, str, str]:
@@ -902,6 +965,9 @@ class InteractiveWorkflow:
         context = self.controller.objective_context
         if context is None:
             raise ValueError("Objective decision rendering requires controller context.")
+        summary_html = self._objective_summary_html(
+            context, self.objective_decisions, self.controller.objective_run
+        )
         cards = []
         for menu, selection, attempt in self.objective_decisions:
             row = self._objective_attempt_row(menu, selection, attempt)
@@ -934,9 +1000,7 @@ class InteractiveWorkflow:
             prior.selected_index = None
         self.objective_attempt_cards = tuple(cards)
         self.objective_attempt_box.children = self.objective_attempt_cards
-        self.objective_summary.value = self._objective_summary_html(
-            context, self.objective_decisions, self.controller.objective_run
-        )
+        self.objective_summary.value = summary_html
         self._set_body()
 
     def _append_objective_attempt(self, menu, selection, attempt) -> None:

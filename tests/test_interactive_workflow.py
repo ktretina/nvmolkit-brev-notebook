@@ -22,7 +22,8 @@ from objective_challenge import (
     measure_panel, score_key,
 )
 from objective_fixtures import (
-    BOUNDARY_CASES, controlled_context_with_action_count, two_revision_context,
+    BOUNDARY_CASES, controlled_context_with_action_count,
+    controlled_context_without_improving_swaps, two_revision_context,
 )
 from objective_receipts import objective_receipt
 from interactive_workflow import InteractiveWorkflow, controls_for
@@ -806,6 +807,103 @@ def test_score_comparison_collapses_raw_difference_inside_one_decision_key():
 
     assert left == right == "0.500000000000"
     assert status == "tied at 1e-12 decision precision"
+
+
+def test_no_legal_step_zero_terminal_renders_empty_menu_and_truthful_reason(monkeypatch):
+    controller = Controller()
+
+    def begin_no_legal():
+        controller.calls.append("objective_begin")
+        controller.report = SimpleNamespace(evidence=())
+        controller.objective_prompt_appended = True
+        controller.objective_context = controlled_context_without_improving_swaps()
+        source = measure_panel(
+            controller.objective_context, controller.objective_context.baseline_ids
+        )
+        controller.pending_action_menu = build_action_menu(
+            controller.objective_context, source, 0
+        )
+        controller.objective_run = SimpleNamespace(
+            context=controller.objective_context,
+            attempts=(),
+            achieved=False,
+            termination_reason=TerminationReason.NO_LEGAL_IMPROVING_SWAP,
+            final_ids=source.selected_ids,
+            final_score=source.score,
+        )
+        controller.objective_evidence = SimpleNamespace(key="O01")
+        return controller.objective_context
+
+    controller.begin_objective_challenge = begin_no_legal
+    monkeypatch.setattr("interactive_workflow.objective_figures", lambda run, state: ())
+    workflow = InteractiveWorkflow(controller)
+
+    workflow._show_objective_challenge()
+
+    summary = workflow.objective_summary.value
+    assert "No legal improving swap" in summary
+    assert "No legal improving candidate actions." in summary
+    assert "attempt limit" not in summary.lower()
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        (TerminationReason.TARGET_ACHIEVED, "target achieved"),
+        (TerminationReason.BASELINE_ALREADY_OPTIMAL, "Baseline already optimal"),
+        (TerminationReason.ATTEMPT_LIMIT_REACHED, "Attempt limit reached"),
+        (TerminationReason.NO_LEGAL_IMPROVING_SWAP, "No legal improving swap"),
+        (TerminationReason.OBJECTIVE_CORRECTION_LIMIT, "correction limit reached"),
+        (TerminationReason.OBJECTIVE_PROVIDER_FAILURE, "provider failure"),
+        (TerminationReason.EVALUATION_NOT_COMPLETED, "Evaluation not completed"),
+    ],
+)
+def test_every_terminal_reason_has_an_explicit_truthful_label(reason, expected):
+    context = controlled_context_without_improving_swaps()
+    run = SimpleNamespace(
+        achieved=reason is TerminationReason.TARGET_ACHIEVED,
+        termination_reason=reason,
+    )
+
+    summary = InteractiveWorkflow._objective_summary_html(context, (), run)
+
+    assert expected in summary
+
+
+def test_step_zero_uses_visible_baseline_target_boundary_precision():
+    context = replace(
+        controlled_context_without_improving_swaps(),
+        baseline_score=0.5,
+        target_score=0.500000000001,
+    )
+
+    summary = InteractiveWorkflow._objective_summary_html(context, ())
+
+    assert "0.500000000000" in summary
+    assert "0.500000000001" in summary
+    assert "below at 1e-12 decision precision" in summary
+
+
+def test_summary_rebuilds_menu_and_rejects_self_consistent_forged_target_truth():
+    context, (first, _second) = two_revision_decisions()
+    menu, selection, attempt = first
+    selected = attempt.selected_swap
+    forged_action = replace(selected, target_status="meets_target")
+    forged_menu = replace(
+        menu,
+        actions=tuple(
+            forged_action if action.swap_id == selected.swap_id else action
+            for action in menu.actions
+        ),
+    )
+    forged_attempt = replace(
+        attempt, selected_swap=forged_action, achieved=True
+    )
+
+    with pytest.raises(ValueError):
+        InteractiveWorkflow._objective_summary_html(
+            context, ((forged_menu, selection, forged_attempt),)
+        )
 
 
 def test_attempt_and_menu_rows_escape_every_molecule_and_state_value():
