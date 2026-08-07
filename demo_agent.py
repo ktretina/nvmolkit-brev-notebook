@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
 
-from openai import AuthenticationError, OpenAI, PermissionDeniedError
+import httpx
+from openai import APIConnectionError, AuthenticationError, OpenAI, PermissionDeniedError
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -1330,7 +1331,9 @@ class BoundedWorkflowController:
                     max_tokens=400,
                     stream=False,
                 )
-            except Exception:
+            except Exception as error:
+                if not isinstance(error, (httpx.TransportError, APIConnectionError)):
+                    _raise_request_error(error)
                 if self.objective_transport_retry_used:
                     self._terminalize_objective(TerminationReason.OBJECTIVE_PROVIDER_FAILURE)
                 else:
@@ -1339,12 +1342,8 @@ class BoundedWorkflowController:
 
             try:
                 message = response.choices[0].message
-            except (AttributeError, IndexError, TypeError):
-                if self.objective_transport_retry_used:
-                    self._terminalize_objective(TerminationReason.OBJECTIVE_PROVIDER_FAILURE)
-                else:
-                    self._objective_transport_retry_pending = True
-                raise ToolCallError(_REQUEST_ERROR) from None
+            except (AttributeError, IndexError, TypeError) as error:
+                _raise_request_error(error)
             self.selection_response_count += 1
             assistant = self._objective_assistant_payload(message)
             calls = getattr(message, "tool_calls", None)

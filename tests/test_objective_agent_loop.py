@@ -2,9 +2,11 @@ import json
 from dataclasses import replace
 from types import SimpleNamespace
 
+import httpx
 import numpy as np
 import pytest
 from jsonschema import Draft202012Validator
+from openai import AuthenticationError, PermissionDeniedError
 from rdkit import Chem
 
 import demo_agent
@@ -72,6 +74,21 @@ class FakeCompletions:
 
 
 AUTO_SELECTION = object()
+
+
+def connect_error(label="objective transport failure"):
+    return httpx.ConnectError(
+        label,
+        request=httpx.Request("POST", f"{demo_agent.NVIDIA_BASE_URL}/chat/completions"),
+    )
+
+
+def request_error(status, error_type):
+    response = httpx.Response(
+        status,
+        request=httpx.Request("POST", f"{demo_agent.NVIDIA_BASE_URL}/chat/completions"),
+    )
+    return error_type("objective authorization failure", response=response, body=None)
 
 
 def response(name, arguments, *, content=None):
@@ -272,7 +289,7 @@ def test_transport_retry_counts_only_requests_then_valid_response():
     controller, completions = completed_controller([])
     controller.begin_objective_challenge()
     menu = controller.pending_action_menu
-    completions.responses.extend([Exception("secret"), selection(menu)])
+    completions.responses.extend([connect_error(), selection(menu)])
 
     with pytest.raises(demo_agent.ToolCallError):
         controller.request_objective_selection()
@@ -326,7 +343,7 @@ def test_displayed_nonmax_selection_is_rejected_when_menu_has_lower_option(monke
 
 
 def test_two_transport_failures_terminalize_without_assistant_response():
-    controller, completions = completed_controller([Exception("first"), Exception("second")])
+    controller, completions = completed_controller([connect_error("first"), connect_error("second")])
     controller.begin_objective_challenge()
     with pytest.raises(demo_agent.ToolCallError):
         controller.request_objective_selection()
@@ -338,6 +355,60 @@ def test_two_transport_failures_terminalize_without_assistant_response():
     assert controller.rejected_selection_count == 0
     assert controller.objective_run.termination_reason == "objective_provider_failure"
     assert controller.objective_evidence.key == "O01"
+
+
+@pytest.mark.parametrize(
+    "hosted_error",
+    [
+        request_error(401, AuthenticationError),
+        request_error(403, PermissionDeniedError),
+    ],
+)
+def test_objective_auth_errors_bypass_transport_retry_and_terminal_evidence(hosted_error):
+    controller, completions = completed_controller([hosted_error])
+    controller.begin_objective_challenge()
+
+    with pytest.raises(ValueError, match="API key"):
+        controller.request_objective_selection()
+
+    assert len(completions.calls) == 1
+    assert controller.provider_request_attempt_count == 1
+    assert controller.selection_response_count == 0
+    assert controller.rejected_selection_count == 0
+    assert controller.correction_prompts_sent == 0
+    assert controller.accepted_attempt_count == 0
+    assert controller._objective_transport_retry_pending is False
+    assert controller.objective_transport_retry_used is False
+    assert controller.objective_run is None
+    assert controller.objective_evidence is None
+
+
+@pytest.mark.parametrize(
+    "nontransport_failure",
+    [
+        RuntimeError("provider implementation failure"),
+        SimpleNamespace(choices=[]),
+    ],
+)
+def test_nontransport_objective_failures_are_not_retryable_or_terminalized(
+    nontransport_failure,
+):
+    controller, completions = completed_controller([nontransport_failure])
+    controller.begin_objective_challenge()
+
+    with pytest.raises(demo_agent.ToolCallError):
+        controller.request_objective_selection()
+
+    assert len(completions.calls) == 1
+    assert controller.provider_request_attempt_count == 1
+    assert controller.selection_response_count == 0
+    assert controller.rejected_selection_count == 0
+    assert controller.correction_prompts_sent == 0
+    assert controller.accepted_attempt_count == 0
+    assert controller._objective_transport_retry_pending is False
+    assert controller.objective_transport_retry_used is False
+    assert controller.objective_run is None
+    assert controller.objective_evidence is None
 
 
 @pytest.mark.parametrize(
@@ -456,21 +527,23 @@ def test_provider_content_is_transcript_only_and_never_enters_attempt_or_o01():
 
 
 @pytest.mark.parametrize(
-    "sequence_name",
+    ("sequence_name", "expected_counters", "expected_terminal"),
     [
-        "valid",
-        "nonmax-valid",
-        "wrong_pair-valid",
-        "wrong_tool-valid",
-        "malformed-valid",
-        "valid-invalid-invalid",
-        "invalid-valid-invalid",
-        "invalid-invalid",
-        "transport-valid",
-        "transport-transport",
+        ("valid", (1, 0, 0, 1, 1), None),
+        ("nonmax-valid", (1, 1, 1, 2, 2), "target_achieved"),
+        ("wrong_pair-valid", (1, 1, 1, 2, 2), None),
+        ("wrong_tool-valid", (1, 1, 1, 2, 2), None),
+        ("malformed-valid", (1, 1, 1, 2, 2), None),
+        ("valid-invalid-invalid", (1, 2, 1, 3, 3), "objective_correction_limit"),
+        ("invalid-valid-invalid", (1, 2, 1, 3, 3), "objective_correction_limit"),
+        ("invalid-invalid", (0, 2, 1, 2, 2), "objective_correction_limit"),
+        ("transport-valid", (1, 0, 0, 1, 2), None),
+        ("transport-transport", (0, 0, 0, 0, 2), "objective_provider_failure"),
     ],
 )
-def test_objective_selection_transition_table(monkeypatch, sequence_name):
+def test_objective_selection_transition_table(
+    monkeypatch, sequence_name, expected_counters, expected_terminal
+):
     context = (
         controlled_context_with_ranked_swaps()
         if sequence_name == "nonmax-valid"
@@ -482,62 +555,80 @@ def test_objective_selection_transition_table(monkeypatch, sequence_name):
     menu = controller.pending_action_menu
 
     if sequence_name == "transport-transport":
-        completions.responses.extend([Exception("first"), Exception("second")])
+        completions.responses.extend([connect_error("first"), connect_error("second")])
         with pytest.raises(demo_agent.ToolCallError):
             controller.request_objective_selection()
         with pytest.raises(demo_agent.ToolCallError):
             controller.request_objective_selection(is_transport_retry=True)
-        assert controller.objective_run.termination_reason == "objective_provider_failure"
-        return
-    if sequence_name == "transport-valid":
-        completions.responses.extend([Exception("first"), selection(menu)])
+    elif sequence_name == "transport-valid":
+        completions.responses.extend([connect_error(), selection(menu)])
         with pytest.raises(demo_agent.ToolCallError):
             controller.request_objective_selection()
         pending = controller.request_objective_selection(is_transport_retry=True)
         controller.execute_objective_selection(pending)
-        assert controller.selection_response_count == 1
-        return
-
-    invalid = selection(menu, state_id="state-0000000000000000")
-    if sequence_name == "nonmax-valid":
-        maxima = accepted_maxima(menu)
-        lower = next(i for i, action in enumerate(menu.actions) if action not in maxima)
-        completions.responses.extend([
-            selection(menu, lower), selection(menu, menu.actions.index(maxima[0]))
-        ])
-    elif sequence_name == "wrong_pair-valid":
-        completions.responses.extend([
-            selection(menu, observed_limiting_pairs=[[menu.source.selected_ids[0], menu.source.selected_ids[2]]]),
-            selection(menu),
-        ])
-    elif sequence_name == "wrong_tool-valid":
-        completions.responses.extend([
-            response("select_diverse_panel", {"legacy": True}), selection(menu)
-        ])
-    elif sequence_name == "malformed-valid":
-        completions.responses.extend([
-            raw_response("select_next_panel_swap", "{"), selection(menu)
-        ])
-    elif sequence_name in {"invalid-valid-invalid", "invalid-invalid"}:
-        completions.responses.extend([invalid, selection(menu)] if sequence_name == "invalid-valid-invalid" else [invalid, invalid])
     else:
-        completions.responses.append(selection(menu))
+        invalid = selection(menu, state_id="state-0000000000000000")
+        if sequence_name == "nonmax-valid":
+            maxima = accepted_maxima(menu)
+            lower = next(i for i, action in enumerate(menu.actions) if action not in maxima)
+            completions.responses.extend([
+                selection(menu, lower), selection(menu, menu.actions.index(maxima[0]))
+            ])
+        elif sequence_name == "wrong_pair-valid":
+            completions.responses.extend([
+                selection(menu, observed_limiting_pairs=[[menu.source.selected_ids[0], menu.source.selected_ids[2]]]),
+                selection(menu),
+            ])
+        elif sequence_name == "wrong_tool-valid":
+            completions.responses.extend([
+                response("select_diverse_panel", {"legacy": True}), selection(menu)
+            ])
+        elif sequence_name == "malformed-valid":
+            completions.responses.extend([
+                raw_response("select_next_panel_swap", "{"), selection(menu)
+            ])
+        elif sequence_name in {"invalid-valid-invalid", "invalid-invalid"}:
+            completions.responses.extend(
+                [invalid, selection(menu)]
+                if sequence_name == "invalid-valid-invalid"
+                else [invalid, invalid]
+            )
+        else:
+            completions.responses.append(selection(menu))
 
-    if sequence_name == "invalid-invalid":
-        with pytest.raises(demo_agent.ObjectiveCorrectionLimitError):
-            controller.request_objective_selection()
-        assert controller.accepted_attempt_count == 0
-        return
+        if sequence_name == "invalid-invalid":
+            with pytest.raises(demo_agent.ObjectiveCorrectionLimitError):
+                controller.request_objective_selection()
+        else:
+            pending = controller.request_objective_selection()
+            controller.execute_objective_selection(pending)
+            if sequence_name in {"valid-invalid-invalid", "invalid-valid-invalid"}:
+                next_menu = controller.pending_action_menu
+                stale = selection(next_menu, state_id="state-0000000000000000")
+                completions.responses.extend(
+                    [stale, stale]
+                    if sequence_name == "valid-invalid-invalid"
+                    else [stale]
+                )
+                with pytest.raises(demo_agent.ObjectiveCorrectionLimitError):
+                    controller.request_objective_selection()
 
-    pending = controller.request_objective_selection()
-    controller.execute_objective_selection(pending)
-    if sequence_name in {"valid-invalid-invalid", "invalid-valid-invalid"}:
-        next_menu = controller.pending_action_menu
-        stale = selection(next_menu, state_id="state-0000000000000000")
-        completions.responses.extend([stale, stale] if sequence_name == "valid-invalid-invalid" else [stale])
-        with pytest.raises(demo_agent.ObjectiveCorrectionLimitError):
-            controller.request_objective_selection()
-        assert controller.accepted_attempt_count == 1
+    assert (
+        controller.accepted_attempt_count,
+        controller.rejected_selection_count,
+        controller.correction_prompts_sent,
+        controller.selection_response_count,
+        controller.provider_request_attempt_count,
+    ) == expected_counters
+    assert len(controller.objective_attempts) == controller.accepted_attempt_count
+    actual_terminal = (
+        controller.objective_run.termination_reason
+        if controller.objective_run is not None
+        else None
+    )
+    assert actual_terminal == expected_terminal
+    assert len(completions.calls) == controller.provider_request_attempt_count
+    assert_paired(controller.session.messages)
 
 
 def safe_objective_proposals():
