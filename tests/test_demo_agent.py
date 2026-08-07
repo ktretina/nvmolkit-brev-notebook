@@ -656,6 +656,12 @@ def test_decision_basis_accepts_brief_nonempty_text():
         "decisionbases",
         "selectedIds decisionBasis",
         "SELECTEDIDS + DECISIONBASES",
+        "selectedidsdecisionbasis",
+        "selectedIdsDecisionBasis",
+        "decisionbasisselectedids",
+        "decisionBasisSelectedIds",
+        "selected_idsdecision_basis",
+        "decision_basisselected_ids",
     ],
 )
 def test_objective_decision_basis_rejects_schema_field_placeholders(value):
@@ -683,8 +689,15 @@ def test_objective_decision_basis_accepts_short_quantitative_reasons(value):
     assert parsed.decision_basis == value
 
 
-def test_objective_placeholder_guard_does_not_match_unrelated_compound_words():
-    value = "Decisionmaking improves score to 0.8."
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Decisionmaking improves score to 0.8.",
+        "selectedidsdecisionbasis improves score to 0.8.",
+        "selectedidsdecisionbasisish is unrelated prose.",
+    ],
+)
+def test_objective_placeholder_guard_does_not_match_real_compound_reasons(value):
     parsed = demo_agent.ObjectiveProposal.model_validate(
         {
             "selected_ids": ["mol-0", "mol-1", "mol-2", "mol-3"],

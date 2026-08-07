@@ -246,14 +246,35 @@ class ObjectiveProposal(_StrictModel):
             "decisionbasis": ("decision", "basis"),
             "decisionbases": ("decision", "bases"),
         }
+        normalized = "".join(re.findall(r"[a-z0-9]+", value.casefold()))
+        segments = tuple(
+            [(compound, True) for compound in compound_tokens]
+            + [(connector, False) for connector in connectors]
+        )
+        reachable = {(0, False)}
+        for index in range(len(normalized) + 1):
+            for saw_placeholder in (False, True):
+                if (index, saw_placeholder) not in reachable:
+                    continue
+                for segment, is_placeholder in segments:
+                    if normalized.startswith(segment, index):
+                        reachable.add(
+                            (
+                                index + len(segment),
+                                saw_placeholder or is_placeholder,
+                            )
+                        )
+        is_placeholder_sequence = (len(normalized), True) in reachable
         tokens = [
             part
             for token in re.findall(r"[a-z0-9]+", value.casefold())
             for part in compound_tokens.get(token, (token,))
         ]
         meaningful_tokens = [token for token in tokens if token not in connectors]
-        if not meaningful_tokens or all(
-            token in placeholder_tokens for token in meaningful_tokens
+        if (
+            is_placeholder_sequence
+            or not meaningful_tokens
+            or all(token in placeholder_tokens for token in meaningful_tokens)
         ):
             raise ValueError("Objective decision basis must be a rationale.")
         return value
