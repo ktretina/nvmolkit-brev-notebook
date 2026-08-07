@@ -169,6 +169,13 @@ def live_invalid_objective_conclusion_arguments():
     return arguments
 
 
+def schema_invalid_objective_conclusion_arguments():
+    arguments = objective_conclusion_arguments()
+    arguments["sections"][5]["theme"] = "bogus_theme"
+    arguments["sections"][5]["evidence_keys"] = ["UNKNOWN"]
+    return arguments
+
+
 def test_objective_proposal_requires_four_unique_bounded_ids():
     valid = demo_agent.ObjectiveProposal(
         selected_ids=["mol-0", "mol-2", "mol-4", "mol-6"],
@@ -869,3 +876,82 @@ def test_valid_first_objective_conclusion_does_not_append_feedback():
 
     assert result.messages[-1]["role"] == "assistant"
     assert result.messages[-1]["tool_calls"][0]["function"]["name"] == "submit_synthesis"
+
+
+def test_schema_invalid_objective_conclusion_gets_paired_feedback_then_retries():
+    controller, completions = completed_controller([
+        proposal(["mol-0", "mol-2", "mol-4", "mol-6"], "Remove the limiting analogue."),
+        response("submit_synthesis", schema_invalid_objective_conclusion_arguments()),
+        response("submit_synthesis", objective_conclusion_arguments()),
+    ])
+    controller.begin_objective_challenge()
+    pending = controller.request_objective_attempt()
+    controller.execute_objective_attempt(pending)
+
+    with pytest.raises(demo_agent.ConclusionValidationError):
+        controller.request_synthesis()
+
+    rejected, feedback = controller.session.messages[-2:]
+    assert rejected["role"] == "assistant"
+    assert rejected["tool_calls"][0]["id"] == "call-submit_synthesis"
+    assert json.loads(rejected["tool_calls"][0]["function"]["arguments"]) == {
+        "validation_issues": [
+            {"error_type": "literal_error", "field": "sections.item.theme"},
+            {
+                "error_type": "literal_error",
+                "field": "sections.item.evidence_keys.item",
+            },
+        ]
+    }
+    assert feedback["role"] == "tool"
+    assert feedback["tool_call_id"] == rejected["tool_calls"][0]["id"]
+    assert json.loads(feedback["content"]) == {
+        "accepted": False,
+        "instruction": (
+            "Resubmit a valid seven-theme objective conclusion using only the "
+            "allowed evidence_keys."
+        ),
+        "validation_issues": [
+            {"error_type": "literal_error", "field": "sections.item.theme"},
+            {
+                "error_type": "literal_error",
+                "field": "sections.item.evidence_keys.item",
+            },
+        ],
+    }
+    assert "bogus_theme" not in json.dumps((rejected, feedback))
+    assert "UNKNOWN" not in json.dumps((rejected, feedback))
+    assert controller.session.turn_count == 9
+
+    result = controller.request_synthesis()
+
+    assert result.turn_count == 10 <= demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS
+    assert result.messages[-3:-1] == (rejected, feedback)
+    assert completions.calls[-1]["messages"][-2] == feedback
+
+
+def test_schema_invalid_objective_conclusions_consume_the_bounded_turns():
+    invalid_responses = [
+        response("submit_synthesis", schema_invalid_objective_conclusion_arguments())
+        for _ in range(5)
+    ]
+    controller, completions = completed_controller([
+        proposal(["mol-0", "mol-2", "mol-4", "mol-6"], "Remove the limiting analogue."),
+        *invalid_responses,
+    ])
+    controller.begin_objective_challenge()
+    pending = controller.request_objective_attempt()
+    controller.execute_objective_attempt(pending)
+
+    for expected_turn in range(9, demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS + 1):
+        with pytest.raises(demo_agent.ConclusionValidationError):
+            controller.request_synthesis()
+        assert controller.session.turn_count == expected_turn
+        assert controller.session.messages[-2]["role"] == "assistant"
+        assert controller.session.messages[-1]["role"] == "tool"
+
+    with pytest.raises(demo_agent.ToolCallError):
+        controller.request_synthesis()
+
+    assert controller.session.turn_count == demo_agent.MAX_OBJECTIVE_SYNTHESIS_TURNS
+    assert len(completions.calls) == 6

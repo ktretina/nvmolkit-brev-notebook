@@ -800,6 +800,54 @@ def _append_rejected_hosted_call(
     session.turn_count += 1
 
 
+def _bounded_objective_synthesis_issues(
+    issues: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    """Reduce hosted schema errors to a small allowlisted retry vocabulary."""
+    allowed_error_types = {
+        "extra_forbidden",
+        "invalid_json",
+        "list_type",
+        "literal_error",
+        "missing",
+        "non_object_json",
+        "string_too_long",
+        "string_too_short",
+        "string_type",
+        "too_long",
+        "too_short",
+    }
+    bounded: list[tuple[str, str]] = []
+    for field, error_type in issues:
+        parts = field.split(".")
+        if parts in (["arguments"], ["headline"], ["sections"]):
+            bounded_field = field
+        elif len(parts) >= 2 and parts[0] == "sections" and parts[1].isdigit():
+            if len(parts) == 2:
+                bounded_field = "sections.item"
+            elif len(parts) == 3 and parts[2] in {"theme", "prose", "evidence_keys"}:
+                bounded_field = f"sections.item.{parts[2]}"
+            elif (
+                len(parts) == 4
+                and parts[2] == "evidence_keys"
+                and parts[3].isdigit()
+            ):
+                bounded_field = "sections.item.evidence_keys.item"
+            else:
+                bounded_field = "arguments"
+        else:
+            bounded_field = "arguments"
+        bounded_error = (
+            error_type if error_type in allowed_error_types else "invalid_value"
+        )
+        issue = (bounded_field, bounded_error)
+        if issue not in bounded:
+            bounded.append(issue)
+        if len(bounded) == 12:
+            break
+    return tuple(bounded)
+
+
 def _system_grounding(skill: str | None = None) -> str:
     bundled_skill = _SKILL_PATH.read_text(encoding="utf-8")
     if skill is None:
@@ -1339,7 +1387,27 @@ class BoundedWorkflowController:
                     raise
             else:
                 conclusion = validate_conclusion(conclusion, scientific.report)
-        except _HostedArgumentsValidationError:
+        except _HostedArgumentsValidationError as error:
+            if objective_active:
+                bounded_issues = _bounded_objective_synthesis_issues(error.issues)
+                rejected = _HostedArgumentsValidationError(
+                    error.stage, bounded_issues, error.call_id
+                )
+                _append_rejected_hosted_call(self.session, rejected)
+                _append_tool_result(
+                    self.session,
+                    {
+                        "accepted": False,
+                        "validation_issues": [
+                            {"field": field, "error_type": error_type}
+                            for field, error_type in bounded_issues
+                        ],
+                        "instruction": (
+                            "Resubmit a valid seven-theme objective conclusion using "
+                            "only the allowed evidence_keys."
+                        ),
+                    },
+                )
             raise ConclusionValidationError(scientific.report) from None
         return WorkflowResult(
             tuple(self.session.messages),
