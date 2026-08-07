@@ -210,7 +210,7 @@ def test_nvmolkit_gpu_workflow():
                     >= context.target_score
                     for suggestion in next_suggestions
                 )
-    assert below_target
+    assert len(below_target) == 35
 
     completions.expected_names.append("select_diverse_panel")
     completions.arguments.append(
