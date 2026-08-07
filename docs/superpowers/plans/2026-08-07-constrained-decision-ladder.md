@@ -79,6 +79,13 @@ BOUNDARY_CASES = (
     (0.5000000000005, 0.5, True),
     (0.5000000000006, 0.5, True),
 )
+
+TARGET_BOUNDARY_CASES = (
+    (0.4999999999994, 0.5, False),
+    (0.4999999999995, 0.5, True),
+    (0.5, 0.5, True),
+    (0.5000000000005, 0.5, True),
+)
 ```
 
 Import these shared helpers from `tests.objective_fixtures` in every later task instead of inventing local context/report/menu factories.
@@ -117,7 +124,7 @@ def test_improvement_uses_score_keys(candidate, current, expected):
 
 @pytest.mark.parametrize(
     ("score", "target", "expected"),
-    BOUNDARY_CASES,
+    TARGET_BOUNDARY_CASES,
 )
 def test_target_attainment_uses_the_same_score_key(score, target, expected):
     assert target_is_achieved(score, target) is expected
