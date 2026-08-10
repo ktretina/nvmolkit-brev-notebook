@@ -147,7 +147,9 @@ def test_notebook_preflight_checks_cuda_and_exact_nvmolkit_capabilities(monkeypa
     assert imported == list(capabilities)
 
 
-def test_notebook_preflight_uses_hidden_prompt_without_leaking_secret(monkeypatch, capsys):
+def test_notebook_preflight_reads_protected_launch_key_without_prompt(
+    monkeypatch, capsys, tmp_path
+):
     class FakeCuda:
         @staticmethod
         def is_available():
@@ -171,11 +173,50 @@ def test_notebook_preflight_uses_hidden_prompt_without_leaking_secret(monkeypatc
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
-    monkeypatch.setattr("getpass.getpass", lambda prompt: SECRET)
+    key_path = tmp_path / "NVIDIA_API_KEY"
+    key_path.write_text(VALID_API_KEY, encoding="utf-8")
+    key_path.chmod(0o600)
+    monkeypatch.setattr(demo_agent, "_NVIDIA_API_KEY_PATH", key_path, raising=False)
+    monkeypatch.setattr(
+        "getpass.getpass",
+        lambda prompt: pytest.fail("notebook preflight must not prompt for a key"),
+    )
 
-    assert demo_agent.notebook_preflight() == SECRET
+    assert demo_agent.notebook_preflight() == VALID_API_KEY
     captured = capsys.readouterr()
-    assert SECRET not in captured.out + captured.err
+    assert VALID_API_KEY not in captured.out + captured.err
+
+
+def test_notebook_preflight_fails_closed_when_launch_key_is_missing(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.setattr(
+        demo_agent,
+        "_NVIDIA_API_KEY_PATH",
+        tmp_path / "missing" / "NVIDIA_API_KEY",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "getpass.getpass",
+        lambda prompt: pytest.fail("notebook preflight must not prompt for a key"),
+    )
+
+    with pytest.raises(ValueError, match="Redeploy.*NVIDIA_API_KEY"):
+        demo_agent.notebook_preflight()
+
+
+def test_notebook_preflight_rejects_launch_key_with_unsafe_permissions(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    key_path = tmp_path / "NVIDIA_API_KEY"
+    key_path.write_text(VALID_API_KEY, encoding="utf-8")
+    key_path.chmod(0o644)
+    monkeypatch.setattr(demo_agent, "_NVIDIA_API_KEY_PATH", key_path, raising=False)
+
+    with pytest.raises(ValueError, match="mode 0600"):
+        demo_agent.notebook_preflight()
 
 
 def test_notebook_preflight_rejects_non_cpython_312(monkeypatch):

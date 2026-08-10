@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
+import stat
 from copy import deepcopy
 from dataclasses import dataclass, field, fields as dataclass_fields, is_dataclass
 from pathlib import Path
@@ -79,9 +81,9 @@ MAX_OBJECTIVE_HOSTED_TURNS = 12
 MAX_OBJECTIVE_SYNTHESIS_TURNS = 13
 AUTH_GUIDANCE = (
     "NVIDIA_API_KEY must be a hosted Developer API key. Generate it from the "
-    "Nemotron build.nvidia.com model page, then paste only the bare key; it "
-    "starts with nvapi-. An NGC personal key is a different credential and "
-    "must not be substituted."
+    "Nemotron build.nvidia.com model page, then provide it in the Brev "
+    "Launchable Setup values; it starts with nvapi-. An NGC personal key is "
+    "a different credential and must not be substituted."
 )
 _REQUEST_ERROR = (
     "The hosted Nemotron request failed. Check network access and model availability."
@@ -94,6 +96,8 @@ _SYNTHESIS_PROMPT = (
 )
 _SKILL_PATH = Path(__file__).resolve().parent / "skills" / "nvmolkit" / "SKILL.md"
 _DATA_PATH = Path(__file__).resolve().parent / "data" / "sample_molecules.csv"
+_NVIDIA_API_KEY_PATH = Path.home() / ".config" / "nvmolkit" / "NVIDIA_API_KEY"
+_MAX_API_KEY_FILE_BYTES = 4096
 
 _NVMOLKIT_CAPABILITIES = (
     ("nvmolkit.fingerprints", "MorganFingerprintGenerator"),
@@ -104,10 +108,52 @@ _NVMOLKIT_CAPABILITIES = (
 )
 
 
+def _load_nvidia_api_key() -> str:
+    api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
+    if api_key:
+        return api_key
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(_NVIDIA_API_KEY_PATH, flags)
+    except FileNotFoundError as exc:
+        raise ValueError(
+            "NVIDIA_API_KEY is unavailable. Redeploy the Brev Launchable and "
+            "provide NVIDIA_API_KEY in Setup values."
+        ) from exc
+    except OSError as exc:
+        raise ValueError(
+            "The stored NVIDIA_API_KEY could not be opened securely. Redeploy "
+            "the Brev Launchable."
+        ) from exc
+
+    try:
+        file_status = os.fstat(descriptor)
+        if not stat.S_ISREG(file_status.st_mode):
+            raise ValueError("The stored NVIDIA_API_KEY must be a regular file.")
+        if file_status.st_uid != os.getuid():
+            raise ValueError("The stored NVIDIA_API_KEY must be owned by this user.")
+        if stat.S_IMODE(file_status.st_mode) != 0o600:
+            raise ValueError("The stored NVIDIA_API_KEY must have mode 0600.")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as key_file:
+            descriptor = -1
+            api_key = key_file.read(_MAX_API_KEY_FILE_BYTES + 1).strip()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    if len(api_key.encode("utf-8")) > _MAX_API_KEY_FILE_BYTES:
+        raise ValueError("The stored NVIDIA_API_KEY is unexpectedly large.")
+    if not api_key:
+        raise ValueError(
+            "NVIDIA_API_KEY is unavailable. Redeploy the Brev Launchable and "
+            "provide NVIDIA_API_KEY in Setup values."
+        )
+    return api_key
+
+
 def notebook_preflight() -> str:
-    """Validate the supported GPU runtime and return a hidden hosted API key."""
-    import getpass
-    import os
+    """Validate the supported GPU runtime and return the launch-time API key."""
     import sys
 
     assert sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 12), (
@@ -120,14 +166,7 @@ def notebook_preflight() -> str:
         module = __import__(module_name, fromlist=(entry_point,))
         assert hasattr(module, entry_point), f"Missing nvMolKit capability: {entry_point}"
 
-    api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
-    if not api_key:
-        api_key = getpass.getpass(
-            "Hosted NVIDIA Developer API key (nvapi-; input hidden): "
-        ).strip()
-    if not api_key:
-        raise ValueError("NVIDIA_API_KEY is required.")
-    return api_key
+    return _load_nvidia_api_key()
 
 STAGES = (
     "inspect_library",

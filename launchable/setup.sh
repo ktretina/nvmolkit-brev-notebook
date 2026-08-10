@@ -12,6 +12,27 @@ fi
 
 cd "${PROJECT_DIR}"
 
+if [[ -z "${NVIDIA_API_KEY:-}" ]]; then
+  echo "Error: NVIDIA_API_KEY is required in Brev Setup values." >&2
+  exit 1
+fi
+
+api_key_directory="${HOME}/.config/nvmolkit"
+api_key_path="${HOME}/.config/nvmolkit/NVIDIA_API_KEY"
+install -d -m 700 "${api_key_directory}"
+chmod 700 "${api_key_directory}"
+umask 077
+api_key_temp="$(mktemp "${api_key_path}.tmp.XXXXXX")"
+cleanup_api_key_temp() {
+  rm -f -- "${api_key_temp}"
+}
+trap cleanup_api_key_temp EXIT
+printf '%s' "${NVIDIA_API_KEY}" >"${api_key_temp}"
+chmod 600 "${api_key_temp}"
+mv -f -- "${api_key_temp}" "${api_key_path}"
+trap - EXIT
+unset NVIDIA_API_KEY
+
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "Error: this Launchable requires Linux x86-64 with CPython 3.12; found OS $(uname -s)." >&2
   exit 1
@@ -94,4 +115,4 @@ else:
     )
 PY
 
-echo "Setup complete. Brev manages JupyterLab and its Secure Link on port 8888."
+echo "Setup complete. The launch credential is protected for notebook use. Brev manages JupyterLab and its Secure Link on port 8888."

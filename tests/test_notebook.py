@@ -224,7 +224,7 @@ def test_fixed_artifacts_and_skill_provenance_are_intact():
     skill_bytes = (REPO_ROOT / "skills" / "nvmolkit" / "SKILL.md").read_bytes()
     assert "ce151c15470991c8cb9a0efdd531a124c346ca5b" in provenance
     assert hashlib.sha256(skill_bytes).hexdigest() in provenance
-    for relative_path in ("launchable/fields.md", "data/sample_molecules.csv"):
+    for relative_path in ("data/sample_molecules.csv",):
         committed = subprocess.run(
             ["git", "show", f"31c8567b6ed743e56e87ee3475b4c143a7614c9b:{relative_path}"],
             cwd=REPO_ROOT, check=True, capture_output=True,
@@ -247,8 +247,8 @@ def test_readme_preserves_launch_and_separate_acceptance_gates():
         assert "Only my organization" in instructions
         assert "Secure Link" in instructions
         assert "CPython 3.12" in instructions
-        assert "hidden" in instructions.lower()
-        assert "not rely on setup-variable persistence" in instructions
+        assert "mode `0600`" in instructions
+        assert "hidden prompt" not in instructions.lower()
     lowered = readme.lower()
     hosted_gate = next(
         line.lower()
@@ -291,6 +291,10 @@ def test_setup_uses_brev_managed_python_and_leaves_jupyter_to_brev():
     assert '"${PYTHON}" -m pip install --upgrade pip' in setup
     assert '"${PYTHON}" -m pip install -r requirements.txt' in setup
     assert 'url = "http://127.0.0.1:8888/api"' in setup
+    assert '${HOME}/.config/nvmolkit/NVIDIA_API_KEY' in setup
+    assert 'chmod 600 "${api_key_temp}"' in setup
+    assert "NEMOTRON_MODEL" not in setup
+    assert "JUPYTER_PORT" not in setup
     assert all(forbidden not in setup for forbidden in ("jupyter lab", "nohup", "PID_FILE", "kill ", "-m venv"))
     assert "jupyterlab==" not in requirements
 
@@ -319,18 +323,42 @@ esac
 [[ "${1:-}" == "-s" ]] && printf 'Linux\n' || printf 'x86_64\n'
 """, encoding="utf-8")
     (fake_bin / "uname").chmod(0o755)
-    env = os.environ | {"HOME": str(fake_home), "INVOCATION_LOG": str(log), "PATH": f"{fake_bin}:/usr/bin:/bin"}
+    launch_key = "nvapi-setup-sentinel-must-not-leak"
+    env = os.environ | {
+        "HOME": str(fake_home),
+        "INVOCATION_LOG": str(log),
+        "NVIDIA_API_KEY": launch_key,
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+    }
     copied_setup = tmp_path / "brev-generated-setup.sh"
     copied_setup.write_bytes((REPO_ROOT / "launchable" / "setup.sh").read_bytes())
     execution_dir = tmp_path / "execution"
     execution_dir.mkdir()
     result = subprocess.run(["bash", str(copied_setup)], cwd=execution_dir, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+    key_directory = fake_home / ".config" / "nvmolkit"
+    key_file = key_directory / "NVIDIA_API_KEY"
+    assert key_file.read_text(encoding="utf-8") == launch_key
+    assert key_directory.stat().st_mode & 0o777 == 0o700
+    assert key_file.stat().st_mode & 0o777 == 0o600
+    assert launch_key not in result.stdout + result.stderr
     invocations = log.read_text(encoding="utf-8").splitlines()
     assert any("sys.implementation.name" in line for line in invocations)
     assert invocations.index("MODULE ensurepip --upgrade ") < invocations.index("MODULE pip install --upgrade")
     assert invocations.index("MODULE pip install --upgrade") < invocations.index("MODULE pip install -r")
     assert invocations.index("MODULE pip install -r") < invocations.index("SMOKE") < invocations.index("HEALTH")
+
+
+def test_launchable_contract_fixes_storage_model_port_and_one_setup_value():
+    fields = (REPO_ROOT / "launchable" / "fields.md").read_text(encoding="utf-8")
+    assert "75 GiB" in fields
+    assert "50 GiB" not in fields
+    assert "`NVIDIA_API_KEY`" in fields
+    assert "required" in fields.lower()
+    assert "no default" in fields.lower()
+    assert "`nvidia/nemotron-3-nano-30b-a3b`" in fields
+    assert "port `8888`" in fields
+    assert "Remove both `NEMOTRON_MODEL` and `JUPYTER_PORT`" in fields
 
 
 def health_probe_source():

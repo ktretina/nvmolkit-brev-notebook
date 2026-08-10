@@ -24,12 +24,13 @@ After all six approvals complete through MMFF94, click **Run Objective Challenge
 
 Use Linux x86-64 with CPython 3.12 in VM mode. Enable Jupyter in the Brev Console so the Brev-managed Jupyter runtime is available; the setup script installs into that runtime and does not manage the Jupyter service.
 
-1. Create the Launchable in the Brev web Console using [`launchable/fields.md`](launchable/fields.md).
-2. Enable Jupyter and keep access set to **Only my organization** with a Secure Link on port `8888`; do not expose unrestricted public TCP.
-3. Deploy, open JupyterLab through the Secure Link, and run `notebooks/nvmolkit_nemotron_demo.ipynb`.
-4. From the Nemotron model page on build.nvidia.com, generate a hosted NVIDIA Developer API key beginning with `nvapi-`. Provide `NVIDIA_API_KEY` to the kernel or paste only the bare key into the hidden prompt. This is distinct from an NGC personal key. Do not rely on setup-variable persistence, and never save the key in notebook outputs, files, logs, screenshots, or chat.
+1. Create the Launchable in the Brev web Console using [`launchable/fields.md`](launchable/fields.md). Set the default disk storage to **75 GiB**.
+2. Keep only one Launch parameter: required `NVIDIA_API_KEY`, with no default. Remove `NEMOTRON_MODEL` and `JUPYTER_PORT` from Setup values.
+3. Enable Jupyter and keep access set to **Only my organization** with a Secure Link on the fixed port `8888`; do not expose unrestricted public TCP. The hosted model is fixed to `nvidia/nemotron-3-nano-30b-a3b`.
+4. From the Nemotron model page on build.nvidia.com, generate a hosted NVIDIA Developer API key beginning with `nvapi-`. Enter it once in Setup values when you deploy. The setup script stores it outside the repository in `${HOME}/.config/nvmolkit/NVIDIA_API_KEY` with file mode `0600`, and notebook preflight loads it automatically without a prompt. This is distinct from an NGC personal key. Never expose the key in notebook outputs, logs, screenshots, or chat.
+5. Open JupyterLab through the Secure Link and run `notebooks/nvmolkit_nemotron_demo.ipynb`.
 
-**Qualification:** This demo is designed for fresh deployment only and is not yet live-qualified. GPU execution, hosted inference, rendered visuals, and Secure Link access each require live acceptance. After a VM stop/start, verify the managed Jupyter service, restart the notebook kernel, rerun the notebook, and enter the key again if prompted; do not claim automatic restart without live evidence.
+**Qualification:** This demo is designed for fresh deployment only and is not yet live-qualified. GPU execution, hosted inference, rendered visuals, Secure Link access, and credential persistence each require live acceptance. The protected key file remains on the VM disk until the environment is deleted or the file is removed. After a VM stop/start, verify the managed Jupyter service, restart the notebook kernel, and rerun the notebook; do not claim automatic restart without live evidence.
 
 ## Verify
 
