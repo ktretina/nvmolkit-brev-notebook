@@ -77,6 +77,12 @@ def test_notebook_is_one_clean_eight_cell_story():
         assert cell.outputs == []
 
 
+def test_preflight_copy_describes_automatic_launch_key_loading():
+    preflight = read_notebook().cells[1].source
+    assert "loads the protected NVIDIA API key supplied during Brev deployment" in preflight
+    assert "hidden notebook prompt" not in preflight
+
+
 def test_notebook_exposes_one_goal_and_one_public_agent_call():
     notebook = read_notebook()
     code = notebook_code(notebook)
@@ -359,6 +365,7 @@ def test_launchable_contract_fixes_storage_model_port_and_one_setup_value():
     assert "`nvidia/nemotron-3-nano-30b-a3b`" in fields
     assert "port `8888`" in fields
     assert "Remove both `NEMOTRON_MODEL` and `JUPYTER_PORT`" in fields
+    assert "paste the current contents of `launchable/setup.sh`" in fields
 
 
 def health_probe_source():

@@ -202,7 +202,10 @@ def test_notebook_preflight_fails_closed_when_launch_key_is_missing(
         lambda prompt: pytest.fail("notebook preflight must not prompt for a key"),
     )
 
-    with pytest.raises(ValueError, match="Redeploy.*NVIDIA_API_KEY"):
+    with pytest.raises(
+        ValueError,
+        match="saved Launchable setup script.*launchable/setup.sh.*redeploy",
+    ):
         demo_agent.notebook_preflight()
 
 

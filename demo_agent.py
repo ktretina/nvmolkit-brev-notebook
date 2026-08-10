@@ -118,8 +118,9 @@ def _load_nvidia_api_key() -> str:
         descriptor = os.open(_NVIDIA_API_KEY_PATH, flags)
     except FileNotFoundError as exc:
         raise ValueError(
-            "NVIDIA_API_KEY is unavailable. Redeploy the Brev Launchable and "
-            "provide NVIDIA_API_KEY in Setup values."
+            "The saved Launchable setup script did not store NVIDIA_API_KEY. "
+            "In the Brev Console, paste the current launchable/setup.sh, then "
+            "redeploy and provide NVIDIA_API_KEY in Setup values."
         ) from exc
     except OSError as exc:
         raise ValueError(
@@ -146,8 +147,9 @@ def _load_nvidia_api_key() -> str:
         raise ValueError("The stored NVIDIA_API_KEY is unexpectedly large.")
     if not api_key:
         raise ValueError(
-            "NVIDIA_API_KEY is unavailable. Redeploy the Brev Launchable and "
-            "provide NVIDIA_API_KEY in Setup values."
+            "The saved Launchable setup script did not store NVIDIA_API_KEY. "
+            "In the Brev Console, paste the current launchable/setup.sh, then "
+            "redeploy and provide NVIDIA_API_KEY in Setup values."
         )
     return api_key
 
