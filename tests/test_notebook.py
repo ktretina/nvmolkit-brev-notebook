@@ -146,16 +146,17 @@ def test_intro_and_run_text_make_attribution_and_grounding_explicit():
         "click **Run Objective Challenge**",
         "minimum pairwise Tanimoto distance",
         "at most three attempts",
-        "Observe → Candidate actions → Nemotron choice → Execute → Measure",
-        "Python evaluator receipt",
-        "score trajectory",
-        "attempt ledger",
+        "Observe panel → Candidate menu → Agent chooses → Execute panel → Measure panel",
+        "actual retained RDKit molecules",
+        "input is a validated menu of legal molecular swaps",
+        "output is one selected swap ID",
+        "progress bar after every attempt",
         "Evidence-Backed Conclusion",
         "validated, approved agent tool call",
         "corresponding RDKit inspection or nvMolKit invocation",
         "Button callback failures remain in the active card",
         "do not mark the notebook cell failed",
-        "full deterministic action menu",
+        "up to four ranked candidate replacements",
         "state-bound argmax action selection",
         "co-limiting pairs",
         "Python-owned headline and facts",
@@ -166,6 +167,9 @@ def test_intro_and_run_text_make_attribution_and_grounding_explicit():
         "qualitative interpretation is not automatically fact-verified",
         "Validated Nemotron proposal",
         "review the Nemotron proposal",
+        "Python evaluator receipt",
+        "score trajectory and attempt ledger",
+        "full deterministic action menu",
     ):
         assert stale not in combined
 
@@ -175,6 +179,9 @@ def test_readme_uses_current_objective_and_receipt_contracts():
     for phrase in (
         "state-bound argmax action selection",
         "all co-limiting pairs",
+        "Observe panel → Candidate menu → Agent chooses → Execute panel → Measure panel",
+        "actual retained RDKit molecules",
+        "progress bar after every attempt",
         "Python-owned headline and facts",
         "Nemotron-selected predicate-true emphasis",
         "RUN_GPU_TESTS=1 .venv/bin/python -m pytest -q",
@@ -187,6 +194,9 @@ def test_readme_uses_current_objective_and_receipt_contracts():
         "validated Nemotron proposal",
         "proposes up to three objective panels",
         "drafts one evidence-linked",
+        "full deterministic menu",
+        "Python evaluator receipt",
+        "score trajectory and attempt ledger",
     ):
         assert stale not in readme
 

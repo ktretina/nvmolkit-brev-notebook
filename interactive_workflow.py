@@ -18,7 +18,6 @@ from objective_challenge import (
     TerminationReason, accepted_maxima, build_action_menu, measure_panel,
     build_objective_evidence, objective_figures, score_key, target_is_achieved,
 )
-from objective_receipts import objective_receipt
 
 
 _MODELS = demo_agent.TOOL_ARGUMENT_MODELS
@@ -98,7 +97,7 @@ class InteractiveWorkflow:
         self.objective_card: widgets.VBox | None = None
         self.objective_button: widgets.Button | None = None
         self.objective_summary = widgets.HTML()
-        self.objective_attempt_cards: tuple[widgets.Accordion, ...] = ()
+        self.objective_attempt_cards: tuple[widgets.HTML, ...] = ()
         self.objective_decisions: tuple[
             tuple[ObjectiveActionMenu, demo_agent.ObjectiveSelection, ObjectiveAttempt | None],
             ...,
@@ -577,31 +576,6 @@ class InteractiveWorkflow:
             )
         precision = max((values[3] for values in display_values), default=3)
         scientific = any(values[4] for values in display_values)
-        score_items = [
-            (
-                "Baseline",
-                context.baseline_score,
-                "Current largest-clusters-first policy",
-            )
-        ]
-        score_items.extend(
-            (
-                f"Attempt {attempt.attempt_number}",
-                attempt.score,
-                "Goal achieved" if attempt.achieved else "Revise",
-            )
-            for attempt in attempts
-        )
-        score_strip = "".join(
-            (
-                "<span style='display:inline-block;padding:6px 10px;margin:2px;"
-                "border:1px solid #aaa;border-radius:12px'>"
-                f"<b>{escape(label)}</b> "
-                f"{InteractiveWorkflow._objective_scalar(score, precision, scientific)}<br>"
-                f"<small>{escape(status)}</small></span>"
-            )
-            for label, score, status in score_items
-        )
         baseline_pairs = " · ".join(
             f"{escape(first)} / {escape(second)}"
             for first, second in baseline.limiting_pairs
@@ -621,11 +595,9 @@ class InteractiveWorkflow:
             f"<small><b>Target status:</b> {escape(baseline_status)}</small>"
             "</section>"
         )
-        decision_ladder = baseline_row + "".join(
-            InteractiveWorkflow._objective_attempt_row(
-                menu, selection, attempt, context
-            )
-            for menu, selection, attempt in decisions
+        current_score = attempts[-1].score if attempts else baseline.score
+        current_progress = InteractiveWorkflow._objective_current_progress_html(
+            context, current_score
         )
         terminal_actions = ""
         final = ""
@@ -671,6 +643,8 @@ class InteractiveWorkflow:
                 )
             final = f"<p><b>Outcome:</b> {escape(label)}</p>"
         return (
+            InteractiveWorkflow._objective_story_style()
+            + "<div aria-label='Objective decision ladder'>"
             "<p><b>Objective:</b> Select four MMFF94-parameter-eligible compounds "
             "that maximize minimum pairwise Morgan/Tanimoto distance.</p>"
             "<p><b>Constraints:</b> four unique supplied IDs · four distinct fused "
@@ -678,8 +652,7 @@ class InteractiveWorkflow:
             "<p><b>Target:</b> D_min ≥ "
             f"{InteractiveWorkflow._objective_scalar(context.target_score, precision, scientific)} "
             "(80% of attainable improvement over baseline)</p>"
-            f"<div aria-label='Objective decision ladder'>{decision_ladder}</div>"
-            f"{terminal_actions}<div>{score_strip}</div>{final}"
+            f"{current_progress}{baseline_row}{terminal_actions}{final}</div>"
         )
 
     @staticmethod
@@ -766,8 +739,187 @@ class InteractiveWorkflow:
         return "<div><b>Candidate actions</b>" + "".join(rows) + "</div>"
 
     @staticmethod
-    def _objective_attempt_row(menu, selection, attempt=None, context=None) -> str:
-        """Render one exact menu/selection/commit decision without model rationale."""
+    def _objective_molecule_svg(context, molecules, molecule_id: str) -> str:
+        """Draw one retained objective molecule as an inline RDKit SVG."""
+        if molecules is None:
+            return ""
+        if type(molecules) not in {list, tuple}:
+            raise ValueError("Objective molecule rendering requires retained molecules.")
+        matches = tuple(
+            candidate
+            for candidate in context.candidates
+            if candidate.molecule_id == molecule_id
+        )
+        if len(matches) != 1:
+            raise ValueError("Objective molecule ID does not resolve uniquely.")
+        candidate = matches[0]
+        if not 0 <= candidate.molecule_index < len(molecules):
+            raise ValueError("Objective molecule provenance is outside retained state.")
+        molecule = molecules[candidate.molecule_index]
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import Draw
+
+            if not isinstance(molecule, Chem.Mol) or molecule.GetNumAtoms() < 1:
+                raise ValueError
+            svg = str(
+                Draw.MolsToGridImage(
+                    [molecule],
+                    molsPerRow=1,
+                    subImgSize=(220, 135),
+                    useSVG=True,
+                )
+            )
+        except Exception as error:
+            raise ValueError("Objective molecule could not be drawn safely.") from error
+        start = svg.find("<svg")
+        end = svg.rfind("</svg>")
+        if start < 0 or end < start:
+            raise ValueError("RDKit did not return an inline SVG molecule drawing.")
+        return svg[start : end + len("</svg>")]
+
+    @staticmethod
+    def _objective_molecule_tile(
+        context,
+        molecules,
+        molecule_id: str,
+        *,
+        status: str = "",
+        caption: str | None = None,
+    ) -> str:
+        svg = InteractiveWorkflow._objective_molecule_svg(
+            context, molecules, molecule_id
+        )
+        drawing = (
+            svg
+            if svg
+            else "<span class='odc-structure-unavailable'>Structure unavailable</span>"
+        )
+        safe_id = escape(molecule_id, quote=True)
+        return (
+            f"<div class='odc-molecule {escape(status, quote=True)}' "
+            f"data-molecule-id='{safe_id}'>"
+            f"<div class='odc-drawing'>{drawing}</div>"
+            f"<span>{escape(caption or molecule_id)}</span></div>"
+        )
+
+    @staticmethod
+    def _objective_progress_html(context, score: float, attempt_number: int) -> str:
+        required = context.target_score - context.baseline_score
+        achieved = score - context.baseline_score
+        fraction = 1.0 if score_key(required) == 0 else achieved / required
+        percent = max(0.0, min(100.0, 100.0 * fraction))
+        remaining = max(0.0, context.target_score - score)
+        score_text, target_text, remaining_text, _precision, _scientific = (
+            InteractiveWorkflow._objective_display_values(
+                score, context.target_score, remaining
+            )
+        )
+        status = InteractiveWorkflow._score_comparison(score, context.target_score)[2]
+        percent_text = f"{percent:.0f}%"
+        if score_key(score) < score_key(context.target_score) and percent_text == "100%":
+            percent_text = "<100%"
+        return (
+            f"<section class='odc-progress' data-objective-progress='{attempt_number}' "
+            f"aria-label='Attempt {attempt_number} progress'>"
+            "<div class='odc-progress-head'>"
+            f"<b>After Attempt {attempt_number}: D_min = {score_text}</b>"
+            f"<span>{remaining_text.lstrip('+')} from target · {escape(percent_text)} of required improvement achieved</span>"
+            "</div><div class='odc-progress-track'>"
+            f"<span class='odc-progress-fill' style='width:{percent:.1f}%'></span>"
+            "<span class='odc-progress-baseline'>baseline</span>"
+            f"<span class='odc-progress-current' style='left:{percent:.1f}%'>{score_text}</span>"
+            f"<span class='odc-progress-target'>{target_text} target</span>"
+            f"</div><small>{escape(status)}</small></section>"
+        )
+
+    @staticmethod
+    def _objective_current_progress_html(context, score: float) -> str:
+        required = context.target_score - context.baseline_score
+        achieved = score - context.baseline_score
+        fraction = 1.0 if score_key(required) == 0 else achieved / required
+        percent = max(0.0, min(100.0, 100.0 * fraction))
+        remaining = max(0.0, context.target_score - score)
+        score_text, target_text, remaining_text, _precision, _scientific = (
+            InteractiveWorkflow._objective_display_values(
+                score, context.target_score, remaining
+            )
+        )
+        status = InteractiveWorkflow._score_comparison(score, context.target_score)[2]
+        percent_text = f"{percent:.0f}%"
+        if score_key(score) < score_key(context.target_score) and percent_text == "100%":
+            percent_text = "<100%"
+        baseline_text = InteractiveWorkflow._score_comparison(
+            context.baseline_score, context.target_score
+        )[0]
+        return (
+            "<section class='odc-progress odc-current-progress' "
+            "data-objective-current-progress='true' aria-label='Current objective progress'>"
+            "<div class='odc-progress-head'>"
+            f"<b>Current D_min = {score_text}</b>"
+            f"<span>{remaining_text.lstrip('+')} from target · {escape(percent_text)} of required improvement achieved</span>"
+            "</div><div class='odc-progress-track'>"
+            f"<span class='odc-progress-fill' style='width:{percent:.1f}%'></span>"
+            f"<span class='odc-progress-baseline'><b>Baseline</b> {baseline_text}</span>"
+            f"<span class='odc-progress-current' style='left:{percent:.1f}%'>{score_text} current</span>"
+            f"<span class='odc-progress-target'>{target_text} target</span>"
+            f"</div><small>{escape(status)}</small></section>"
+        )
+
+    @staticmethod
+    def _objective_unmeasured_progress_html(
+        context, score: float, attempt_number: int
+    ) -> str:
+        required = context.target_score - context.baseline_score
+        achieved = score - context.baseline_score
+        fraction = 1.0 if score_key(required) == 0 else achieved / required
+        percent = max(0.0, min(100.0, 100.0 * fraction))
+        remaining = max(0.0, context.target_score - score)
+        score_text, target_text, remaining_text, _precision, _scientific = (
+            InteractiveWorkflow._objective_display_values(
+                score, context.target_score, remaining
+            )
+        )
+        return (
+            f"<section class='odc-progress' data-objective-progress='{attempt_number}' "
+            "data-progress-status='unmeasured' aria-label='Last measured objective progress'>"
+            "<div class='odc-progress-head'>"
+            f"<b>Last measured D_min = {score_text}</b>"
+            "<span>no progress update · selection was not evaluated</span>"
+            "</div><div class='odc-progress-track'>"
+            f"<span class='odc-progress-fill' style='width:{percent:.1f}%'></span>"
+            "<span class='odc-progress-baseline'>baseline</span>"
+            f"<span class='odc-progress-current' style='left:{percent:.1f}%'>{score_text}</span>"
+            f"<span class='odc-progress-target'>{target_text} target</span>"
+            f"</div><small>{remaining_text.lstrip('+')} remained before the target</small></section>"
+        )
+
+    @staticmethod
+    def _objective_story_style() -> str:
+        return """
+<style>
+.odc-attempt{border-left:4px solid #6c757d;padding:12px;margin:10px 0 18px;background:#181818;color:#f2f2f2}
+.odc-attempt.odc-revise{border-left-color:#D68A00}.odc-attempt.odc-achieved{border-left-color:#76B900}
+.odc-attempt h4{margin:0 0 8px}.odc-steps{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));border:1px solid #4a4a4a}
+.odc-step{min-width:0;padding:10px;border-right:1px solid #4a4a4a}.odc-step:last-child{border-right:0}.odc-step-title{display:flex;gap:7px;align-items:center;margin-bottom:8px;font-weight:600}.odc-step-number{display:inline-grid;place-items:center;width:22px;height:22px;background:#76B900;color:#101010}
+.odc-molecules{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.odc-molecule{min-width:0;padding:5px;background:linear-gradient(145deg,#fff,#edf1e9);border:2px solid #d2d7cf;border-radius:8px;box-shadow:0 2px 7px rgba(0,0,0,.24);text-align:center;color:#202020}.odc-molecule.odc-weak,.odc-molecule.odc-out{border-color:#E57373}.odc-molecule.odc-in{border-color:#76B900}.odc-molecule.odc-limit{border-color:#F2B84B}.odc-drawing{height:72px;display:grid;place-items:center;overflow:hidden}.odc-drawing svg{width:100%;height:100%;display:block}.odc-molecule span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;font-weight:600}
+.odc-candidates{display:grid;gap:6px}.odc-candidate{display:grid;grid-template-columns:62px 1fr;gap:7px;align-items:center;padding:5px;background:#f4f5f1;color:#202020;border:1px solid #d2d7cf;border-radius:7px}.odc-candidate.odc-selected{border:2px solid #76B900}.odc-candidate .odc-molecule{padding:2px;border:0;box-shadow:none}.odc-candidate .odc-drawing{height:42px}.odc-candidate small{display:block}.odc-choice{display:grid;grid-template-columns:1fr 22px 1fr;gap:4px;align-items:center}.odc-arrow{text-align:center;color:#9bd43e;font-size:22px}.odc-step p{margin:8px 0 0;color:#c7c7c7;font-size:12px}.odc-score{margin-top:8px;color:#9bd43e;font-size:18px;font-weight:600}
+.odc-explain{display:grid;grid-template-columns:1.2fr 1fr;gap:12px;margin-top:12px}.odc-explain-panel{padding:12px;background:#222;border:1px solid #4a4a4a}.odc-change{display:grid;grid-template-columns:1fr 34px 1fr;gap:8px;align-items:center}.odc-change .odc-drawing{height:105px}.odc-why{margin:0;padding-left:20px}.odc-why li{margin:8px 0}
+.odc-progress{margin-top:11px;padding:11px 12px;background:#222;border:1px solid #4a4a4a}.odc-progress-head{display:flex;justify-content:space-between;gap:12px;align-items:baseline}.odc-progress-head span{color:#9bd43e}.odc-progress-track{position:relative;height:40px;margin-top:6px}.odc-progress-track:before{content:'';position:absolute;left:0;right:0;top:18px;height:6px;background:#383838}.odc-progress-fill{position:absolute;left:0;top:18px;height:6px;background:#76B900}.odc-progress-baseline,.odc-progress-current,.odc-progress-target{position:absolute;top:26px;font-size:10px;color:#bbb}.odc-progress-baseline{left:0}.odc-progress-current{color:#9bd43e;transform:translateX(-50%)}.odc-progress-target{right:0;color:#F2B84B}
+@media(max-width:900px){.odc-steps{grid-template-columns:1fr}.odc-step{border-right:0;border-bottom:1px solid #4a4a4a}.odc-step:last-child{border-bottom:0}.odc-explain{grid-template-columns:1fr}.odc-progress-head{display:block}.odc-progress-head span{display:block;margin-top:4px}}
+</style>"""
+
+    @staticmethod
+    def _objective_attempt_row(
+        menu,
+        selection,
+        attempt=None,
+        context=None,
+        *,
+        molecules=None,
+        show_explanation=False,
+    ) -> str:
+        """Render one validated decision as a concise five-step molecule story."""
         if type(menu) is not ObjectiveActionMenu or type(selection) is not demo_agent.ObjectiveSelection:
             raise ValueError("Objective rows require exact public menu and selection types.")
         source_ids = menu.source.selected_ids
@@ -836,31 +988,39 @@ class InteractiveWorkflow:
         target_score = (
             objective_context.target_score if objective_context is not None else None
         )
-        action_rows = []
-        for action in menu.actions:
-            pairs = " · ".join(
-                f"{escape(first)} / {escape(second)}" for first, second in action.limiting_pairs
+        source_limiters = {
+            molecule_id for pair in menu.source.limiting_pairs for molecule_id in pair
+        }
+        source_tiles = "".join(
+            InteractiveWorkflow._objective_molecule_tile(
+                objective_context,
+                molecules,
+                molecule_id,
+                status="odc-weak" if molecule_id in source_limiters else "",
             )
-            resulting = ", ".join(escape(item) for item in action.resulting_ids)
-            action_rows.append(
-                "<li aria-label='Candidate action'>"
-                f"<b>{escape(action.swap_id)}</b>: replace={escape(action.replace_id)}; "
-                f"replacement={escape(action.replacement_id)}; resulting panel={resulting}; "
-                f"predicted score={action.predicted_score!r}; "
-                f"score_key={action.predicted_score_key}; delta={action.score_delta!r}; "
-                f"resulting co-limiting pairs={pairs}; target comparison="
-                f"{escape(InteractiveWorkflow._objective_target_status(action.predicted_score, target_score) if type(target_score) is float else action.target_status)}"
-                "</li>"
+            for molecule_id in source_ids
+        )
+        candidate_rows = []
+        for action in menu.actions[:4]:
+            tile = InteractiveWorkflow._objective_molecule_tile(
+                objective_context,
+                molecules,
+                action.replacement_id,
+                status="odc-in" if action.swap_id == selected.swap_id else "",
             )
-        candidate_html = (
-            "<ul>" + "".join(action_rows) + "</ul>"
-            if action_rows
-            else "<p>No legal improving candidate actions.</p>"
+            candidate_rows.append(
+                "<div class='odc-candidate "
+                f"{'odc-selected' if action.swap_id == selected.swap_id else ''}' "
+                "aria-label='Candidate molecule action'>"
+                f"{tile}<div><b>{escape(action.swap_id)}</b>"
+                f"<small>D_min {action.predicted_score!r} · Δ {action.score_delta:+.3f}</small>"
+                "</div></div>"
+            )
+        omitted_count = max(0, len(menu.actions) - len(candidate_rows))
+        omitted = (
+            f"<p>+{omitted_count} additional legal action{'s' if omitted_count != 1 else ''}</p>"
+            if omitted_count else ""
         )
-        source_pairs = " · ".join(
-            f"{escape(first)} / {escape(second)}" for first, second in menu.source.limiting_pairs
-        )
-        source_panel = ", ".join(escape(item) for item in source_ids)
         maximum_key = max(action.predicted_score_key for action in menu.actions)
         maximum_count = sum(
             action.predicted_score_key == maximum_key for action in menu.actions
@@ -871,62 +1031,22 @@ class InteractiveWorkflow:
             else "the unique argmax at 1e-12 decision precision"
         )
         attempt_number = menu.accepted_attempt_count + 1
-        if objective_context is not None:
-            receipt = objective_receipt(
-                objective_context, selection, menu, selected, attempt
-            )
-            validated_selection = receipt.validated_selection
-            planned_command = receipt.planned_command
-            python_evaluation = (
-                "context = objective_context\n"
-                "pending_action_menu = objective_action_menu\n"
-                "selected_action = resolved_menu_action\n"
-                f"attempt_number = {attempt_number}\n"
-                f"{receipt.python_evaluation.replace('accepted_attempt_count + 1', 'attempt_number')}"
-            )
-            executed_measurement = receipt.executed_measurement
-        else:
-            validated_selection = (
-                "ObjectiveSelection("
-                f"state_id={selection.state_id!r}, swap_id={selection.swap_id!r}, "
-                f"observed_limiting_pairs={menu.source.limiting_pairs!r}, "
-                f"decision_rule={selection.decision_rule!r})"
-            )
-            planned_command = (
-                "select_next_panel_swap("
-                f"state_id={menu.state_id!r}, swap_id={selected.swap_id!r}, "
-                "decision_rule='maximize_predicted_minimum_distance')"
-            )
-            python_evaluation = (
-                "context = objective_context\n"
-                "pending_action_menu = objective_action_menu\n"
-                "selected_action = resolved_menu_action\n"
-                f"attempt_number = {attempt_number}\n"
-                "result = evaluate_selected_swap(\n"
-                "    context,\n"
-                "    pending_action_menu,\n"
-                "    selected_action,\n"
-                "    attempt_number,\n"
-                ")"
-            )
-            executed_measurement = None
         if attempt is None:
             accent = "#6c757d"
-            explanation = (
-                "Controller explanation: Python validation: "
-                f"swap_id={selected.swap_id!r} replaces "
-                f"replace_id={selected.replace_id!r} with "
-                f"replacement_id={selected.replacement_id!r}; the action affects "
-                f"every prior co-limiting pair {menu.source.limiting_pairs!r}; "
-                f"it was {maximum_description}; evaluation was not completed, so no "
-                "measured improvement or target result is claimed."
-            )
-            measure = (
-                "Evaluation not completed; selection validated but unmeasured. "
-                "No measurement is available.<br>"
-                f"<small>{escape(explanation)}</small>"
-            )
             outcome = "Evaluation not completed"
+            executed_ids = source_ids
+            execute_detail = (
+                "Not executed. The selection was validated, but the source panel remains active."
+            )
+            measured_ids = source_ids
+            measured_limiters = source_limiters
+            measured_score = menu.source.score
+            measured_pairs = "Measurement unavailable"
+            measure_detail = (
+                "Evaluation was not completed. The selection is validated but unmeasured; "
+                "the last measured source panel is shown, and no new D_min or target "
+                "result is claimed."
+            )
         else:
             if (
                 type(attempt) is not ObjectiveAttempt
@@ -945,6 +1065,12 @@ class InteractiveWorkflow:
                 raise ValueError("Committed attempt does not match its menu-bound selection.")
             accent = "#76B900" if attempt.achieved else "#D68A00"
             outcome = "Goal achieved" if attempt.achieved else "Revise"
+            executed_ids = selected.resulting_ids
+            execute_detail = "Python validates four unique IDs and four clusters."
+            measured_ids = attempt.selected_ids
+            measured_limiters = {
+                molecule_id for pair in attempt.limiting_pairs for molecule_id in pair
+            }
             measured_pairs = " · ".join(
                 f"{escape(first)} / {escape(second)}" for first, second in attempt.limiting_pairs
             )
@@ -967,46 +1093,82 @@ class InteractiveWorkflow:
                 if type(target_score) is float
                 else selected.target_status
             )
-            target_outcome = (
-                "the target was achieved" if attempt.achieved
-                else "the target remains unmet"
+            measured_score = attempt.score
+            measure_detail = (
+                f"Co-limiting pair{'s' if len(attempt.limiting_pairs) != 1 else ''}: "
+                f"{measured_pairs}. Limiting Tanimoto similarities: {similarities}. "
+                f"Constraints passed. {target_comparison}."
             )
-            explanation = (
-                "Controller explanation: Python validation: "
-                f"swap_id={selected.swap_id!r} replaces "
-                f"replace_id={selected.replace_id!r} with "
-                f"replacement_id={selected.replacement_id!r}; the action affects "
-                f"every prior co-limiting pair {menu.source.limiting_pairs!r}; "
-                f"it was {maximum_description}; measured D_min improved "
-                f"{menu.source.score!r} → {attempt.score!r} "
-                f"(delta {selected.score_delta!r}); {target_outcome}; "
-                f"{target_comparison}."
+        chosen_out = InteractiveWorkflow._objective_molecule_tile(
+            objective_context, molecules, selected.replace_id, status="odc-out",
+            caption=f"{selected.replace_id} out",
+        )
+        chosen_in = InteractiveWorkflow._objective_molecule_tile(
+            objective_context, molecules, selected.replacement_id, status="odc-in",
+            caption=f"{selected.replacement_id} in",
+        )
+        executed_tiles = "".join(
+            InteractiveWorkflow._objective_molecule_tile(
+                objective_context,
+                molecules,
+                molecule_id,
+                status="odc-in" if molecule_id == selected.replacement_id else "",
             )
-            measure = (
-                f"D_min {attempt.score!r}; score_key={attempt.score_key}; "
-                f"delta={selected.score_delta!r}; co-limiting pairs={measured_pairs}; "
-                f"limiting Tanimoto similarities={similarities}; constraints passed=true; "
-                f"target comparison={escape(target_comparison)}<br>"
-                f"<pre data-receipt='executed-measurement'>{escape(executed_measurement or '')}</pre>"
-                f"<small>{escape(explanation)}</small>"
+            for molecule_id in executed_ids
+        )
+        measured_tiles = "".join(
+            InteractiveWorkflow._objective_molecule_tile(
+                objective_context,
+                molecules,
+                molecule_id,
+                status="odc-limit" if molecule_id in measured_limiters else "",
             )
+            for molecule_id in measured_ids
+        )
+        explain = ""
+        if show_explanation:
+            explain = (
+                "<div class='odc-explain'>"
+                "<section class='odc-explain-panel' aria-label='Molecular change'>"
+                "<h4>Molecular change</h4><div class='odc-change'>"
+                f"{chosen_out}<span class='odc-arrow'>→</span>{chosen_in}</div></section>"
+                "<section class='odc-explain-panel' aria-label='Why this choice'>"
+                "<h4>Why this choice?</h4><ol class='odc-why'>"
+                f"<li>It was {escape(maximum_description)}.</li>"
+                "<li>It removes one molecule from every current co-limiting pair.</li>"
+                "<li>It preserves four unique molecules from four fused Butina clusters.</li>"
+                "</ol></section></div>"
+            )
+        progress = (
+            InteractiveWorkflow._objective_progress_html(
+                objective_context, measured_score, attempt_number
+            )
+            if attempt is not None
+            else InteractiveWorkflow._objective_unmeasured_progress_html(
+                objective_context, measured_score, attempt_number
+            )
+        )
+        css_class = (
+            "odc-achieved" if attempt is not None and attempt.achieved
+            else "odc-revise" if attempt is not None else "odc-unmeasured"
+        )
         return (
-            f"<div style='border-left:3px solid {accent};padding:6px 10px;"
-            "margin:6px 0' aria-label='Objective attempt'>"
-            f"<b>Attempt {attempt_number}</b> · {escape(outcome)}<br>"
-            "<section aria-label='Observe'><b>Observe:</b> "
-            f"<small>state {escape(menu.state_id)}; source panel {source_panel}; "
-            f"source D_min {menu.source.score!r}; score_key={menu.source.score_key}; "
-            f"co-limiting pairs {source_pairs}; target comparison="
-            f"{escape(InteractiveWorkflow._objective_target_status(menu.source.score, target_score) if type(target_score) is float else 'target supplied by the objective context')}</small></section>"
-            "<section aria-label='Deterministically evaluated candidate actions'>"
-            f"<b>Deterministically evaluated candidate actions:</b>{candidate_html}</section>"
-            "<section aria-label='Nemotron choice'><b>Nemotron choice:</b> "
-            f"<pre data-receipt='validated-selection'>{escape(validated_selection)}</pre>"
-            f"<pre data-receipt='planned-command'>{escape(planned_command)}</pre></section>"
-            "<section aria-label='Execute'><b>Execute:</b> "
-            f"<pre data-receipt='python-evaluation'>{escape(python_evaluation)}</pre></section>"
-            f"<section aria-label='Measure'><b>Measure:</b> {measure}</section></div>"
+            InteractiveWorkflow._objective_story_style()
+            + f"<article class='odc-attempt {css_class}' style='border-left-color:{accent}' "
+            "aria-label='Objective attempt'>"
+            f"<h4>Attempt {attempt_number} · {escape(outcome)}</h4>"
+            "<div class='odc-steps'>"
+            "<section class='odc-step' aria-label='Objective step'><div class='odc-step-title'><span class='odc-step-number'>1</span><span>Observe panel</span></div>"
+            f"<div class='odc-molecules'>{source_tiles}</div><p>D_min {menu.source.score!r} · limiting pair{'s' if len(menu.source.limiting_pairs) != 1 else ''}: {escape(str(menu.source.limiting_pairs))}</p></section>"
+            "<section class='odc-step' aria-label='Objective step'><div class='odc-step-title'><span class='odc-step-number'>2</span><span>Candidate menu</span></div>"
+            f"<div class='odc-candidates'>{''.join(candidate_rows)}</div>{omitted}</section>"
+            "<section class='odc-step' aria-label='Objective step'><div class='odc-step-title'><span class='odc-step-number'>3</span><span>Agent chooses</span></div>"
+            f"<div class='odc-choice'>{chosen_out}<span class='odc-arrow'>→</span>{chosen_in}</div><p>Highest calculated D_min in the validated menu.</p></section>"
+            "<section class='odc-step' aria-label='Objective step'><div class='odc-step-title'><span class='odc-step-number'>4</span><span>Execute panel</span></div>"
+            f"<div class='odc-molecules'>{executed_tiles}</div><p>{escape(execute_detail)}</p></section>"
+            "<section class='odc-step' aria-label='Objective step'><div class='odc-step-title'><span class='odc-step-number'>5</span><span>Measure panel</span></div>"
+            f"<div class='odc-molecules'>{measured_tiles}</div><div class='odc-score'>D_min {measured_score!r}</div><p>{escape(measure_detail)}</p></section>"
+            f"</div>{explain}{progress}</article>"
         )
 
     @staticmethod
@@ -1122,24 +1284,19 @@ class InteractiveWorkflow:
         summary_html = self._objective_summary_html(
             context, self.objective_decisions, self.controller.objective_run
         )
+        molecules = getattr(self.controller.session.state, "molecules", None)
         cards = []
-        for menu, selection, attempt in self.objective_decisions:
+        last_index = len(self.objective_decisions) - 1
+        for index, (menu, selection, attempt) in enumerate(self.objective_decisions):
             row = self._objective_attempt_row(
-                menu, selection, attempt, self.controller.objective_context
+                menu,
+                selection,
+                attempt,
+                self.controller.objective_context,
+                molecules=molecules,
+                show_explanation=index == last_index,
             )
-            result_label = (
-                "Evaluation not completed" if attempt is None
-                else "Goal achieved" if attempt.achieved else "Revise"
-            )
-            details_html = row
-            card = widgets.Accordion((widgets.HTML(details_html),))
-            card.set_title(
-                0, f"Attempt {menu.accepted_attempt_count + 1} — {result_label}"
-            )
-            card.selected_index = 0
-            cards.append(card)
-        for prior in cards[:-1]:
-            prior.selected_index = None
+            cards.append(widgets.HTML(row))
         self.objective_attempt_cards = tuple(cards)
         self.objective_attempt_box.children = self.objective_attempt_cards
         self.objective_summary.value = summary_html

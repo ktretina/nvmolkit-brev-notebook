@@ -1,9 +1,8 @@
-import ast
 import inspect
 import re
 from io import BytesIO
 from dataclasses import fields, replace
-from html import escape, unescape
+from html import escape
 from types import SimpleNamespace
 
 import httpx
@@ -34,7 +33,6 @@ from objective_findings import (
     FindingCatalog, build_evidence_snapshot, build_finding_catalog_from_snapshot,
     build_measured_summary,
 )
-from objective_receipts import objective_receipt
 from interactive_workflow import InteractiveWorkflow, controls_for
 from ipywidgets.embed import dependency_state, embed_minimal_html
 
@@ -128,7 +126,10 @@ class Session:
     def __init__(self, controller):
         self.controller = controller
         self.turn_count = 0
-        self.state = SimpleNamespace(phase=demo_agent.WorkflowPhase.NEW)
+        self.state = SimpleNamespace(
+            phase=demo_agent.WorkflowPhase.NEW,
+            molecules=optimized_state().molecules,
+        )
     def eligible_tool_name(self): return demo_agent.STAGES[self.controller.index] if self.controller.index < 6 else "submit_synthesis"
 
 
@@ -635,19 +636,22 @@ def test_baseline_step_zero_is_measured_before_any_attempt(monkeypatch):
     assert controller.objective_attempts == []
 
 
-def test_attempt_card_persists_complete_decision_ladder_without_model_rationale(monkeypatch):
+def test_attempt_card_persists_complete_five_step_molecule_story(monkeypatch):
     workflow, _controller = completed_objective_workflow(monkeypatch)
 
     first = combined_html(workflow.objective_attempt_cards[0])
     for label in (
-        "Observe",
-        "Deterministically evaluated candidate actions",
-        "Nemotron choice",
-        "Execute",
-        "Measure",
+        "Observe panel",
+        "Candidate menu",
+        "Agent chooses",
+        "Execute panel",
+        "Measure panel",
     ):
         assert label in first
-    assert "select_next_panel_swap" in first
+    assert first.count("aria-label='Objective step'") == 5
+    assert "<svg" in first
+    assert "data-objective-progress='1'" in first
+    assert "data-receipt" not in first
     assert "decision_basis" not in first
 
 
@@ -705,86 +709,103 @@ def test_attempt_row_rejects_forged_selection_and_committed_attempt():
 
 
 def test_attempt_rows_bind_initial_and_revision_to_exact_menu_provenance():
-    _context, (first, second) = two_revision_decisions()
+    context, (first, second) = two_revision_decisions()
 
-    first_row = InteractiveWorkflow._objective_attempt_row(*first)
-    second_row = InteractiveWorkflow._objective_attempt_row(*second)
+    first_row = InteractiveWorkflow._objective_attempt_row(*first, context)
+    second_row = InteractiveWorkflow._objective_attempt_row(*second, context)
 
     assert "Attempt 1" in first_row and "Attempt 2" in second_row
     assert first[0].source.selected_ids != second[0].source.selected_ids
     assert second[0].source == first[2].measurement
 
 
-def test_attempt_card_renders_complete_decision_ladder_without_rationale():
+def test_objective_attempt_renders_five_step_molecule_story_with_progress_bar():
+    context, (first, _second) = two_revision_decisions()
+    state = optimized_state()
+
+    rendered = InteractiveWorkflow._objective_attempt_row(
+        *first,
+        context,
+        molecules=state.molecules,
+        show_explanation=True,
+    )
+
+    labels = (
+        "Observe panel",
+        "Candidate menu",
+        "Agent chooses",
+        "Execute panel",
+        "Measure panel",
+    )
+    positions = tuple(rendered.index(f">{label}<") for label in labels)
+    assert positions == tuple(sorted(positions))
+    assert rendered.count("aria-label='Objective step'") == 5
+    assert rendered.count("data-molecule-id=") >= 16
+    assert "<svg" in rendered
+    assert "Molecular change" in rendered
+    assert "Why this choice?" in rendered
+    assert "data-objective-progress" in rendered
+    assert "required improvement achieved" in rendered
+
+
+def test_objective_attempt_keeps_visible_story_concise_and_receipt_free():
+    context, (first, _second) = two_revision_decisions()
+
+    rendered = InteractiveWorkflow._objective_attempt_row(
+        *first,
+        context,
+        molecules=optimized_state().molecules,
+        show_explanation=True,
+    )
+
+    assert rendered.count("aria-label='Candidate molecule action'") <= 4
+    for obsolete in (
+        "ObjectiveSelection(",
+        "PanelMeasurement(",
+        "data-receipt",
+        "Full candidate menu",
+        "Validated JSON",
+        "executed Python",
+        "measurement receipt",
+        "Molecules carry the state through the story",
+    ):
+        assert obsolete not in rendered
+
+
+def test_attempt_card_renders_ordered_scientific_story_without_raw_receipts():
     context, (first, _second) = two_revision_decisions()
     menu, selection, attempt = first
     rendered = InteractiveWorkflow._objective_attempt_row(
-        menu, selection, attempt, context
+        menu,
+        selection,
+        attempt,
+        context,
+        molecules=optimized_state().molecules,
+        show_explanation=True,
     )
 
     section_labels = (
-        "Observe",
-        "Deterministically evaluated candidate actions",
-        "Nemotron choice",
-        "Execute",
-        "Measure",
+        "Observe panel",
+        "Candidate menu",
+        "Agent chooses",
+        "Execute panel",
+        "Measure panel",
     )
     positions = tuple(
-        rendered.index(f"aria-label='{label}'") for label in section_labels
+        rendered.index(f">{label}<") for label in section_labels
     )
     assert positions == tuple(sorted(positions))
-    assert rendered.count("aria-label='Observe'") == 1
-    assert rendered.count("aria-label='Deterministically evaluated candidate actions'") == 1
-    assert rendered.count("aria-label='Nemotron choice'") == 1
-    assert rendered.count("aria-label='Execute'") == 1
-    assert rendered.count("aria-label='Measure'") == 1
+    assert rendered.count("aria-label='Objective step'") == 5
     for phrase in (
-        "source panel",
-        "target comparison=",
-        "replace=",
-        "replacement=",
-        "resulting panel=",
-        "predicted score=",
-        "score_key=",
-        "delta=",
-        "resulting co-limiting pairs=",
-        "ObjectiveSelection(",
-        "Python validation:",
-        "at 1e-12 decision precision",
-        "select_next_panel_swap(",
-        "context = objective_context",
-        "pending_action_menu = objective_action_menu",
-        "selected_action = resolved_menu_action",
-        f"attempt_number = {attempt.attempt_number}",
-        "evaluate_selected_swap(\n    context,\n    pending_action_menu,\n    selected_action,\n    attempt_number,\n)",
-        "evaluate_selected_swap",
-        "limiting Tanimoto similarities=",
-        "constraints passed=true",
-        "Controller explanation:",
-        "measured D_min improved",
+        "D_min",
+        "Limiting Tanimoto similarities",
+        "Constraints passed",
+        "Molecular change",
+        "Why this choice?",
+        "required improvement achieved",
+        "four fused Butina clusters",
     ):
         assert phrase in rendered
-    assert rendered.count("ObjectiveSelection(") == 1
-    assert rendered.count("select_next_panel_swap(") == 1
-    assert rendered.count("evaluate_selected_swap(") == 1
-    assert rendered.count("PanelMeasurement(") == 1
-    receipt = objective_receipt(context, selection, menu, attempt.selected_swap, attempt)
-    unescaped = unescape(rendered)
-    assert receipt.validated_selection in unescaped
-    assert receipt.planned_command in unescaped
-    assert receipt.executed_measurement in unescaped
-    nemotron_section = re.search(
-        r"<section aria-label='Nemotron choice'>(.*?)</section>",
-        rendered,
-        re.DOTALL,
-    )
-    execute_section = re.search(
-        r"<section aria-label='Execute'>(.*?)</section>", rendered, re.DOTALL
-    )
-    assert nemotron_section is not None and execute_section is not None
-    assert receipt.planned_command in unescape(nemotron_section.group(1))
-    assert "select_next_panel_swap(" not in unescape(execute_section.group(1))
-    assert "evaluate_selected_swap(" in unescape(execute_section.group(1))
     maximum_count = sum(
         action.predicted_score_key
         == max(item.predicted_score_key for item in menu.actions)
@@ -795,30 +816,12 @@ def test_attempt_card_renders_complete_decision_ladder_without_rationale():
         if maximum_count > 1
         else "the unique argmax at 1e-12 decision precision"
     )
-    assert (
-        "Controller explanation: Python validation: "
-        f"swap_id={attempt.selected_swap.swap_id!r} replaces "
-        f"replace_id={attempt.selected_swap.replace_id!r} with "
-        f"replacement_id={attempt.selected_swap.replacement_id!r}; the action "
-        "affects every prior co-limiting pair "
-        f"{menu.source.limiting_pairs!r}; it was {maximum_description}; measured "
-        f"D_min improved {menu.source.score!r} → {attempt.score!r} "
-        f"(delta {attempt.selected_swap.score_delta!r}); "
-        "the target remains unmet; "
-        f"{InteractiveWorkflow._objective_target_status(attempt.score, context.target_score)}."
-    ) in unescaped
-    evaluation_match = re.search(
-        r"data-receipt='python-evaluation'>(.*?)</pre>", rendered, re.DOTALL
-    )
-    assert evaluation_match is not None
-    evaluation_source = unescape(evaluation_match.group(1))
-    evaluation_tree = ast.parse(evaluation_source)
-    evaluation_call = evaluation_tree.body[-1].value
-    assert isinstance(evaluation_call, ast.Call)
-    assert ast.unparse(evaluation_call) == (
-        "evaluate_selected_swap(context, pending_action_menu, selected_action, "
-        "attempt_number)"
-    )
+    assert maximum_description in rendered
+    assert rendered.count("data-objective-progress='1'") == 1
+    assert "ObjectiveSelection(" not in rendered
+    assert "PanelMeasurement(" not in rendered
+    assert "data-receipt" not in rendered
+    assert "evaluate_selected_swap" not in rendered
     assert "rationale" not in rendered.lower()
 
 
@@ -901,13 +904,13 @@ def test_revision_row_rejects_wrong_attempt_number_or_missing_selected_swap():
 
 
 def test_attempt_row_uses_neutral_amber_and_green_for_unmeasured_miss_and_success():
-    _context, (first, second) = two_revision_decisions()
+    context, (first, second) = two_revision_decisions()
 
     assert "#6c757d" in InteractiveWorkflow._objective_attempt_row(
-        first[0], first[1], None
+        first[0], first[1], None, context
     )
-    assert "#D68A00" in InteractiveWorkflow._objective_attempt_row(*first)
-    assert "#76B900" in InteractiveWorkflow._objective_attempt_row(*second)
+    assert "#D68A00" in InteractiveWorkflow._objective_attempt_row(*first, context)
+    assert "#76B900" in InteractiveWorkflow._objective_attempt_row(*second, context)
 
 
 @pytest.mark.parametrize(
@@ -1190,6 +1193,21 @@ def test_step_zero_uses_visible_baseline_target_boundary_precision():
     assert "below at 1e-12 decision precision" in summary
 
 
+def test_progress_bar_never_rounds_a_real_remaining_gap_to_success():
+    context = replace(
+        controlled_context_without_improving_swaps(),
+        baseline_score=0.4,
+        target_score=0.500000000001,
+    )
+
+    rendered = InteractiveWorkflow._objective_current_progress_html(context, 0.5)
+
+    assert "0.000 from target" not in rendered
+    assert "· 100% of required improvement achieved" not in rendered
+    assert "from target" in rendered
+    assert "&lt;100% of required improvement achieved" in rendered
+
+
 def test_summary_rebuilds_menu_and_rejects_self_consistent_forged_target_truth():
     context, (first, _second) = two_revision_decisions()
     menu, selection, attempt = first
@@ -1226,7 +1244,9 @@ def test_attempt_and_menu_rows_escape_every_molecule_and_state_value():
 
     rendered = (
         InteractiveWorkflow._objective_action_menu_html(context, menu)
-        + InteractiveWorkflow._objective_attempt_row(menu, selection, first)
+        + InteractiveWorkflow._objective_attempt_row(
+            menu, selection, first, context
+        )
     )
 
     assert "mol<0>" not in rendered
@@ -1245,7 +1265,12 @@ def test_evaluation_failure_persists_neutral_unmeasured_selection_and_never_succ
     rendered = combined_html(workflow.objective_card)
     assert "Evaluation not completed" in rendered
     assert "validated but unmeasured" in rendered
-    assert "executed" not in rendered.lower()
+    assert "Not executed" in rendered
+    assert "Last measured D_min" in rendered
+    assert "no progress update" in rendered
+    assert "After Attempt 1" not in rendered
+    assert "Python validates four unique IDs" not in rendered
+    assert "Python executed" not in rendered
     assert "success" not in rendered.lower()
     assert "Goal achieved" not in rendered
     assert controller.calls.count("objective_proposal") == 1
@@ -1296,11 +1321,18 @@ def test_completed_real_workflow_root_survives_embed_with_ladder_conclusion_and_
     rendered = target.read_text(encoding="utf-8")
     for text in (
         "Step 0",
-        "Deterministically evaluated candidate actions",
-        "Nemotron choice",
+        "Observe panel",
+        "Candidate menu",
+        "Agent chooses",
+        "Execute panel",
+        "Measure panel",
+        "required improvement achieved",
         "Evidence-Backed Conclusion",
     ):
         assert text in rendered
+    assert rendered.count("data-objective-progress") >= 2
+    assert "data-molecule-id" in rendered
+    assert "data-receipt" not in rendered
     assert rendered.count("iVBOR") == 2
     if finding_selection_status == "selected":
         assert rendered.count("agent-selected evidence emphasis") == 7
@@ -1440,7 +1472,7 @@ def test_render_revalidates_the_entire_retained_conclusion_container():
         ready_interactive_workflow()._render_workflow_result(conclusion)
 
 
-def test_objective_card_retains_attempts_receipts_scores_and_limiting_pairs(monkeypatch):
+def test_objective_card_retains_molecule_attempts_scores_and_limiting_pairs(monkeypatch):
     monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
     monkeypatch.setattr("interactive_workflow.objective_figures", lambda run, state: ())
     workflow, controller = started()
@@ -1449,22 +1481,22 @@ def test_objective_card_retains_attempts_receipts_scores_and_limiting_pairs(monk
 
     text = " ".join(html_text(card) for card in workflow.objective_attempt_cards)
     assert len(workflow.objective_attempt_cards) == 2
-    assert "ObjectiveSelection(" in text
-    assert "PanelMeasurement(" in text
-    assert "data-receipt='planned-command'" in text
-    assert "data-receipt='python-evaluation'" in text
-    assert "select_next_panel_swap" in text
-    assert "evaluate_selected_swap" in text
+    assert text.count("aria-label='Objective step'") == 10
+    assert text.count("data-objective-progress") == 2
+    assert "<svg" in text
+    assert "Molecular change" in text
+    assert "Why this choice?" in text
+    assert "data-receipt" not in text
+    assert "ObjectiveSelection(" not in text
+    assert "PanelMeasurement(" not in text
     assert "decision_basis" not in text and "Decision summary" not in text
-    assert "D_min" in text and "co-limiting pairs" in text
+    assert "D_min" in text and "limiting pair" in text
     assert "Revise" in text and "Goal achieved" in text
     assert "Baseline" in workflow.objective_summary.value
-    assert "Attempt 1" in workflow.objective_summary.value
-    assert "Attempt 2" in workflow.objective_summary.value
     assert [attempt.score for attempt in controller.objective_attempts] == [0.40, 0.90]
 
 
-def test_objective_attempts_render_as_observe_act_measure_decision_ladder(monkeypatch):
+def test_objective_attempts_render_as_left_to_right_molecule_stories(monkeypatch):
     monkeypatch.setattr(demo_agent, "_display_conclusion", lambda result: None)
     monkeypatch.setattr("interactive_workflow.objective_figures", lambda run, state: ())
     workflow, _controller = started()
@@ -1473,41 +1505,47 @@ def test_objective_attempts_render_as_observe_act_measure_decision_ladder(monkey
 
     summary = workflow.objective_summary.value
     details = " ".join(html_text(card) for card in workflow.objective_attempt_cards)
-    assert "Observe" in summary
-    assert "Deterministically evaluated candidate actions" in summary
-    assert "Nemotron choice" in summary
-    assert "Execute" in summary
-    assert "Measure" in summary
-    assert "candidate-0-&gt;candidate-4" in summary
-    assert "state-" in summary
-    assert "Controller explanation:" in summary
-    assert "the target remains unmet" in summary
-    assert "the target was achieved" in summary
-    assert "#D68A00" in summary
-    assert "#76B900" in summary
-    assert "data-receipt='planned-command'" in details
-    assert "select_next_panel_swap(" in details
+    assert "Step 0" in summary
+    assert "Current D_min" in summary
+    assert "data-objective-current-progress" in summary
+    assert "aria-label='Objective attempt'" not in summary
+    positions = tuple(
+        details.index(label)
+        for label in (
+            "Observe panel",
+            "Candidate menu",
+            "Agent chooses",
+            "Execute panel",
+            "Measure panel",
+        )
+    )
+    assert positions == tuple(sorted(positions))
+    assert "candidate-0-&gt;candidate-4" in details
+    assert "data-receipt" not in details
+    assert "select_next_panel_swap(" not in details
     assert "Goal achieved" in details
 
 
-def test_objective_receipt_render_failure_after_commit_never_reexecutes(monkeypatch):
+def test_objective_molecule_render_failure_after_commit_never_reexecutes(monkeypatch):
     workflow, controller = started()
     complete_six_stages(workflow)
     reached = []
 
-    real_receipt = objective_receipt
+    from rdkit.Chem import Draw
 
-    def fail_receipt(*args, **kwargs):
+    real_draw = Draw.MolsToGridImage
+
+    def fail_draw(*args, **kwargs):
         reached.append("render")
         if len(reached) == 1:
-            raise RuntimeError("injected receipt render failure")
-        return real_receipt(*args, **kwargs)
+            raise RuntimeError("injected molecule render failure")
+        return real_draw(*args, **kwargs)
 
-    monkeypatch.setattr("interactive_workflow.objective_receipt", fail_receipt)
+    monkeypatch.setattr(Draw, "MolsToGridImage", fail_draw)
     workflow.objective_button.click()
     workflow.objective_button.click()
 
-    assert len(reached) >= 4
+    assert len(reached) >= 16
     assert len(controller.objective_attempts) == 2
     assert len([
         call for call in controller.calls
