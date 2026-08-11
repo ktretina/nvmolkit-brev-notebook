@@ -13,16 +13,21 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Final, NoReturn
 
+import pandas as pd
+from rdkit import Chem
+
 from chemistry_workflow import (
     RepresentativePolicy,
     StageResult,
     WorkflowState,
+    build_workflow_report,
     discover_fused_butina_clusters,
     embed_representative_conformers,
     generate_morgan_fingerprints,
     inspect_library,
     measure_tanimoto_similarity,
     optimize_conformers_mmff94,
+    validated_similarity_matrix,
 )
 
 SCHEMA_VERSION: Final = 1
@@ -44,6 +49,21 @@ STAGE_DIRECTORIES: Final = {
     "discover_fused_butina_clusters": "04-clusters",
     "embed_representative_conformers": "05-conformers",
     "optimize_conformers_mmff94": "06-mmff94",
+}
+STAGE_DATA_NAMES: Final = {
+    "inspect_library": (),
+    "generate_morgan_fingerprints": (),
+    "measure_tanimoto_similarity": (
+        "top_similarity_pairs.csv",
+        "similarity_matrix.csv",
+    ),
+    "discover_fused_butina_clusters": ("cluster_assignments.csv",),
+    "embed_representative_conformers": (),
+    "optimize_conformers_mmff94": (
+        "mmff94_energies.csv",
+        "optimized_conformers.sdf",
+        "workflow_evidence.json",
+    ),
 }
 PROFILE: Final[dict[str, Any]] = {
     "fingerprint_radius": 2,
@@ -72,6 +92,7 @@ __all__ = (
     "RepresentativePolicy",
     "SCHEMA_VERSION",
     "STAGE_DIRECTORIES",
+    "STAGE_DATA_NAMES",
     "STAGE_ORDER",
     "STAGE_SPECS",
     "StageResult",
@@ -193,6 +214,21 @@ class WorkflowExecution:
     state: WorkflowState
     stage_results: tuple[StageResult, ...]
     gpu: GpuIdentity | None
+
+
+@dataclass(frozen=True)
+class _SdfExportRecord:
+    record_id: str
+    molecule: Any
+    conformer_index: int
+    properties: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class _StageDataExports:
+    csv_files: tuple[tuple[str, Any], ...] = ()
+    sdf_file: tuple[str, tuple[_SdfExportRecord, ...]] | None = None
+    json_files: tuple[tuple[str, dict[str, Any]], ...] = ()
 
 
 WorkflowExecutor = Callable[[str], WorkflowExecution]
@@ -648,6 +684,377 @@ def _formatted_json(value: Any) -> str:
     )
 
 
+def _invalid_chemistry_export() -> RuntimeError:
+    return RuntimeError("Workshop chemistry export is invalid.")
+
+
+def _validated_library_rows(state: WorkflowState) -> list[tuple[str, int]]:
+    if len(state.records) != 256:
+        raise _invalid_chemistry_export()
+    rows: list[tuple[str, int]] = []
+    for record in state.records:
+        if type(record) is not dict:
+            raise _invalid_chemistry_export()
+        molecule_id = record.get("id")
+        source_row = record.get("source_row")
+        if (
+            type(molecule_id) is not str
+            or not molecule_id
+            or type(source_row) is not int
+            or source_row < 0
+        ):
+            raise _invalid_chemistry_export()
+        rows.append((molecule_id, source_row))
+    molecule_ids = [molecule_id for molecule_id, _ in rows]
+    source_rows = [source_row for _, source_row in rows]
+    if len(set(molecule_ids)) != len(rows) or len(set(source_rows)) != len(rows):
+        raise _invalid_chemistry_export()
+    return rows
+
+
+def _top_similarity_rows(state: WorkflowState) -> list[dict[str, Any]]:
+    library_rows = _validated_library_rows(state)
+    matrix = validated_similarity_matrix(state)
+    ranked: list[tuple[float, int, int]] = []
+    for first in range(len(library_rows)):
+        for second in range(first + 1, len(library_rows)):
+            ranked.append((float(matrix[first, second]), first, second))
+    ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
+    if len(ranked) < 10:
+        raise _invalid_chemistry_export()
+    return [
+        {
+            "rank": rank,
+            "molecule_1_id": library_rows[first][0],
+            "molecule_1_source_row": library_rows[first][1],
+            "molecule_2_id": library_rows[second][0],
+            "molecule_2_source_row": library_rows[second][1],
+            "tanimoto_similarity": score,
+        }
+        for rank, (score, first, second) in enumerate(ranked[:10], start=1)
+    ]
+
+
+def _similarity_exports(state: WorkflowState) -> _StageDataExports:
+    library_rows = _validated_library_rows(state)
+    matrix = validated_similarity_matrix(state)
+    molecule_ids = [molecule_id for molecule_id, _ in library_rows]
+    source_rows = [source_row for _, source_row in library_rows]
+    pair_columns = [
+        "rank",
+        "molecule_1_id",
+        "molecule_1_source_row",
+        "molecule_2_id",
+        "molecule_2_source_row",
+        "tanimoto_similarity",
+    ]
+    pair_frame = pd.DataFrame(_top_similarity_rows(state), columns=pair_columns)
+    matrix_frame = pd.DataFrame(matrix, columns=molecule_ids)
+    matrix_frame.insert(0, "source_row", source_rows)
+    matrix_frame.insert(0, "molecule_id", molecule_ids)
+    if matrix_frame.shape != (256, 258):
+        raise _invalid_chemistry_export()
+    return _StageDataExports(
+        csv_files=(
+            ("top_similarity_pairs.csv", pair_frame),
+            ("similarity_matrix.csv", matrix_frame),
+        )
+    )
+
+
+def _cluster_exports(state: WorkflowState) -> _StageDataExports:
+    library_rows = _validated_library_rows(state)
+    cluster_rows: list[dict[str, Any]] = []
+    assigned: list[int] = []
+    if type(state.clusters) is not list or not state.clusters:
+        raise _invalid_chemistry_export()
+    for cluster_id, cluster in enumerate(state.clusters):
+        if type(cluster) is not list or not cluster:
+            raise _invalid_chemistry_export()
+        cluster_size = len(cluster)
+        for molecule_index in cluster:
+            if type(molecule_index) is not int or not 0 <= molecule_index < len(
+                library_rows
+            ):
+                raise _invalid_chemistry_export()
+            molecule_id, source_row = library_rows[molecule_index]
+            assigned.append(molecule_index)
+            cluster_rows.append(
+                {
+                    "molecule_index": molecule_index,
+                    "molecule_id": molecule_id,
+                    "source_row": source_row,
+                    "cluster_id": cluster_id,
+                    "cluster_size": cluster_size,
+                }
+            )
+    if sorted(assigned) != list(range(len(library_rows))):
+        raise _invalid_chemistry_export()
+    cluster_rows.sort(key=lambda row: row["molecule_index"])
+    columns = [
+        "molecule_index",
+        "molecule_id",
+        "source_row",
+        "cluster_id",
+        "cluster_size",
+    ]
+    return _StageDataExports(
+        csv_files=(
+            ("cluster_assignments.csv", pd.DataFrame(cluster_rows, columns=columns)),
+        )
+    )
+
+
+def _representative_source(
+    state: WorkflowState,
+    representative: dict[str, Any],
+) -> tuple[str, int, int, int]:
+    molecule_index = representative.get("molecule_index")
+    molecule_id = representative.get("molecule_id")
+    source_row = representative.get("source_row")
+    cluster_id = representative.get("cluster_id")
+    generated_count = representative.get("generated_conformer_count")
+    if (
+        type(molecule_index) is not int
+        or not 0 <= molecule_index < len(state.records)
+        or type(molecule_id) is not str
+        or type(source_row) is not int
+        or type(cluster_id) is not int
+        or cluster_id < 0
+        or type(generated_count) is not int
+        or generated_count <= 0
+    ):
+        raise _invalid_chemistry_export()
+    source = state.records[molecule_index]
+    if (
+        source.get("id") != molecule_id
+        or source.get("source_row") != source_row
+        or cluster_id >= len(state.clusters)
+        or molecule_index not in state.clusters[cluster_id]
+    ):
+        raise _invalid_chemistry_export()
+    return molecule_id, source_row, cluster_id, generated_count
+
+
+def _mmff94_exports(state: WorkflowState) -> _StageDataExports:
+    _validated_library_rows(state)
+    optimization_summary = state.summaries.get("optimize_conformers_mmff94")
+    if type(optimization_summary) is not dict:
+        raise _invalid_chemistry_export()
+    raw_rows = optimization_summary.get("per_conformer_records")
+    if type(raw_rows) is not list or not raw_rows:
+        raise _invalid_chemistry_export()
+
+    successful_representatives: list[dict[str, Any]] = []
+    for record in state.representative_records:
+        if type(record) is not dict:
+            raise _invalid_chemistry_export()
+        generated_count = record.get("generated_conformer_count")
+        if type(generated_count) is not int or generated_count < 0:
+            raise _invalid_chemistry_export()
+        if generated_count > 0:
+            successful_representatives.append(record)
+    if len(successful_representatives) != len(state.conformer_molecules):
+        raise _invalid_chemistry_export()
+
+    representative_sources: list[tuple[str, int, int, int]] = []
+    expected_pairs: set[tuple[int, int]] = set()
+    for optimization_molecule_index, (representative, molecule) in enumerate(
+        zip(
+            successful_representatives,
+            state.conformer_molecules,
+            strict=True,
+        )
+    ):
+        source = _representative_source(state, representative)
+        if (
+            not isinstance(molecule, Chem.Mol)
+            or molecule.GetNumConformers() != source[3]
+        ):
+            raise _invalid_chemistry_export()
+        try:
+            for conformer_index in range(molecule.GetNumConformers()):
+                conformer = molecule.GetConformer(conformer_index)
+                if conformer.GetId() != conformer_index or any(
+                    not math.isfinite(float(coordinate))
+                    for position in conformer.GetPositions()
+                    for coordinate in position
+                ):
+                    raise _invalid_chemistry_export()
+        except (RuntimeError, ValueError) as error:
+            raise _invalid_chemistry_export() from error
+        representative_sources.append(source)
+        expected_pairs.update(
+            (optimization_molecule_index, conformer_index)
+            for conformer_index in range(molecule.GetNumConformers())
+        )
+
+    public_rows: list[dict[str, Any]] = []
+    sdf_records: list[_SdfExportRecord] = []
+    observed_pairs: set[tuple[int, int]] = set()
+    for raw_row in raw_rows:
+        if type(raw_row) is not dict:
+            raise _invalid_chemistry_export()
+        raw_optimization_molecule_index = raw_row.get("optimization_molecule_index")
+        raw_conformer_index = raw_row.get("conformer_index")
+        energy = raw_row.get("energy_kcal_mol")
+        converged = raw_row.get("converged")
+        raw_molecule_id = raw_row.get("molecule_id")
+        raw_cluster_id = raw_row.get("cluster_id")
+        if (
+            type(raw_optimization_molecule_index) is not int
+            or not 0 <= raw_optimization_molecule_index < len(representative_sources)
+            or type(raw_conformer_index) is not int
+            or raw_conformer_index < 0
+            or isinstance(energy, bool)
+            or not isinstance(energy, (int, float))
+            or not math.isfinite(float(energy))
+            or type(converged) is not bool
+            or type(raw_molecule_id) is not str
+            or type(raw_cluster_id) is not int
+        ):
+            raise _invalid_chemistry_export()
+        molecule_id, source_row, cluster_id, _ = representative_sources[
+            raw_optimization_molecule_index
+        ]
+        if raw_molecule_id != molecule_id or raw_cluster_id != cluster_id:
+            raise _invalid_chemistry_export()
+        pair = (raw_optimization_molecule_index, raw_conformer_index)
+        if pair not in expected_pairs or pair in observed_pairs:
+            raise _invalid_chemistry_export()
+        observed_pairs.add(pair)
+        record_id = f"{molecule_id}:cluster-{cluster_id}:conf-{raw_conformer_index}"
+        public_row = {
+            "record_id": record_id,
+            "molecule_id": molecule_id,
+            "source_row": source_row,
+            "cluster_id": cluster_id,
+            "conformer_index": raw_conformer_index,
+            "energy_kcal_mol": float(energy),
+            "converged": converged,
+        }
+        public_rows.append(public_row)
+        sdf_records.append(
+            _SdfExportRecord(
+                record_id=record_id,
+                molecule=state.conformer_molecules[raw_optimization_molecule_index],
+                conformer_index=raw_conformer_index,
+                properties=(
+                    ("ACS_RECORD_ID", record_id),
+                    ("MOLECULE_ID", molecule_id),
+                    ("SOURCE_ROW", str(source_row)),
+                    ("CLUSTER_ID", str(cluster_id)),
+                    ("CONFORMER_INDEX", str(raw_conformer_index)),
+                    ("CONVERGED", str(converged).lower()),
+                    ("MMFF94_ENERGY_KCAL_MOL", repr(float(energy))),
+                ),
+            )
+        )
+    if observed_pairs != expected_pairs:
+        raise _invalid_chemistry_export()
+
+    report = build_workflow_report(state)
+    expected_evidence_keys = [f"E{index:02d}" for index in range(1, 7)]
+    if [record.key for record in report.evidence] != expected_evidence_keys:
+        raise _invalid_chemistry_export()
+    evidence_rows: list[dict[str, Any]] = []
+    for record in report.evidence:
+        try:
+            payload = json.loads(
+                record.payload_json,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(f"invalid JSON constant {value}")
+                ),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise _invalid_chemistry_export() from error
+        if type(payload) is not dict:
+            raise _invalid_chemistry_export()
+        evidence_rows.append(
+            {
+                "key": record.key,
+                "label": record.label,
+                "payload": payload,
+                "provenance": record.provenance,
+            }
+        )
+    evidence_payload = {
+        "schema_version": SCHEMA_VERSION,
+        "evidence": evidence_rows,
+    }
+    columns = [
+        "record_id",
+        "molecule_id",
+        "source_row",
+        "cluster_id",
+        "conformer_index",
+        "energy_kcal_mol",
+        "converged",
+    ]
+    return _StageDataExports(
+        csv_files=(
+            ("mmff94_energies.csv", pd.DataFrame(public_rows, columns=columns)),
+        ),
+        sdf_file=("optimized_conformers.sdf", tuple(sdf_records)),
+        json_files=(("workflow_evidence.json", evidence_payload),),
+    )
+
+
+def _prepare_stage_data(
+    stage_name: str,
+    state: WorkflowState,
+) -> _StageDataExports:
+    if stage_name == "measure_tanimoto_similarity":
+        exports = _similarity_exports(state)
+    elif stage_name == "discover_fused_butina_clusters":
+        exports = _cluster_exports(state)
+    elif stage_name == "optimize_conformers_mmff94":
+        exports = _mmff94_exports(state)
+    else:
+        exports = _StageDataExports()
+    names = [name for name, _ in exports.csv_files]
+    if exports.sdf_file is not None:
+        names.append(exports.sdf_file[0])
+    names.extend(name for name, _ in exports.json_files)
+    if tuple(names) != STAGE_DATA_NAMES[stage_name]:
+        raise _invalid_chemistry_export()
+    return exports
+
+
+def _write_sdf(
+    path: Path,
+    records: tuple[_SdfExportRecord, ...],
+) -> None:
+    with Chem.SDWriter(str(path)) as writer:
+        for record in records:
+            molecule = Chem.Mol(record.molecule)
+            for property_name, property_value in record.properties:
+                molecule.SetProp(property_name, property_value)
+            writer.write(molecule, confId=record.conformer_index)
+    supplier = Chem.SDMolSupplier(str(path), removeHs=False)
+    observed = list(supplier)
+    if (
+        any(molecule is None for molecule in observed)
+        or len(observed) != len(records)
+        or [molecule.GetProp("ACS_RECORD_ID") for molecule in observed]
+        != [record.record_id for record in records]
+    ):
+        raise _invalid_chemistry_export()
+
+
+def _write_stage_data(
+    stage_directory: Path,
+    exports: _StageDataExports,
+) -> None:
+    for name, frame in exports.csv_files:
+        frame.to_csv(stage_directory / name, index=False, lineterminator="\n")
+    if exports.sdf_file is not None:
+        name, records = exports.sdf_file
+        _write_sdf(stage_directory / name, records)
+    for name, payload in exports.json_files:
+        (stage_directory / name).write_text(_formatted_json(payload), encoding="utf-8")
+
+
 def _publish_stage(
     stage_name: str,
     execution: WorkflowExecution,
@@ -660,6 +1067,7 @@ def _publish_stage(
         raise ValueError("Unsupported workshop stage.") from error
     result = _stage_result(stage_name, execution)
     _validate_stage_images(stage_name, result, stage_spec)
+    data_exports = _prepare_stage_data(stage_name, execution.state)
 
     if stage_name == "inspect_library":
         if execution.gpu is not None:
@@ -670,7 +1078,14 @@ def _publish_stage(
             raise RuntimeError("Workshop stage GPU identity is invalid.")
         gpu_payload = asdict(execution.gpu)
 
-    artifact_names = sorted(("README.md", "summary.json", *stage_spec.image_names))
+    artifact_names = sorted(
+        (
+            "README.md",
+            "summary.json",
+            *stage_spec.image_names,
+            *STAGE_DATA_NAMES[stage_name],
+        )
+    )
     summary_payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "stage": stage_name,
@@ -697,6 +1112,7 @@ def _publish_stage(
             _save_matplotlib_figure(figure, image_path)
     (stage_directory / "README.md").write_text(readme_text, encoding="utf-8")
     (stage_directory / "summary.json").write_text(summary_text, encoding="utf-8")
+    _write_stage_data(stage_directory, data_exports)
     return summary_payload, stage_directory, stage_spec
 
 

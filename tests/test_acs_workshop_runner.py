@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
@@ -8,11 +10,16 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+import numpy as np
+import pandas as pd
 import pytest
 from matplotlib.figure import Figure
 from PIL import Image
+from rdkit import Chem
+from rdkit.Geometry import Point3D
 
 import acs_workshop_runner as runner
+import chemistry_workflow
 
 
 MANIFEST_FILES = (
@@ -32,6 +39,22 @@ EXPECTED_STAGE_IMAGES = {
     "optimize_conformers_mmff94": (
         "conformer_energies.png",
         "optimized_structures.png",
+    ),
+}
+
+EXPECTED_STAGE_DATA = {
+    "inspect_library": (),
+    "generate_morgan_fingerprints": (),
+    "measure_tanimoto_similarity": (
+        "top_similarity_pairs.csv",
+        "similarity_matrix.csv",
+    ),
+    "discover_fused_butina_clusters": ("cluster_assignments.csv",),
+    "embed_representative_conformers": (),
+    "optimize_conformers_mmff94": (
+        "mmff94_energies.csv",
+        "optimized_conformers.sdf",
+        "workflow_evidence.json",
     ),
 }
 
@@ -204,13 +227,250 @@ def workshop_paths(tmp_path: Path) -> runner.WorkshopPaths:
     return write_manifest(root)
 
 
+class _FakeTensor:
+    def __init__(self, values: object, *, device: str = "cuda:0") -> None:
+        self.values = np.asarray(values)
+        self.shape = self.values.shape
+        self.device = device
+
+    def cpu(self) -> _FakeTensor:
+        return self
+
+    def numpy(self) -> np.ndarray:
+        return self.values.copy()
+
+
+class _FakeGpuResult:
+    def __init__(self, values: object, *, device: str = "cuda:0") -> None:
+        self.tensor = _FakeTensor(values, device=device)
+
+    def torch(self) -> _FakeTensor:
+        return self.tensor
+
+
+class _FakeOptimizationResult:
+    def __init__(self, molecules: list[Chem.Mol]) -> None:
+        pairs = [
+            (molecule_index, conformer_index)
+            for molecule_index, molecule in enumerate(molecules)
+            for conformer_index in range(molecule.GetNumConformers())
+        ]
+        self.mol_indices = _FakeGpuResult([pair[0] for pair in pairs])
+        self.conf_indices = _FakeGpuResult([pair[1] for pair in pairs])
+        self.energies = _FakeGpuResult(
+            [
+                float(10 * molecule_index + conformer_index) + 0.125
+                for molecule_index, conformer_index in pairs
+            ]
+        )
+        self.converged = _FakeGpuResult(
+            [
+                int((molecule_index, conformer_index) != (5, 4))
+                for molecule_index, conformer_index in pairs
+            ]
+        )
+        self._coordinates = [
+            [
+                np.asarray(
+                    [
+                        (
+                            molecule_index + atom_index / 100.0,
+                            conformer_index + atom_index / 200.0,
+                            molecule_index + conformer_index + atom_index / 300.0,
+                        )
+                        for atom_index in range(molecule.GetNumAtoms())
+                    ],
+                    dtype=float,
+                )
+                for conformer_index in range(molecule.GetNumConformers())
+            ]
+            for molecule_index, molecule in enumerate(molecules)
+        ]
+
+    def per_molecule(self) -> list[list[np.ndarray]]:
+        return self._coordinates
+
+
+def _workshop_similarity_matrix() -> np.ndarray:
+    molecule_count = 256
+    matrix = np.eye(molecule_count, dtype=float)
+    for first in range(molecule_count):
+        for second in range(first + 1, molecule_count):
+            score = ((first * molecule_count + second) % 997) / 10_000.0
+            matrix[first, second] = score
+            matrix[second, first] = score
+    ranked_pairs = (
+        (7, 9, 0.99),
+        (0, 1, 0.95),
+        (0, 2, 0.95),
+        (2, 3, 0.94),
+        (4, 5, 0.93),
+        (6, 8, 0.92),
+        (10, 11, 0.91),
+        (12, 13, 0.90),
+        (14, 15, 0.89),
+        (16, 17, 0.88),
+        (18, 19, 0.87),
+    )
+    for first, second, score in ranked_pairs:
+        matrix[first, second] = score
+        matrix[second, first] = score
+    return matrix
+
+
+@pytest.fixture
+def fake_workshop_gpu(monkeypatch: pytest.MonkeyPatch) -> np.ndarray:
+    similarity_matrix = _workshop_similarity_matrix()
+    fingerprint_result = _FakeGpuResult(np.zeros((256, 32), dtype=np.int32))
+    similarity_result = _FakeGpuResult(similarity_matrix)
+
+    class Generator:
+        def __init__(self, *, radius: int, fpSize: int) -> None:
+            assert (radius, fpSize) == (2, 1024)
+
+        def GetFingerprints(self, molecules: list[Chem.Mol]) -> _FakeGpuResult:
+            assert len(molecules) == 256
+            return fingerprint_result
+
+    def cluster(_fingerprints: _FakeTensor, *, cutoff: float):
+        assert cutoff == 0.40
+        clusters = [list(range(start, start + 32)) for start in range(0, 256, 32)]
+        return clusters, [len(cluster_members) for cluster_members in clusters]
+
+    def embed(
+        molecules: list[Chem.Mol],
+        parameters: object,
+        *,
+        confsPerMolecule: int,
+        maxIterations: int,
+    ) -> None:
+        assert getattr(parameters, "randomSeed") == 7
+        assert getattr(parameters, "useRandomCoords") is True
+        assert (len(molecules), confsPerMolecule, maxIterations) == (6, 5, -1)
+        for molecule in molecules:
+            molecule.RemoveAllConformers()
+            for conformer_index in range(confsPerMolecule):
+                conformer = Chem.Conformer(molecule.GetNumAtoms())
+                conformer.SetId(conformer_index)
+                molecule.AddConformer(conformer, assignId=True)
+
+    def optimize(
+        molecules: list[Chem.Mol], *, maxIters: int, output: object
+    ) -> _FakeOptimizationResult:
+        assert len(molecules) == 6
+        assert maxIters == 500
+        assert output == "cuda:0"
+        return _FakeOptimizationResult(molecules)
+
+    monkeypatch.setattr(
+        chemistry_workflow, "_morgan_generator_class", lambda: Generator
+    )
+    monkeypatch.setattr(
+        chemistry_workflow,
+        "_cross_tanimoto_similarity",
+        lambda fingerprints: similarity_result,
+    )
+    monkeypatch.setattr(chemistry_workflow, "_fused_butina", cluster)
+    monkeypatch.setattr(chemistry_workflow, "_embed_molecules", embed)
+    monkeypatch.setattr(chemistry_workflow, "_optimize_mmff94", optimize)
+    monkeypatch.setattr(
+        chemistry_workflow, "_coordinate_output_device", lambda: "cuda:0"
+    )
+    monkeypatch.setattr(chemistry_workflow, "_synchronize_cuda", lambda: None)
+    monkeypatch.setattr(runner, "_gpu_identity", lambda: FIXED_GPU)
+    return similarity_matrix
+
+
+@pytest.fixture
+def completed_similarity(
+    workshop_paths: runner.WorkshopPaths,
+    fake_workshop_gpu: np.ndarray,
+) -> Path:
+    del fake_workshop_gpu
+    runner.run_stage("measure_tanimoto_similarity", paths=workshop_paths)
+    return workshop_paths.output_root / "03-similarity"
+
+
+@pytest.fixture
+def completed_clusters(
+    workshop_paths: runner.WorkshopPaths,
+    fake_workshop_gpu: np.ndarray,
+) -> Path:
+    del fake_workshop_gpu
+    runner.run_stage("discover_fused_butina_clusters", paths=workshop_paths)
+    return workshop_paths.output_root / "04-clusters"
+
+
+@pytest.fixture
+def completed_mmff94(
+    workshop_paths: runner.WorkshopPaths,
+    fake_workshop_gpu: np.ndarray,
+) -> Path:
+    del fake_workshop_gpu
+    runner.run_stage("optimize_conformers_mmff94", paths=workshop_paths)
+    return workshop_paths.output_root / "06-mmff94"
+
+
 @pytest.fixture
 def workflow_executions() -> dict[str, runner.WorkflowExecution]:
-    state = runner.WorkflowState()
-    state.records = [
+    records = [
         {"id": f"CHEMBL{index}", "smiles": "C", "source_row": index}
         for index in range(256)
     ]
+    clusters = [list(range(cluster_id, 256, 39)) for cluster_id in range(39)]
+    representative_records: list[dict[str, object]] = []
+    conformer_molecules: list[Chem.Mol] = []
+    generated_counts = (5, 5, 5, 5, 5, 4)
+    for cluster_id, generated_count in enumerate(generated_counts):
+        molecule_index = clusters[cluster_id][0]
+        representative_records.append(
+            {
+                "molecule_id": records[molecule_index]["id"],
+                "source_row": records[molecule_index]["source_row"],
+                "cluster_id": cluster_id,
+                "molecule_index": molecule_index,
+                "generated_conformer_count": generated_count,
+            }
+        )
+        molecule = Chem.AddHs(Chem.MolFromSmiles("C"))
+        assert molecule is not None
+        for conformer_index in range(generated_count):
+            conformer = Chem.Conformer(molecule.GetNumAtoms())
+            conformer.SetId(conformer_index)
+            molecule.AddConformer(conformer, assignId=True)
+        conformer_molecules.append(molecule)
+    optimization_result = _FakeOptimizationResult(conformer_molecules)
+    per_conformer_records = [
+        {
+            "molecule_id": representative_records[molecule_index]["molecule_id"],
+            "cluster_id": molecule_index,
+            "conformer_index": conformer_index,
+            "energy_kcal_mol": float(10 * molecule_index + conformer_index) + 0.125,
+            "converged": (molecule_index, conformer_index) != (5, 3),
+            "optimization_molecule_index": molecule_index,
+        }
+        for molecule_index, molecule in enumerate(conformer_molecules)
+        for conformer_index in range(molecule.GetNumConformers())
+    ]
+    state = runner.WorkflowState(
+        phase=chemistry_workflow.WorkflowPhase.OPTIMIZED,
+        records=records,
+        molecules=[Chem.MolFromSmiles("C") for _ in range(256)],
+        fingerprints=_FakeGpuResult(np.zeros((256, 32), dtype=np.int32)),
+        fingerprint_parameters=(2, 1024),
+        similarity=_FakeGpuResult(np.eye(256, dtype=float)),
+        clusters=clusters,
+        cluster_cutoff=0.40,
+        representative_records=representative_records,
+        conformer_molecules=conformer_molecules,
+        optimization_result=optimization_result,
+        summaries={
+            "optimize_conformers_mmff94": {
+                "per_conformer_records": per_conformer_records,
+            }
+        },
+        embedding_parameters=(6, "largest_clusters_first", 5),
+    )
     results: list[runner.StageResult] = []
     executions: dict[str, runner.WorkflowExecution] = {}
     for stage_name in runner.STAGE_ORDER:
@@ -249,6 +509,161 @@ def completed_stage(
         workflow_executor=lambda selected: workflow_executions[selected],
     )
     return workshop_paths.output_root / EXPECTED_STAGE_DIRECTORIES[stage_name]
+
+
+def test_similarity_csvs_match_records_and_matrix(
+    completed_similarity: Path,
+    fake_workshop_gpu: np.ndarray,
+) -> None:
+    pairs = pd.read_csv(completed_similarity / "top_similarity_pairs.csv")
+    matrix = pd.read_csv(completed_similarity / "similarity_matrix.csv")
+    assert list(pairs.columns) == [
+        "rank",
+        "molecule_1_id",
+        "molecule_1_source_row",
+        "molecule_2_id",
+        "molecule_2_source_row",
+        "tanimoto_similarity",
+    ]
+    assert pairs["rank"].tolist() == list(range(1, 11))
+    assert matrix.shape == (256, 258)
+    assert matrix.columns[:2].tolist() == ["molecule_id", "source_row"]
+    assert matrix["molecule_id"].tolist() == matrix.columns[2:].tolist()
+    assert matrix["source_row"].tolist() == list(range(256))
+    assert np.allclose(matrix.iloc[:, 2:].to_numpy(), fake_workshop_gpu)
+
+    expected_pairs = sorted(
+        (
+            (-float(fake_workshop_gpu[first, second]), first, second)
+            for first in range(256)
+            for second in range(first + 1, 256)
+        )
+    )[:10]
+    for row, (negative_score, first, second) in zip(
+        pairs.to_dict(orient="records"), expected_pairs, strict=True
+    ):
+        assert row["molecule_1_id"] == matrix.iloc[first]["molecule_id"]
+        assert row["molecule_1_source_row"] == first
+        assert row["molecule_2_id"] == matrix.iloc[second]["molecule_id"]
+        assert row["molecule_2_source_row"] == second
+        assert row["tanimoto_similarity"] == pytest.approx(-negative_score)
+
+
+def test_cluster_assignments_cover_each_molecule_once(
+    completed_clusters: Path,
+) -> None:
+    rows = pd.read_csv(completed_clusters / "cluster_assignments.csv")
+    assert list(rows.columns) == [
+        "molecule_index",
+        "molecule_id",
+        "source_row",
+        "cluster_id",
+        "cluster_size",
+    ]
+    assert rows["molecule_index"].tolist() == list(range(256))
+    assert rows["molecule_id"].is_unique
+    assert rows["source_row"].tolist() == list(range(256))
+    assert rows.groupby("cluster_id")["molecule_index"].count().to_dict() == {
+        cluster_id: 32 for cluster_id in range(8)
+    }
+    assert rows["cluster_size"].tolist() == [32] * 256
+
+
+def test_mmff94_csv_and_sdf_have_matching_provenance(
+    completed_mmff94: Path,
+) -> None:
+    rows = pd.read_csv(completed_mmff94 / "mmff94_energies.csv")
+    assert list(rows.columns) == [
+        "record_id",
+        "molecule_id",
+        "source_row",
+        "cluster_id",
+        "conformer_index",
+        "energy_kcal_mol",
+        "converged",
+    ]
+    supplier = Chem.SDMolSupplier(
+        str(completed_mmff94 / "optimized_conformers.sdf"),
+        removeHs=False,
+    )
+    molecules = [molecule for molecule in supplier if molecule is not None]
+    assert len(molecules) == len(rows) == 30
+    assert [molecule.GetProp("ACS_RECORD_ID") for molecule in molecules] == (
+        rows["record_id"].tolist()
+    )
+    for molecule, row in zip(molecules, rows.to_dict(orient="records"), strict=True):
+        assert molecule.GetProp("MOLECULE_ID") == row["molecule_id"]
+        assert int(molecule.GetProp("SOURCE_ROW")) == row["source_row"]
+        assert int(molecule.GetProp("CLUSTER_ID")) == row["cluster_id"]
+        assert int(molecule.GetProp("CONFORMER_INDEX")) == row["conformer_index"]
+        assert float(molecule.GetProp("MMFF94_ENERGY_KCAL_MOL")) == pytest.approx(
+            row["energy_kcal_mol"]
+        )
+        assert molecule.GetProp("CONVERGED").lower() == str(row["converged"]).lower()
+
+
+def test_workflow_evidence_has_parsed_e01_through_e06(
+    completed_mmff94: Path,
+) -> None:
+    payload = json.loads(
+        (completed_mmff94 / "workflow_evidence.json").read_text(encoding="utf-8")
+    )
+    assert set(payload) == {"schema_version", "evidence"}
+    assert payload["schema_version"] == 1
+    assert [record["key"] for record in payload["evidence"]] == [
+        "E01",
+        "E02",
+        "E03",
+        "E04",
+        "E05",
+        "E06",
+    ]
+    assert all(
+        set(record) == {"key", "label", "payload", "provenance"}
+        for record in payload["evidence"]
+    )
+    assert all(type(record["payload"]) is dict for record in payload["evidence"])
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "malformed_representative",
+        "unknown_conformer_id",
+        "boolean_cluster_id",
+        "nonfinite_coordinate",
+    ),
+)
+def test_mmff94_csv_validation_rejects_invalid_provenance_before_writing(
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    mutation: str,
+) -> None:
+    state = workflow_executions["optimize_conformers_mmff94"].state
+    if mutation == "malformed_representative":
+        state.representative_records.append(
+            {
+                "molecule_index": 200,
+                "molecule_id": "CHEMBL200",
+                "source_row": 200,
+                "cluster_id": 5,
+                "generated_conformer_count": "5",
+            }
+        )
+    elif mutation == "unknown_conformer_id":
+        state.conformer_molecules[0].GetConformer(0).SetId(99)
+    elif mutation == "boolean_cluster_id":
+        rows = state.summaries["optimize_conformers_mmff94"]["per_conformer_records"]
+        assert isinstance(rows, list)
+        rows[0]["cluster_id"] = False
+    elif mutation == "nonfinite_coordinate":
+        state.conformer_molecules[0].GetConformer(0).SetAtomPosition(
+            0, Point3D(float("nan"), 0.0, 0.0)
+        )
+    else:
+        raise AssertionError(mutation)
+
+    with pytest.raises(RuntimeError, match=r"^Workshop chemistry export is invalid\.$"):
+        runner._mmff94_exports(state)
 
 
 def _manifest_payload(paths: runner.WorkshopPaths) -> dict[str, object]:
@@ -315,7 +730,12 @@ def test_stage_summary_has_closed_finite_schema(completed_stage: Path) -> None:
     assert payload["gpu"] == expected_gpu
     assert payload["facts"] == EXPECTED_STAGE_FACTS[payload["stage"]]
     expected_artifacts = sorted(
-        ("README.md", "summary.json", *EXPECTED_STAGE_IMAGES[payload["stage"]])
+        (
+            "README.md",
+            "summary.json",
+            *EXPECTED_STAGE_IMAGES[payload["stage"]],
+            *EXPECTED_STAGE_DATA[payload["stage"]],
+        )
     )
     assert payload["artifacts"] == expected_artifacts
     assert sorted(path.name for path in completed_stage.iterdir()) == expected_artifacts
