@@ -37,14 +37,14 @@ Each attendee answer uses this fixed structure: Question; What ran; Measured res
 - [x] Verified 8 focused export tests, 157 combined runner/workflow tests, Ruff, compilation, diff checks, and Gitleaks.
 - [x] Committed as `9598080434e93091098fb985cd97263d10fcde8a`.
 
-### Task 2: Add three paired lessons, concise output, and a safe bundle
+### Task 2: Add three paired lessons, concise output, and a safe bundle — complete
 
 **Files:**
 
 - Modify: `acs_workshop_runner.py`
 - Modify: `tests/test_acs_workshop_runner.py`
 
-- [ ] **Step 1: Write failing paired-lesson tests**
+- [x] **Step 1: Write failing paired-lesson tests**
 
 Add one fixed `run-lesson` command with exactly these choices and publications:
 
@@ -56,7 +56,7 @@ sampled-3d-geometry -> embed_representative_conformers, optimize_conformers_mmff
 
 Each command must call `execute_workflow_prefix` once at the pair's terminal stage and publish both retained `StageResult` objects. Prompt-facing code must not execute six separate stage commands.
 
-- [ ] **Step 2: Write failing concise-envelope tests**
+- [x] **Step 2: Write failing concise-envelope tests**
 
 Return only this information:
 
@@ -67,7 +67,7 @@ results_zip_path, artifact_relative_zip_path
 
 Each `completed_stages` item contains only `stage`, one concise measured `result`, `image_paths`, `summary_path`, `readme_path`, and `artifact_directory`. It must not contain the full summary or per-cluster/per-conformer records. Full facts remain in `summary.json`.
 
-- [ ] **Step 3: Write failing atomic-publication and ZIP tests**
+- [x] **Step 3: Write failing atomic-publication and ZIP tests**
 
 Build each new stage in one task-owned temporary directory, validate all declared files, and rename it into place only when complete. Reuse a valid completed stage; reject an invalid or symlinked target. Do not implement backup restoration across stages.
 
@@ -83,7 +83,7 @@ data/PROVENANCE.md
 
 The root README maps the four workshop questions to artifact directories. Private state and the ZIP itself are excluded.
 
-- [ ] **Step 4: Implement, verify, and commit**
+- [x] **Step 4: Implement, verify, and commit**
 
 ```bash
 env PYTHONPATH=. MPLCONFIGDIR=/private/tmp/acs-workshop-mpl \
@@ -96,6 +96,8 @@ Run Ruff, compilation, `git diff --check`, and staged Gitleaks. Commit with:
 ```bash
 git commit -m "Add paired ACS workshop lessons"
 ```
+
+Completed as `1817b22eef5137e218c191de9d0c18a754f2eb62`: 167 focused and adjacent tests passed; Ruff, compilation, diff checks, and staged Gitleaks passed; specification and code-quality reviews found no remaining Critical or Important issue. This is local implementation evidence only.
 
 ### Task 3: Add the bounded diversity objective
 
