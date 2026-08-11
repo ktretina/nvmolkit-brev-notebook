@@ -83,6 +83,40 @@ def test_setup_script_has_the_complete_secret_safe_contract() -> None:
     assert "gateway-token --quiet" in source
 
 
+def test_setup_applies_verified_host_provider_timeout_before_runtime_checks() -> None:
+    source = _source()
+    executable_check = (
+        '[[ -x "${nemoclaw}" && -x "${openshell}" ]] || '
+        'die "NemoClaw or OpenShell is missing."'
+    )
+    config_set = (
+        '"${nemoclaw}" "${sandbox_name}" config set \\\n'
+        "  --key models.providers.inference.timeoutSeconds \\\n"
+        "  --value 300 \\\n"
+        "  --config-accept-new-path \\\n"
+        "  --restart"
+    )
+    config_get = (
+        'provider_timeout="$("${nemoclaw}" "${sandbox_name}" config get \\\n'
+        "  --key models.providers.inference.timeoutSeconds \\\n"
+        '  --format json)"'
+    )
+    timeout_check = '[[ "${provider_timeout}" == "300" ]] ||'
+    listener_check = 'ss -H -ltn "sport = :18789"'
+    seed_turn = "agent --session-id main --json --timeout 600 -m"
+
+    assert config_set in source
+    assert config_get in source
+    assert timeout_check in source
+    assert source.index(executable_check) < source.index(config_set)
+    assert source.index(config_set) < source.index(config_get)
+    assert source.index(config_get) < source.index(timeout_check)
+    assert source.index(timeout_check) < source.index(listener_check)
+    assert source.index(timeout_check) < source.index(seed_turn)
+    assert "shields down" not in source
+    assert "openclaw config set" not in source
+
+
 def test_setup_script_orchestrates_fixed_assets_and_one_time_bounded_agent_turn() -> (
     None
 ):

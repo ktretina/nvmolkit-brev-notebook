@@ -100,6 +100,18 @@ done
 [[ "${#node_candidates[@]}" == "1" ]] || die "exactly one executable NVM Node binary is required."
 readonly node_bin="${node_candidates[0]}"
 
+"${nemoclaw}" "${sandbox_name}" config set \
+  --key models.providers.inference.timeoutSeconds \
+  --value 300 \
+  --config-accept-new-path \
+  --restart
+provider_timeout="$("${nemoclaw}" "${sandbox_name}" config get \
+  --key models.providers.inference.timeoutSeconds \
+  --format json)"
+[[ "${provider_timeout}" == "300" ]] ||
+  die "the inference provider timeout was not set to 300 seconds."
+readonly provider_timeout
+
 dashboard_listeners="$(ss -H -ltn "sport = :18789")"
 [[ -n "${dashboard_listeners}" ]] || die "the private OpenClaw dashboard is not listening."
 ACS_DASHBOARD_LISTENERS="${dashboard_listeners}" python3 -c '
