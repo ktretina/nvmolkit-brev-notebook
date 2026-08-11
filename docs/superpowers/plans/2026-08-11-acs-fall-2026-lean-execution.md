@@ -156,7 +156,7 @@ git commit -m "Add the bounded ACS diversity objective"
 
 Completed as `2c9c022e29c9150d1d9e7695d5c3bf77eeb7a0b1`: the bounded objective persists one immutable eight-candidate context and one small retry-safe state, performs no objective-time GPU recomputation, publishes the exact six-file terminal result, and extends the hash-bound lesson archive. The final repair rejects skipped attempt sequences, preserves a terminal ZIP when lesson rerun validation fails, validates the bound archive before a cached pending retry, and enforces 8 MiB per-member and 32 MiB aggregate archive limits before decompression. Fresh verification passed 198 runner/objective tests, Ruff, compilation, diff checks, and staged Gitleaks. Independent specification and code-quality reviews found no remaining Critical or Important issue. This is local implementation evidence only.
 
-### Task 4: Rewire the Launchable without a hidden model turn
+### Task 4: Rewire the Launchable without a hidden model turn — complete
 
 **Files:**
 
@@ -165,17 +165,17 @@ Completed as `2c9c022e29c9150d1d9e7695d5c3bf77eeb7a0b1`: the bounded objective p
 - Modify: `tests/test_acs_nemoclaw_launchable_setup.py`
 - Modify: `tests/test_nemoclaw_phase_zero_setup.py`
 
-- [ ] **Step 1: Write failing setup-source tests**
+- [x] **Step 1: Write failing setup-source tests**
 
 Require setup to upload the runner, `objective_challenge.py`, `chemistry_workflow.py`, the fixed CSV, `data/PROVENANCE.md`, `TOOLS.md`, and the artifact server. Create the closed read-only manifest after upload and before runner smoke.
 
 Remove the hidden threshold-0.80 agent turn, its source edit, its threshold artifacts, and its validation. Do not replace it with another setup-time Nemotron request. Keep the pinned install, real small nvMolKit CUDA probe, 300-second provider timeout, runner manifest/help smoke, artifact-server readiness, protected proxy on 18788, download service on 8765, secret handling, and private raw 18789.
 
-- [ ] **Step 2: Add safe progress and rerun behavior**
+- [x] **Step 2: Add safe progress and rerun behavior**
 
 Print short phase names without raw installer output, keys, tokens, or tokenized URLs. On a full setup rerun, remove only setup-owned workshop output/state and recreate the manifest. Do not delete unrelated attendee files.
 
-- [ ] **Step 3: Implement, verify, and commit**
+- [x] **Step 3: Implement, verify, and commit**
 
 ```bash
 env PYTHONPATH=. MPLCONFIGDIR=/private/tmp/acs-workshop-mpl \
@@ -193,6 +193,8 @@ Run Ruff, compilation, `git diff --check`, and staged Gitleaks. Commit with:
 ```bash
 git commit -m "Wire the lean ACS workshop Launchable"
 ```
+
+Completed as `e0d98d7332cf5b030ef16f8d00c9fc3022305133`: setup now uploads the reviewed workshop runner, objective domain, workflow, fixed data and provenance, tools note, and artifact server; creates the exact read-only six-file manifest; runs only deterministic L4, CUDA, runner, proxy, and download-service checks; and makes no setup-time model request. Exact process identity, failure rollback, a setup-owned download sentinel, and coherent ready-state cleanup support fresh runs and bounded reruns. Fresh verification passed 31 setup tests, three proxy tests, Bash syntax, Ruff, compilation, diff checks, and staged Gitleaks. Independent specification and code-quality reviews found no remaining Critical or Important issue. This is local implementation evidence only.
 
 ### Task 5: Create the canonical attendee page and four prompts
 
