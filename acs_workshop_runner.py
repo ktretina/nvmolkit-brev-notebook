@@ -6,8 +6,11 @@ import importlib.metadata
 import json
 import math
 import os
+import shutil
 import stat
 import sys
+import tempfile
+import zipfile
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -80,14 +83,35 @@ MANIFEST_FILES: Final = (
     "acs_workshop_runner.py",
     "chemistry_workflow.py",
     "data/sample_molecules.csv",
+    "data/PROVENANCE.md",
     "objective_challenge.py",
 )
+LESSON_TERMINAL_STAGES: Final = {
+    "data-and-representation": "generate_morgan_fingerprints",
+    "relationships-and-groups": "discover_fused_butina_clusters",
+    "sampled-3d-geometry": "optimize_conformers_mmff94",
+}
+LESSON_STAGES: Final = {
+    "data-and-representation": (
+        "inspect_library",
+        "generate_morgan_fingerprints",
+    ),
+    "relationships-and-groups": (
+        "measure_tanimoto_similarity",
+        "discover_fused_butina_clusters",
+    ),
+    "sampled-3d-geometry": (
+        "embed_representative_conformers",
+        "optimize_conformers_mmff94",
+    ),
+}
 
 __all__ = (
     "DATASET_SHA256",
     "DEFAULT_PATHS",
     "GpuIdentity",
     "MANIFEST_FILES",
+    "LESSON_TERMINAL_STAGES",
     "PROFILE",
     "RepresentativePolicy",
     "SCHEMA_VERSION",
@@ -111,6 +135,7 @@ __all__ = (
     "measure_tanimoto_similarity",
     "optimize_conformers_mmff94",
     "run_stage",
+    "run_lesson",
     "verify_manifest",
 )
 
@@ -415,6 +440,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     stage_parser = subparsers.add_parser("run-stage")
     stage_parser.add_argument("stage_name", choices=STAGE_ORDER)
+
+    lesson_parser = subparsers.add_parser("run-lesson")
+    lesson_parser.add_argument("lesson", choices=tuple(LESSON_TERMINAL_STAGES))
 
     subparsers.add_parser("objective-start")
 
@@ -1055,12 +1083,23 @@ def _write_stage_data(
         (stage_directory / name).write_text(_formatted_json(payload), encoding="utf-8")
 
 
-def _publish_stage(
+def _stage_artifact_names(stage_name: str, stage_spec: StageSpec) -> list[str]:
+    return sorted(
+        (
+            "README.md",
+            "summary.json",
+            *stage_spec.image_names,
+            *STAGE_DATA_NAMES[stage_name],
+        )
+    )
+
+
+def _stage_publication(
     stage_name: str,
     execution: WorkflowExecution,
     *,
     paths: WorkshopPaths,
-) -> tuple[dict[str, Any], Path, StageSpec]:
+) -> tuple[dict[str, Any], str, StageSpec, _StageDataExports]:
     try:
         stage_spec = STAGE_SPECS[stage_name]
     except KeyError as error:
@@ -1078,14 +1117,6 @@ def _publish_stage(
             raise RuntimeError("Workshop stage GPU identity is invalid.")
         gpu_payload = asdict(execution.gpu)
 
-    artifact_names = sorted(
-        (
-            "README.md",
-            "summary.json",
-            *stage_spec.image_names,
-            *STAGE_DATA_NAMES[stage_name],
-        )
-    )
     summary_payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "stage": stage_name,
@@ -1097,22 +1128,207 @@ def _publish_stage(
         "profile": dict(PROFILE),
         "gpu": gpu_payload,
         "facts": result.summary,
-        "artifacts": artifact_names,
+        "artifacts": _stage_artifact_names(stage_name, stage_spec),
     }
-    summary_text = _formatted_json(summary_payload)
-    readme_text = _stage_readme(stage_name, stage_spec, result.summary)
+    return (
+        summary_payload,
+        _stage_readme(stage_name, stage_spec, result.summary),
+        stage_spec,
+        data_exports,
+    )
 
-    stage_directory = paths.output_root / stage_spec.directory
-    stage_directory.mkdir(parents=True, exist_ok=True)
+
+def _safe_output_root(paths: WorkshopPaths) -> Path:
+    fixed_root = _fixed_root(paths)
+    try:
+        relative = paths.output_root.relative_to(paths.root)
+    except ValueError as error:
+        raise RuntimeError("Workshop output root is invalid.") from error
+    current = fixed_root
+    for component in relative.parts:
+        current = current / component
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            current.mkdir(mode=0o700)
+            mode = os.lstat(current).st_mode
+        except OSError as error:
+            raise RuntimeError("Workshop output root is invalid.") from error
+        if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode):
+            raise RuntimeError("Workshop output root is invalid.")
+    return current
+
+
+def _regular_stage_file(directory: Path, name: str) -> Path:
+    path = directory / name
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError as error:
+        raise RuntimeError("Workshop stage artifacts are invalid.") from error
+    if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+        raise RuntimeError("Workshop stage artifacts are invalid.")
+    return path
+
+
+def _validate_stage_directory(
+    stage_name: str,
+    directory: Path,
+    *,
+    expected_summary: dict[str, Any] | None = None,
+    expected_readme: str | None = None,
+) -> None:
+    stage_spec = STAGE_SPECS[stage_name]
+    try:
+        mode = os.lstat(directory).st_mode
+        names = {entry.name for entry in directory.iterdir()}
+    except OSError as error:
+        raise RuntimeError("Workshop stage artifacts are invalid.") from error
+    expected_names = set(_stage_artifact_names(stage_name, stage_spec))
+    if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode) or names != expected_names:
+        raise RuntimeError("Workshop stage artifacts are invalid.")
+    files = {name: _regular_stage_file(directory, name) for name in expected_names}
+    try:
+        summary_text = files["summary.json"].read_text(encoding="utf-8")
+        summary = json.loads(summary_text)
+        readme = files["README.md"].read_text(encoding="utf-8")
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("Workshop stage artifacts are invalid.") from error
+    if (
+        type(summary) is not dict
+        or set(summary)
+        != {
+            "schema_version",
+            "stage",
+            "dataset",
+            "profile",
+            "gpu",
+            "facts",
+            "artifacts",
+        }
+        or summary["stage"] != stage_name
+        or summary["schema_version"] != SCHEMA_VERSION
+        or summary["dataset"]
+        != {
+            "filename": "sample_molecules.csv",
+            "molecule_count": 256,
+            "sha256": DATASET_SHA256,
+        }
+        or summary["profile"] != PROFILE
+        or type(summary["facts"]) is not dict
+        or summary["artifacts"] != _stage_artifact_names(stage_name, stage_spec)
+        or summary_text != _formatted_json(summary)
+        or readme != _stage_readme(stage_name, stage_spec, summary["facts"])
+    ):
+        raise RuntimeError("Workshop stage artifacts are invalid.")
+    if expected_summary is not None and summary != expected_summary:
+        raise RuntimeError("Workshop stage artifacts are invalid.")
+    if expected_readme is not None and readme != expected_readme:
+        raise RuntimeError("Workshop stage artifacts are invalid.")
+    for image_name in stage_spec.image_names:
+        try:
+            from PIL import Image
+
+            with Image.open(files[image_name]) as image:
+                image.verify()
+        except (OSError, ValueError) as error:
+            raise RuntimeError("Workshop stage artifacts are invalid.") from error
+    for data_name in STAGE_DATA_NAMES[stage_name]:
+        try:
+            if files[data_name].stat().st_size == 0:
+                raise RuntimeError("Workshop stage artifacts are invalid.")
+        except OSError as error:
+            raise RuntimeError("Workshop stage artifacts are invalid.") from error
+
+
+def _remove_task_owned_stage_directory(path: Path, output_root: Path) -> None:
+    if path.parent == output_root and path.name.startswith(".acs-stage-"):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _write_stage_directory(
+    stage_name: str,
+    execution: WorkflowExecution,
+    stage_spec: StageSpec,
+    summary_payload: dict[str, Any],
+    readme_text: str,
+    data_exports: _StageDataExports,
+    directory: Path,
+) -> None:
+    result = _stage_result(stage_name, execution)
     for figure, image_name in zip(result.figures, stage_spec.image_names, strict=True):
-        image_path = stage_directory / image_name
+        image_path = directory / image_name
         if stage_name == "inspect_library":
             _save_pil_image(figure, image_path)
         else:
             _save_matplotlib_figure(figure, image_path)
-    (stage_directory / "README.md").write_text(readme_text, encoding="utf-8")
-    (stage_directory / "summary.json").write_text(summary_text, encoding="utf-8")
-    _write_stage_data(stage_directory, data_exports)
+    (directory / "README.md").write_text(readme_text, encoding="utf-8")
+    (directory / "summary.json").write_text(
+        _formatted_json(summary_payload), encoding="utf-8"
+    )
+    _write_stage_data(directory, data_exports)
+
+
+def _stage_directories_match(
+    stage_name: str,
+    expected_directory: Path,
+    fixed_directory: Path,
+) -> None:
+    names = _stage_artifact_names(stage_name, STAGE_SPECS[stage_name])
+    for name in names:
+        if _read_regular_file(expected_directory / name) != _read_regular_file(
+            fixed_directory / name
+        ):
+            raise RuntimeError("Workshop stage artifacts are invalid.")
+
+
+def _publish_stage(
+    stage_name: str,
+    execution: WorkflowExecution,
+    *,
+    paths: WorkshopPaths,
+) -> tuple[dict[str, Any], Path, StageSpec]:
+    summary_payload, readme_text, stage_spec, data_exports = _stage_publication(
+        stage_name, execution, paths=paths
+    )
+    output_root = _safe_output_root(paths)
+    stage_directory = output_root / stage_spec.directory
+    temporary_directory: Path | None = Path(
+        tempfile.mkdtemp(prefix=".acs-stage-", dir=output_root)
+    )
+    try:
+        _write_stage_directory(
+            stage_name,
+            execution,
+            stage_spec,
+            summary_payload,
+            readme_text,
+            data_exports,
+            temporary_directory,
+        )
+        _validate_stage_directory(
+            stage_name,
+            temporary_directory,
+            expected_summary=summary_payload,
+            expected_readme=readme_text,
+        )
+        try:
+            os.lstat(stage_directory)
+        except FileNotFoundError:
+            os.replace(temporary_directory, stage_directory)
+            temporary_directory = None
+        else:
+            _validate_stage_directory(
+                stage_name,
+                stage_directory,
+                expected_summary=summary_payload,
+                expected_readme=readme_text,
+            )
+            _stage_directories_match(stage_name, temporary_directory, stage_directory)
+    except OSError as error:
+        raise RuntimeError("Workshop stage artifacts are invalid.") from error
+    finally:
+        if temporary_directory is not None:
+            _remove_task_owned_stage_directory(temporary_directory, output_root)
     return summary_payload, stage_directory, stage_spec
 
 
@@ -1148,12 +1364,198 @@ def run_stage(
     }
 
 
+def _lesson_execution_for_stage(
+    stage_name: str,
+    execution: WorkflowExecution,
+    lesson_stages: tuple[str, str],
+) -> WorkflowExecution:
+    retained = execution.stage_results[-2:]
+    if tuple(result.stage for result in retained) != lesson_stages:
+        raise RuntimeError("Workshop lesson result is invalid.")
+    return _prefix_execution_for_stage(stage_name, execution)
+
+
+def _prefix_execution_for_stage(
+    stage_name: str,
+    execution: WorkflowExecution,
+) -> WorkflowExecution:
+    try:
+        result = next(
+            result for result in execution.stage_results if result.stage == stage_name
+        )
+    except StopIteration as error:
+        raise RuntimeError("Workshop lesson result is invalid.") from error
+    return WorkflowExecution(
+        state=execution.state,
+        stage_results=(result,),
+        gpu=None if stage_name == "inspect_library" else execution.gpu,
+    )
+
+
+def _compact_stage_item(
+    stage_name: str,
+    summary: dict[str, Any],
+    stage_directory: Path,
+    stage_spec: StageSpec,
+) -> dict[str, Any]:
+    return {
+        "stage": stage_name,
+        "result": _stage_result_text(stage_name, _fact_dict(summary, "facts")),
+        "image_paths": [
+            str((stage_directory / image_name).resolve())
+            for image_name in stage_spec.image_names
+        ],
+        "summary_path": str((stage_directory / "summary.json").resolve()),
+        "readme_path": str((stage_directory / "README.md").resolve()),
+        "artifact_directory": str(stage_directory.resolve()),
+    }
+
+
+def _bundle_readme(present_stages: set[str]) -> str:
+    questions = (
+        (
+            "What is in the fixed molecule library and its fingerprint representation?",
+            ("01-inspection", "02-fingerprints"),
+        ),
+        (
+            "Which molecules are similar and how are they grouped?",
+            ("03-similarity", "04-clusters"),
+        ),
+        (
+            "What sampled 3D geometries and MMFF94 results are available?",
+            ("05-conformers", "06-mmff94"),
+        ),
+        (
+            "What objective challenge output is available?",
+            ("07-objective",),
+        ),
+    )
+    lines = ["# ACS workshop results", ""]
+    for question, directories in questions:
+        available = all(
+            any(STAGE_DIRECTORIES.get(stage) == directory for stage in present_stages)
+            for directory in directories
+        )
+        location = ", ".join(f"`{directory}/`" for directory in directories)
+        state = "available" if available else "pending"
+        lines.append(f"- {question} {location} ({state}).")
+    return "\n".join(lines) + "\n"
+
+
+def _zip_member(archive: zipfile.ZipFile, name: str, contents: bytes) -> None:
+    member = zipfile.ZipInfo(filename=name, date_time=(1980, 1, 1, 0, 0, 0))
+    member.compress_type = zipfile.ZIP_DEFLATED
+    member.external_attr = (stat.S_IFREG | 0o644) << 16
+    archive.writestr(member, contents)
+
+
+def _rebuild_results_zip(paths: WorkshopPaths, execution: WorkflowExecution) -> Path:
+    output_root = _safe_output_root(paths)
+    present: list[tuple[str, Path]] = []
+    for stage_name in STAGE_ORDER:
+        directory = output_root / STAGE_DIRECTORIES[stage_name]
+        try:
+            os.lstat(directory)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise RuntimeError("Workshop stage artifacts are invalid.") from error
+        try:
+            stage_execution = _prefix_execution_for_stage(stage_name, execution)
+        except RuntimeError:
+            continue
+        _, validated_directory, _ = _publish_stage(
+            stage_name, stage_execution, paths=paths
+        )
+        present.append((stage_name, validated_directory))
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".acs-results-", suffix=".zip", dir=output_root
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    archive_path = output_root / "results.zip"
+    try:
+        with zipfile.ZipFile(
+            temporary_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            strict_timestamps=True,
+        ) as archive:
+            _zip_member(
+                archive,
+                "README.md",
+                _bundle_readme({name for name, _ in present}).encode("utf-8"),
+            )
+            for source_name in ("data/sample_molecules.csv", "data/PROVENANCE.md"):
+                _zip_member(
+                    archive, source_name, (paths.root / source_name).read_bytes()
+                )
+            for stage_name, directory in present:
+                for artifact_name in _stage_artifact_names(
+                    stage_name, STAGE_SPECS[stage_name]
+                ):
+                    _zip_member(
+                        archive,
+                        f"{STAGE_DIRECTORIES[stage_name]}/{artifact_name}",
+                        _read_regular_file(directory / artifact_name),
+                    )
+        os.replace(temporary_path, archive_path)
+    except Exception:
+        try:
+            if temporary_path.exists() and temporary_path.parent == output_root:
+                temporary_path.unlink()
+        except OSError:
+            pass
+        raise
+    return archive_path
+
+
+def run_lesson(
+    lesson: str,
+    *,
+    paths: WorkshopPaths = DEFAULT_PATHS,
+    workflow_executor: WorkflowExecutor | None = None,
+) -> dict[str, Any]:
+    verify_manifest(paths)
+    try:
+        terminal_stage = LESSON_TERMINAL_STAGES[lesson]
+        lesson_stages = LESSON_STAGES[lesson]
+    except KeyError as error:
+        raise ValueError("Invalid workshop arguments.") from error
+    if workflow_executor is None:
+        execution = execute_workflow_prefix(terminal_stage, paths=paths)
+    else:
+        execution = workflow_executor(terminal_stage)
+    completed_stages: list[dict[str, Any]] = []
+    for stage_name in lesson_stages:
+        stage_execution = _lesson_execution_for_stage(
+            stage_name, execution, lesson_stages
+        )
+        summary, directory, stage_spec = _publish_stage(
+            stage_name, stage_execution, paths=paths
+        )
+        completed_stages.append(
+            _compact_stage_item(stage_name, summary, directory, stage_spec)
+        )
+    archive_path = _rebuild_results_zip(paths, execution)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "complete",
+        "lesson": lesson,
+        "completed_stages": completed_stages,
+        "results_zip_path": str(archive_path.resolve()),
+        "artifact_relative_zip_path": "workshop/results.zip",
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         verify_manifest(DEFAULT_PATHS)
         arguments = build_parser().parse_args(argv)
         if arguments.command == "run-stage":
             result = run_stage(arguments.stage_name, paths=DEFAULT_PATHS)
+        elif arguments.command == "run-lesson":
+            result = run_lesson(arguments.lesson, paths=DEFAULT_PATHS)
         elif arguments.command == "objective-start":
             raise RuntimeError("Workshop objective execution is not implemented.")
         else:

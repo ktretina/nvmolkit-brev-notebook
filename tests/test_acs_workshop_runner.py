@@ -7,6 +7,7 @@ import os
 import stat
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 from types import ModuleType
 
@@ -27,6 +28,7 @@ MANIFEST_FILES = (
     "acs_workshop_runner.py",
     "chemistry_workflow.py",
     "data/sample_molecules.csv",
+    "data/PROVENANCE.md",
     "objective_challenge.py",
 )
 
@@ -218,6 +220,7 @@ def workshop_paths(tmp_path: Path) -> runner.WorkshopPaths:
         "acs_workshop_runner.py": source_root / "acs_workshop_runner.py",
         "chemistry_workflow.py": source_root / "chemistry_workflow.py",
         "data/sample_molecules.csv": source_root / "data" / "sample_molecules.csv",
+        "data/PROVENANCE.md": source_root / "data" / "PROVENANCE.md",
         "objective_challenge.py": source_root / "objective_challenge.py",
     }
     for name, source in sources.items():
@@ -864,6 +867,259 @@ def test_stage_result_envelope_is_exact(
     }
 
 
+def test_run_lesson_parser_has_exact_fixed_choices_and_terminal_mappings() -> None:
+    parser = runner.build_parser()
+    subcommands = next(
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    lesson_parser = subcommands.choices["run-lesson"]
+    lesson_action = next(
+        action for action in lesson_parser._actions if action.dest == "lesson"
+    )
+    expected = {
+        "data-and-representation": "generate_morgan_fingerprints",
+        "relationships-and-groups": "discover_fused_butina_clusters",
+        "sampled-3d-geometry": "optimize_conformers_mmff94",
+    }
+    assert tuple(lesson_action.choices) == tuple(expected)
+    assert runner.LESSON_TERMINAL_STAGES == expected
+    for lesson in expected:
+        assert parser.parse_args(["run-lesson", lesson]).lesson == lesson
+
+
+def test_run_lesson_executes_one_terminal_prefix_and_returns_closed_compact_items(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    calls: list[str] = []
+
+    def execute(stage_name: str) -> runner.WorkflowExecution:
+        calls.append(stage_name)
+        return workflow_executions[stage_name]
+
+    result = runner.run_lesson(
+        "relationships-and-groups",
+        paths=workshop_paths,
+        workflow_executor=execute,
+    )
+
+    assert calls == ["discover_fused_butina_clusters"]
+    assert set(result) == {
+        "schema_version",
+        "status",
+        "lesson",
+        "completed_stages",
+        "results_zip_path",
+        "artifact_relative_zip_path",
+    }
+    assert result["lesson"] == "relationships-and-groups"
+    assert [item["stage"] for item in result["completed_stages"]] == [
+        "measure_tanimoto_similarity",
+        "discover_fused_butina_clusters",
+    ]
+    for item in result["completed_stages"]:
+        assert set(item) == {
+            "stage",
+            "result",
+            "image_paths",
+            "summary_path",
+            "readme_path",
+            "artifact_directory",
+        }
+        assert item["result"] == EXPECTED_STAGE_RESULTS[item["stage"]]
+        assert "facts" not in item
+        assert "records" not in item
+        assert "matrix" not in item
+    assert not (workshop_paths.output_root / "01-inspection").exists()
+    assert (workshop_paths.output_root / "03-similarity").is_dir()
+    assert (workshop_paths.output_root / "04-clusters").is_dir()
+
+
+def test_run_lesson_failure_does_not_publish_a_partial_fixed_stage(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    execution = workflow_executions["generate_morgan_fingerprints"]
+    invalid_inspection = runner.StageResult(
+        stage="inspect_library",
+        display_label="inspection",
+        summary=EXPECTED_STAGE_FACTS["inspect_library"],
+        figures=(),
+    )
+    invalid_execution = runner.WorkflowExecution(
+        state=execution.state,
+        stage_results=(invalid_inspection, execution.stage_results[-1]),
+        gpu=execution.gpu,
+    )
+
+    with pytest.raises(
+        RuntimeError, match=r"^Workshop stage image count is invalid\.$"
+    ):
+        runner.run_lesson(
+            "data-and-representation",
+            paths=workshop_paths,
+            workflow_executor=lambda stage: invalid_execution,
+        )
+    assert not (workshop_paths.output_root / "01-inspection").exists()
+    assert not (workshop_paths.output_root / "02-fingerprints").exists()
+
+
+def test_run_lesson_reuses_valid_stage_bytes_and_rejects_a_symlink_target(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    def execute(stage: str) -> runner.WorkflowExecution:
+        return workflow_executions[stage]
+
+    runner.run_lesson(
+        "data-and-representation", paths=workshop_paths, workflow_executor=execute
+    )
+    stage_directory = workshop_paths.output_root / "01-inspection"
+    before = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in stage_directory.iterdir()
+    }
+    runner.run_lesson(
+        "data-and-representation", paths=workshop_paths, workflow_executor=execute
+    )
+    after = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in stage_directory.iterdir()
+    }
+    assert after == before
+
+    backing = workshop_paths.output_root / "01-inspection-real"
+    os.replace(stage_directory, backing)
+    os.symlink(backing.name, stage_directory)
+    with pytest.raises(RuntimeError):
+        runner.run_lesson(
+            "data-and-representation", paths=workshop_paths, workflow_executor=execute
+        )
+    assert stage_directory.is_symlink()
+    assert backing.is_dir()
+
+
+def test_run_lesson_rebuilds_only_safe_public_zip_members_and_preserves_old_zip_on_failure(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def execute(stage: str) -> runner.WorkflowExecution:
+        return workflow_executions[stage]
+
+    runner.run_lesson(
+        "data-and-representation", paths=workshop_paths, workflow_executor=execute
+    )
+    archive_path = workshop_paths.output_root / "results.zip"
+    with zipfile.ZipFile(archive_path) as archive:
+        members = archive.namelist()
+    expected = {"README.md", "data/sample_molecules.csv", "data/PROVENANCE.md"}
+    for stage_name in ("inspect_library", "generate_morgan_fingerprints"):
+        directory = EXPECTED_STAGE_DIRECTORIES[stage_name]
+        expected.update(
+            f"{directory}/{name}"
+            for name in (
+                "README.md",
+                "summary.json",
+                *EXPECTED_STAGE_IMAGES[stage_name],
+                *EXPECTED_STAGE_DATA[stage_name],
+            )
+        )
+    assert set(members) == expected
+    assert len(members) == len(set(members))
+    assert all(
+        not name.startswith("/") and ".." not in Path(name).parts for name in members
+    )
+    assert all(".acs-stage-" not in name and name != "results.zip" for name in members)
+
+    previous_bytes = archive_path.read_bytes()
+    real_replace = runner.os.replace
+
+    def fail_archive_replace(source: object, destination: object) -> None:
+        if Path(destination) == archive_path:
+            raise OSError("replace failed")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(runner.os, "replace", fail_archive_replace)
+    with pytest.raises(OSError, match=r"^replace failed$"):
+        runner.run_lesson(
+            "data-and-representation", paths=workshop_paths, workflow_executor=execute
+        )
+    assert archive_path.read_bytes() == previous_bytes
+
+
+@pytest.mark.parametrize(
+    "lesson,relative_artifact,mutation",
+    (
+        pytest.param(
+            "relationships-and-groups",
+            "03-similarity/top_similarity_pairs.csv",
+            "csv",
+            id="csv",
+        ),
+        pytest.param(
+            "sampled-3d-geometry",
+            "06-mmff94/workflow_evidence.json",
+            "json",
+            id="json",
+        ),
+        pytest.param(
+            "sampled-3d-geometry",
+            "06-mmff94/optimized_conformers.sdf",
+            "sdf",
+            id="sdf",
+        ),
+        pytest.param(
+            "relationships-and-groups",
+            "04-clusters/cluster_sizes.png",
+            "png",
+            id="png",
+        ),
+    ),
+)
+def test_run_lesson_rejects_nonempty_tampered_public_artifacts_without_replacing_zip(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    lesson: str,
+    relative_artifact: str,
+    mutation: str,
+) -> None:
+    def execute(stage: str) -> runner.WorkflowExecution:
+        return workflow_executions[stage]
+
+    runner.run_lesson(lesson, paths=workshop_paths, workflow_executor=execute)
+    target = workshop_paths.output_root / relative_artifact
+    archive_path = workshop_paths.output_root / "results.zip"
+    previous_archive = archive_path.read_bytes()
+    if mutation == "png":
+        Image.new("RGB", (8, 8), color="red").save(target, format="PNG")
+    else:
+        target.write_text(f"tampered {mutation}\n", encoding="utf-8")
+    tampered_bytes = target.read_bytes()
+
+    with pytest.raises(RuntimeError, match=r"^Workshop stage artifacts are invalid\.$"):
+        runner.run_lesson(lesson, paths=workshop_paths, workflow_executor=execute)
+    assert target.read_bytes() == tampered_bytes
+    assert archive_path.read_bytes() == previous_archive
+
+
+def test_provenance_manifest_mutation_stops_lesson_before_executor(
+    workshop_paths: runner.WorkshopPaths,
+) -> None:
+    provenance = workshop_paths.root / "data" / "PROVENANCE.md"
+    provenance.write_text("changed\n", encoding="utf-8")
+    calls: list[str] = []
+    with pytest.raises(RuntimeError, match="(?i)manifest"):
+        runner.run_lesson(
+            "data-and-representation",
+            paths=workshop_paths,
+            workflow_executor=lambda stage: calls.append(stage),
+        )
+    assert calls == []
+
+
 def test_stage_summary_does_not_mutate_stage_result_facts(
     workshop_paths: runner.WorkshopPaths,
     workflow_executions: dict[str, runner.WorkflowExecution],
@@ -922,6 +1178,7 @@ def test_cli_exposes_only_fixed_commands_without_path_options() -> None:
     )
     assert tuple(subcommands.choices) == (
         "run-stage",
+        "run-lesson",
         "objective-start",
         "objective-step",
     )
