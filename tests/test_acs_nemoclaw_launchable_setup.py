@@ -99,12 +99,10 @@ def test_setup_applies_verified_host_provider_timeout_before_runtime_checks() ->
     config_get = (
         'provider_timeout="$("${nemoclaw}" "${sandbox_name}" config get \\\n'
         "  --key models.providers.inference.timeoutSeconds \\\n"
-        '  --format json)"'
+        '  --format json 2>/dev/null)"'
     )
     timeout_check = '[[ "${provider_timeout}" == "300" ]] ||'
     listener_check = 'ss -H -ltn "sport = :18789"'
-    seed_turn = "agent --session-id main --json --timeout 600 -m"
-
     assert config_set in source
     assert config_get in source
     assert timeout_check in source
@@ -112,14 +110,14 @@ def test_setup_applies_verified_host_provider_timeout_before_runtime_checks() ->
     assert source.index(config_set) < source.index(config_get)
     assert source.index(config_get) < source.index(timeout_check)
     assert source.index(timeout_check) < source.index(listener_check)
-    assert source.index(timeout_check) < source.index(seed_turn)
+    assert "agent --session-id" not in source
+    assert "HIGHLIGHT_THRESHOLD" not in source
+    assert source.count("threshold-080") == 1
     assert "shields down" not in source
     assert "openclaw config set" not in source
 
 
-def test_setup_script_orchestrates_fixed_assets_and_one_time_bounded_agent_turn() -> (
-    None
-):
+def test_setup_script_orchestrates_only_the_lean_workshop_assets() -> None:
     source = _source()
 
     required_assets = (
@@ -128,10 +126,11 @@ def test_setup_script_orchestrates_fixed_assets_and_one_time_bounded_agent_turn(
         "launchable/nvmolkit_gpu_probe.py",
         "skills/nvmolkit",
         "data/sample_molecules.csv",
-        "acs_chemistry_task.py",
+        "data/PROVENANCE.md",
+        "acs_workshop_runner.py",
+        "objective_challenge.py",
         "chemistry_workflow.py",
         "launchable/acs_workspace_tools.md",
-        "launchable/acs_task_prompt.txt",
         "launchable/start_artifact_server.sh",
         "launchable/openclaw_secure_link_proxy.mjs",
     )
@@ -146,28 +145,15 @@ def test_setup_script_orchestrates_fixed_assets_and_one_time_bounded_agent_turn(
     assert "PYTHONPATH=/tmp/.local/lib/python3.13/site-packages" in source
     assert "skill install" in source
     assert '"${workspace}/TOOLS.md"' in source
-    assert source.count("agent --session-id main --json --timeout 600 -m") == 1
-    assert "outputs/threshold-080/similarity_heatmap.png" in source
-    assert "outputs/threshold-080/results.zip" in source
-    assert "outputs/threshold-080/summary.json" in source
-    assert '"highlight_threshold"' in source
-    assert "0.80" in source
+    assert source.count("sandbox upload") == 9
+    assert "agent --session-id" not in source
+    assert source.count("acs_chemistry_task.py") == 1
+    assert source.count("acs_task_prompt.txt") == 1
 
 
 def test_setup_uploads_files_to_existing_parent_directories() -> None:
     source = _source()
-    stale_path_cleanup = (
-        '"${nemoclaw}" "${sandbox_name}" exec -- rm -rf -- \\\n'
-        '  "/tmp/acs-setup/install_nvmolkit_in_sandbox.sh" \\\n'
-        '  "/tmp/acs-setup/nvmolkit_gpu_probe.py" \\\n'
-        '  "${workspace}/data/sample_molecules.csv" \\\n'
-        '  "${workspace}/acs_chemistry_task.py" \\\n'
-        '  "${workspace}/chemistry_workflow.py" \\\n'
-        '  "${workspace}/TOOLS.md" \\\n'
-        '  "${workspace}/acs_workspace_tools.md" \\\n'
-        '  "${workspace}/acs_task_prompt.txt" \\\n'
-        '  "${workspace}/start_artifact_server.sh"'
-    )
+    cleanup = source.index('"${nemoclaw}" "${sandbox_name}" exec -- rm -rf --')
     expected_uploads = (
         '"${openshell}" sandbox upload "${sandbox_name}" "${sandbox_installer}" \\\n'
         '  "/tmp/acs-setup"',
@@ -175,20 +161,34 @@ def test_setup_uploads_files_to_existing_parent_directories() -> None:
         '  "/tmp/acs-setup"',
         '"${openshell}" sandbox upload "${sandbox_name}" "${dataset}" \\\n'
         '  "${workspace}/data"',
-        '"${openshell}" sandbox upload "${sandbox_name}" "${chemistry_task}" \\\n'
+        '"${openshell}" sandbox upload "${sandbox_name}" "${provenance}" \\\n'
+        '  "${workspace}/data"',
+        '"${openshell}" sandbox upload "${sandbox_name}" "${workshop_runner}" \\\n'
+        '  "${workspace}"',
+        '"${openshell}" sandbox upload "${sandbox_name}" "${objective_challenge}" \\\n'
         '  "${workspace}"',
         '"${openshell}" sandbox upload "${sandbox_name}" "${chemistry_workflow}" \\\n'
         '  "${workspace}"',
         '"${openshell}" sandbox upload "${sandbox_name}" "${workspace_tools}" \\\n'
         '  "${workspace}"',
-        '"${openshell}" sandbox upload "${sandbox_name}" "${task_prompt}" \\\n'
-        '  "${workspace}"',
         '"${openshell}" sandbox upload "${sandbox_name}" "${artifact_server}" \\\n'
         '  "${workspace}"',
     )
 
-    assert stale_path_cleanup in source
-    assert source.index(stale_path_cleanup) < source.index(expected_uploads[0])
+    for path in (
+        '"${workspace}/outputs/workshop"',
+        '"${workspace}/.acs-workshop-state"',
+        '"${workspace}/outputs/threshold-080"',
+        '"${workspace}/acs_chemistry_task.py"',
+        '"${workspace}/acs_task_prompt.txt"',
+    ):
+        assert path in source[cleanup : source.index(expected_uploads[0])]
+    assert 'rm -rf -- "${workspace}"' not in source
+    assert (
+        '"${workspace}/outputs"'
+        not in source[cleanup : source.index(expected_uploads[0])]
+    )
+    assert cleanup < source.index(expected_uploads[0])
     assert source.count("sandbox upload") == len(expected_uploads)
     for upload in expected_uploads:
         assert upload in source
@@ -196,6 +196,39 @@ def test_setup_uploads_files_to_existing_parent_directories() -> None:
         '"${nemoclaw}" "${sandbox_name}" exec -- mv -- \\\n'
         '  "${workspace}/acs_workspace_tools.md" "${workspace}/TOOLS.md"' in source
     )
+
+
+def test_setup_creates_the_exact_atomic_read_only_manifest_before_quiet_help() -> None:
+    source = _source()
+    last_upload = source.rindex("sandbox upload")
+    state_create = source.index('mkdir -m 700 -- "${workspace}/.acs-workshop-state"')
+    manifest_create = source.index('ACS_EXPECTED_RUNNER_SHA="${expected_runner_sha}"')
+    help_smoke = source.index("acs_workshop_runner.py --help >/dev/null 2>&1")
+
+    assert last_upload < state_create < manifest_create < help_smoke
+    assert 'expected_runner_sha="$(host_sha256 "${workshop_runner}")"' in source
+    assert 'expected_objective_sha="$(host_sha256 "${objective_challenge}")"' in source
+    assert 'expected_workflow_sha="$(host_sha256 "${chemistry_workflow}")"' in source
+    assert 'expected_dataset_sha="$(host_sha256 "${dataset}")"' in source
+    assert 'expected_provenance_sha="$(host_sha256 "${provenance}")"' in source
+    assert 'expected_tools_sha="$(host_sha256 "${workspace_tools}")"' in source
+    for name in (
+        '"TOOLS.md": os.environ["ACS_EXPECTED_TOOLS_SHA"]',
+        '"acs_workshop_runner.py": os.environ["ACS_EXPECTED_RUNNER_SHA"]',
+        '"chemistry_workflow.py": os.environ["ACS_EXPECTED_WORKFLOW_SHA"]',
+        '"data/sample_molecules.csv": os.environ["ACS_EXPECTED_DATASET_SHA"]',
+        '"data/PROVENANCE.md": os.environ["ACS_EXPECTED_PROVENANCE_SHA"]',
+        '"objective_challenge.py": os.environ["ACS_EXPECTED_OBJECTIVE_SHA"]',
+    ):
+        assert name in source
+    assert "os.O_CREAT | os.O_EXCL | os.O_WRONLY" in source
+    assert "os.fsync(descriptor)" in source
+    assert "os.replace(temporary, manifest)" in source
+    assert "os.chmod(manifest, 0o444)" in source
+    assert source.count('"schema_version": 1') == 1
+    assert source.count("ACS_EXPECTED_") == 12
+    assert "chmod 0444 -- \\\n" in source
+    assert source.index("chmod 0444 -- \\\n") < help_smoke
 
 
 def test_setup_script_requires_a_loopback_dashboard_and_exposes_only_the_proxy() -> (
@@ -207,8 +240,8 @@ def test_setup_script_requires_a_loopback_dashboard_and_exposes_only_the_proxy()
     )
 
     start_artifacts = (
-        'forward start --background 0.0.0.0:8765 "${sandbox_name}" '
-        "</dev/null >/dev/null 2>&1"
+        '"${openshell}" forward start 0.0.0.0:8765 "${sandbox_name}" '
+        "</dev/null >/dev/null 2>&1 &"
     )
     forbidden_bind = "NEMOCLAW_DASHBOARD_BIND" + "=0.0.0.0"
     assert forbidden_bind not in phase_zero + source
@@ -220,9 +253,11 @@ def test_setup_script_requires_a_loopback_dashboard_and_exposes_only_the_proxy()
     assert 'ACS_DASHBOARD_TOKEN="${gateway_token}"' in source
     assert '"${node_bin}" "${dashboard_proxy}"' in source
     assert start_artifacts in source
-    assert source.count("/usr/bin/setsid -f") == 1
+    assert "forward start --background" not in source
+    assert source.count("/usr/bin/setsid -f") == 0
     assert "http://127.0.0.1:18788/" in source
-    assert "http://127.0.0.1:8765/threshold-080/results.zip" in source
+    assert 'wait_for_http "http://127.0.0.1:8765/${artifact_sentinel_name}"' in source
+    assert source.count("threshold-080") == 1
     assert source.index("gateway-token --quiet") < source.index(
         'ACS_DASHBOARD_TOKEN="${gateway_token}"'
     )
@@ -230,48 +265,178 @@ def test_setup_script_requires_a_loopback_dashboard_and_exposes_only_the_proxy()
         "unset gateway_token"
     )
     assert "for attempt in {1..60}" in source
-    assert source.index(
-        "http://127.0.0.1:8765/threshold-080/results.zip"
-    ) < source.index("printf 'ready\\n'")
+    assert source.index("http://127.0.0.1:8765/") < source.index("printf 'ready\\n'")
 
 
-def test_setup_verifies_the_exact_post_turn_source_inputs_and_artifact_set() -> None:
+def test_rerun_stops_exact_tracked_services_before_workspace_reset() -> None:
     source = _source()
-    agent_turn = source.index("agent --session-id main --json --timeout 600 -m")
+    cleanup = source.index('"${nemoclaw}" "${sandbox_name}" exec -- rm -rf --')
+    stop_proxy = source.index("stop_tracked_proxy\n")
+    stop_forward = source.index("stop_tracked_artifact_forward\n")
+    proxy_listener = source.index('ss -H -ltn "sport = :18788"', stop_proxy)
+    forward_listener = source.index('ss -H -ltn "sport = :8765"', stop_forward)
 
-    assert "acs_chemistry_task.original.py" not in source
-    assert "protected.sha256" not in source
-    assert 'expected_task_sha="$(python3 - "${chemistry_task}"' in source
-    assert 'expected_dataset_sha="$(host_sha256 "${dataset}")"' in source
-    assert 'expected_workflow_sha="$(host_sha256 "${chemistry_workflow}")"' in source
-    assert 'expected_tools_sha="$(host_sha256 "${workspace_tools}")"' in source
-    assert 'expected_prompt_sha="$(host_sha256 "${task_prompt}")"' in source
-    assert 'expected_server_sha="$(host_sha256 "${artifact_server}")"' in source
     assert (
-        source.index('expected_task_sha="$(python3 - "${chemistry_task}"') < agent_turn
+        'readonly artifact_forward_pid_file="${state_dir}/artifact-forward.pid"'
+        in source
     )
-    assert source.index('rm -rf -- "${result_dir}"') < agent_turn
-    assert source.index('mkdir -p -- "${result_dir}"') < agent_turn
-    assert source.index('rm -rf -- "${result_dir}"') < source.index(
-        'mkdir -p -- "${result_dir}"'
+    assert "proxy_process_matches" in source
+    assert "artifact_forward_process_matches" in source
+    assert '"/proc/${pid}/stat"' in source
+    assert 'local expected_start_ticks="$2"' in source
+    assert '"${process_argv[1]}" == "forward"' in source
+    assert '"${process_argv[2]}" == "start"' in source
+    assert '"${process_argv[3]}" == "0.0.0.0:8765"' in source
+    assert '"${process_argv[4]}" == "${sandbox_name}"' in source
+    assert stop_proxy < stop_forward < proxy_listener < forward_listener < cleanup
+    assert 'die "the recorded proxy PID file is unsafe."' in source
+    assert 'die "the recorded artifact-forward PID file is unsafe."' in source
+    assert 'die "port 8765 is already owned by an untracked process."' in source
+
+
+def test_nonzero_exit_rolls_back_only_new_validated_services_until_ready() -> None:
+    source = _source()
+    cleanup = source[source.index("cleanup() {") : source.index("trap cleanup EXIT")]
+    proxy_spawn = source.index(
+        '/usr/bin/setsid "${node_bin}" "${dashboard_proxy}" '
+        "</dev/null >/dev/null 2>&1 &"
     )
-    assert 'old = b"HIGHLIGHT_THRESHOLD = 0.70\\n"' in source
-    assert 'new = b"HIGHLIGHT_THRESHOLD = 0.80\\n"' in source
-    assert 'ACS_EXPECTED_TASK_SHA="${expected_task_sha}"' in source
-    assert 'ACS_EXPECTED_SERVER_SHA="${expected_server_sha}"' in source
-    assert '"start_artifact_server.sh": os.environ["ACS_EXPECTED_SERVER_SHA"]' in source
-    assert "hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash" in source
-    assert "expected_files = {" in source
-    for artifact in (
-        '"README.md"',
-        '"summary.json"',
-        '"top_10_pairs.csv"',
-        '"similarity_heatmap.png"',
-        '"results.zip"',
+    proxy_pid = source.index("proxy_pid=$!", proxy_spawn)
+    proxy_tick = source.index(
+        'if ! proxy_start_ticks="$(process_start_ticks "${proxy_pid}")"', proxy_pid
+    )
+    proxy_arm = source.index("proxy_rollback_armed=1", proxy_pid)
+    proxy_publish = source.index(
+        'mv -f -- "${proxy_pid_temp}" "${proxy_pid_file}"', proxy_arm
+    )
+    forward_spawn = source.index(
+        '/usr/bin/setsid "${openshell}" forward start 0.0.0.0:8765 '
+        '"${sandbox_name}" </dev/null >/dev/null 2>&1 &'
+    )
+    forward_pid = source.index("artifact_forward_pid=$!", forward_spawn)
+    forward_tick = source.index(
+        'if ! artifact_forward_start_ticks="$(process_start_ticks "${artifact_forward_pid}")"',
+        forward_pid,
+    )
+    forward_arm = source.index("artifact_forward_rollback_armed=1", forward_pid)
+    forward_publish = source.index(
+        'mv -f -- "${artifact_forward_pid_temp}" "${artifact_forward_pid_file}"',
+        forward_arm,
+    )
+    assert "local exit_code=$?" in cleanup
+    assert "rollback_new_artifact_forward" in cleanup
+    assert "rollback_new_proxy" in cleanup
+    assert proxy_pid < proxy_tick < proxy_arm < proxy_publish
+    assert forward_pid < forward_tick < forward_arm < forward_publish
+    assert '"${proxy_pid}:${proxy_start_ticks}"' in source
+    assert '"${artifact_forward_pid}:${artifact_forward_start_ticks}"' in source
+    for function_name, validator, pid in (
+        ("rollback_new_proxy", "proxy_process_matches", "proxy_pid"),
+        (
+            "rollback_new_artifact_forward",
+            "artifact_forward_process_matches",
+            "artifact_forward_pid",
+        ),
     ):
-        assert artifact in source
-    assert "set(output.iterdir())" not in source
-    assert "actual_files != expected_files" in source
+        function_start = source.index(f"{function_name}() {{")
+        function_end = source.index("\n}", function_start)
+        body = source[function_start:function_end]
+        normalized_body = " ".join(body.split())
+        assert f'{validator} "${{{pid}}}"' in normalized_body
+        assert f'kill -TERM "${{{pid}}}"' in body
+        assert f'kill -KILL "${{{pid}}}"' in body
+
+
+def test_failed_start_tick_read_terminates_and_reaps_the_direct_child() -> None:
+    source = _source()
+    helper_start = source.index("terminate_just_spawned_child() {")
+    helper_end = source.index("\n}", helper_start)
+    helper = source[helper_start:helper_end]
+
+    assert 'kill -TERM "${pid}"' in helper
+    assert 'kill -KILL "${pid}"' in helper
+    assert 'wait "${pid}"' in helper
+    assert "for attempt in {1..10}" in helper
+    for ticks, pid, error in (
+        (
+            "proxy_start_ticks",
+            "proxy_pid",
+            "could not record the new proxy process identity.",
+        ),
+        (
+            "artifact_forward_start_ticks",
+            "artifact_forward_pid",
+            "could not record the new artifact-forward process identity.",
+        ),
+    ):
+        guard = source.index(f'if ! {ticks}="$(process_start_ticks "${{{pid}}}")"')
+        guard_end = source.index("\nfi", guard)
+        body = source[guard:guard_end]
+        arm = source.index(f"{pid.removesuffix('_pid')}_rollback_armed=1", guard)
+        assert f'terminate_just_spawned_child "${{{pid}}}"' in body
+        assert f'die "{error}"' in body
+        assert guard_end < arm
+
+
+def test_ready_marker_and_final_output_remain_failure_atomic() -> None:
+    source = _source()
+    cleanup = source[source.index("cleanup() {") : source.index("trap cleanup EXIT")]
+    ready_publish = source.index('mv -f -- "${ready_temp}" "${ready_marker}"')
+    ready_output = source.index("printf 'ACS chemistry workspace is ready.\\n'")
+    success = source.index("setup_succeeded=1")
+
+    assert "setup_succeeded=0" in source
+    assert '"${exit_code}" != "0"' in cleanup
+    assert '"${setup_succeeded}" != "1"' in cleanup
+    assert 'rm -f -- "${ready_marker}"' in cleanup
+    assert cleanup.index('rm -f -- "${ready_marker}"') < cleanup.index(
+        "rollback_new_artifact_forward"
+    )
+    assert "trap 'exit 129' HUP" in source
+    assert "trap 'exit 130' INT" in source
+    assert "trap 'exit 143' TERM" in source
+    assert ready_publish < ready_output < success
+    assert source.count("proxy_rollback_armed=0") == 1
+    assert source.count("artifact_forward_rollback_armed=0") == 1
+
+
+def test_artifact_forward_serves_an_exact_setup_sentinel_before_ready() -> None:
+    source = _source()
+    create = source.index(
+        'ACS_ARTIFACT_SENTINEL_CONTENT="${artifact_sentinel_content}"'
+    )
+    fetch = source.index(
+        'wait_for_http "http://127.0.0.1:8765/${artifact_sentinel_name}"'
+    )
+    compare = source.index(
+        '[[ "$(<"${artifact_probe}")" == "${artifact_sentinel_content}" ]]'
+    )
+    ready = source.index('mv -f -- "${ready_temp}" "${ready_marker}"')
+
+    assert 'readonly artifact_sentinel_name=".acs-artifact-service-ready"' in source
+    assert (
+        'readonly artifact_sentinel_content="acs-artifact-service-ready-v1"' in source
+    )
+    assert '"${workspace}/outputs/${artifact_sentinel_name}"' in source
+    assert create < fetch < compare < ready
+    assert 'rm -f -- "${artifact_probe}"' in source
+
+
+def test_setup_has_short_progress_without_raw_tool_output() -> None:
+    source = _source()
+
+    for label in (
+        "Validate hardware",
+        "Install OpenClaw runtime",
+        "Verify private dashboard",
+        "Install chemistry tools",
+        "Prepare workshop files",
+        "Start attendee services",
+    ):
+        assert f'phase "{label}"' in source
+    assert "set -x" not in source
+    assert "--json" not in source
+    assert source.count(">/dev/null 2>&1") >= 12
 
 
 def test_setup_tracks_and_validates_proxy_process_ownership() -> None:
@@ -285,7 +450,7 @@ def test_setup_tracks_and_validates_proxy_process_ownership() -> None:
     assert '"/proc/${pid}/cmdline"' in source
     assert 'kill -TERM "${old_proxy_pid}"' in source
     assert 'kill -0 "${old_proxy_pid}"' in source
-    assert "kill -KILL" not in source
+    assert 'kill -KILL "${old_proxy_pid}"' not in source
     assert 'ss -H -ltn "sport = :18788"' in source
     assert '/usr/bin/setsid "${node_bin}" "${dashboard_proxy}"' in source
     assert '/usr/bin/setsid -f "${node_bin}" "${dashboard_proxy}"' not in source

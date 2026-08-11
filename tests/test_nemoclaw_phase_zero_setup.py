@@ -10,7 +10,6 @@ PYTORCH_POLICY = ROOT / "launchable" / "pytorch-cu128-policy.yaml"
 NVMOLKIT_INSTALLER = ROOT / "launchable" / "install_nvmolkit_in_sandbox.sh"
 GPU_PROBE = ROOT / "launchable" / "nvmolkit_gpu_probe.py"
 WORKSPACE_TOOLS = ROOT / "launchable" / "acs_workspace_tools.md"
-ACCEPTANCE_PROMPT = ROOT / "launchable" / "acs_task_prompt.txt"
 ARTIFACT_SERVER = ROOT / "launchable" / "start_artifact_server.sh"
 
 
@@ -118,32 +117,40 @@ def test_gpu_probe_exercises_real_morgan_fingerprints_on_cuda():
     assert "(3, 32)" in source
 
 
-def test_workspace_note_routes_agent_to_the_preinstalled_chemistry_runtime():
+def test_workspace_note_exposes_only_the_bounded_workshop_commands_and_artifacts():
     source = WORKSPACE_TOOLS.read_text()
 
-    assert "Do not install or upgrade packages" in source
     assert "nvmolkit-usage" in source
-    assert "PYTHONPATH=/tmp/.local/lib/python3.13/site-packages" in source
-    assert "/sandbox/.openclaw/workspace/data/sample_molecules.csv" in source
-    assert "/sandbox/.openclaw/workspace/outputs" in source
+    runner = (
+        "env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages python3 "
+        "/sandbox/.openclaw/workspace/acs_workshop_runner.py"
+    )
+    lessons = (
+        "data-and-representation",
+        "relationships-and-groups",
+        "sampled-3d-geometry",
+    )
+    assert source.count("run-lesson") == 3
+    for lesson in lessons:
+        assert f"{runner} run-lesson {lesson}" in source
+    assert source.count(f"{runner} objective-start") == 1
+    assert source.count(f"{runner} objective-step") == 1
+    assert "--state-id 'STATE_ID_FROM_MENU' --swap-id 'SWAP_ID_FROM_MENU'" in source
+    for path in (
+        "MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/01-inspection/library_preview.png",
+        "MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/04-clusters/cluster_sizes.png",
+        "MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/06-mmff94/optimized_structures.png",
+        "MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/07-objective/final_panel.png",
+        "workshop/results.zip",
+    ):
+        assert path in source
+    assert "Do not install" in source
+    assert "Do not use the network" in source
+    assert "Do not edit" in source
+    assert ".acs-workshop-state" in source
+    assert "run-stage" not in source
+    assert "<script.py>" not in source
     assert "not evidence of biological activity" in source
-
-
-def test_acceptance_prompt_requests_one_bounded_edit_and_one_gpu_run():
-    source = ACCEPTANCE_PROMPT.read_text()
-
-    assert "HIGHLIGHT_THRESHOLD = 0.70" in source
-    assert "HIGHLIGHT_THRESHOLD = 0.80" in source
-    assert source.count("env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages") == 1
-    assert "--output /sandbox/.openclaw/workspace/outputs/threshold-080" in source
-    assert "Do not install packages" in source
-    assert (
-        "MEDIA:/sandbox/.openclaw/workspace/outputs/threshold-080/similarity_heatmap.png"
-        in source
-    )
-    assert (
-        "MEDIA:/sandbox/.openclaw/workspace/outputs/threshold-080/results.zip" in source
-    )
 
 
 def test_artifact_server_is_retry_safe_and_serves_only_outputs():
