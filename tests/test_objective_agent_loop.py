@@ -93,6 +93,14 @@ class FakeCompletions:
         return item
 
 
+class ExplodingObjectiveMessage:
+    content = None
+
+    @property
+    def tool_calls(self):
+        raise RuntimeError("provider response accessor failed")
+
+
 AUTO_SELECTION = object()
 
 
@@ -738,6 +746,27 @@ def test_nontransport_objective_failures_terminalize_without_retry(
         "objective_provider_failure"
     )
     assert all(message.get("role") != "assistant" for message in controller.session.messages)
+
+
+def test_unexpected_objective_response_parsing_failure_terminalizes_safely():
+    response_with_exploding_message = SimpleNamespace(
+        choices=[SimpleNamespace(message=ExplodingObjectiveMessage())]
+    )
+    controller, completions = completed_controller([response_with_exploding_message])
+    controller.begin_objective_challenge()
+
+    with pytest.raises(demo_agent.ToolCallError):
+        controller.request_objective_selection()
+
+    assert len(completions.calls) == 1
+    assert controller.provider_request_attempt_count == 1
+    assert controller.selection_response_count == 1
+    assert controller.rejected_selection_count == 0
+    assert controller.accepted_attempt_count == 0
+    assert controller.objective_transport_retry_pending is False
+    assert controller.pending_objective is None
+    assert controller.objective_run.termination_reason == "objective_provider_failure"
+    assert controller.objective_evidence.key == "O01"
 
 
 def test_objective_evaluation_error_is_not_misclassified_as_provider_failure(monkeypatch):

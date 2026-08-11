@@ -73,6 +73,14 @@ def raw_tool_response(name, raw_arguments):
     ))])
 
 
+class ExplodingObjectiveMessage:
+    content = None
+
+    @property
+    def tool_calls(self):
+        raise RuntimeError("provider response accessor failed")
+
+
 class RealControllerCompletions:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -1208,6 +1216,25 @@ def test_progress_bar_never_rounds_a_real_remaining_gap_to_success():
     assert "&lt;100% of required improvement achieved" in rendered
 
 
+def test_progress_card_is_theme_safe_and_equal_markers_do_not_overlap():
+    context = controlled_context_without_improving_swaps()
+
+    rendered = InteractiveWorkflow._objective_current_progress_html(
+        context, context.baseline_score
+    )
+    style = InteractiveWorkflow._objective_story_style()
+
+    assert ".odc-progress{margin-top:11px" in style
+    assert "color:#f2f2f2" in style
+    assert ".odc-progress-head b{color:#f2f2f2!important}" in style
+    assert "margin-top:3px;font-size:12px" in style
+    assert "<div class='odc-progress-labels'>" in rendered
+    assert "<span class='odc-progress-baseline'><b>Baseline</b>" in rendered
+    assert "<span class='odc-progress-current'><b>Current</b>" in rendered
+    assert "<span class='odc-progress-target'><b>Target</b>" in rendered
+    assert "odc-progress-current' style='left:" not in rendered
+
+
 def test_summary_rebuilds_menu_and_rejects_self_consistent_forged_target_truth():
     context, (first, _second) = two_revision_decisions()
     menu, selection, attempt = first
@@ -1834,6 +1861,16 @@ def test_auth_and_nontransport_objective_failures_offer_no_retry(failure):
         ),
         (
             [SimpleNamespace(choices=[]), SimpleNamespace(choices=[])],
+            TerminationReason.OBJECTIVE_PROVIDER_FAILURE,
+            "Objective provider unavailable",
+        ),
+        (
+            [
+                SimpleNamespace(
+                    choices=[SimpleNamespace(message=ExplodingObjectiveMessage())]
+                ),
+                SimpleNamespace(choices=[]),
+            ],
             TerminationReason.OBJECTIVE_PROVIDER_FAILURE,
             "Objective provider unavailable",
         ),

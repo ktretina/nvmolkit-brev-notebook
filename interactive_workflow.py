@@ -819,6 +819,9 @@ class InteractiveWorkflow:
         percent_text = f"{percent:.0f}%"
         if score_key(score) < score_key(context.target_score) and percent_text == "100%":
             percent_text = "<100%"
+        baseline_text = InteractiveWorkflow._score_comparison(
+            context.baseline_score, context.target_score
+        )[0]
         return (
             f"<section class='odc-progress' data-objective-progress='{attempt_number}' "
             f"aria-label='Attempt {attempt_number} progress'>"
@@ -827,9 +830,10 @@ class InteractiveWorkflow:
             f"<span>{remaining_text.lstrip('+')} from target · {escape(percent_text)} of required improvement achieved</span>"
             "</div><div class='odc-progress-track'>"
             f"<span class='odc-progress-fill' style='width:{percent:.1f}%'></span>"
-            "<span class='odc-progress-baseline'>baseline</span>"
-            f"<span class='odc-progress-current' style='left:{percent:.1f}%'>{score_text}</span>"
-            f"<span class='odc-progress-target'>{target_text} target</span>"
+            "</div><div class='odc-progress-labels'>"
+            f"<span class='odc-progress-baseline'><b>Baseline</b> {baseline_text}</span>"
+            f"<span class='odc-progress-current'><b>Current</b> {score_text}</span>"
+            f"<span class='odc-progress-target'><b>Target</b> {target_text}</span>"
             f"</div><small>{escape(status)}</small></section>"
         )
 
@@ -860,9 +864,10 @@ class InteractiveWorkflow:
             f"<span>{remaining_text.lstrip('+')} from target · {escape(percent_text)} of required improvement achieved</span>"
             "</div><div class='odc-progress-track'>"
             f"<span class='odc-progress-fill' style='width:{percent:.1f}%'></span>"
+            "</div><div class='odc-progress-labels'>"
             f"<span class='odc-progress-baseline'><b>Baseline</b> {baseline_text}</span>"
-            f"<span class='odc-progress-current' style='left:{percent:.1f}%'>{score_text} current</span>"
-            f"<span class='odc-progress-target'>{target_text} target</span>"
+            f"<span class='odc-progress-current'><b>Current</b> {score_text}</span>"
+            f"<span class='odc-progress-target'><b>Target</b> {target_text}</span>"
             f"</div><small>{escape(status)}</small></section>"
         )
 
@@ -880,6 +885,9 @@ class InteractiveWorkflow:
                 score, context.target_score, remaining
             )
         )
+        baseline_text = InteractiveWorkflow._score_comparison(
+            context.baseline_score, context.target_score
+        )[0]
         return (
             f"<section class='odc-progress' data-objective-progress='{attempt_number}' "
             "data-progress-status='unmeasured' aria-label='Last measured objective progress'>"
@@ -888,9 +896,10 @@ class InteractiveWorkflow:
             "<span>no progress update · selection was not evaluated</span>"
             "</div><div class='odc-progress-track'>"
             f"<span class='odc-progress-fill' style='width:{percent:.1f}%'></span>"
-            "<span class='odc-progress-baseline'>baseline</span>"
-            f"<span class='odc-progress-current' style='left:{percent:.1f}%'>{score_text}</span>"
-            f"<span class='odc-progress-target'>{target_text} target</span>"
+            "</div><div class='odc-progress-labels'>"
+            f"<span class='odc-progress-baseline'><b>Baseline</b> {baseline_text}</span>"
+            f"<span class='odc-progress-current'><b>Current</b> {score_text}</span>"
+            f"<span class='odc-progress-target'><b>Target</b> {target_text}</span>"
             f"</div><small>{remaining_text.lstrip('+')} remained before the target</small></section>"
         )
 
@@ -905,7 +914,7 @@ class InteractiveWorkflow:
 .odc-molecules{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.odc-molecule{min-width:0;padding:5px;background:linear-gradient(145deg,#fff,#edf1e9);border:2px solid #d2d7cf;border-radius:8px;box-shadow:0 2px 7px rgba(0,0,0,.24);text-align:center;color:#202020}.odc-molecule.odc-weak,.odc-molecule.odc-out{border-color:#E57373}.odc-molecule.odc-in{border-color:#76B900}.odc-molecule.odc-limit{border-color:#F2B84B}.odc-drawing{height:72px;display:grid;place-items:center;overflow:hidden}.odc-drawing svg{width:100%;height:100%;display:block}.odc-molecule span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;font-weight:600}
 .odc-candidates{display:grid;gap:6px}.odc-candidate{display:grid;grid-template-columns:62px 1fr;gap:7px;align-items:center;padding:5px;background:#f4f5f1;color:#202020;border:1px solid #d2d7cf;border-radius:7px}.odc-candidate.odc-selected{border:2px solid #76B900}.odc-candidate .odc-molecule{padding:2px;border:0;box-shadow:none}.odc-candidate .odc-drawing{height:42px}.odc-candidate small{display:block}.odc-choice{display:grid;grid-template-columns:1fr 22px 1fr;gap:4px;align-items:center}.odc-arrow{text-align:center;color:#9bd43e;font-size:22px}.odc-step p{margin:8px 0 0;color:#c7c7c7;font-size:12px}.odc-score{margin-top:8px;color:#9bd43e;font-size:18px;font-weight:600}
 .odc-explain{display:grid;grid-template-columns:1.2fr 1fr;gap:12px;margin-top:12px}.odc-explain-panel{padding:12px;background:#222;border:1px solid #4a4a4a}.odc-change{display:grid;grid-template-columns:1fr 34px 1fr;gap:8px;align-items:center}.odc-change .odc-drawing{height:105px}.odc-why{margin:0;padding-left:20px}.odc-why li{margin:8px 0}
-.odc-progress{margin-top:11px;padding:11px 12px;background:#222;border:1px solid #4a4a4a}.odc-progress-head{display:flex;justify-content:space-between;gap:12px;align-items:baseline}.odc-progress-head span{color:#9bd43e}.odc-progress-track{position:relative;height:40px;margin-top:6px}.odc-progress-track:before{content:'';position:absolute;left:0;right:0;top:18px;height:6px;background:#383838}.odc-progress-fill{position:absolute;left:0;top:18px;height:6px;background:#76B900}.odc-progress-baseline,.odc-progress-current,.odc-progress-target{position:absolute;top:26px;font-size:10px;color:#bbb}.odc-progress-baseline{left:0}.odc-progress-current{color:#9bd43e;transform:translateX(-50%)}.odc-progress-target{right:0;color:#F2B84B}
+.odc-progress{margin-top:11px;padding:11px 12px;background:#222;border:1px solid #4a4a4a;color:#f2f2f2}.odc-progress-head{display:flex;justify-content:space-between;gap:12px;align-items:baseline}.odc-progress-head b{color:#f2f2f2!important}.odc-progress-head span{color:#9bd43e}.odc-progress-track{position:relative;height:18px;margin-top:6px}.odc-progress-track:before{content:'';position:absolute;left:0;right:0;top:7px;height:6px;background:#383838}.odc-progress-fill{position:absolute;left:0;top:7px;height:6px;background:#76B900}.odc-progress-labels{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:3px;font-size:12px}.odc-progress-labels span{position:static;transform:none;white-space:nowrap}.odc-progress-baseline{text-align:left;color:#bbb}.odc-progress-current{text-align:center;color:#9bd43e}.odc-progress-target{text-align:right;color:#F2B84B}.odc-progress-labels b{color:inherit!important}.odc-progress small{display:block;margin-top:5px;color:#c7c7c7!important}
 @media(max-width:900px){.odc-steps{grid-template-columns:1fr}.odc-step{border-right:0;border-bottom:1px solid #4a4a4a}.odc-step:last-child{border-bottom:0}.odc-explain{grid-template-columns:1fr}.odc-progress-head{display:block}.odc-progress-head span{display:block;margin-top:4px}}
 </style>"""
 
