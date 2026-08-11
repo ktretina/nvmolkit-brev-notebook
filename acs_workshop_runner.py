@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import importlib.metadata
 import json
 import math
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any, Final, NoReturn
 
 import pandas as pd
+import numpy as np
 from rdkit import Chem
 
 from chemistry_workflow import (
@@ -31,6 +33,30 @@ from chemistry_workflow import (
     measure_tanimoto_similarity,
     optimize_conformers_mmff94,
     validated_similarity_matrix,
+)
+from objective_challenge import (
+    MAX_ATTEMPTS,
+    ObjectiveActionMenu,
+    ObjectiveAttempt,
+    ObjectiveCandidate,
+    ObjectiveContext,
+    ObjectiveRun,
+    ObjectiveSwap,
+    PanelMeasurement,
+    TerminationReason,
+    accepted_maxima,
+    attainable_benchmark,
+    baseline_terminal_run,
+    build_action_menu,
+    build_objective_context,
+    build_objective_evidence,
+    certify_argmax_reachability,
+    evaluate_selected_swap,
+    finalize_no_legal_swap,
+    measure_panel,
+    objective_figures,
+    resolve_menu_action,
+    terminal_objective_run,
 )
 
 SCHEMA_VERSION: Final = 1
@@ -133,6 +159,8 @@ __all__ = (
     "inspect_library",
     "main",
     "measure_tanimoto_similarity",
+    "objective_start",
+    "objective_step",
     "optimize_conformers_mmff94",
     "run_stage",
     "run_lesson",
@@ -289,6 +317,25 @@ def _canonical_json_bytes(value: Any) -> bytes:
 
 def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _private_json_bytes(value: Any) -> bytes:
+    return _formatted_json(value).encode("utf-8")
+
+
+def _exact_json_equal(first: Any, second: Any) -> bool:
+    if type(first) is not type(second):
+        return False
+    if type(first) is dict:
+        return set(first) == set(second) and all(
+            _exact_json_equal(first[key], second[key]) for key in first
+        )
+    if type(first) is list:
+        return len(first) == len(second) and all(
+            _exact_json_equal(left, right)
+            for left, right in zip(first, second, strict=True)
+        )
+    return first == second
 
 
 def _invalid_manifest() -> RuntimeError:
@@ -1411,6 +1458,556 @@ def _compact_stage_item(
     }
 
 
+_OBJECTIVE_CONTEXT_KEYS: Final = {
+    "schema_version",
+    "dataset_sha256",
+    "profile",
+    "candidates",
+    "baseline_ids",
+    "baseline_score",
+    "benchmark_score",
+    "target_score",
+    "distance_matrix",
+    "stage_results_zip_sha256",
+}
+_OBJECTIVE_STATE_KEYS: Final = {
+    "schema_version",
+    "dataset_sha256",
+    "context_sha256",
+    "current",
+    "menu",
+    "accepted_attempt_count",
+    "terminal",
+    "termination_reason",
+    "attempts",
+    "last_request",
+    "last_result",
+}
+_OBJECTIVE_FILES: Final = (
+    "README.md",
+    "objective_summary.json",
+    "objective_evidence.json",
+    "score_trajectory.png",
+    "final_panel.png",
+    "final_similarity_heatmap.png",
+)
+# The fixed workshop bundle contains only small text, table, structure, and image
+# artifacts. Bound expansion before reading any member so a damaged or hostile
+# archive cannot turn a retry into an unbounded memory allocation.
+_RESULTS_ARCHIVE_MAX_MEMBER_BYTES: Final = 8 * 1024 * 1024
+_RESULTS_ARCHIVE_MAX_EXPANDED_BYTES: Final = 32 * 1024 * 1024
+
+
+def _objective_error() -> RuntimeError:
+    return RuntimeError("Workshop objective state is invalid.")
+
+
+def _validated_private_root(paths: WorkshopPaths) -> Path:
+    try:
+        mode = os.lstat(paths.state_root).st_mode
+    except OSError as error:
+        raise _objective_error() from error
+    if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode) or stat.S_IMODE(mode) != 0o700:
+        raise _objective_error()
+    return paths.state_root
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(_read_regular_file(path)).hexdigest()
+
+
+def _atomic_private_json(path: Path, payload: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as destination:
+            descriptor = -1
+            destination.write(_private_json_bytes(payload))
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _read_private_json(path: Path) -> tuple[dict[str, Any], bytes]:
+    try:
+        mode = os.lstat(path).st_mode
+        if not stat.S_ISREG(mode) or stat.S_ISLNK(mode) or stat.S_IMODE(mode) != 0o600:
+            raise _objective_error()
+        payload_bytes = _read_regular_file(path)
+        payload = json.loads(
+            payload_bytes.decode("utf-8"),
+            object_pairs_hook=_object_without_duplicate_keys,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"invalid JSON constant {value}")
+            ),
+        )
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise _objective_error() from error
+    if type(payload) is not dict or _private_json_bytes(payload) != payload_bytes:
+        raise _objective_error()
+    return payload, payload_bytes
+
+
+def _measurement_payload(
+    measurement: PanelMeasurement, *, public: bool = False
+) -> dict[str, Any]:
+    payload = {
+        "selected_ids": list(measurement.selected_ids),
+        "score": measurement.score,
+        "limiting_pairs": [list(pair) for pair in measurement.limiting_pairs],
+        "achieved": measurement.achieved,
+    }
+    if not public:
+        payload["score_key"] = measurement.score_key
+    return payload
+
+
+def _action_payload(action: ObjectiveSwap, *, public: bool = False) -> dict[str, Any]:
+    payload = {
+        "swap_id": action.swap_id,
+        "replace_id": action.replace_id,
+        "replacement_id": action.replacement_id,
+        "resulting_ids": list(action.resulting_ids),
+        "predicted_score": action.predicted_score,
+        "score_delta": action.score_delta,
+        "limiting_pairs": [list(pair) for pair in action.limiting_pairs],
+        "target_status": action.target_status,
+    }
+    if not public:
+        payload["predicted_score_key"] = action.predicted_score_key
+        payload["limiting_pair"] = list(action.limiting_pair or ())
+    return payload
+
+
+def _attempt_payload(attempt: ObjectiveAttempt) -> dict[str, Any]:
+    return {
+        "attempt_number": attempt.attempt_number,
+        "state_id": attempt.state_id,
+        "selected_ids": list(attempt.selected_ids),
+        "score": attempt.score,
+        "score_key": attempt.score_key,
+        "limiting_pair": list(attempt.limiting_pair),
+        "limiting_pairs": [list(pair) for pair in attempt.limiting_pairs],
+        "constraints_passed": attempt.constraints_passed,
+        "achieved": attempt.achieved,
+        "selected_swap": _action_payload(attempt.selected_swap),
+    }
+
+
+def _menu_payload(menu: ObjectiveActionMenu) -> dict[str, Any]:
+    return {
+        "state_id": menu.state_id,
+        "source": _measurement_payload(menu.source),
+        "accepted_attempt_count": menu.accepted_attempt_count,
+        "actions": [_action_payload(action) for action in menu.actions],
+    }
+
+
+def _context_payload(
+    context: ObjectiveContext, stage_zip_sha256: str
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "dataset_sha256": DATASET_SHA256,
+        "profile": dict(PROFILE),
+        "candidates": [asdict(candidate) for candidate in context.candidates],
+        "baseline_ids": list(context.baseline_ids),
+        "baseline_score": context.baseline_score,
+        "benchmark_score": context.benchmark_score,
+        "target_score": context.target_score,
+        "distance_matrix": context.distance_matrix.tolist(),
+        "stage_results_zip_sha256": stage_zip_sha256,
+    }
+
+
+def _context_from_payload(payload: dict[str, Any]) -> ObjectiveContext:
+    try:
+        if (
+            set(payload) != _OBJECTIVE_CONTEXT_KEYS
+            or payload["schema_version"] != SCHEMA_VERSION
+            or type(payload["schema_version"]) is not int
+            or payload["dataset_sha256"] != DATASET_SHA256
+            or not _exact_json_equal(payload["profile"], PROFILE)
+            or type(payload["candidates"]) is not list
+            or len(payload["candidates"]) != 8
+            or type(payload["stage_results_zip_sha256"]) is not str
+            or len(payload["stage_results_zip_sha256"]) != 64
+            or any(
+                character not in _LOWER_HEXADECIMAL
+                for character in payload["stage_results_zip_sha256"]
+            )
+        ):
+            raise ValueError
+        candidates = tuple(
+            ObjectiveCandidate(**candidate) for candidate in payload["candidates"]
+        )
+        context = ObjectiveContext(
+            candidates=candidates,
+            baseline_ids=tuple(payload["baseline_ids"]),
+            baseline_score=payload["baseline_score"],
+            benchmark_score=payload["benchmark_score"],
+            target_score=payload["target_score"],
+            distance_matrix=np.asarray(payload["distance_matrix"], dtype=np.float64),
+        )
+        baseline = measure_panel(context, context.baseline_ids)
+        benchmark = attainable_benchmark(context)
+        if (
+            baseline.score != context.baseline_score
+            or benchmark.score != context.benchmark_score
+            or not certify_argmax_reachability(context)
+            or not _exact_json_equal(
+                _context_payload(context, payload["stage_results_zip_sha256"]),
+                payload,
+            )
+        ):
+            raise ValueError
+    except (KeyError, TypeError, ValueError) as error:
+        raise _objective_error() from error
+    return context
+
+
+def _swap_from_payload(payload: object) -> ObjectiveSwap:
+    if type(payload) is not dict:
+        raise _objective_error()
+    try:
+        swap = ObjectiveSwap(
+            swap_id=payload["swap_id"],
+            replace_id=payload["replace_id"],
+            replacement_id=payload["replacement_id"],
+            resulting_ids=tuple(payload["resulting_ids"]),
+            predicted_score=payload["predicted_score"],
+            predicted_score_key=payload["predicted_score_key"],
+            score_delta=payload["score_delta"],
+            limiting_pair=tuple(payload["limiting_pair"]),
+            limiting_pairs=tuple(tuple(pair) for pair in payload["limiting_pairs"]),
+            target_status=payload["target_status"],
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise _objective_error() from error
+    if not _exact_json_equal(_action_payload(swap), payload):
+        raise _objective_error()
+    return swap
+
+
+def _derive_objective(
+    context: ObjectiveContext, attempts: tuple[ObjectiveAttempt, ...]
+) -> tuple[PanelMeasurement, ObjectiveActionMenu | None, ObjectiveRun | None]:
+    current = measure_panel(context, context.baseline_ids)
+    for position, attempt in enumerate(attempts, start=1):
+        if attempt.attempt_number != position:
+            raise _objective_error()
+        menu = build_action_menu(context, current, position - 1)
+        expected = evaluate_selected_swap(
+            context, menu, attempt.selected_swap, position
+        )
+        if not _exact_json_equal(_attempt_payload(expected), _attempt_payload(attempt)):
+            raise _objective_error()
+        current = expected.measurement
+    return _resolve_objective_state(context, attempts, current, validate_terminal=True)
+
+
+def _current_objective_run(
+    context: ObjectiveContext,
+    attempts: tuple[ObjectiveAttempt, ...],
+    current: PanelMeasurement,
+    reason: TerminationReason,
+) -> ObjectiveRun:
+    return ObjectiveRun(
+        context=context,
+        baseline=measure_panel(context, context.baseline_ids),
+        attempts=attempts,
+        achieved=reason
+        in {
+            TerminationReason.TARGET_ACHIEVED,
+            TerminationReason.BASELINE_ALREADY_OPTIMAL,
+        },
+        termination_reason=reason,
+        final_ids=current.selected_ids,
+        final_score=current.score,
+        final_score_key=current.score_key,
+    )
+
+
+def _resolve_objective_state(
+    context: ObjectiveContext,
+    attempts: tuple[ObjectiveAttempt, ...],
+    current: PanelMeasurement,
+    *,
+    validate_terminal: bool = False,
+) -> tuple[PanelMeasurement, ObjectiveActionMenu | None, ObjectiveRun | None]:
+    baseline = measure_panel(context, context.baseline_ids)
+    benchmark = attainable_benchmark(context)
+    if baseline.score_key == benchmark.score_key:
+        return current, None, baseline_terminal_run(context)
+    if current.achieved:
+        if not validate_terminal:
+            return (
+                current,
+                None,
+                _current_objective_run(
+                    context, attempts, current, TerminationReason.TARGET_ACHIEVED
+                ),
+            )
+        return (
+            current,
+            None,
+            terminal_objective_run(
+                context, attempts, TerminationReason.TARGET_ACHIEVED
+            ),
+        )
+    if len(attempts) == MAX_ATTEMPTS:
+        if not validate_terminal:
+            return (
+                current,
+                None,
+                _current_objective_run(
+                    context,
+                    attempts,
+                    current,
+                    TerminationReason.ATTEMPT_LIMIT_REACHED,
+                ),
+            )
+        return (
+            current,
+            None,
+            terminal_objective_run(
+                context, attempts, TerminationReason.ATTEMPT_LIMIT_REACHED
+            ),
+        )
+    menu = build_action_menu(context, current, len(attempts))
+    if not menu.actions:
+        if not validate_terminal:
+            return (
+                current,
+                None,
+                _current_objective_run(
+                    context,
+                    attempts,
+                    current,
+                    TerminationReason.NO_LEGAL_IMPROVING_SWAP,
+                ),
+            )
+        return current, None, finalize_no_legal_swap(context, attempts, current, menu)
+    return current, menu, None
+
+
+def _state_payload(
+    context_sha256: str,
+    current: PanelMeasurement,
+    menu: ObjectiveActionMenu | None,
+    run: ObjectiveRun | None,
+    attempts: tuple[ObjectiveAttempt, ...],
+    *,
+    last_request: dict[str, str] | None = None,
+    last_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "dataset_sha256": DATASET_SHA256,
+        "context_sha256": context_sha256,
+        "current": _measurement_payload(current),
+        "menu": None if menu is None else _menu_payload(menu),
+        "accepted_attempt_count": len(attempts),
+        "terminal": run is not None,
+        "termination_reason": (None if run is None else run.termination_reason.value),
+        "attempts": [_attempt_payload(attempt) for attempt in attempts],
+        "last_request": last_request,
+        "last_result": last_result,
+    }
+
+
+def _load_objective_state(
+    paths: WorkshopPaths,
+) -> tuple[
+    ObjectiveContext,
+    tuple[ObjectiveAttempt, ...],
+    PanelMeasurement,
+    ObjectiveActionMenu | None,
+    ObjectiveRun | None,
+    dict[str, Any],
+]:
+    _validated_private_root(paths)
+    context_payload, context_bytes = _read_private_json(paths.context_path)
+    state_payload, _ = _read_private_json(paths.history_path)
+    context = _context_from_payload(context_payload)
+    try:
+        if (
+            set(state_payload) != _OBJECTIVE_STATE_KEYS
+            or state_payload["schema_version"] != SCHEMA_VERSION
+            or type(state_payload["schema_version"]) is not int
+            or state_payload["dataset_sha256"] != DATASET_SHA256
+            or state_payload["context_sha256"]
+            != hashlib.sha256(context_bytes).hexdigest()
+            or type(state_payload["attempts"]) is not list
+            or not 0 <= len(state_payload["attempts"]) <= MAX_ATTEMPTS
+            or type(state_payload["accepted_attempt_count"]) is not int
+            or type(state_payload["terminal"]) is not bool
+        ):
+            raise ValueError
+        attempts = tuple(
+            ObjectiveAttempt(
+                attempt_number=item["attempt_number"],
+                state_id=item["state_id"],
+                selected_ids=tuple(item["selected_ids"]),
+                score=item["score"],
+                score_key=item["score_key"],
+                limiting_pair=tuple(item["limiting_pair"]),
+                limiting_pairs=tuple(tuple(pair) for pair in item["limiting_pairs"]),
+                constraints_passed=item["constraints_passed"],
+                achieved=item["achieved"],
+                selected_swap=_swap_from_payload(item["selected_swap"]),
+            )
+            for item in state_payload["attempts"]
+        )
+        if not _exact_json_equal(
+            [_attempt_payload(attempt) for attempt in attempts],
+            state_payload["attempts"],
+        ):
+            raise ValueError
+        current, menu, run = _derive_objective(context, attempts)
+        expected = _state_payload(
+            state_payload["context_sha256"],
+            current,
+            menu,
+            run,
+            attempts,
+            last_request=state_payload["last_request"],
+            last_result=state_payload["last_result"],
+        )
+        if not _exact_json_equal(expected, state_payload):
+            raise ValueError
+        last_request = state_payload["last_request"]
+        last_result = state_payload["last_result"]
+        if (last_request is None) != (last_result is None):
+            raise ValueError
+        if last_request is not None and (
+            type(last_request) is not dict
+            or set(last_request) != {"state_id", "swap_id"}
+            or any(type(value) is not str for value in last_request.values())
+            or type(last_result) is not dict
+            or not attempts
+            or last_request
+            != {
+                "state_id": attempts[-1].state_id,
+                "swap_id": attempts[-1].selected_swap.swap_id,
+            }
+        ):
+            raise ValueError
+        if last_request is not None:
+            expected_result = (
+                _terminal_envelope(paths, run)
+                if run is not None
+                else _pending_envelope(paths, context, current, menu)
+            )
+            if not _exact_json_equal(last_result, expected_result):
+                raise ValueError
+    except (KeyError, TypeError, ValueError) as error:
+        raise _objective_error() from error
+    return context, attempts, current, menu, run, state_payload
+
+
+def _initialize_objective_state(
+    paths: WorkshopPaths, execution: WorkflowExecution, stage_archive: Path
+) -> None:
+    _validated_private_root(paths)
+    context = build_objective_context(execution.state)
+    expected_context = _context_payload(context, _sha256_file(stage_archive))
+    context_exists = paths.context_path.exists() or paths.context_path.is_symlink()
+    state_exists = paths.history_path.exists() or paths.history_path.is_symlink()
+    if context_exists != state_exists:
+        raise _objective_error()
+    if not context_exists:
+        context_sha256 = hashlib.sha256(
+            _private_json_bytes(expected_context)
+        ).hexdigest()
+        current, menu, run = _derive_objective(context, ())
+        initial = _state_payload(context_sha256, current, menu, run, ())
+        _atomic_private_json(paths.context_path, expected_context)
+        _atomic_private_json(paths.history_path, initial)
+        return
+    stored_context, _ = _read_private_json(paths.context_path)
+    if not _exact_json_equal(stored_context, expected_context):
+        raise _objective_error()
+    _load_objective_state(paths)
+
+
+def _pending_envelope(
+    paths: WorkshopPaths,
+    context: ObjectiveContext,
+    current: PanelMeasurement,
+    menu: ObjectiveActionMenu,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "pending",
+        "terminal": False,
+        "attempt_count": menu.accepted_attempt_count,
+        "attempt_limit": MAX_ATTEMPTS,
+        "state_id": menu.state_id,
+        "current": _measurement_payload(current, public=True),
+        "target_score": context.target_score,
+        "actions": [_action_payload(action, public=True) for action in menu.actions],
+        "achieved": None,
+        "termination_reason": None,
+        "image_paths": [],
+        "artifact_directory": str((paths.output_root / "07-objective").resolve()),
+        "results_zip_path": str((paths.output_root / "results.zip").resolve()),
+        "artifact_relative_zip_path": "workshop/results.zip",
+    }
+
+
+def _terminal_attempt_payload(attempt: ObjectiveAttempt) -> dict[str, Any]:
+    measurement = attempt.measurement
+    return {
+        "attempt_number": attempt.attempt_number,
+        "state_id": attempt.state_id,
+        "selected_ids": list(attempt.selected_ids),
+        "score": attempt.score,
+        "limiting_pairs": [list(pair) for pair in measurement.limiting_pairs],
+        "achieved": attempt.achieved,
+        "selected_swap": _action_payload(attempt.selected_swap, public=True),
+    }
+
+
+def _terminal_envelope(paths: WorkshopPaths, run: ObjectiveRun) -> dict[str, Any]:
+    objective_directory = paths.output_root / "07-objective"
+    final = measure_panel(run.context, run.final_ids)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "complete",
+        "terminal": True,
+        "attempt_count": len(run.attempts),
+        "attempt_limit": MAX_ATTEMPTS,
+        "baseline": _measurement_payload(run.baseline, public=True),
+        "target_score": run.context.target_score,
+        "final": _measurement_payload(final, public=True),
+        "attempts": [_terminal_attempt_payload(attempt) for attempt in run.attempts],
+        "achieved": run.achieved,
+        "termination_reason": run.termination_reason.value,
+        "image_paths": [
+            str((objective_directory / name).resolve())
+            for name in (
+                "score_trajectory.png",
+                "final_panel.png",
+                "final_similarity_heatmap.png",
+            )
+        ],
+        "artifact_directory": str(objective_directory.resolve()),
+        "results_zip_path": str((paths.output_root / "results.zip").resolve()),
+        "artifact_relative_zip_path": "workshop/results.zip",
+    }
+
+
 def _bundle_readme(present_stages: set[str]) -> str:
     questions = (
         (
@@ -1433,7 +2030,10 @@ def _bundle_readme(present_stages: set[str]) -> str:
     lines = ["# ACS workshop results", ""]
     for question, directories in questions:
         available = all(
-            any(STAGE_DIRECTORIES.get(stage) == directory for stage in present_stages)
+            (directory == "07-objective" and "objective" in present_stages)
+            or any(
+                STAGE_DIRECTORIES.get(stage) == directory for stage in present_stages
+            )
             for directory in directories
         )
         location = ", ".join(f"`{directory}/`" for directory in directories)
@@ -1449,7 +2049,9 @@ def _zip_member(archive: zipfile.ZipFile, name: str, contents: bytes) -> None:
     archive.writestr(member, contents)
 
 
-def _rebuild_results_zip(paths: WorkshopPaths, execution: WorkflowExecution) -> Path:
+def _build_results_zip_candidate(
+    paths: WorkshopPaths, execution: WorkflowExecution
+) -> Path:
     output_root = _safe_output_root(paths)
     present: list[tuple[str, Path]] = []
     for stage_name in STAGE_ORDER:
@@ -1473,7 +2075,6 @@ def _rebuild_results_zip(paths: WorkshopPaths, execution: WorkflowExecution) -> 
     )
     os.close(descriptor)
     temporary_path = Path(temporary_name)
-    archive_path = output_root / "results.zip"
     try:
         with zipfile.ZipFile(
             temporary_path,
@@ -1499,6 +2100,21 @@ def _rebuild_results_zip(paths: WorkshopPaths, execution: WorkflowExecution) -> 
                         f"{STAGE_DIRECTORIES[stage_name]}/{artifact_name}",
                         _read_regular_file(directory / artifact_name),
                     )
+    except Exception:
+        try:
+            if temporary_path.exists() and temporary_path.parent == output_root:
+                temporary_path.unlink()
+        except OSError:
+            pass
+        raise
+    return temporary_path
+
+
+def _rebuild_results_zip(paths: WorkshopPaths, execution: WorkflowExecution) -> Path:
+    output_root = _safe_output_root(paths)
+    temporary_path = _build_results_zip_candidate(paths, execution)
+    archive_path = output_root / "results.zip"
+    try:
         os.replace(temporary_path, archive_path)
     except Exception:
         try:
@@ -1508,6 +2124,368 @@ def _rebuild_results_zip(paths: WorkshopPaths, execution: WorkflowExecution) -> 
             pass
         raise
     return archive_path
+
+
+def _objective_readme(run: ObjectiveRun) -> str:
+    return (
+        "# Bounded molecular-diversity objective\n\n"
+        "- Objective: maximize the minimum pairwise Morgan/Tanimoto distance.\n"
+        f"- Result: {run.termination_reason.value}.\n"
+        f"- Accepted actions: {len(run.attempts)} of {MAX_ATTEMPTS}.\n"
+        "- Scope: structural diversity in the fixed eight-molecule candidate pool.\n"
+    )
+
+
+def _objective_payloads(run: ObjectiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
+    evidence = build_objective_evidence(run)
+    objective_payload = json.loads(evidence.payload_json)
+    summary = {"schema_version": SCHEMA_VERSION, **objective_payload}
+    evidence_payload = {
+        "schema_version": SCHEMA_VERSION,
+        "evidence": [
+            {
+                "key": evidence.key,
+                "label": evidence.label,
+                "payload": objective_payload,
+                "provenance": evidence.provenance,
+            }
+        ],
+    }
+    return summary, evidence_payload
+
+
+def _objective_render_state(paths: WorkshopPaths) -> WorkflowState:
+    state = WorkflowState()
+    inspect_library(state, paths.dataset_path)
+    return state
+
+
+def _write_objective_directory(
+    directory: Path, run: ObjectiveRun, paths: WorkshopPaths
+) -> None:
+    summary, evidence = _objective_payloads(run)
+    (directory / "README.md").write_text(_objective_readme(run), encoding="utf-8")
+    (directory / "objective_summary.json").write_text(
+        _formatted_json(summary), encoding="utf-8"
+    )
+    (directory / "objective_evidence.json").write_text(
+        _formatted_json(evidence), encoding="utf-8"
+    )
+    trajectory, panel, heatmap = objective_figures(run, _objective_render_state(paths))
+    _save_matplotlib_figure(trajectory, directory / "score_trajectory.png")
+    _save_pil_image(panel, directory / "final_panel.png")
+    _save_matplotlib_figure(heatmap, directory / "final_similarity_heatmap.png")
+
+
+def _validate_objective_directory(directory: Path, run: ObjectiveRun) -> None:
+    try:
+        mode = os.lstat(directory).st_mode
+        names = {entry.name for entry in directory.iterdir()}
+    except OSError as error:
+        raise _objective_error() from error
+    if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode) or names != set(_OBJECTIVE_FILES):
+        raise _objective_error()
+    summary, evidence = _objective_payloads(run)
+    expected_text = {
+        "README.md": _objective_readme(run),
+        "objective_summary.json": _formatted_json(summary),
+        "objective_evidence.json": _formatted_json(evidence),
+    }
+    for name, text in expected_text.items():
+        path = directory / name
+        if _read_regular_file(path) != text.encode("utf-8"):
+            raise _objective_error()
+    for name in _OBJECTIVE_FILES[3:]:
+        path = directory / name
+        try:
+            from PIL import Image
+
+            with Image.open(path) as image:
+                image.verify()
+        except (OSError, ValueError) as error:
+            raise _objective_error() from error
+
+
+def _objective_directories_match(first: Path, second: Path) -> None:
+    for name in _OBJECTIVE_FILES:
+        if _read_regular_file(first / name) != _read_regular_file(second / name):
+            raise _objective_error()
+
+
+def _publish_objective_directory(paths: WorkshopPaths, run: ObjectiveRun) -> Path:
+    output_root = _safe_output_root(paths)
+    fixed = output_root / "07-objective"
+    temporary = Path(tempfile.mkdtemp(prefix=".acs-objective-", dir=output_root))
+    try:
+        _write_objective_directory(temporary, run, paths)
+        _validate_objective_directory(temporary, run)
+        try:
+            os.lstat(fixed)
+        except FileNotFoundError:
+            os.replace(temporary, fixed)
+            temporary = Path()
+        else:
+            _validate_objective_directory(fixed, run)
+            _objective_directories_match(temporary, fixed)
+    finally:
+        if (
+            temporary.name.startswith(".acs-objective-")
+            and temporary.parent == output_root
+        ):
+            shutil.rmtree(temporary, ignore_errors=True)
+    return fixed
+
+
+def _results_archive_bytes(
+    present_stages: set[str],
+    stage_members: dict[str, bytes],
+    objective_members: dict[str, bytes] | None = None,
+) -> bytes:
+    stream = io.BytesIO()
+    with zipfile.ZipFile(
+        stream,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        strict_timestamps=True,
+    ) as archive:
+        available = set(present_stages)
+        if objective_members is not None:
+            available.add("objective")
+        _zip_member(archive, "README.md", _bundle_readme(available).encode("utf-8"))
+        for name in ("data/sample_molecules.csv", "data/PROVENANCE.md"):
+            _zip_member(archive, name, stage_members[name])
+        for stage_name in STAGE_ORDER:
+            if stage_name not in present_stages:
+                continue
+            for artifact_name in _stage_artifact_names(
+                stage_name, STAGE_SPECS[stage_name]
+            ):
+                member_name = f"{STAGE_DIRECTORIES[stage_name]}/{artifact_name}"
+                _zip_member(archive, member_name, stage_members[member_name])
+        if objective_members is not None:
+            for name in _OBJECTIVE_FILES:
+                member_name = f"07-objective/{name}"
+                _zip_member(archive, member_name, objective_members[member_name])
+    return stream.getvalue()
+
+
+def _validated_results_archive(
+    archive_path: Path,
+) -> tuple[bytes, set[str], dict[str, bytes], dict[str, bytes] | None]:
+    raw = _read_regular_file(archive_path)
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            infos = archive.infolist()
+            names = [info.filename for info in infos]
+            if len(names) != len(set(names)):
+                raise _objective_error()
+            objective_present = any(name.startswith("07-objective/") for name in names)
+            present_stages: set[str] = set()
+            expected_names = {
+                "README.md",
+                "data/sample_molecules.csv",
+                "data/PROVENANCE.md",
+            }
+            observed_names = set(names)
+            for stage_name in STAGE_ORDER:
+                stage_names = {
+                    f"{STAGE_DIRECTORIES[stage_name]}/{artifact_name}"
+                    for artifact_name in _stage_artifact_names(
+                        stage_name, STAGE_SPECS[stage_name]
+                    )
+                }
+                overlap = stage_names & observed_names
+                if overlap and overlap != stage_names:
+                    raise _objective_error()
+                if overlap:
+                    present_stages.add(stage_name)
+                    expected_names.update(stage_names)
+            if not {
+                "embed_representative_conformers",
+                "optimize_conformers_mmff94",
+            }.issubset(present_stages):
+                raise _objective_error()
+            if objective_present:
+                expected_names.update(
+                    f"07-objective/{name}" for name in _OBJECTIVE_FILES
+                )
+            if observed_names != expected_names:
+                raise _objective_error()
+            expected_attributes = (stat.S_IFREG | 0o644) << 16
+            declared_expanded_bytes = 0
+            for info in infos:
+                if (
+                    info.is_dir()
+                    or info.date_time != (1980, 1, 1, 0, 0, 0)
+                    or info.compress_type != zipfile.ZIP_DEFLATED
+                    or info.external_attr != expected_attributes
+                    or info.filename.startswith("/")
+                    or "\\" in info.filename
+                    or any(part in {"", ".", ".."} for part in info.filename.split("/"))
+                    or info.file_size > _RESULTS_ARCHIVE_MAX_MEMBER_BYTES
+                ):
+                    raise _objective_error()
+                declared_expanded_bytes += info.file_size
+                if declared_expanded_bytes > _RESULTS_ARCHIVE_MAX_EXPANDED_BYTES:
+                    raise _objective_error()
+            members: dict[str, bytes] = {}
+            expanded_bytes = 0
+            for info in infos:
+                contents = archive.read(info)
+                expanded_bytes += len(contents)
+                if (
+                    len(contents) != info.file_size
+                    or expanded_bytes > _RESULTS_ARCHIVE_MAX_EXPANDED_BYTES
+                ):
+                    raise _objective_error()
+                members[info.filename] = contents
+    except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+        if isinstance(error, RuntimeError):
+            raise
+        raise _objective_error() from error
+    expected_readme = _bundle_readme(
+        present_stages | ({"objective"} if objective_present else set())
+    ).encode("utf-8")
+    if members["README.md"] != expected_readme:
+        raise _objective_error()
+    stage_members = {
+        name: contents
+        for name, contents in members.items()
+        if name != "README.md" and not name.startswith("07-objective/")
+    }
+    objective_members = None
+    if objective_present:
+        objective_members = {
+            name: members[name] for name in members if name.startswith("07-objective/")
+        }
+    return raw, present_stages, stage_members, objective_members
+
+
+def _publish_objective(paths: WorkshopPaths, run: ObjectiveRun) -> Path:
+    objective_directory = _publish_objective_directory(paths, run)
+    output_root = _safe_output_root(paths)
+    archive_path = output_root / "results.zip"
+    context_payload, _ = _read_private_json(paths.context_path)
+    binding = context_payload["stage_results_zip_sha256"]
+    raw, present_stages, stage_members, current_objective = _validated_results_archive(
+        archive_path
+    )
+    canonical_stage = _results_archive_bytes(present_stages, stage_members)
+    if hashlib.sha256(canonical_stage).hexdigest() != binding:
+        raise _objective_error()
+    objective_members = {
+        f"07-objective/{name}": _read_regular_file(objective_directory / name)
+        for name in _OBJECTIVE_FILES
+    }
+    expected = _results_archive_bytes(present_stages, stage_members, objective_members)
+    if current_objective is not None:
+        if current_objective != objective_members or raw != expected:
+            raise _objective_error()
+        return archive_path
+    if hashlib.sha256(raw).hexdigest() != binding:
+        raise _objective_error()
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".acs-objective-results-", suffix=".zip", dir=output_root
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as destination:
+            descriptor = -1
+            destination.write(expected)
+        os.replace(temporary, archive_path)
+        temporary = Path()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if (
+            temporary.name.startswith(".acs-objective-results-")
+            and temporary.parent == output_root
+        ):
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+    return archive_path
+
+
+def _validate_bound_stage_archive(paths: WorkshopPaths) -> None:
+    context_payload, _ = _read_private_json(paths.context_path)
+    if (
+        _sha256_file(paths.output_root / "results.zip")
+        != context_payload["stage_results_zip_sha256"]
+    ):
+        raise _objective_error()
+
+
+def objective_start(*, paths: WorkshopPaths = DEFAULT_PATHS) -> dict[str, Any]:
+    verify_manifest(paths)
+    context, attempts, current, menu, run, state_payload = _load_objective_state(paths)
+    del attempts
+    if run is None:
+        if menu is None:
+            raise _objective_error()
+        _validate_bound_stage_archive(paths)
+        return _pending_envelope(paths, context, current, menu)
+    result = _terminal_envelope(paths, run)
+    last_result = state_payload["last_result"]
+    if last_result is not None and last_result != result:
+        raise _objective_error()
+    _publish_objective(paths, run)
+    return result
+
+
+def objective_step(
+    state_id: str,
+    swap_id: str,
+    *,
+    paths: WorkshopPaths = DEFAULT_PATHS,
+) -> dict[str, Any]:
+    verify_manifest(paths)
+    context, attempts, current, menu, run, state_payload = _load_objective_state(paths)
+    request = {"state_id": state_id, "swap_id": swap_id}
+    if request == state_payload["last_request"]:
+        result = state_payload["last_result"]
+        if run is None:
+            _validate_bound_stage_archive(paths)
+        else:
+            _publish_objective(paths, run)
+        return result
+    if run is not None or menu is None:
+        raise ValueError("Objective selection does not match the exact menu revision.")
+    _validate_bound_stage_archive(paths)
+    action = resolve_menu_action(
+        context,
+        menu,
+        state_id=state_id,
+        swap_id=swap_id,
+        observed_limiting_pairs=current.limiting_pairs,
+        decision_rule="maximize_predicted_minimum_distance",
+    )
+    if action not in accepted_maxima(menu):
+        raise ValueError("Objective selection is not an accepted exact menu action.")
+    attempt = evaluate_selected_swap(context, menu, action, len(attempts) + 1)
+    updated_attempts = (*attempts, attempt)
+    next_current, next_menu, next_run = _resolve_objective_state(
+        context, updated_attempts, attempt.measurement
+    )
+    result = (
+        _pending_envelope(paths, context, next_current, next_menu)
+        if next_run is None and next_menu is not None
+        else _terminal_envelope(paths, next_run)
+    )
+    updated_state = _state_payload(
+        state_payload["context_sha256"],
+        next_current,
+        next_menu,
+        next_run,
+        updated_attempts,
+        last_request=request,
+        last_result=result,
+    )
+    _atomic_private_json(paths.history_path, updated_state)
+    if next_run is not None:
+        _publish_objective(paths, next_run)
+    return result
 
 
 def run_lesson(
@@ -1537,7 +2515,28 @@ def run_lesson(
         completed_stages.append(
             _compact_stage_item(stage_name, summary, directory, stage_spec)
         )
-    archive_path = _rebuild_results_zip(paths, execution)
+    if lesson == "sampled-3d-geometry":
+        output_root = _safe_output_root(paths)
+        temporary_archive = _build_results_zip_candidate(paths, execution)
+        try:
+            _initialize_objective_state(paths, execution, temporary_archive)
+            _, _, _, _, objective_run, _ = _load_objective_state(paths)
+            archive_path = output_root / "results.zip"
+            os.replace(temporary_archive, archive_path)
+            temporary_archive = Path()
+        finally:
+            if (
+                temporary_archive.name.startswith(".acs-results-")
+                and temporary_archive.parent == output_root
+            ):
+                try:
+                    temporary_archive.unlink()
+                except OSError:
+                    pass
+        if objective_run is not None:
+            _publish_objective(paths, objective_run)
+    else:
+        archive_path = _rebuild_results_zip(paths, execution)
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "complete",
@@ -1557,9 +2556,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif arguments.command == "run-lesson":
             result = run_lesson(arguments.lesson, paths=DEFAULT_PATHS)
         elif arguments.command == "objective-start":
-            raise RuntimeError("Workshop objective execution is not implemented.")
+            result = objective_start(paths=DEFAULT_PATHS)
         else:
-            raise RuntimeError("Workshop objective execution is not implemented.")
+            result = objective_step(
+                arguments.state_id,
+                arguments.swap_id,
+                paths=DEFAULT_PATHS,
+            )
         print(_canonical_json_bytes(result).decode("utf-8"), end="")
         return 0
     except Exception as error:

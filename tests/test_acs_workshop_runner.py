@@ -21,6 +21,12 @@ from rdkit.Geometry import Point3D
 
 import acs_workshop_runner as runner
 import chemistry_workflow
+from objective_fixtures import (
+    controlled_context_with_three_misses,
+    controlled_context_with_ranked_swaps,
+    controlled_context_with_tied_paths,
+    target_achieved_context,
+)
 
 
 MANIFEST_FILES = (
@@ -1836,21 +1842,573 @@ def test_cli_main_emits_one_safe_error_line_for_invalid_arguments(
     assert "usage:" not in captured.err.lower()
 
 
-@pytest.mark.parametrize(
-    "argv",
-    (
-        ["objective-start"],
-        ["objective-step", "--state-id", "state-1", "--swap-id", "A->B"],
-    ),
-)
-def test_cli_objective_commands_return_one_not_implemented_error(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    argv: list[str],
-) -> None:
-    monkeypatch.setattr(runner, "verify_manifest", lambda paths: None)
+def _objective_execution(
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    context=None,
+) -> runner.WorkflowExecution:
+    execution = workflow_executions["optimize_conformers_mmff94"]
+    similarity = np.eye(256, dtype=float)
+    source = target_achieved_context() if context is None else context
+    similarity[:8, :8] = 1.0 - source.distance_matrix
+    execution.state.similarity = _FakeGpuResult(similarity)
+    return execution
 
-    assert runner.main(argv) == 2
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert captured.err == "Error: Workshop objective execution is not implemented.\n"
+
+def test_third_lesson_initializes_private_objective_and_start_is_pending(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution = _objective_execution(workflow_executions)
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+
+    assert sorted(path.name for path in workshop_paths.state_root.iterdir()) == [
+        "context.json",
+        "history.json",
+        "manifest.json",
+    ]
+    for path in (workshop_paths.context_path, workshop_paths.history_path):
+        assert stat.S_ISREG(os.lstat(path).st_mode)
+        assert stat.S_IMODE(os.lstat(path).st_mode) == 0o600
+    context = json.loads(workshop_paths.context_path.read_text(encoding="utf-8"))
+    assert set(context) == {
+        "schema_version",
+        "dataset_sha256",
+        "profile",
+        "candidates",
+        "baseline_ids",
+        "baseline_score",
+        "benchmark_score",
+        "target_score",
+        "distance_matrix",
+        "stage_results_zip_sha256",
+    }
+    assert len(context["candidates"]) == 8
+    assert np.asarray(context["distance_matrix"]).shape == (8, 8)
+    reconstructed = runner._context_from_payload(context)
+    assert runner.certify_argmax_reachability(reconstructed)
+
+    monkeypatch.setattr(runner, "execute_workflow_prefix", pytest.fail)
+    pending = runner.objective_start(paths=workshop_paths)
+    assert set(pending) == {
+        "schema_version",
+        "status",
+        "terminal",
+        "attempt_count",
+        "attempt_limit",
+        "state_id",
+        "current",
+        "target_score",
+        "actions",
+        "achieved",
+        "termination_reason",
+        "image_paths",
+        "artifact_directory",
+        "results_zip_path",
+        "artifact_relative_zip_path",
+    }
+    assert pending["status"] == "pending"
+    assert pending["attempt_count"] == 0
+    assert 1 <= len(pending["actions"]) <= 3
+    with zipfile.ZipFile(workshop_paths.output_root / "results.zip") as archive:
+        assert all(".acs-workshop-state" not in name for name in archive.namelist())
+
+
+def test_objective_step_accepts_maximum_publishes_and_retries_exactly(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    execution = _objective_execution(workflow_executions)
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    pending = runner.objective_start(paths=workshop_paths)
+    selected = max(pending["actions"], key=lambda action: action["predicted_score"])
+    terminal = runner.objective_step(
+        pending["state_id"], selected["swap_id"], paths=workshop_paths
+    )
+    history_bytes = workshop_paths.history_path.read_bytes()
+    assert terminal["status"] == "complete"
+    assert terminal["attempt_count"] == 1
+    assert terminal["termination_reason"] == "target_achieved"
+    assert (
+        runner.objective_step(
+            pending["state_id"], selected["swap_id"], paths=workshop_paths
+        )
+        == terminal
+    )
+    assert workshop_paths.history_path.read_bytes() == history_bytes
+
+    objective_directory = workshop_paths.output_root / "07-objective"
+    assert sorted(path.name for path in objective_directory.iterdir()) == [
+        "README.md",
+        "final_panel.png",
+        "final_similarity_heatmap.png",
+        "objective_evidence.json",
+        "objective_summary.json",
+        "score_trajectory.png",
+    ]
+    for image_name in terminal["image_paths"]:
+        with Image.open(image_name) as image:
+            image.verify()
+    summary = json.loads(
+        (objective_directory / "objective_summary.json").read_text(encoding="utf-8")
+    )
+    evidence = json.loads(
+        (objective_directory / "objective_evidence.json").read_text(encoding="utf-8")
+    )
+    assert evidence["evidence"][0]["key"] == "O01"
+    assert evidence["evidence"][0]["payload"] == {
+        key: value for key, value in summary.items() if key != "schema_version"
+    }
+    with zipfile.ZipFile(workshop_paths.output_root / "results.zip") as archive:
+        members = set(archive.namelist())
+    assert "07-objective/objective_summary.json" in members
+    assert all(".acs-workshop-state" not in member for member in members)
+    terminal_state_bytes = workshop_paths.history_path.read_bytes()
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    assert workshop_paths.history_path.read_bytes() == terminal_state_bytes
+
+
+def test_objective_step_rejects_nonmaximum_without_mutation(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    execution = _objective_execution(
+        workflow_executions, controlled_context_with_ranked_swaps()
+    )
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    pending = runner.objective_start(paths=workshop_paths)
+    lower = min(pending["actions"], key=lambda action: action["predicted_score"])
+    assert lower["predicted_score"] < max(
+        action["predicted_score"] for action in pending["actions"]
+    )
+    before = workshop_paths.history_path.read_bytes()
+    with pytest.raises(ValueError, match="accepted exact menu action"):
+        runner.objective_step(
+            pending["state_id"], lower["swap_id"], paths=workshop_paths
+        )
+    assert workshop_paths.history_path.read_bytes() == before
+
+
+def test_third_lesson_preserves_progress_and_rejects_incomplete_state(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    execution = _objective_execution(
+        workflow_executions, controlled_context_with_tied_paths(True)
+    )
+    run = lambda: runner.run_lesson(  # noqa: E731
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    run()
+    pending = runner.objective_start(paths=workshop_paths)
+    selected = max(pending["actions"], key=lambda action: action["predicted_score"])
+    runner.objective_step(
+        pending["state_id"], selected["swap_id"], paths=workshop_paths
+    )
+    before = workshop_paths.history_path.read_bytes()
+    run()
+    assert workshop_paths.history_path.read_bytes() == before
+
+    workshop_paths.context_path.unlink()
+    with pytest.raises(RuntimeError, match="objective state"):
+        run()
+    assert workshop_paths.history_path.read_bytes() == before
+
+
+def test_tied_maxima_are_accepted_and_attempt_limit_is_exact(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    execution = _objective_execution(
+        workflow_executions, controlled_context_with_tied_paths(True)
+    )
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    result = runner.objective_start(paths=workshop_paths)
+    saw_tie = False
+    while not result["terminal"]:
+        maximum = max(action["predicted_score"] for action in result["actions"])
+        tied = [
+            action
+            for action in result["actions"]
+            if action["predicted_score"] == maximum
+        ]
+        saw_tie = saw_tie or len(tied) > 1
+        result = runner.objective_step(
+            result["state_id"], tied[-1]["swap_id"], paths=workshop_paths
+        )
+    assert result["terminal"] is True
+    assert result["termination_reason"] == "target_achieved"
+    assert saw_tie
+    before = workshop_paths.history_path.read_bytes()
+    with pytest.raises(ValueError):
+        runner.objective_step("state-invented", "mol-0->mol-7", paths=workshop_paths)
+    assert workshop_paths.history_path.read_bytes() == before
+
+    context = controlled_context_with_three_misses()
+    attempts = []
+    current = runner.measure_panel(context, context.baseline_ids)
+    for number in range(1, 4):
+        menu = runner.build_action_menu(context, current, number - 1)
+        attempt = runner.evaluate_selected_swap(
+            context, menu, runner.accepted_maxima(menu)[0], number
+        )
+        attempts.append(attempt)
+        current = attempt.measurement
+    _, menu, run = runner._derive_objective(context, tuple(attempts))
+    assert menu is None
+    assert run.termination_reason.value == "attempt_limit_reached"
+
+
+def test_terminal_publication_interruption_recovers_without_another_attempt(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution = _objective_execution(workflow_executions)
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    pending = runner.objective_start(paths=workshop_paths)
+    selected = max(pending["actions"], key=lambda action: action["predicted_score"])
+    real_publish = runner._publish_objective
+    calls = 0
+
+    def interrupt(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("simulated interruption")
+        return real_publish(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_publish_objective", interrupt)
+    with pytest.raises(OSError, match="simulated interruption"):
+        runner.objective_step(
+            pending["state_id"], selected["swap_id"], paths=workshop_paths
+        )
+    stored = json.loads(workshop_paths.history_path.read_text(encoding="utf-8"))
+    assert stored["accepted_attempt_count"] == 1
+    recovered = runner.objective_start(paths=workshop_paths)
+    assert recovered["status"] == "complete"
+    assert recovered["attempt_count"] == 1
+    assert calls == 2
+
+
+def test_private_json_is_indented_and_rejects_forged_cached_result(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    execution = _objective_execution(
+        workflow_executions, controlled_context_with_tied_paths(True)
+    )
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    context_bytes = workshop_paths.context_path.read_bytes()
+    assert context_bytes.startswith(b'{\n  "')
+    pending = runner.objective_start(paths=workshop_paths)
+    selected = max(pending["actions"], key=lambda action: action["predicted_score"])
+    runner.objective_step(
+        pending["state_id"], selected["swap_id"], paths=workshop_paths
+    )
+    state = json.loads(workshop_paths.history_path.read_text(encoding="utf-8"))
+    state["last_result"]["status"] = "forged"
+    workshop_paths.history_path.write_bytes(runner._private_json_bytes(state))
+    with pytest.raises(RuntimeError, match="objective state"):
+        runner.objective_start(paths=workshop_paths)
+
+
+def test_terminal_zip_extends_bound_archive_not_mutated_stage_directory(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    execution = _objective_execution(workflow_executions)
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    archive_path = workshop_paths.output_root / "results.zip"
+    member_name = "06-mmff94/conformer_energies.png"
+    with zipfile.ZipFile(archive_path) as archive:
+        bound_member = archive.read(member_name)
+    stage_image = workshop_paths.output_root / member_name
+    Image.new("RGB", (11, 7), color="red").save(stage_image, format="PNG")
+    mutated_member = stage_image.read_bytes()
+    assert mutated_member != bound_member
+
+    pending = runner.objective_start(paths=workshop_paths)
+    selected = max(pending["actions"], key=lambda action: action["predicted_score"])
+    runner.objective_step(
+        pending["state_id"], selected["swap_id"], paths=workshop_paths
+    )
+
+    with zipfile.ZipFile(archive_path) as archive:
+        assert archive.read(member_name) == bound_member
+        assert archive.read(member_name) != mutated_member
+
+
+def test_forged_terminal_zip_matching_mutated_stage_directory_fails_closed(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    tmp_path: Path,
+) -> None:
+    execution = _objective_execution(workflow_executions)
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    pending = runner.objective_start(paths=workshop_paths)
+    selected = max(pending["actions"], key=lambda action: action["predicted_score"])
+    runner.objective_step(
+        pending["state_id"], selected["swap_id"], paths=workshop_paths
+    )
+    stage_image = workshop_paths.output_root / "06-mmff94/conformer_energies.png"
+    Image.new("RGB", (13, 9), color="blue").save(stage_image, format="PNG")
+    forged = tmp_path / "forged-results.zip"
+    archive_path = workshop_paths.output_root / "results.zip"
+    with zipfile.ZipFile(archive_path) as archive:
+        members = [(info.filename, archive.read(info)) for info in archive.infolist()]
+    with zipfile.ZipFile(forged, "w") as archive:
+        for name, contents in members:
+            if name == "06-mmff94/conformer_energies.png":
+                contents = stage_image.read_bytes()
+            runner._zip_member(archive, name, contents)
+    os.replace(forged, workshop_paths.output_root / "results.zip")
+    before = (workshop_paths.output_root / "results.zip").read_bytes()
+
+    with pytest.raises(RuntimeError, match="objective state"):
+        runner.objective_start(paths=workshop_paths)
+    assert (workshop_paths.output_root / "results.zip").read_bytes() == before
+
+
+@pytest.mark.parametrize("command", ("start", "step"))
+def test_objective_commands_reject_nonprivate_state_root_without_mutation(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    command: str,
+) -> None:
+    execution = _objective_execution(workflow_executions)
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    pending = runner.objective_start(paths=workshop_paths)
+    selected = max(pending["actions"], key=lambda action: action["predicted_score"])
+    before = workshop_paths.history_path.read_bytes()
+    workshop_paths.state_root.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="objective state"):
+        if command == "start":
+            runner.objective_start(paths=workshop_paths)
+        else:
+            runner.objective_step(
+                pending["state_id"], selected["swap_id"], paths=workshop_paths
+            )
+    assert workshop_paths.history_path.read_bytes() == before
+
+
+def test_new_objective_action_is_evaluated_exactly_once(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution = _objective_execution(workflow_executions)
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    pending = runner.objective_start(paths=workshop_paths)
+    selected = max(pending["actions"], key=lambda action: action["predicted_score"])
+    real_evaluator = runner.evaluate_selected_swap
+    calls = 0
+
+    def counted_evaluator(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_evaluator(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "evaluate_selected_swap", counted_evaluator)
+    runner.objective_step(
+        pending["state_id"], selected["swap_id"], paths=workshop_paths
+    )
+    assert calls == 1
+
+
+def test_objective_history_rejects_skipped_attempt_number_without_mutation(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    execution = _objective_execution(
+        workflow_executions, controlled_context_with_tied_paths(True)
+    )
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+
+    context_bytes = workshop_paths.context_path.read_bytes()
+    context = runner._context_from_payload(json.loads(context_bytes))
+    current = runner.measure_panel(context, context.baseline_ids)
+    skipped_menu = runner.build_action_menu(context, current, 1)
+    skipped_attempt = runner.evaluate_selected_swap(
+        context,
+        skipped_menu,
+        runner.accepted_maxima(skipped_menu)[0],
+        2,
+    )
+    next_current, next_menu, next_run = runner._resolve_objective_state(
+        context,
+        (skipped_attempt,),
+        skipped_attempt.measurement,
+        validate_terminal=True,
+    )
+    forged_state = runner._state_payload(
+        hashlib.sha256(context_bytes).hexdigest(),
+        next_current,
+        next_menu,
+        next_run,
+        (skipped_attempt,),
+    )
+    workshop_paths.history_path.write_bytes(runner._private_json_bytes(forged_state))
+    history_before = workshop_paths.history_path.read_bytes()
+    archive_before = (workshop_paths.output_root / "results.zip").read_bytes()
+
+    with pytest.raises(RuntimeError, match="objective state"):
+        runner.objective_start(paths=workshop_paths)
+    assert workshop_paths.history_path.read_bytes() == history_before
+    assert (workshop_paths.output_root / "results.zip").read_bytes() == archive_before
+
+
+def test_third_lesson_invalid_state_preserves_prior_terminal_archive(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    execution = _objective_execution(workflow_executions)
+    run = lambda: runner.run_lesson(  # noqa: E731
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    run()
+    pending = runner.objective_start(paths=workshop_paths)
+    selected = max(pending["actions"], key=lambda action: action["predicted_score"])
+    runner.objective_step(
+        pending["state_id"], selected["swap_id"], paths=workshop_paths
+    )
+    archive_path = workshop_paths.output_root / "results.zip"
+    archive_before = archive_path.read_bytes()
+    with zipfile.ZipFile(archive_path) as archive:
+        assert "07-objective/objective_summary.json" in archive.namelist()
+
+    state = json.loads(workshop_paths.history_path.read_text(encoding="utf-8"))
+    state["accepted_attempt_count"] = 0
+    workshop_paths.history_path.write_bytes(runner._private_json_bytes(state))
+
+    with pytest.raises(RuntimeError, match="objective state"):
+        run()
+    assert archive_path.read_bytes() == archive_before
+    with zipfile.ZipFile(archive_path) as archive:
+        assert "07-objective/objective_summary.json" in archive.namelist()
+
+
+def test_pending_duplicate_retry_rejects_tampered_bound_archive_without_mutation(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    execution = _objective_execution(
+        workflow_executions, controlled_context_with_tied_paths(True)
+    )
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    pending = runner.objective_start(paths=workshop_paths)
+    selected = max(pending["actions"], key=lambda action: action["predicted_score"])
+    next_pending = runner.objective_step(
+        pending["state_id"], selected["swap_id"], paths=workshop_paths
+    )
+    assert next_pending["status"] == "pending"
+    history_before = workshop_paths.history_path.read_bytes()
+    archive_path = workshop_paths.output_root / "results.zip"
+    archive_path.write_bytes(b"tampered archive")
+    archive_before = archive_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="objective state"):
+        runner.objective_step(
+            pending["state_id"], selected["swap_id"], paths=workshop_paths
+        )
+    assert workshop_paths.history_path.read_bytes() == history_before
+    assert archive_path.read_bytes() == archive_before
+
+
+@pytest.mark.parametrize("limit_kind", ("member", "aggregate"))
+def test_results_archive_limits_fail_before_reading_expanded_members(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    limit_kind: str,
+) -> None:
+    assert runner._RESULTS_ARCHIVE_MAX_MEMBER_BYTES == 8 * 1024 * 1024
+    assert runner._RESULTS_ARCHIVE_MAX_EXPANDED_BYTES == 32 * 1024 * 1024
+    execution = _objective_execution(workflow_executions)
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    source_path = workshop_paths.output_root / "results.zip"
+    with zipfile.ZipFile(source_path) as source:
+        members = [(info.filename, source.read(info)) for info in source.infolist()]
+
+    malicious_path = tmp_path / f"{limit_kind}.zip"
+    oversized = b"x" * (runner._RESULTS_ARCHIVE_MAX_MEMBER_BYTES + 1)
+    aggregate = b"y" * (7 * 1024 * 1024)
+    with zipfile.ZipFile(malicious_path, "w") as archive:
+        for index, (name, contents) in enumerate(members):
+            if limit_kind == "member" and index == 0:
+                contents = oversized
+            elif limit_kind == "aggregate" and index < 5:
+                contents = aggregate
+            runner._zip_member(archive, name, contents)
+
+    monkeypatch.setattr(
+        runner.zipfile.ZipFile,
+        "read",
+        lambda *args, **kwargs: pytest.fail(
+            "archive content was read before declared-size limits were checked"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="objective state"):
+        runner._validated_results_archive(malicious_path)
