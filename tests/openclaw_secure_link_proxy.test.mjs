@@ -16,6 +16,12 @@ import {
 const PROXY_PATH = fileURLToPath(
   new URL("../launchable/openclaw_secure_link_proxy.mjs", import.meta.url),
 );
+const SECURE_LINK_HOST =
+  "open-chemistry-agent-4z4yqg7de.apps.run.brev.nvidia.com";
+const SECURE_LINK_ORIGIN = `https://${SECURE_LINK_HOST}`;
+const BACKEND_ORIGIN = "http://127.0.0.1:18789";
+
+
 function listen(server, port) {
   return new Promise((resolve, reject) => {
     const onError = (error) => reject(error);
@@ -177,6 +183,25 @@ function readHandshake(socket) {
 }
 
 
+async function requestUpgradeHandshake(port, headers) {
+  const socket = net.connect({ host: "127.0.0.1", port });
+  await once(socket, "connect");
+  const key = Buffer.from("invalid-upgrade").toString("base64");
+  const handshake = readHandshake(socket);
+  socket.write(
+    "GET /socket HTTP/1.1\r\n" +
+      headers.map(([name, value]) => `${name}: ${value}\r\n`).join("") +
+      "Upgrade: websocket\r\n" +
+      "Connection: Upgrade\r\n" +
+      `Sec-WebSocket-Key: ${key}\r\n` +
+      "Sec-WebSocket-Version: 13\r\n\r\n",
+  );
+  const result = await handshake;
+  socket.destroy();
+  return result.headers;
+}
+
+
 test("bootstraps once, proxies HTTP, and tunnels WebSocket data", async (t) => {
   assert.deepEqual(PROXY_DEFAULTS, {
     listenHost: "0.0.0.0",
@@ -295,7 +320,8 @@ test("bootstraps once, proxies HTTP, and tunnels WebSocket data", async (t) => {
   const handshake = readHandshake(socket);
   socket.write(
     "GET /socket?keep=1 HTTP/1.1\r\n" +
-      "Host: secure-link.example\r\n" +
+      `Host: ${SECURE_LINK_HOST}\r\n` +
+      `Origin: ${SECURE_LINK_ORIGIN}\r\n` +
       "Upgrade: websocket\r\n" +
       "Connection: Upgrade\r\n" +
       `Sec-WebSocket-Key: ${key}\r\n` +
@@ -311,8 +337,162 @@ test("bootstraps once, proxies HTTP, and tunnels WebSocket data", async (t) => {
 
   assert.equal(upgrades.length, 1);
   assert.equal(upgrades[0].url, "/socket?keep=1");
-  assert.equal(upgrades[0].headers.host, "secure-link.example");
+  assert.equal(upgrades[0].headers.host, SECURE_LINK_HOST);
+  assert.equal(upgrades[0].headers.origin, BACKEND_ORIGIN);
   assert.equal(upgrades[0].headers["x-acs-test"], "websocket-header");
+});
+
+
+test("rejects invalid Brev WebSocket origins before a backend connection", async (t) => {
+  let backendConnectionCount = 0;
+  const backendSockets = new Set();
+  const backend = net.createServer((socket) => {
+    backendConnectionCount += 1;
+    backendSockets.add(socket);
+    socket.on("close", () => backendSockets.delete(socket));
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Connection: Upgrade\r\n" +
+        "Upgrade: websocket\r\n\r\n",
+    );
+  });
+  const backendPort = await listen(backend, 0);
+
+  const proxy = createSecureLinkProxy({ token: "test-token", backendPort });
+  const proxySockets = new Set();
+  proxy.on("connection", (socket) => {
+    proxySockets.add(socket);
+    socket.on("close", () => proxySockets.delete(socket));
+  });
+  const proxyPort = await listen(proxy, 0);
+  t.after(async () => {
+    for (const socket of proxySockets) {
+      socket.destroy();
+    }
+    for (const socket of backendSockets) {
+      socket.destroy();
+    }
+    await closeServer(proxy);
+    await closeServer(backend);
+  });
+
+  const invalidRequests = [
+    {
+      name: "missing Host",
+      headers: [["Origin", SECURE_LINK_ORIGIN]],
+    },
+    {
+      name: "missing Origin",
+      headers: [["Host", SECURE_LINK_HOST]],
+    },
+    {
+      name: "duplicate Host",
+      headers: [
+        ["Host", SECURE_LINK_HOST],
+        [
+          "Host",
+          "open-chemistry-agent-attacker.apps.run.brev.nvidia.com",
+        ],
+        ["Origin", SECURE_LINK_ORIGIN],
+      ],
+    },
+    {
+      name: "duplicate Origin",
+      headers: [
+        ["Host", SECURE_LINK_HOST],
+        ["Origin", SECURE_LINK_ORIGIN],
+        [
+          "Origin",
+          "https://open-chemistry-agent-attacker.apps.run.brev.nvidia.com",
+        ],
+      ],
+    },
+    {
+      name: "mismatched Origin",
+      headers: [
+        ["Host", SECURE_LINK_HOST],
+        [
+          "Origin",
+          "https://open-chemistry-agent-other.apps.run.brev.nvidia.com",
+        ],
+      ],
+    },
+    {
+      name: "HTTP Origin",
+      headers: [
+        ["Host", SECURE_LINK_HOST],
+        ["Origin", `http://${SECURE_LINK_HOST}`],
+      ],
+    },
+    {
+      name: "Origin suffix confusion",
+      headers: [
+        ["Host", SECURE_LINK_HOST],
+        ["Origin", `${SECURE_LINK_ORIGIN}.attacker.example`],
+      ],
+    },
+    {
+      name: "Host suffix confusion",
+      headers: [
+        ["Host", `${SECURE_LINK_HOST}.attacker.example`],
+        ["Origin", `${SECURE_LINK_ORIGIN}.attacker.example`],
+      ],
+    },
+    {
+      name: "non-alphanumeric instance ID",
+      headers: [
+        [
+          "Host",
+          "open-chemistry-agent-4z4y-qg7de.apps.run.brev.nvidia.com",
+        ],
+        [
+          "Origin",
+          "https://open-chemistry-agent-4z4y-qg7de.apps.run.brev.nvidia.com",
+        ],
+      ],
+    },
+    {
+      name: "uppercase instance ID",
+      headers: [
+        [
+          "Host",
+          "open-chemistry-agent-4Z4YQG7DE.apps.run.brev.nvidia.com",
+        ],
+        [
+          "Origin",
+          "https://open-chemistry-agent-4Z4YQG7DE.apps.run.brev.nvidia.com",
+        ],
+      ],
+    },
+    {
+      name: "Host with port",
+      headers: [
+        ["Host", `${SECURE_LINK_HOST}:443`],
+        ["Origin", `${SECURE_LINK_ORIGIN}:443`],
+      ],
+    },
+  ];
+
+  const observed = [];
+  for (const invalidRequest of invalidRequests) {
+    const headers = await requestUpgradeHandshake(
+      proxyPort,
+      invalidRequest.headers,
+    );
+    observed.push({
+      name: invalidRequest.name,
+      status: headers.split("\r\n", 1)[0],
+    });
+  }
+
+  assert.deepEqual(
+    observed,
+    invalidRequests.map(({ name }) => ({
+      name,
+      status: "HTTP/1.1 403 Forbidden",
+    })),
+  );
+  assert.equal(backendConnectionCount, 0);
 });
 
 

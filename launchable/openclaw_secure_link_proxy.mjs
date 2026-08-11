@@ -12,6 +12,9 @@ export const PROXY_DEFAULTS = Object.freeze({
   backendHost: "127.0.0.1",
   backendPort: 18789,
 });
+const SECURE_LINK_HOST_PATTERN =
+  /^open-chemistry-agent-[a-z0-9]+\.apps\.run\.brev\.nvidia\.com$/;
+const PRIVATE_DASHBOARD_ORIGIN = "http://127.0.0.1:18789";
 
 
 function javascriptString(value) {
@@ -63,6 +66,38 @@ function writeBadGateway(response) {
 }
 
 
+function singleRawHeader(request, expectedName) {
+  const values = [];
+  for (let index = 0; index < request.rawHeaders.length; index += 2) {
+    if (request.rawHeaders[index].toLowerCase() === expectedName) {
+      values.push(request.rawHeaders[index + 1]);
+    }
+  }
+  return values.length === 1 ? values[0] : null;
+}
+
+
+function isAllowedSecureLinkUpgrade(request) {
+  const host = singleRawHeader(request, "host");
+  const origin = singleRawHeader(request, "origin");
+  return (
+    host !== null &&
+    origin !== null &&
+    SECURE_LINK_HOST_PATTERN.test(host) &&
+    origin === `https://${host}`
+  );
+}
+
+
+function rejectUpgrade(clientSocket) {
+  clientSocket.end(
+    "HTTP/1.1 403 Forbidden\r\n" +
+      "Connection: close\r\n" +
+      "Content-Length: 0\r\n\r\n",
+  );
+}
+
+
 function forwardUpgrade(request, clientSocket, head, backendHost, backendPort) {
   const backendSocket = net.connect({ host: backendHost, port: backendPort });
   const closeBackend = () => backendSocket.destroy();
@@ -73,7 +108,12 @@ function forwardUpgrade(request, clientSocket, head, backendHost, backendPort) {
   backendSocket.once("connect", () => {
     let requestHead = `${request.method} ${request.url} HTTP/${request.httpVersion}\r\n`;
     for (let index = 0; index < request.rawHeaders.length; index += 2) {
-      requestHead += `${request.rawHeaders[index]}: ${request.rawHeaders[index + 1]}\r\n`;
+      const name = request.rawHeaders[index];
+      const value =
+        name.toLowerCase() === "origin"
+          ? PRIVATE_DASHBOARD_ORIGIN
+          : request.rawHeaders[index + 1];
+      requestHead += `${name}: ${value}\r\n`;
     }
     backendSocket.write(`${requestHead}\r\n`, "latin1");
     if (head.length > 0) {
@@ -133,6 +173,10 @@ export function createSecureLinkProxy({
   });
 
   server.on("upgrade", (request, clientSocket, head) => {
+    if (!isAllowedSecureLinkUpgrade(request)) {
+      rejectUpgrade(clientSocket);
+      return;
+    }
     forwardUpgrade(request, clientSocket, head, backendHost, backendPort);
   });
   return server;
