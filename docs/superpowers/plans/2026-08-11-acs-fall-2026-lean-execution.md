@@ -99,7 +99,7 @@ git commit -m "Add paired ACS workshop lessons"
 
 Completed as `1817b22eef5137e218c191de9d0c18a754f2eb62`: 167 focused and adjacent tests passed; Ruff, compilation, diff checks, and staged Gitleaks passed; specification and code-quality reviews found no remaining Critical or Important issue. This is local implementation evidence only.
 
-### Task 3: Add the bounded diversity objective
+### Task 3: Add the bounded diversity objective — complete
 
 **Files:**
 
@@ -108,7 +108,7 @@ Completed as `1817b22eef5137e218c191de9d0c18a754f2eb62`: 167 focused and adjacen
 - Read: `objective_challenge.py`
 - Read: `tests/objective_fixtures.py`
 
-- [ ] **Step 1: Write failing private-state tests**
+- [x] **Step 1: Write failing private-state tests**
 
 At the end of the third lesson, write two mode-0600 regular non-symlink files atomically:
 
@@ -119,13 +119,13 @@ Objective steps must not rerun nvMolKit, RDKit embedding, or MMFF94.
 
 After this state exists, extend third-lesson cache validation: a cached third lesson is valid only when its immutable objective context and compatible mutable state also validate. Preserve valid initial, progressed, or terminal objective state; create initial state only when no valid objective progress exists.
 
-- [ ] **Step 2: Write failing action and retry tests**
+- [x] **Step 2: Write failing action and retry tests**
 
 `objective-start` returns the baseline panel, weakest-link `D_min`, limiting pair, target, state ID, and at most three fixed legal actions. `objective-step --state-id ID --swap-id ID` accepts only a displayed action tied for the maximum predicted `D_min` and stops at target, no legal improvement, or three accepted actions.
 
 An exact duplicate of the most recently committed `(state_id, swap_id)` returns the already committed current or terminal envelope. Every other stale, invented, or fourth action fails without mutation. This is retry safety, not a replay log.
 
-- [ ] **Step 3: Write failing terminal-artifact tests**
+- [x] **Step 3: Write failing terminal-artifact tests**
 
 Terminal output is exactly:
 
@@ -140,7 +140,7 @@ final_similarity_heatmap.png
 
 The summary reports baseline, final, target, limiting pair, accepted swaps, and terminal reason. Python computes every score; Nemotron only selects a displayed action and explains the measured result. Rebuild the public ZIP after terminal publication.
 
-- [ ] **Step 4: Implement, verify, and commit**
+- [x] **Step 4: Implement, verify, and commit**
 
 ```bash
 env PYTHONPATH=. MPLCONFIGDIR=/private/tmp/acs-workshop-mpl \
@@ -153,6 +153,8 @@ Run Ruff, compilation, `git diff --check`, and staged Gitleaks. Commit with:
 ```bash
 git commit -m "Add the bounded ACS diversity objective"
 ```
+
+Completed as `2c9c022e29c9150d1d9e7695d5c3bf77eeb7a0b1`: the bounded objective persists one immutable eight-candidate context and one small retry-safe state, performs no objective-time GPU recomputation, publishes the exact six-file terminal result, and extends the hash-bound lesson archive. The final repair rejects skipped attempt sequences, preserves a terminal ZIP when lesson rerun validation fails, validates the bound archive before a cached pending retry, and enforces 8 MiB per-member and 32 MiB aggregate archive limits before decompression. Fresh verification passed 198 runner/objective tests, Ruff, compilation, diff checks, and staged Gitleaks. Independent specification and code-quality reviews found no remaining Critical or Important issue. This is local implementation evidence only.
 
 ### Task 4: Rewire the Launchable without a hidden model turn
 
