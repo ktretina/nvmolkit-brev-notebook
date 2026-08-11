@@ -762,14 +762,19 @@ class InteractiveWorkflow:
 
             if not isinstance(molecule, Chem.Mol) or molecule.GetNumAtoms() < 1:
                 raise ValueError
-            svg = str(
-                Draw.MolsToGridImage(
-                    [molecule],
-                    molsPerRow=1,
-                    subImgSize=(220, 135),
-                    useSVG=True,
-                )
+            drawing = Draw.MolsToGridImage(
+                [molecule],
+                molsPerRow=1,
+                subImgSize=(220, 135),
+                useSVG=True,
             )
+            svg = (
+                drawing
+                if isinstance(drawing, str)
+                else getattr(drawing, "data", None)
+            )
+            if not isinstance(svg, str):
+                raise ValueError
         except Exception as error:
             raise ValueError("Objective molecule could not be drawn safely.") from error
         start = svg.find("<svg")

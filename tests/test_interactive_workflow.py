@@ -756,6 +756,31 @@ def test_objective_attempt_renders_five_step_molecule_story_with_progress_bar():
     assert "required improvement achieved" in rendered
 
 
+def test_objective_molecule_svg_accepts_ipython_display_svg(monkeypatch):
+    from IPython.display import SVG
+    from rdkit.Chem import Draw
+
+    context, _decisions = two_revision_decisions()
+    state = optimized_state()
+    original = Draw.MolsToGridImage
+
+    def return_display_svg(*args, **kwargs):
+        rendered = original(*args, **kwargs)
+        raw_svg = rendered if isinstance(rendered, str) else rendered.data
+        return SVG(data=raw_svg)
+
+    monkeypatch.setattr(Draw, "MolsToGridImage", return_display_svg)
+
+    svg = InteractiveWorkflow._objective_molecule_svg(
+        context,
+        state.molecules,
+        context.baseline_ids[0],
+    )
+
+    assert svg.startswith("<svg")
+    assert svg.endswith("</svg>")
+
+
 def test_objective_attempt_keeps_visible_story_concise_and_receipt_free():
     context, (first, _second) = two_revision_decisions()
 
