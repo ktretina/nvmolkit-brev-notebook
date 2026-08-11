@@ -9,6 +9,8 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from matplotlib.figure import Figure
+from PIL import Image
 
 import acs_workshop_runner as runner
 
@@ -19,6 +21,152 @@ MANIFEST_FILES = (
     "chemistry_workflow.py",
     "data/sample_molecules.csv",
     "objective_challenge.py",
+)
+
+EXPECTED_STAGE_IMAGES = {
+    "inspect_library": ("library_preview.png",),
+    "generate_morgan_fingerprints": ("fingerprint_density.png",),
+    "measure_tanimoto_similarity": ("similarity_heatmap.png",),
+    "discover_fused_butina_clusters": ("cluster_sizes.png",),
+    "embed_representative_conformers": ("embedding_counts.png",),
+    "optimize_conformers_mmff94": (
+        "conformer_energies.png",
+        "optimized_structures.png",
+    ),
+}
+
+EXPECTED_STAGE_METADATA = {
+    "inspect_library": (
+        "What is in the fixed molecule library?",
+        "RDKit input validation",
+        "validation does not establish activity or suitability",
+    ),
+    "generate_morgan_fingerprints": (
+        "What do the GPU Morgan fingerprints show?",
+        "nvMolKit MorganFingerprintGenerator",
+        "fingerprints are structural descriptors, not biological evidence",
+    ),
+    "measure_tanimoto_similarity": (
+        "Which molecules are most similar in this fingerprint space?",
+        "nvMolKit crossTanimotoSimilarity",
+        "similarity does not establish activity, binding, efficacy, or safety",
+    ),
+    "discover_fused_butina_clusters": (
+        "How does fused Butina partition the library?",
+        "nvMolKit fused_butina with RDKit MMFF94 eligibility",
+        "clusters depend on this fingerprint and cutoff",
+    ),
+    "embed_representative_conformers": (
+        "Did ETKDGv3 generate the requested representative conformers?",
+        "nvMolKit EmbedMolecules",
+        "sampled conformers are not experimental structures",
+    ),
+    "optimize_conformers_mmff94": (
+        "Which sampled conformers converged under MMFF94?",
+        "nvMolKit MMFFOptimizeMoleculesConfs",
+        "MMFF94 compares sampled force-field geometries within each molecule only",
+    ),
+}
+
+EXPECTED_STAGE_DIRECTORIES = {
+    "inspect_library": "01-inspection",
+    "generate_morgan_fingerprints": "02-fingerprints",
+    "measure_tanimoto_similarity": "03-similarity",
+    "discover_fused_butina_clusters": "04-clusters",
+    "embed_representative_conformers": "05-conformers",
+    "optimize_conformers_mmff94": "06-mmff94",
+}
+
+EXPECTED_STAGE_FACTS = {
+    "inspect_library": {
+        "raw_count": 256,
+        "valid_count": 256,
+        "invalid_count": 0,
+        "preview_count": 24,
+        "unused_internal_detail": "DO_NOT_RENDER",
+    },
+    "generate_morgan_fingerprints": {
+        "fingerprint_radius": 2,
+        "fingerprint_size": 1024,
+        "packed_shape": [256, 32],
+        "active_bits_min": 4,
+        "active_bits_median": 17.5,
+        "active_bits_max": 41,
+        "unused_internal_detail": "DO_NOT_RENDER",
+    },
+    "measure_tanimoto_similarity": {
+        "q1": 0.125,
+        "median": 0.25,
+        "q3": 0.375,
+        "p90": 0.625,
+        "most_similar_nonidentical_pair": {
+            "molecule_ids": ["CHEMBL6223", "CHEMBL6228"],
+            "source_rows": [21, 22],
+            "similarity": 1.0,
+        },
+        "unused_internal_detail": "DO_NOT_RENDER",
+    },
+    "discover_fused_butina_clusters": {
+        "cluster_cutoff": 0.4,
+        "cluster_count": 39,
+        "singleton_count": 12,
+        "largest_cluster_sizes": [31, 25, 18, 14, 12],
+        "unused_internal_detail": "DO_NOT_RENDER",
+    },
+    "embed_representative_conformers": {
+        "requested_representative_count": 6,
+        "selected_representative_count": 6,
+        "requested_conformers_per_representative": 5,
+        "generated_conformer_count": 29,
+        "partial_embedding_ids": ["CHEMBL300"],
+        "zero_embedding_ids": [],
+        "unused_internal_detail": "DO_NOT_RENDER",
+    },
+    "optimize_conformers_mmff94": {
+        "attempted_conformer_count": 29,
+        "converged_conformer_count": 27,
+        "unconverged_conformer_count": 2,
+        "selected_conformer_records": [
+            {"molecule_id": "CHEMBL100", "energy_kcal_mol": -12.3456},
+            {"molecule_id": "CHEMBL200", "energy_kcal_mol": 3.25},
+        ],
+        "unused_internal_detail": "DO_NOT_RENDER",
+    },
+}
+
+EXPECTED_STAGE_RESULTS = {
+    "inspect_library": (
+        "256 raw rows; 256 valid molecules; 0 invalid molecules; "
+        "24 molecules in the preview."
+    ),
+    "generate_morgan_fingerprints": (
+        "Morgan radius 2 with 1024 bits produced packed shape 256 x 32; "
+        "active bits min 4, median 17.500, max 41."
+    ),
+    "measure_tanimoto_similarity": (
+        'top non-self pair "CHEMBL6223" and "CHEMBL6228" had Tanimoto '
+        "similarity 1.000; q1 0.125, median 0.250, q3 0.375, p90 0.625."
+    ),
+    "discover_fused_butina_clusters": (
+        "cutoff 0.40 produced 39 clusters with 12 singletons; "
+        "largest cluster sizes: 31, 25, 18, 14, 12."
+    ),
+    "embed_representative_conformers": (
+        "selected 6 of 6 representatives and generated 29 of 30 requested "
+        "conformers; 1 partial ID, 0 zero IDs; ETKDGv3 seed 7."
+    ),
+    "optimize_conformers_mmff94": (
+        "29 conformers attempted; 27 converged; 2 unconverged; "
+        'within-molecule minima: "CHEMBL100"=-12.346 kcal/mol, '
+        '"CHEMBL200"=3.250 kcal/mol; maximum iterations 500.'
+    ),
+}
+
+FIXED_GPU = runner.GpuIdentity(
+    name="NVIDIA L4",
+    device="cuda:0",
+    torch_version="2.7.1+cu128",
+    nvmolkit_version="0.5.0",
 )
 
 
@@ -56,6 +204,53 @@ def workshop_paths(tmp_path: Path) -> runner.WorkshopPaths:
     return write_manifest(root)
 
 
+@pytest.fixture
+def workflow_executions() -> dict[str, runner.WorkflowExecution]:
+    state = runner.WorkflowState()
+    state.records = [
+        {"id": f"CHEMBL{index}", "smiles": "C", "source_row": index}
+        for index in range(256)
+    ]
+    results: list[runner.StageResult] = []
+    executions: dict[str, runner.WorkflowExecution] = {}
+    for stage_name in runner.STAGE_ORDER:
+        image_names = EXPECTED_STAGE_IMAGES[stage_name]
+        if stage_name == "inspect_library":
+            figures: tuple[object, ...] = (
+                Image.new("RGB", (24, 16), color=(118, 185, 0)),
+            )
+        else:
+            figures = tuple(Figure(figsize=(1.0, 1.0)) for _ in image_names)
+        result = runner.StageResult(
+            stage=stage_name,
+            display_label=EXPECTED_STAGE_METADATA[stage_name][1],
+            summary=EXPECTED_STAGE_FACTS[stage_name],
+            figures=figures,
+        )
+        results.append(result)
+        executions[stage_name] = runner.WorkflowExecution(
+            state=state,
+            stage_results=tuple(results),
+            gpu=None if stage_name == "inspect_library" else FIXED_GPU,
+        )
+    return executions
+
+
+@pytest.fixture(params=runner.STAGE_ORDER)
+def completed_stage(
+    request: pytest.FixtureRequest,
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> Path:
+    stage_name = str(request.param)
+    runner.run_stage(
+        stage_name,
+        paths=workshop_paths,
+        workflow_executor=lambda selected: workflow_executions[selected],
+    )
+    return workshop_paths.output_root / EXPECTED_STAGE_DIRECTORIES[stage_name]
+
+
 def _manifest_payload(paths: runner.WorkshopPaths) -> dict[str, object]:
     return json.loads(paths.manifest_path.read_text(encoding="utf-8"))
 
@@ -86,6 +281,182 @@ def _assert_manifest_rejected_before_executor(
         )
     assert calls == []
     assert len(str(caught.value)) < 160
+
+
+def test_stage_summary_has_closed_finite_schema(completed_stage: Path) -> None:
+    summary_path = completed_stage / "summary.json"
+    summary_text = summary_path.read_text(encoding="utf-8")
+    payload = json.loads(summary_text)
+    assert set(payload) == {
+        "schema_version",
+        "stage",
+        "dataset",
+        "profile",
+        "gpu",
+        "facts",
+        "artifacts",
+    }
+    assert payload["schema_version"] == 1
+    assert set(payload["dataset"]) == {"filename", "molecule_count", "sha256"}
+    assert payload["dataset"] == {
+        "filename": "sample_molecules.csv",
+        "molecule_count": 256,
+        "sha256": runner.DATASET_SHA256,
+    }
+    assert payload["profile"] == runner.PROFILE
+    expected_gpu = None
+    if payload["stage"] != "inspect_library":
+        expected_gpu = {
+            "name": "NVIDIA L4",
+            "device": "cuda:0",
+            "torch_version": "2.7.1+cu128",
+            "nvmolkit_version": "0.5.0",
+        }
+    assert payload["gpu"] == expected_gpu
+    assert payload["facts"] == EXPECTED_STAGE_FACTS[payload["stage"]]
+    expected_artifacts = sorted(
+        ("README.md", "summary.json", *EXPECTED_STAGE_IMAGES[payload["stage"]])
+    )
+    assert payload["artifacts"] == expected_artifacts
+    assert sorted(path.name for path in completed_stage.iterdir()) == expected_artifacts
+    assert summary_text == (
+        json.dumps(payload, sort_keys=True, indent=2, allow_nan=False) + "\n"
+    )
+    json.dumps(payload, allow_nan=False)
+
+
+def test_matplotlib_and_pil_image_adapters_write_readable_pngs(
+    completed_stage: Path,
+) -> None:
+    payload = json.loads((completed_stage / "summary.json").read_text())
+    expected_images = EXPECTED_STAGE_IMAGES[payload["stage"]]
+    assert tuple(sorted(path.name for path in completed_stage.glob("*.png"))) == tuple(
+        sorted(expected_images)
+    )
+    for path in completed_stage.glob("*.png"):
+        assert path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+        with Image.open(path) as image:
+            image.verify()
+
+
+def test_image_adapters_reject_the_wrong_runtime_type(tmp_path: Path) -> None:
+    pil_image = Image.new("RGB", (8, 8), color="white")
+    matplotlib_figure = Figure(figsize=(1.0, 1.0))
+    with pytest.raises(TypeError, match=r"^Expected an exact Matplotlib Figure\.$"):
+        runner._save_matplotlib_figure(pil_image, tmp_path / "wrong-mpl.png")
+    with pytest.raises(TypeError, match=r"^Expected a PIL image\.$"):
+        runner._save_pil_image(matplotlib_figure, tmp_path / "wrong-pil.png")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "stage_name,bad_figures,error_type,error_message",
+    (
+        (
+            "inspect_library",
+            (),
+            RuntimeError,
+            r"^Workshop stage image count is invalid\.$",
+        ),
+        (
+            "generate_morgan_fingerprints",
+            (Image.new("RGB", (8, 8), color="white"),),
+            TypeError,
+            r"^Expected an exact Matplotlib Figure\.$",
+        ),
+    ),
+)
+def test_image_contract_rejects_count_or_type_before_publication(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    stage_name: str,
+    bad_figures: tuple[object, ...],
+    error_type: type[Exception],
+    error_message: str,
+) -> None:
+    source = workflow_executions[stage_name]
+    final_result = source.stage_results[-1]
+    bad_result = runner.StageResult(
+        stage=final_result.stage,
+        display_label=final_result.display_label,
+        summary=final_result.summary,
+        figures=bad_figures,
+    )
+    execution = runner.WorkflowExecution(
+        state=source.state,
+        stage_results=(*source.stage_results[:-1], bad_result),
+        gpu=source.gpu,
+    )
+    with pytest.raises(error_type, match=error_message):
+        runner.run_stage(
+            stage_name,
+            paths=workshop_paths,
+            workflow_executor=lambda selected: execution,
+        )
+    stage_directory = (
+        workshop_paths.output_root / EXPECTED_STAGE_DIRECTORIES[stage_name]
+    )
+    assert not stage_directory.exists()
+
+
+def test_stage_readme_uses_fixed_metadata_and_measured_result_source(
+    completed_stage: Path,
+) -> None:
+    payload = json.loads((completed_stage / "summary.json").read_text())
+    question, method, scientific_limit = EXPECTED_STAGE_METADATA[payload["stage"]]
+    readme = (completed_stage / "README.md").read_text(encoding="utf-8")
+    assert readme.startswith(f"# {question}\n")
+    assert f"- Method: {method}\n" in readme
+    assert "- Result source: `summary.json`" in readme
+    assert f"- Result: {EXPECTED_STAGE_RESULTS[payload['stage']]}\n" in readme
+    assert "unused_internal_detail" not in readme
+    assert "DO_NOT_RENDER" not in readme
+    assert f"- Scientific limit: {scientific_limit}\n" in readme
+    assert readme.endswith("\n")
+
+
+def test_stage_result_envelope_is_exact(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    stage_name = "optimize_conformers_mmff94"
+    result = runner.run_stage(
+        stage_name,
+        paths=workshop_paths,
+        workflow_executor=lambda selected: workflow_executions[selected],
+    )
+    stage_directory = workshop_paths.output_root / "06-mmff94"
+    summary_payload = json.loads(
+        (stage_directory / "summary.json").read_text(encoding="utf-8")
+    )
+    assert result == {
+        "schema_version": 1,
+        "status": "complete",
+        "stage": stage_name,
+        "summary": summary_payload,
+        "image_paths": [
+            str((stage_directory / name).resolve())
+            for name in EXPECTED_STAGE_IMAGES[stage_name]
+        ],
+        "artifact_directory": str(stage_directory.resolve()),
+        "results_zip_path": str((workshop_paths.output_root / "results.zip").resolve()),
+        "artifact_relative_zip_path": "workshop/results.zip",
+    }
+
+
+def test_stage_summary_does_not_mutate_stage_result_facts(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    stage_name = "measure_tanimoto_similarity"
+    facts = workflow_executions[stage_name].stage_results[-1].summary
+    expected = dict(facts)
+    runner.run_stage(
+        stage_name,
+        paths=workshop_paths,
+        workflow_executor=lambda selected: workflow_executions[selected],
+    )
+    assert facts == expected
 
 
 def test_cli_contract_constants_and_workshop_paths_are_fixed(tmp_path: Path) -> None:
@@ -555,6 +926,7 @@ def test_nvidia_l4_identity_includes_fixed_device_and_package_versions(
 
 def test_manifest_precedes_real_workflow_executor_and_selected_paths_are_passed(
     workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, object]] = []
@@ -568,14 +940,15 @@ def test_manifest_precedes_real_workflow_executor_and_selected_paths_are_passed(
         paths: runner.WorkshopPaths,
     ) -> runner.WorkflowExecution:
         calls.append(("execute", (stage_name, paths)))
-        return runner.WorkflowExecution(runner.WorkflowState(), (), None)
+        return workflow_executions[stage_name]
 
     monkeypatch.setattr(runner, "verify_manifest", verify)
     monkeypatch.setattr(runner, "execute_workflow_prefix", execute)
 
     result = runner.run_stage("inspect_library", paths=workshop_paths)
 
-    assert result == {"stage": "inspect_library"}
+    assert result["stage"] == "inspect_library"
+    assert result["status"] == "complete"
     assert calls == [
         ("verify", workshop_paths),
         ("execute", ("inspect_library", workshop_paths)),
@@ -584,6 +957,7 @@ def test_manifest_precedes_real_workflow_executor_and_selected_paths_are_passed(
 
 def test_manifest_precedes_injected_one_argument_workflow_executor(
     workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, object]] = []
@@ -593,7 +967,7 @@ def test_manifest_precedes_injected_one_argument_workflow_executor(
 
     def injected(stage_name: str) -> runner.WorkflowExecution:
         calls.append(("injected", stage_name))
-        return runner.WorkflowExecution(runner.WorkflowState(), (), None)
+        return workflow_executions[stage_name]
 
     monkeypatch.setattr(runner, "verify_manifest", verify)
     monkeypatch.setattr(
@@ -608,7 +982,8 @@ def test_manifest_precedes_injected_one_argument_workflow_executor(
         workflow_executor=injected,
     )
 
-    assert result == {"stage": "inspect_library"}
+    assert result["stage"] == "inspect_library"
+    assert result["status"] == "complete"
     assert calls == [
         ("verify", workshop_paths),
         ("injected", "inspect_library"),
@@ -616,6 +991,8 @@ def test_manifest_precedes_injected_one_argument_workflow_executor(
 
 
 def test_cli_main_emits_one_canonical_json_object_for_run_stage(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -630,19 +1007,25 @@ def test_cli_main_emits_one_canonical_json_object_for_run_stage(
         paths: runner.WorkshopPaths,
     ) -> runner.WorkflowExecution:
         calls.append(("execute", (stage_name, paths)))
-        return runner.WorkflowExecution(runner.WorkflowState(), (), None)
+        return workflow_executions[stage_name]
 
+    monkeypatch.setattr(runner, "DEFAULT_PATHS", workshop_paths)
     monkeypatch.setattr(runner, "verify_manifest", verify)
     monkeypatch.setattr(runner, "execute_workflow_prefix", execute)
 
     assert runner.main(["run-stage", "inspect_library"]) == 0
     captured = capsys.readouterr()
-    assert captured.out == '{"stage":"inspect_library"}\n'
+    payload = json.loads(captured.out)
+    assert payload["status"] == "complete"
+    assert payload["stage"] == "inspect_library"
+    assert captured.out == (
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    )
     assert captured.err == ""
     assert calls == [
-        ("verify", runner.DEFAULT_PATHS),
-        ("verify", runner.DEFAULT_PATHS),
-        ("execute", ("inspect_library", runner.DEFAULT_PATHS)),
+        ("verify", workshop_paths),
+        ("verify", workshop_paths),
+        ("execute", ("inspect_library", workshop_paths)),
     ]
 
 
@@ -654,7 +1037,7 @@ def test_cli_main_emits_one_safe_error_line_for_expected_failure(
     monkeypatch.setattr(
         runner,
         "run_stage",
-        lambda stage_name: (_ for _ in ()).throw(
+        lambda stage_name, *, paths: (_ for _ in ()).throw(
             ValueError("Unsupported workshop stage.")
         ),
     )
@@ -687,7 +1070,9 @@ def test_cli_main_redacts_unapproved_exception_details(
 ) -> None:
     monkeypatch.setattr(runner, "verify_manifest", lambda paths: None)
 
-    def fail_stage(stage_name: str) -> dict[str, object]:
+    def fail_stage(
+        stage_name: str, *, paths: runner.WorkshopPaths
+    ) -> dict[str, object]:
         raise error
 
     monkeypatch.setattr(runner, "run_stage", fail_stage)
@@ -706,7 +1091,9 @@ def test_cli_main_redacts_unexpected_operational_exception(
 ) -> None:
     monkeypatch.setattr(runner, "verify_manifest", lambda paths: None)
 
-    def fail_stage(stage_name: str) -> dict[str, object]:
+    def fail_stage(
+        stage_name: str, *, paths: runner.WorkshopPaths
+    ) -> dict[str, object]:
         raise KeyError("/private/unsafe-token")
 
     monkeypatch.setattr(runner, "run_stage", fail_stage)
@@ -731,7 +1118,9 @@ def test_cli_main_does_not_catch_base_exceptions(
 ) -> None:
     monkeypatch.setattr(runner, "verify_manifest", lambda paths: None)
 
-    def interrupt_stage(stage_name: str) -> dict[str, object]:
+    def interrupt_stage(
+        stage_name: str, *, paths: runner.WorkshopPaths
+    ) -> dict[str, object]:
         raise interruption
 
     monkeypatch.setattr(runner, "run_stage", interrupt_stage)

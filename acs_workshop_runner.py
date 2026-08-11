@@ -4,11 +4,12 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import stat
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Final, NoReturn
 
@@ -36,6 +37,14 @@ STAGE_ORDER: Final = (
     "embed_representative_conformers",
     "optimize_conformers_mmff94",
 )
+STAGE_DIRECTORIES: Final = {
+    "inspect_library": "01-inspection",
+    "generate_morgan_fingerprints": "02-fingerprints",
+    "measure_tanimoto_similarity": "03-similarity",
+    "discover_fused_butina_clusters": "04-clusters",
+    "embed_representative_conformers": "05-conformers",
+    "optimize_conformers_mmff94": "06-mmff94",
+}
 PROFILE: Final[dict[str, Any]] = {
     "fingerprint_radius": 2,
     "fingerprint_size_bits": 1024,
@@ -62,8 +71,11 @@ __all__ = (
     "PROFILE",
     "RepresentativePolicy",
     "SCHEMA_VERSION",
+    "STAGE_DIRECTORIES",
     "STAGE_ORDER",
+    "STAGE_SPECS",
     "StageResult",
+    "StageSpec",
     "WorkflowExecution",
     "WorkflowExecutor",
     "WorkflowState",
@@ -117,6 +129,63 @@ class GpuIdentity:
     device: str
     torch_version: str
     nvmolkit_version: str
+
+
+@dataclass(frozen=True)
+class StageSpec:
+    directory: str
+    question: str
+    method: str
+    limit: str
+    image_names: tuple[str, ...]
+
+
+STAGE_SPECS: Final = {
+    "inspect_library": StageSpec(
+        directory=STAGE_DIRECTORIES["inspect_library"],
+        question="What is in the fixed molecule library?",
+        method="RDKit input validation",
+        limit="validation does not establish activity or suitability",
+        image_names=("library_preview.png",),
+    ),
+    "generate_morgan_fingerprints": StageSpec(
+        directory=STAGE_DIRECTORIES["generate_morgan_fingerprints"],
+        question="What do the GPU Morgan fingerprints show?",
+        method="nvMolKit MorganFingerprintGenerator",
+        limit="fingerprints are structural descriptors, not biological evidence",
+        image_names=("fingerprint_density.png",),
+    ),
+    "measure_tanimoto_similarity": StageSpec(
+        directory=STAGE_DIRECTORIES["measure_tanimoto_similarity"],
+        question="Which molecules are most similar in this fingerprint space?",
+        method="nvMolKit crossTanimotoSimilarity",
+        limit="similarity does not establish activity, binding, efficacy, or safety",
+        image_names=("similarity_heatmap.png",),
+    ),
+    "discover_fused_butina_clusters": StageSpec(
+        directory=STAGE_DIRECTORIES["discover_fused_butina_clusters"],
+        question="How does fused Butina partition the library?",
+        method="nvMolKit fused_butina with RDKit MMFF94 eligibility",
+        limit="clusters depend on this fingerprint and cutoff",
+        image_names=("cluster_sizes.png",),
+    ),
+    "embed_representative_conformers": StageSpec(
+        directory=STAGE_DIRECTORIES["embed_representative_conformers"],
+        question=("Did ETKDGv3 generate the requested representative conformers?"),
+        method="nvMolKit EmbedMolecules",
+        limit="sampled conformers are not experimental structures",
+        image_names=("embedding_counts.png",),
+    ),
+    "optimize_conformers_mmff94": StageSpec(
+        directory=STAGE_DIRECTORIES["optimize_conformers_mmff94"],
+        question="Which sampled conformers converged under MMFF94?",
+        method="nvMolKit MMFFOptimizeMoleculesConfs",
+        limit=(
+            "MMFF94 compares sampled force-field geometries within each molecule only"
+        ),
+        image_names=("conformer_energies.png", "optimized_structures.png"),
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -375,6 +444,262 @@ def execute_workflow_prefix(
     return WorkflowExecution(state, tuple(results), gpu)
 
 
+def _save_matplotlib_figure(figure: Any, path: Path) -> None:
+    from matplotlib.figure import Figure
+
+    if type(figure) is not Figure:
+        raise TypeError("Expected an exact Matplotlib Figure.")
+    figure.savefig(
+        path,
+        format="png",
+        dpi=120,
+        metadata={"Software": "ACS workshop runner"},
+    )
+
+
+def _save_pil_image(image: Any, path: Path) -> None:
+    from PIL.Image import Image
+
+    if not isinstance(image, Image):
+        raise TypeError("Expected a PIL image.")
+    image.save(path, format="PNG", optimize=False)
+
+
+def _stage_result(
+    stage_name: str,
+    execution: WorkflowExecution,
+) -> StageResult:
+    if not execution.stage_results:
+        raise RuntimeError("Workshop stage result is invalid.")
+    result = execution.stage_results[-1]
+    if result.stage != stage_name:
+        raise RuntimeError("Workshop stage result is invalid.")
+    return result
+
+
+def _validate_stage_images(
+    stage_name: str,
+    result: StageResult,
+    stage_spec: StageSpec,
+) -> None:
+    if len(result.figures) != len(stage_spec.image_names):
+        raise RuntimeError("Workshop stage image count is invalid.")
+    if stage_name == "inspect_library":
+        from PIL.Image import Image
+
+        if any(not isinstance(image, Image) for image in result.figures):
+            raise TypeError("Expected a PIL image.")
+        return
+
+    from matplotlib.figure import Figure
+
+    if any(type(figure) is not Figure for figure in result.figures):
+        raise TypeError("Expected an exact Matplotlib Figure.")
+
+
+def _fact_int(facts: dict[str, Any], key: str) -> int:
+    value = facts.get(key)
+    if type(value) is not int:
+        raise RuntimeError("Workshop stage facts are invalid.")
+    return value
+
+
+def _fact_number(facts: dict[str, Any], key: str) -> float:
+    value = facts.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError("Workshop stage facts are invalid.")
+    number = float(value)
+    if not math.isfinite(number):
+        raise RuntimeError("Workshop stage facts are invalid.")
+    return number
+
+
+def _fact_list(facts: dict[str, Any], key: str) -> list[Any]:
+    value = facts.get(key)
+    if type(value) is not list:
+        raise RuntimeError("Workshop stage facts are invalid.")
+    return value
+
+
+def _fact_dict(facts: dict[str, Any], key: str) -> dict[str, Any]:
+    value = facts.get(key)
+    if type(value) is not dict:
+        raise RuntimeError("Workshop stage facts are invalid.")
+    return value
+
+
+def _fact_string(value: Any) -> str:
+    if type(value) is not str:
+        raise RuntimeError("Workshop stage facts are invalid.")
+    return value
+
+
+def _fact_int_list(facts: dict[str, Any], key: str) -> list[int]:
+    values = _fact_list(facts, key)
+    if any(type(value) is not int for value in values):
+        raise RuntimeError("Workshop stage facts are invalid.")
+    return values
+
+
+def _stage_result_text(stage_name: str, facts: dict[str, Any]) -> str:
+    if stage_name == "inspect_library":
+        return (
+            f"{_fact_int(facts, 'raw_count')} raw rows; "
+            f"{_fact_int(facts, 'valid_count')} valid molecules; "
+            f"{_fact_int(facts, 'invalid_count')} invalid molecules; "
+            f"{_fact_int(facts, 'preview_count')} molecules in the preview."
+        )
+    if stage_name == "generate_morgan_fingerprints":
+        shape = _fact_int_list(facts, "packed_shape")
+        if len(shape) != 2:
+            raise RuntimeError("Workshop stage facts are invalid.")
+        return (
+            f"Morgan radius {_fact_int(facts, 'fingerprint_radius')} with "
+            f"{_fact_int(facts, 'fingerprint_size')} bits produced packed shape "
+            f"{shape[0]} x {shape[1]}; active bits min "
+            f"{_fact_int(facts, 'active_bits_min')}, median "
+            f"{_fact_number(facts, 'active_bits_median'):.3f}, max "
+            f"{_fact_int(facts, 'active_bits_max')}."
+        )
+    if stage_name == "measure_tanimoto_similarity":
+        pair = _fact_dict(facts, "most_similar_nonidentical_pair")
+        molecule_ids = _fact_list(pair, "molecule_ids")
+        if len(molecule_ids) != 2:
+            raise RuntimeError("Workshop stage facts are invalid.")
+        first_id, second_id = (_fact_string(value) for value in molecule_ids)
+        return (
+            f"top non-self pair {json.dumps(first_id)} and "
+            f"{json.dumps(second_id)} had Tanimoto similarity "
+            f"{_fact_number(pair, 'similarity'):.3f}; q1 "
+            f"{_fact_number(facts, 'q1'):.3f}, median "
+            f"{_fact_number(facts, 'median'):.3f}, q3 "
+            f"{_fact_number(facts, 'q3'):.3f}, p90 "
+            f"{_fact_number(facts, 'p90'):.3f}."
+        )
+    if stage_name == "discover_fused_butina_clusters":
+        largest_sizes = _fact_int_list(facts, "largest_cluster_sizes")
+        largest_text = ", ".join(str(size) for size in largest_sizes)
+        return (
+            f"cutoff {_fact_number(facts, 'cluster_cutoff'):.2f} produced "
+            f"{_fact_int(facts, 'cluster_count')} clusters with "
+            f"{_fact_int(facts, 'singleton_count')} singletons; "
+            f"largest cluster sizes: {largest_text}."
+        )
+    if stage_name == "embed_representative_conformers":
+        selected_count = _fact_int(facts, "selected_representative_count")
+        requested_per_representative = _fact_int(
+            facts, "requested_conformers_per_representative"
+        )
+        requested_conformer_count = selected_count * requested_per_representative
+        return (
+            f"selected {selected_count} of "
+            f"{_fact_int(facts, 'requested_representative_count')} representatives "
+            f"and generated {_fact_int(facts, 'generated_conformer_count')} of "
+            f"{requested_conformer_count} requested conformers; "
+            f"{len(_fact_list(facts, 'partial_embedding_ids'))} partial ID, "
+            f"{len(_fact_list(facts, 'zero_embedding_ids'))} zero IDs; "
+            f"ETKDGv3 seed {PROFILE['etkdg_random_seed']}."
+        )
+    if stage_name == "optimize_conformers_mmff94":
+        minimum_records = _fact_list(facts, "selected_conformer_records")
+        minimum_values: list[str] = []
+        for record in minimum_records:
+            if type(record) is not dict:
+                raise RuntimeError("Workshop stage facts are invalid.")
+            molecule_id = _fact_string(record.get("molecule_id"))
+            energy = _fact_number(record, "energy_kcal_mol")
+            minimum_values.append(f"{json.dumps(molecule_id)}={energy:.3f} kcal/mol")
+        minima_text = ", ".join(minimum_values) if minimum_values else "none"
+        return (
+            f"{_fact_int(facts, 'attempted_conformer_count')} conformers attempted; "
+            f"{_fact_int(facts, 'converged_conformer_count')} converged; "
+            f"{_fact_int(facts, 'unconverged_conformer_count')} unconverged; "
+            f"within-molecule minima: {minima_text}; maximum iterations "
+            f"{PROFILE['mmff94_max_iterations']}."
+        )
+    raise ValueError("Unsupported workshop stage.")
+
+
+def _stage_readme(
+    stage_name: str,
+    stage_spec: StageSpec,
+    facts: dict[str, Any],
+) -> str:
+    result_text = _stage_result_text(stage_name, facts)
+    return (
+        f"# {stage_spec.question}\n\n"
+        f"- Method: {stage_spec.method}\n"
+        "- Result source: `summary.json`\n"
+        f"- Result: {result_text}\n"
+        f"- Scientific limit: {stage_spec.limit}\n"
+    )
+
+
+def _formatted_json(value: Any) -> str:
+    return (
+        json.dumps(
+            value,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
+
+
+def _publish_stage(
+    stage_name: str,
+    execution: WorkflowExecution,
+    *,
+    paths: WorkshopPaths,
+) -> tuple[dict[str, Any], Path, StageSpec]:
+    try:
+        stage_spec = STAGE_SPECS[stage_name]
+    except KeyError as error:
+        raise ValueError("Unsupported workshop stage.") from error
+    result = _stage_result(stage_name, execution)
+    _validate_stage_images(stage_name, result, stage_spec)
+
+    if stage_name == "inspect_library":
+        if execution.gpu is not None:
+            raise RuntimeError("Workshop stage GPU identity is invalid.")
+        gpu_payload: dict[str, str] | None = None
+    else:
+        if type(execution.gpu) is not GpuIdentity:
+            raise RuntimeError("Workshop stage GPU identity is invalid.")
+        gpu_payload = asdict(execution.gpu)
+
+    artifact_names = sorted(("README.md", "summary.json", *stage_spec.image_names))
+    summary_payload: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "stage": stage_name,
+        "dataset": {
+            "filename": paths.dataset_path.name,
+            "molecule_count": len(execution.state.records),
+            "sha256": DATASET_SHA256,
+        },
+        "profile": dict(PROFILE),
+        "gpu": gpu_payload,
+        "facts": result.summary,
+        "artifacts": artifact_names,
+    }
+    summary_text = _formatted_json(summary_payload)
+    readme_text = _stage_readme(stage_name, stage_spec, result.summary)
+
+    stage_directory = paths.output_root / stage_spec.directory
+    stage_directory.mkdir(parents=True, exist_ok=True)
+    for figure, image_name in zip(result.figures, stage_spec.image_names, strict=True):
+        image_path = stage_directory / image_name
+        if stage_name == "inspect_library":
+            _save_pil_image(figure, image_path)
+        else:
+            _save_matplotlib_figure(figure, image_path)
+    (stage_directory / "README.md").write_text(readme_text, encoding="utf-8")
+    (stage_directory / "summary.json").write_text(summary_text, encoding="utf-8")
+    return summary_payload, stage_directory, stage_spec
+
+
 def run_stage(
     stage_name: str,
     *,
@@ -382,11 +707,29 @@ def run_stage(
     workflow_executor: WorkflowExecutor | None = None,
 ) -> dict[str, Any]:
     verify_manifest(paths)
+    if stage_name not in STAGE_SPECS:
+        raise ValueError("Unsupported workshop stage.")
     if workflow_executor is None:
-        execute_workflow_prefix(stage_name, paths=paths)
+        execution = execute_workflow_prefix(stage_name, paths=paths)
     else:
-        workflow_executor(stage_name)
-    return {"stage": stage_name}
+        execution = workflow_executor(stage_name)
+    stage_summary_payload, stage_directory, stage_spec = _publish_stage(
+        stage_name,
+        execution,
+        paths=paths,
+    )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "complete",
+        "stage": stage_name,
+        "summary": stage_summary_payload,
+        "image_paths": [
+            str((stage_directory / name).resolve()) for name in stage_spec.image_names
+        ],
+        "artifact_directory": str(stage_directory.resolve()),
+        "results_zip_path": str((paths.output_root / "results.zip").resolve()),
+        "artifact_relative_zip_path": "workshop/results.zip",
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -394,7 +737,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         verify_manifest(DEFAULT_PATHS)
         arguments = build_parser().parse_args(argv)
         if arguments.command == "run-stage":
-            result = run_stage(arguments.stage_name)
+            result = run_stage(arguments.stage_name, paths=DEFAULT_PATHS)
         elif arguments.command == "objective-start":
             raise RuntimeError("Workshop objective execution is not implemented.")
         else:
