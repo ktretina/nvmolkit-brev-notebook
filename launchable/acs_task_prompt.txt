@@ -1,0 +1,9 @@
+Work only in /sandbox/.openclaw/workspace.
+Read the installed skill at /sandbox/.openclaw/skills/nvmolkit-usage/SKILL.md before doing chemistry work.
+Make exactly one source edit in /sandbox/.openclaw/workspace/acs_chemistry_task.py: change the exact line HIGHLIGHT_THRESHOLD = 0.70 to HIGHLIGHT_THRESHOLD = 0.80. Do not change any other source line or pre-existing file. If the exact old line is absent, stop and report that; do not guess.
+Then run exactly this command once:
+env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages python3 /sandbox/.openclaw/workspace/acs_chemistry_task.py --output /sandbox/.openclaw/workspace/outputs/threshold-080
+The prepared script may create only its declared artifacts in that output directory. Do not install packages, use the network, repair, or retry with another command. If it fails, stop and report the exact error.
+On success, report the top pair, the number of pairs at or above 0.80, the GPU name, and the exact results.zip path. End with these two lines:
+MEDIA:/sandbox/.openclaw/workspace/outputs/threshold-080/similarity_heatmap.png
+MEDIA:/sandbox/.openclaw/workspace/outputs/threshold-080/results.zip
