@@ -4,7 +4,7 @@
 
 **Goal:** Deliver one reliable ACS chemist workshop path that runs real nvMolKit work on an NVIDIA L4 through OpenClaw and Nemotron, shows native images, and provides useful downloadable chemistry files.
 
-**Architecture:** Keep the fixed runner and stage artifacts already implemented. Add only useful chemistry exports, a simple safe results bundle, a small three-action objective state, four copy-paste prompts, and one fresh end-to-end Brev acceptance run. The long plan at `docs/superpowers/plans/2026-08-11-acs-fall-2026-attendee-workshop.md` remains historical; this plan supersedes its Tasks 4 through 13.
+**Architecture:** Keep the fixed runner, stage artifacts, and chemistry exports already implemented. Three paired lessons each execute one dependency prefix and publish two stages. A concise tool envelope keeps large facts in files, while one immutable eight-candidate context and one small mutable objective state support at most three retry-safe actions without GPU recomputation. The OpenClaw Launchable is the only required hands-on path; the notebook is an optional instructor companion. The long plan at `docs/superpowers/plans/2026-08-11-acs-fall-2026-attendee-workshop.md` remains historical; this plan supersedes its Tasks 4 through 13.
 
 **Tech Stack:** Python 3.13 in the sandbox, nvMolKit 0.5.0, RDKit, pandas, Matplotlib, OpenClaw/NemoClaw, hosted Nemotron, Brev L4, Bash, pytest.
 
@@ -12,79 +12,120 @@
 
 ## Cut line
 
-Keep fixed inputs and commands, API-key secrecy, private raw port 18789, safe artifact paths, no attendee package installation or arbitrary network use, one NVIDIA L4, at most three objective actions, native images, real downloads, a fresh live acceptance run, and exact instance cleanup.
+Keep fixed inputs and commands, API-key secrecy, private raw port 18789, safe artifact paths, no attendee package installation or arbitrary network use, one NVIDIA L4, at most three objective actions, native images, real downloads, a fresh clean-browser acceptance run, and exact instance cleanup.
 
-Do not build transcript receipts, state-log receipt schemas, byte-identical prompt auditing, multi-target rollback recovery, exhaustive hostile-filesystem mutation matrices, or unrelated baseline-test repairs.
+Do not build transcript receipts, state-log receipt schemas, live transcript byte matching, multi-target rollback recovery, exhaustive hostile-filesystem mutation matrices, or unrelated baseline-test repairs. Do not claim representative chemical space, GPU speedup, unrestricted autonomous design, biological activity, or cross-molecule MMFF94 energy comparability.
 
 ## Fixed attendee flow
 
-1. Inspect the 256-molecule library and generate Morgan fingerprints.
-2. Measure Tanimoto similarity and discover fused Butina clusters.
-3. Generate representative conformers and optimize them with MMFF94.
+1. Inspect the 256-molecule convenience sample and generate radius-2, 1024-bit Morgan fingerprints in one GPU lesson.
+2. Measure Tanimoto similarity and discover fused Butina clusters at a 0.40 Tanimoto-distance cutoff in one GPU lesson.
+3. Request up to five conformers for each deterministic MMFF94-eligible selection and optimize the generated conformers with MMFF94 in one GPU lesson.
 4. Complete one bounded four-molecule diversity challenge with at most three actions.
 
-### Task 1: Finish useful chemistry downloads
+Each attendee answer uses this fixed structure: Question; What ran; Measured result with at most three facts; Meaning; Scientific limit; Image and download location. Prompt 4 is the primary wow moment: baseline panel and weakest-link `D_min`, selected swap, final panel, and measured improvement.
+
+### Task 1: Finish useful chemistry downloads — complete
+
+**Files:**
+
+- Modified: `acs_workshop_runner.py`
+- Modified: `tests/test_acs_workshop_runner.py`
+
+- [x] Added `top_similarity_pairs.csv`, `similarity_matrix.csv`, `cluster_assignments.csv`, `mmff94_energies.csv`, `optimized_conformers.sdf`, and parsed E01–E06 `workflow_evidence.json`.
+- [x] Verified raw similarity ordering, complete cluster coverage, source-row provenance, CSV/SDF record identity, finite MMFF94 values, and SDF coordinate round-trip behavior.
+- [x] Verified 8 focused export tests, 157 combined runner/workflow tests, Ruff, compilation, diff checks, and Gitleaks.
+- [x] Committed as `9598080434e93091098fb985cd97263d10fcde8a`.
+
+### Task 2: Add three paired lessons, concise output, and a safe bundle
 
 **Files:**
 
 - Modify: `acs_workshop_runner.py`
 - Modify: `tests/test_acs_workshop_runner.py`
 
-- [ ] **Step 1: Preserve the existing Task 3 RED and GREEN evidence**
+- [ ] **Step 1: Write failing paired-lesson tests**
 
-The current unstaged diff must retain the real-workflow tests for:
+Add one fixed `run-lesson` command with exactly these choices and publications:
 
-- `top_similarity_pairs.csv` and `similarity_matrix.csv`;
-- `cluster_assignments.csv`;
-- `mmff94_energies.csv` and `optimized_conformers.sdf`; and
-- parsed `workflow_evidence.json` records E01 through E06.
+```text
+data-and-representation -> inspect_library, generate_morgan_fingerprints
+relationships-and-groups -> measure_tanimoto_similarity, discover_fused_butina_clusters
+sampled-3d-geometry -> embed_representative_conformers, optimize_conformers_mmff94
+```
 
-- [ ] **Step 2: Run the focused and adjacent tests**
+Each command must call `execute_workflow_prefix` once at the pair's terminal stage and publish both retained `StageResult` objects. Prompt-facing code must not execute six separate stage commands.
+
+- [ ] **Step 2: Write failing concise-envelope tests**
+
+Return only this information:
+
+```text
+schema_version, status, lesson, completed_stages,
+results_zip_path, artifact_relative_zip_path
+```
+
+Each `completed_stages` item contains only `stage`, one concise measured `result`, `image_paths`, `summary_path`, `readme_path`, and `artifact_directory`. It must not contain the full summary or per-cluster/per-conformer records. Full facts remain in `summary.json`.
+
+- [ ] **Step 3: Write failing atomic-publication and ZIP tests**
+
+Build each new stage in one task-owned temporary directory, validate all declared files, and rename it into place only when complete. Reuse a valid completed stage; reject an invalid or symlinked target. Do not implement backup restoration across stages.
+
+Build `results.zip` through one temporary regular file and `os.replace`. Include only safe public paths:
+
+```text
+README.md
+data/sample_molecules.csv
+data/PROVENANCE.md
+01-inspection/ through 06-mmff94/
+07-objective/ when terminal
+```
+
+The root README maps the four workshop questions to artifact directories. Private state and the ZIP itself are excluded.
+
+- [ ] **Step 4: Implement, verify, and commit**
 
 ```bash
-env PYTHONPATH=. MPLCONFIGDIR=/private/tmp/acs-workshop-mpl \
-  /private/tmp/nvmolkit-ui-venv312/bin/pytest -q \
-  tests/test_acs_workshop_runner.py \
-  -k "similarity_csv or cluster_assignments or mmff94_csv or workflow_evidence"
-
 env PYTHONPATH=. MPLCONFIGDIR=/private/tmp/acs-workshop-mpl \
   /private/tmp/nvmolkit-ui-venv312/bin/pytest -q \
   tests/test_acs_workshop_runner.py tests/test_chemistry_workflow.py
 ```
 
-Expected: all selected tests pass. Do not add more export types.
-
-- [ ] **Step 3: Run static and secret gates, then commit**
+Run Ruff, compilation, `git diff --check`, and staged Gitleaks. Commit with:
 
 ```bash
-/Library/Frameworks/Python.framework/Versions/3.12/bin/ruff format --check \
-  acs_workshop_runner.py tests/test_acs_workshop_runner.py
-/Library/Frameworks/Python.framework/Versions/3.12/bin/ruff check \
-  acs_workshop_runner.py tests/test_acs_workshop_runner.py
-/Library/Frameworks/Python.framework/Versions/3.12/bin/python3 -m py_compile \
-  acs_workshop_runner.py tests/test_acs_workshop_runner.py
-git diff --check
-git add acs_workshop_runner.py tests/test_acs_workshop_runner.py
-gitleaks git --staged --no-banner --redact .
-git commit -m "Add downloadable workshop chemistry data"
+git commit -m "Add paired ACS workshop lessons"
 ```
 
-### Task 2: Add a simple safe bundle and bounded objective
+### Task 3: Add the bounded diversity objective
 
 **Files:**
 
 - Modify: `acs_workshop_runner.py`
 - Modify: `tests/test_acs_workshop_runner.py`
+- Read: `objective_challenge.py`
+- Read: `tests/objective_fixtures.py`
 
-- [ ] **Step 1: Write failing lean bundle tests**
+- [ ] **Step 1: Write failing private-state tests**
 
-Require stage output to be built under one task-owned temporary directory and renamed into place only after every declared file validates. A valid existing completed stage returns its existing closed envelope. Build `results.zip` through a temporary regular file and `os.replace`; include only public stage/objective files with safe relative names. Reject symlinks at the output root, selected stage directory, temporary directory, and ZIP target. Do not implement backup restoration or injected multi-replace rollback.
+At the end of the third lesson, write two mode-0600 regular non-symlink files atomically:
 
-- [ ] **Step 2: Write failing bounded-objective tests**
+1. Immutable context: eight candidate IDs, molecule indices, source rows, cluster IDs, the validated 8×8 Tanimoto-distance matrix, baseline, attainable benchmark, target, dataset hash, and fixed profile.
+2. Mutable state: current panel, current action menu, accepted attempt count, terminal status, up to three measured attempt records for the score trajectory and accepted-swap report, and the exact last accepted `(state_id, swap_id)` plus its result envelope.
 
-After stage 6, store one mode-0600, regular, non-symlink JSON state with the dataset hash, current four molecule indices, current score, displayed actions, and attempt count. `objective-start` returns the current panel, score, state ID, and fixed displayed actions. `objective-step --state-id ID --swap-id ID` accepts only a currently displayed action, rejects stale IDs, and stops after success, no legal action, or three accepted actions.
+Objective steps must not rerun nvMolKit, RDKit embedding, or MMFF94.
 
-Terminal output is limited to:
+After this state exists, extend third-lesson cache validation: a cached third lesson is valid only when its immutable objective context and compatible mutable state also validate. Preserve valid initial, progressed, or terminal objective state; create initial state only when no valid objective progress exists.
+
+- [ ] **Step 2: Write failing action and retry tests**
+
+`objective-start` returns the baseline panel, weakest-link `D_min`, limiting pair, target, state ID, and at most three fixed legal actions. `objective-step --state-id ID --swap-id ID` accepts only a displayed action tied for the maximum predicted `D_min` and stops at target, no legal improvement, or three accepted actions.
+
+An exact duplicate of the most recently committed `(state_id, swap_id)` returns the already committed current or terminal envelope. Every other stale, invented, or fourth action fails without mutation. This is retry safety, not a replay log.
+
+- [ ] **Step 3: Write failing terminal-artifact tests**
+
+Terminal output is exactly:
 
 ```text
 README.md
@@ -95,13 +136,9 @@ final_panel.png
 final_similarity_heatmap.png
 ```
 
-The final ZIP is rebuilt after terminal output. Do not add history replay, matrix reconstruction, or transcript receipts.
+The summary reports baseline, final, target, limiting pair, accepted swaps, and terminal reason. Python computes every score; Nemotron only selects a displayed action and explains the measured result. Rebuild the public ZIP after terminal publication.
 
-- [ ] **Step 3: Implement only the tested behavior**
-
-Reuse `objective_challenge.py` for scoring, legal actions, and figures. Keep public output below `outputs/workshop`; keep private objective state below `.acs-workshop-state` and exclude it from the ZIP.
-
-- [ ] **Step 4: Verify and commit**
+- [ ] **Step 4: Implement, verify, and commit**
 
 ```bash
 env PYTHONPATH=. MPLCONFIGDIR=/private/tmp/acs-workshop-mpl \
@@ -109,31 +146,30 @@ env PYTHONPATH=. MPLCONFIGDIR=/private/tmp/acs-workshop-mpl \
   tests/test_acs_workshop_runner.py tests/test_objective_challenge.py
 ```
 
-Run Ruff, scoped strict mypy, compilation, `git diff --check`, and staged Gitleaks. Commit with:
+Run Ruff, compilation, `git diff --check`, and staged Gitleaks. Commit with:
 
 ```bash
-git commit -m "Add bounded workshop objective and results bundle"
+git commit -m "Add the bounded ACS diversity objective"
 ```
 
-### Task 3: Wire the Launchable and create four prompts
+### Task 4: Rewire the Launchable without a hidden model turn
 
 **Files:**
 
 - Modify: `launchable/acs_nemoclaw_launchable_setup.sh`
 - Modify: `launchable/acs_workspace_tools.md`
-- Create: `launchable/acs_workshop_prompts.md`
 - Modify: `tests/test_acs_nemoclaw_launchable_setup.py`
-- Create: `tests/test_acs_workshop_prompts.py`
+- Modify: `tests/test_nemoclaw_phase_zero_setup.py`
 
-- [ ] **Step 1: Write failing setup tests**
+- [ ] **Step 1: Write failing setup-source tests**
 
-Require setup to upload the runner and `objective_challenge.py`, remove only task-owned stale workshop output/state on full setup, create the closed read-only manifest after the seed turn, run `acs_workshop_runner.py --help`, and preserve the working threshold-0.80 seed, ports 18788/8765, proxy, key handling, and private 18789 behavior.
+Require setup to upload the runner, `objective_challenge.py`, `chemistry_workflow.py`, the fixed CSV, `data/PROVENANCE.md`, `TOOLS.md`, and the artifact server. Create the closed read-only manifest after upload and before runner smoke.
 
-- [ ] **Step 2: Write failing four-prompt tests**
+Remove the hidden threshold-0.80 agent turn, its source edit, its threshold artifacts, and its validation. Do not replace it with another setup-time Nemotron request. Keep the pinned install, real small nvMolKit CUDA probe, 300-second provider timeout, runner manifest/help smoke, artifact-server readiness, protected proxy on 18788, download service on 8765, secret handling, and private raw 18789.
 
-Each marked prompt must use only fixed runner commands and the installed nvMolKit skill. Prompts 1 through 3 each run their two named stages in order and end with one approved `MEDIA:` image. Prompt 4 uses `objective-start`, zero to three quoted `objective-step` calls from displayed IDs, stops at terminal status, shows `final_panel.png`, and directs the attendee to the Download Results Secure Link.
+- [ ] **Step 2: Add safe progress and rerun behavior**
 
-Reject package installation, `curl`, `wget`, arbitrary paths/options, raw port 18789, tokenized URLs, and secret-shaped values.
+Print short phase names without raw installer output, keys, tokens, or tokenized URLs. On a full setup rerun, remove only setup-owned workshop output/state and recreate the manifest. Do not delete unrelated attendee files.
 
 - [ ] **Step 3: Implement, verify, and commit**
 
@@ -143,22 +179,55 @@ env PYTHONPATH=. MPLCONFIGDIR=/private/tmp/acs-workshop-mpl \
   tests/test_acs_nemoclaw_launchable_setup.py \
   tests/test_nemoclaw_phase_zero_setup.py \
   tests/test_acs_console_bootstrap.py \
-  tests/test_acs_workshop_prompts.py
+  tests/test_openclaw_secure_link_proxy.py
 bash -n launchable/acs_nemoclaw_launchable_setup.sh
 node --test tests/openclaw_secure_link_proxy.test.mjs
 ```
 
-Run Ruff, `git diff --check`, and staged Gitleaks. Commit with:
+Run Ruff, compilation, `git diff --check`, and staged Gitleaks. Commit with:
 
 ```bash
-git commit -m "Add the ACS workshop prompts"
+git commit -m "Wire the lean ACS workshop Launchable"
 ```
 
-### Task 4: Run lean local acceptance and final review
+### Task 5: Create the canonical attendee page and four prompts
 
 **Files:**
 
-- Verify all files changed in Tasks 1 through 3.
+- Create: `docs/acs-fall-2026-workshop.md`
+- Create: `tests/test_acs_fall_2026_workshop_page.py`
+
+- [ ] **Step 1: Write the concise page**
+
+Use this page as the only prompt source. Label the notebook Launchable as an optional instructor-led companion and the OpenClaw Launchable as the required hands-on path. Put Brev account creation and NVIDIA/Nemotron key generation in pre-work.
+
+Each of four marked prompt blocks must be self-contained, use only the fixed runner CLI, and require the fixed answer structure. Prompt 1 reads the installed nvMolKit skill once. Prompts 1–3 call one paired lesson each and display respectively `library_preview.png`, `cluster_sizes.png`, and `optimized_structures.png`. Prompt 4 uses `objective-start`, zero to three quoted displayed actions tied for the maximum predicted `D_min`, and displays `final_panel.png`.
+
+- [ ] **Step 2: Add exact scientific framing**
+
+The page and prompts must state:
+
+- the ChEMBL data are a deterministic 256-record convenience sample, not representative chemical space;
+- cutoff 0.40 is Tanimoto distance;
+- deterministic selected molecules are not centroids, medoids, or globally optimal representatives;
+- Morgan/Tanimoto conclusions depend on the radius-2, 1024-bit hashed fingerprint and similarity 1.0 does not prove molecular identity;
+- MMFF94 energies compare sampled conformers within one molecule only;
+- `D_min` is the weakest-link diversity score within eight fixed candidates; and
+- the run proves real GPU execution, not acceleration or speedup.
+
+Reject install/network instructions, arbitrary runner options, raw port 18789, tokenized URLs, secret-shaped values, `BuildDoneVideo`, and claims of unrestricted autonomous design.
+
+- [ ] **Step 3: Verify and commit the draft page**
+
+Tests check required URLs, section order, exactly four prompt markers, fixed runner commands, response structure, scientific limits, secrets, optional-vs-required lab wording, download instructions, and stop/delete guidance.
+
+Run focused page tests, Ruff, `git diff --check`, and staged Gitleaks. Commit with:
+
+```bash
+git commit -m "Add the ACS workshop attendee guide"
+```
+
+### Task 6: Run lean local acceptance and final implementation review
 
 - [ ] **Step 1: Run the focused workshop suite**
 
@@ -171,49 +240,38 @@ env PYTHONPATH=. MPLCONFIGDIR=/private/tmp/acs-workshop-mpl \
   tests/test_acs_nemoclaw_launchable_setup.py \
   tests/test_nemoclaw_phase_zero_setup.py \
   tests/test_acs_console_bootstrap.py \
-  tests/test_acs_workshop_prompts.py \
+  tests/test_acs_fall_2026_workshop_page.py \
   tests/test_openclaw_secure_link_proxy.py
 ```
 
-- [ ] **Step 2: Run repository and static gates**
+- [ ] **Step 2: Run proportional repository and static gates**
 
-Run the repository suite once and record any unchanged baseline failures without repairing unrelated tests. Run Ruff, Bash syntax, Node proxy tests, Python compilation, `git diff --check`, and Gitleaks for the implementation range.
+Run the repository suite once and record unchanged baseline failures without repairing unrelated tests. Run Ruff, Bash syntax, Node proxy tests, Python compilation, `git diff --check`, and Gitleaks for the implementation range. Do not add strict mypy without a repository configuration.
 
 - [ ] **Step 3: Run one final specification and code-quality review**
 
-Review the complete implementation against this lean plan. Fix only Critical or Important issues that affect attendee completion, secrets, bounded execution, scientific correctness, downloads, or live reliability.
+Review the complete implementation against this plan. Fix only Critical or Important issues that affect attendee completion, secrets, bounded execution, scientific correctness, downloads, or live reliability.
 
-### Task 5: Publish and qualify one fresh L4
+### Task 7: Publish and qualify one fresh L4
 
-**External approval gate:** Before public push or billable compute, show the exact commit, repository/branch, Launchable ID, organization, L4 configuration, displayed price, and stop/delete contract. Do not switch organizations.
+**External approval gate:** Before public push or billable compute, show the exact commit, repository and branch, Launchable ID, organization, L4 configuration, displayed price, and stop/delete contract. Do not switch organizations.
 
-- [ ] **Step 1: Push the reviewed branch and update the Console bootstrap**
+- [ ] **Step 1: Push and update the Console bootstrap**
 
-Use the exact public 40-character commit in the existing bootstrap. Do not expose the inference key in output, files, process arguments, or chat.
+Use the exact public 40-character commit. Do not expose the inference key in output, files, process arguments, or chat.
 
-- [ ] **Step 2: Deploy one fresh L4 and run the attendee journey**
+- [ ] **Step 2: Run one clean-browser attendee journey**
 
-Wait for setup readiness. Open the protected Open Chemistry Agent link, start one new session, and run the four exact prompt blocks. Confirm the hosted model is `inference/nvidia/nemotron-3-super-120b-a12b`, the GPU is one NVIDIA L4, the four native images render, and the downloaded ZIP contains the CSV, SDF, JSON, README, and PNG outputs.
+Use only `docs/acs-fall-2026-workshop.md`; do not use SSH, a terminal, or repository knowledge to complete the four prompts. Confirm real Nemotron, OpenClaw, nvMolKit, and one NVIDIA L4; four native images; a ZIP that opens and contains the expected CSV, SDF, JSON, README, PNG, input CSV, and provenance; and no facilitator repair.
+
+Before deployment, record the allocated hands-on lab duration. Record setup time, each prompt time, any retry, model, GPU, and ZIP hash. Pass the rehearsal only when all four prompts finish without facilitator repair in at most half of that allocated period, leaving the other half for account issues and one recovery attempt. Do not publish timing guidance unless measured unambiguously.
 
 - [ ] **Step 3: Check secrets and clean up**
 
-Check setup output and the four assistant answers for key/token/tokenized-URL patterns without retaining raw secrets. Preserve only bounded non-secret diagnostics. Stop and delete the exact fresh instance on success, failure, timeout, or interruption.
+Check setup output and four assistant answers for key, token, and tokenized-URL patterns without retaining raw secrets. Preserve only bounded non-secret diagnostics. Stop and delete the exact fresh instance on success, failure, timeout, or interruption.
 
-### Task 6: Create the attendee reference sheet and hand off
+### Task 8: Finalize the attendee record and hand off
 
-**Files:**
-
-- Create: `docs/acs-fall-2026-workshop.md`
-- Create: `tests/test_acs_fall_2026_workshop_page.py`
-
-- [ ] **Step 1: Write the concise page**
-
-Include Brev signup, NVIDIA account and Nemotron API-key instructions, the repository, the notebook Launchable, the OpenClaw Launchable, setup/readiness guidance, the four byte-identical prompt blocks, download instructions, scientific limits, troubleshooting for model timeout, and instructions to stop or delete every workshop environment.
-
-- [ ] **Step 2: Verify links, prompt identity, secrets, and layout**
-
-The page test must check required URLs, prompt order/identity, absence of secret-shaped values and `BuildDoneVideo`, and concise section order. Perform read-only live checks of the public URLs immediately before handoff.
-
-- [ ] **Step 3: Commit and deliver**
-
-Run the focused page and workshop tests, static gates, and Gitleaks. Commit the page locally. Give the user the clickable local Markdown path, implementation and page commits, two Launchable URLs, fresh-L4 result, ZIP hash, and cleanup result. Do not publish a GitHub Page without separate approval.
+- [ ] Add only measured live evidence, confirmed troubleshooting, and any demonstrated attendee blocker to the page. Do not change the four accepted prompt blocks without rerunning live acceptance.
+- [ ] Recheck public links, focused page/workshop tests, static gates, Gitleaks, branch status, and the exact stopped/deleted instance evidence.
+- [ ] Commit the final local page and deliver its clickable path, implementation/page commits, both Launchable URLs, fresh-L4 result, measured timing scope, ZIP hash, and cleanup result. Do not publish a GitHub Page without separate approval.
