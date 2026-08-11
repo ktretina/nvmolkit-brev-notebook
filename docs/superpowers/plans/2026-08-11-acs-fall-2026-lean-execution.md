@@ -235,9 +235,9 @@ git commit -m "Add the ACS workshop attendee guide"
 
 Completed as `2c40c8c26229d0c7bc769253649198e97590146b`: the one-page draft separates account/key pre-work from the required OpenClaw lab, labels the notebook as optional, provides exactly four fixed copy-and-paste prompts, points attendees to native images and `workshop/results.zip`, and includes bounded scientific and cost/lifecycle guidance. Fresh verification passed eight page tests, current runner CLI parsing for all copied commands, Ruff, compilation, diff checks, and staged Gitleaks. Independent specification and target-user reviews found no remaining Critical or Important issue. The page is a locally validated draft and is not yet live-qualified.
 
-### Task 6: Run lean local acceptance and final implementation review
+### Task 6: Run lean local acceptance and final implementation review — complete
 
-- [ ] **Step 1: Run the focused workshop suite**
+- [x] **Step 1: Run the focused workshop suite**
 
 ```bash
 env PYTHONPATH=. MPLCONFIGDIR=/private/tmp/acs-workshop-mpl \
@@ -252,13 +252,15 @@ env PYTHONPATH=. MPLCONFIGDIR=/private/tmp/acs-workshop-mpl \
   tests/test_openclaw_secure_link_proxy.py
 ```
 
-- [ ] **Step 2: Run proportional repository and static gates**
+- [x] **Step 2: Run proportional repository and static gates**
 
 Run the repository suite once and record unchanged baseline failures without repairing unrelated tests. Run Ruff, Bash syntax, Node proxy tests, Python compilation, `git diff --check`, and Gitleaks for the implementation range. Do not add strict mypy without a repository configuration.
 
-- [ ] **Step 3: Run one final specification and code-quality review**
+- [x] **Step 3: Run one final specification and code-quality review**
 
 Review the complete implementation against this plan. Fix only Critical or Important issues that affect attendee completion, secrets, bounded execution, scientific correctness, downloads, or live reliability.
+
+Completed at `089f81c27722180bd0a894ee628e749493199e50`: the exact focused workshop suite passed 316 tests. The repository suite passed 854 tests with one skip and the same two local notebook-preflight failures caused by the environment's missing Torch; these unrelated baseline tests were not changed. Ruff on implementation files, Bash syntax, three Node proxy tests, Python compilation, range diff checks, and Gitleaks across 15 commits passed. Final specification and target-user reviews found no remaining Critical or Important issue and judged the branch ready for the separate public-push and fresh-L4 approval gate. No live CUDA, hosted-model, browser, download, timing, or cleanup claim is made by this local evidence.
 
 ### Task 7: Publish and qualify one fresh L4
 
