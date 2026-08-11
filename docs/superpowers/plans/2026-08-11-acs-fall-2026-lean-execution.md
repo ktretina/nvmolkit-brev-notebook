@@ -196,20 +196,20 @@ git commit -m "Wire the lean ACS workshop Launchable"
 
 Completed as `e0d98d7332cf5b030ef16f8d00c9fc3022305133`: setup now uploads the reviewed workshop runner, objective domain, workflow, fixed data and provenance, tools note, and artifact server; creates the exact read-only six-file manifest; runs only deterministic L4, CUDA, runner, proxy, and download-service checks; and makes no setup-time model request. Exact process identity, failure rollback, a setup-owned download sentinel, and coherent ready-state cleanup support fresh runs and bounded reruns. Fresh verification passed 31 setup tests, three proxy tests, Bash syntax, Ruff, compilation, diff checks, and staged Gitleaks. Independent specification and code-quality reviews found no remaining Critical or Important issue. This is local implementation evidence only.
 
-### Task 5: Create the canonical attendee page and four prompts
+### Task 5: Create the canonical attendee page and four prompts — complete
 
 **Files:**
 
 - Create: `docs/acs-fall-2026-workshop.md`
 - Create: `tests/test_acs_fall_2026_workshop_page.py`
 
-- [ ] **Step 1: Write the concise page**
+- [x] **Step 1: Write the concise page**
 
 Use this page as the only prompt source. Label the notebook Launchable as an optional instructor-led companion and the OpenClaw Launchable as the required hands-on path. Put Brev account creation and NVIDIA/Nemotron key generation in pre-work.
 
 Each of four marked prompt blocks must be self-contained, use only the fixed runner CLI, and require the fixed answer structure. Prompt 1 reads the installed nvMolKit skill once. Prompts 1–3 call one paired lesson each and display respectively `library_preview.png`, `cluster_sizes.png`, and `optimized_structures.png`. Prompt 4 uses `objective-start`, zero to three quoted displayed actions tied for the maximum predicted `D_min`, and displays `final_panel.png`.
 
-- [ ] **Step 2: Add exact scientific framing**
+- [x] **Step 2: Add exact scientific framing**
 
 The page and prompts must state:
 
@@ -223,7 +223,7 @@ The page and prompts must state:
 
 Reject install/network instructions, arbitrary runner options, raw port 18789, tokenized URLs, secret-shaped values, `BuildDoneVideo`, and claims of unrestricted autonomous design.
 
-- [ ] **Step 3: Verify and commit the draft page**
+- [x] **Step 3: Verify and commit the draft page**
 
 Tests check required URLs, section order, exactly four prompt markers, fixed runner commands, response structure, scientific limits, secrets, optional-vs-required lab wording, download instructions, and stop/delete guidance.
 
@@ -232,6 +232,8 @@ Run focused page tests, Ruff, `git diff --check`, and staged Gitleaks. Commit wi
 ```bash
 git commit -m "Add the ACS workshop attendee guide"
 ```
+
+Completed as `2c40c8c26229d0c7bc769253649198e97590146b`: the one-page draft separates account/key pre-work from the required OpenClaw lab, labels the notebook as optional, provides exactly four fixed copy-and-paste prompts, points attendees to native images and `workshop/results.zip`, and includes bounded scientific and cost/lifecycle guidance. Fresh verification passed eight page tests, current runner CLI parsing for all copied commands, Ruff, compilation, diff checks, and staged Gitleaks. Independent specification and target-user reviews found no remaining Critical or Important issue. The page is a locally validated draft and is not yet live-qualified.
 
 ### Task 6: Run lean local acceptance and final implementation review
 
