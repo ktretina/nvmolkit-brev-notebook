@@ -33,6 +33,19 @@ mv -f -- "${api_key_temp}" "${api_key_path}"
 trap - EXIT
 unset NVIDIA_API_KEY
 
+widget_settings_directory="${HOME}/.jupyter/lab/user-settings/@jupyter-widgets/jupyterlab-manager"
+widget_settings_path="${widget_settings_directory}/plugin.jupyterlab-settings"
+install -d -m 700 "${widget_settings_directory}"
+widget_settings_temp="$(mktemp "${widget_settings_path}.tmp.XXXXXX")"
+cleanup_widget_settings_temp() {
+  rm -f -- "${widget_settings_temp}"
+}
+trap cleanup_widget_settings_temp EXIT
+printf '%s\n' '{"saveState": true}' >"${widget_settings_temp}"
+chmod 600 "${widget_settings_temp}"
+mv -f -- "${widget_settings_temp}" "${widget_settings_path}"
+trap - EXIT
+
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "Error: this Launchable requires Linux x86-64 with CPython 3.12; found OS $(uname -s)." >&2
   exit 1

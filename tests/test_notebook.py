@@ -308,6 +308,8 @@ def test_setup_uses_brev_managed_python_and_leaves_jupyter_to_brev():
     assert '"${PYTHON}" -m pip install -r requirements.txt' in setup
     assert 'url = "http://127.0.0.1:8888/api"' in setup
     assert '${HOME}/.config/nvmolkit/NVIDIA_API_KEY' in setup
+    assert '${HOME}/.jupyter/lab/user-settings/@jupyter-widgets/jupyterlab-manager' in setup
+    assert '"saveState": true' in setup
     assert 'chmod 600 "${api_key_temp}"' in setup
     assert "NEMOTRON_MODEL" not in setup
     assert "JUPYTER_PORT" not in setup
@@ -357,6 +359,18 @@ esac
     assert key_file.read_text(encoding="utf-8") == launch_key
     assert key_directory.stat().st_mode & 0o777 == 0o700
     assert key_file.stat().st_mode & 0o777 == 0o600
+    widget_settings = (
+        fake_home
+        / ".jupyter"
+        / "lab"
+        / "user-settings"
+        / "@jupyter-widgets"
+        / "jupyterlab-manager"
+        / "plugin.jupyterlab-settings"
+    )
+    assert json.loads(widget_settings.read_text(encoding="utf-8")) == {
+        "saveState": True
+    }
     assert launch_key not in result.stdout + result.stderr
     invocations = log.read_text(encoding="utf-8").splitlines()
     assert any("sys.implementation.name" in line for line in invocations)
