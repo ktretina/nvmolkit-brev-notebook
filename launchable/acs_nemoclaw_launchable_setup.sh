@@ -149,10 +149,20 @@ readonly expected_tools_sha expected_prompt_sha expected_server_sha
 
 "${nemoclaw}" "${sandbox_name}" exec -- mkdir -p \
   "${workspace}/data" "${workspace}/outputs" "/tmp/acs-setup"
+"${nemoclaw}" "${sandbox_name}" exec -- rm -rf -- \
+  "/tmp/acs-setup/install_nvmolkit_in_sandbox.sh" \
+  "/tmp/acs-setup/nvmolkit_gpu_probe.py" \
+  "${workspace}/data/sample_molecules.csv" \
+  "${workspace}/acs_chemistry_task.py" \
+  "${workspace}/chemistry_workflow.py" \
+  "${workspace}/TOOLS.md" \
+  "${workspace}/acs_workspace_tools.md" \
+  "${workspace}/acs_task_prompt.txt" \
+  "${workspace}/start_artifact_server.sh"
 "${openshell}" sandbox upload "${sandbox_name}" "${sandbox_installer}" \
-  "/tmp/acs-setup/install_nvmolkit_in_sandbox.sh"
+  "/tmp/acs-setup"
 "${openshell}" sandbox upload "${sandbox_name}" "${gpu_probe}" \
-  "/tmp/acs-setup/nvmolkit_gpu_probe.py"
+  "/tmp/acs-setup"
 "${nemoclaw}" "${sandbox_name}" exec -- bash \
   "/tmp/acs-setup/install_nvmolkit_in_sandbox.sh"
 "${nemoclaw}" "${sandbox_name}" exec -- bash -c \
@@ -163,17 +173,19 @@ readonly expected_tools_sha expected_prompt_sha expected_server_sha
 
 "${nemoclaw}" "${sandbox_name}" skill install "${skill_dir}"
 "${openshell}" sandbox upload "${sandbox_name}" "${dataset}" \
-  "${workspace}/data/sample_molecules.csv"
+  "${workspace}/data"
 "${openshell}" sandbox upload "${sandbox_name}" "${chemistry_task}" \
-  "${workspace}/acs_chemistry_task.py"
+  "${workspace}"
 "${openshell}" sandbox upload "${sandbox_name}" "${chemistry_workflow}" \
-  "${workspace}/chemistry_workflow.py"
+  "${workspace}"
 "${openshell}" sandbox upload "${sandbox_name}" "${workspace_tools}" \
-  "${workspace}/TOOLS.md"
+  "${workspace}"
+"${nemoclaw}" "${sandbox_name}" exec -- mv -- \
+  "${workspace}/acs_workspace_tools.md" "${workspace}/TOOLS.md"
 "${openshell}" sandbox upload "${sandbox_name}" "${task_prompt}" \
-  "${workspace}/acs_task_prompt.txt"
+  "${workspace}"
 "${openshell}" sandbox upload "${sandbox_name}" "${artifact_server}" \
-  "${workspace}/start_artifact_server.sh"
+  "${workspace}"
 
 "${nemoclaw}" "${sandbox_name}" exec -- rm -rf -- "${result_dir}"
 "${nemoclaw}" "${sandbox_name}" exec -- mkdir -p -- "${result_dir}"

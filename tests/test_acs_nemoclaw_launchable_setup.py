@@ -120,6 +120,50 @@ def test_setup_script_orchestrates_fixed_assets_and_one_time_bounded_agent_turn(
     assert "0.80" in source
 
 
+def test_setup_uploads_files_to_existing_parent_directories() -> None:
+    source = _source()
+    stale_path_cleanup = (
+        '"${nemoclaw}" "${sandbox_name}" exec -- rm -rf -- \\\n'
+        '  "/tmp/acs-setup/install_nvmolkit_in_sandbox.sh" \\\n'
+        '  "/tmp/acs-setup/nvmolkit_gpu_probe.py" \\\n'
+        '  "${workspace}/data/sample_molecules.csv" \\\n'
+        '  "${workspace}/acs_chemistry_task.py" \\\n'
+        '  "${workspace}/chemistry_workflow.py" \\\n'
+        '  "${workspace}/TOOLS.md" \\\n'
+        '  "${workspace}/acs_workspace_tools.md" \\\n'
+        '  "${workspace}/acs_task_prompt.txt" \\\n'
+        '  "${workspace}/start_artifact_server.sh"'
+    )
+    expected_uploads = (
+        '"${openshell}" sandbox upload "${sandbox_name}" "${sandbox_installer}" \\\n'
+        '  "/tmp/acs-setup"',
+        '"${openshell}" sandbox upload "${sandbox_name}" "${gpu_probe}" \\\n'
+        '  "/tmp/acs-setup"',
+        '"${openshell}" sandbox upload "${sandbox_name}" "${dataset}" \\\n'
+        '  "${workspace}/data"',
+        '"${openshell}" sandbox upload "${sandbox_name}" "${chemistry_task}" \\\n'
+        '  "${workspace}"',
+        '"${openshell}" sandbox upload "${sandbox_name}" "${chemistry_workflow}" \\\n'
+        '  "${workspace}"',
+        '"${openshell}" sandbox upload "${sandbox_name}" "${workspace_tools}" \\\n'
+        '  "${workspace}"',
+        '"${openshell}" sandbox upload "${sandbox_name}" "${task_prompt}" \\\n'
+        '  "${workspace}"',
+        '"${openshell}" sandbox upload "${sandbox_name}" "${artifact_server}" \\\n'
+        '  "${workspace}"',
+    )
+
+    assert stale_path_cleanup in source
+    assert source.index(stale_path_cleanup) < source.index(expected_uploads[0])
+    assert source.count("sandbox upload") == len(expected_uploads)
+    for upload in expected_uploads:
+        assert upload in source
+    assert (
+        '"${nemoclaw}" "${sandbox_name}" exec -- mv -- \\\n'
+        '  "${workspace}/acs_workspace_tools.md" "${workspace}/TOOLS.md"' in source
+    )
+
+
 def test_setup_script_requires_a_loopback_dashboard_and_exposes_only_the_proxy() -> (
     None
 ):
