@@ -1,3 +1,4 @@
+import builtins
 import json
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -5,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 import numpy as np
+from PIL.Image import Image
 from rdkit import Chem
 
 import chemistry_workflow
@@ -46,6 +48,7 @@ def _state_snapshot(state: WorkflowState) -> dict[str, object]:
         "similarity": state.similarity,
         "clusters": list(state.clusters),
         "cluster_cutoff": state.cluster_cutoff,
+        "cluster_backend": state.cluster_backend,
         "representative_records": list(state.representative_records),
         "embedding_parameters": state.embedding_parameters,
         "conformer_molecules": list(state.conformer_molecules),
@@ -76,6 +79,7 @@ def _clustered_state() -> WorkflowState:
         ],
         molecules=[Chem.MolFromSmiles(value) for value in smiles],
         clusters=clusters,
+        cluster_backend="fused",
         invalid_ids=("invalid",),
         summaries={
             "inspect_library": {
@@ -144,6 +148,7 @@ def test_new_state_exposes_only_input_inspection():
     assert state.similarity is None
     assert state.clusters == []
     assert state.cluster_cutoff is None
+    assert state.cluster_backend is None
     assert state.representative_records == []
     assert state.embedding_parameters is None
     assert state.conformer_molecules == []
@@ -332,12 +337,15 @@ def test_inspection_caps_preview_at_first_24_valid_records(tmp_path: Path, monke
     captured = {}
     preview = object()
 
-    def capture_preview(molecules, records):
+    def capture_preview(molecules, legends, **options):
         captured["molecule_count"] = len(molecules)
-        captured["ids"] = [record["id"] for record in records]
+        captured["ids"] = legends
+        captured["options"] = options
         return preview
 
-    monkeypatch.setattr(chemistry_workflow, "_build_molecule_preview", capture_preview)
+    monkeypatch.setattr(
+        chemistry_workflow, "build_molecule_grid_image", capture_preview
+    )
 
     result = inspect_library(WorkflowState(), sample, expected_rows=31)
 
@@ -346,8 +354,107 @@ def test_inspection_caps_preview_at_first_24_valid_records(tmp_path: Path, monke
     assert captured == {
         "molecule_count": 24,
         "ids": [f"valid-{index}" for index in range(24)],
+        "options": {},
     }
     assert result.figures == (preview,)
+
+
+def test_molecule_preview_renders_without_rdkit_draw(monkeypatch):
+    original_import = builtins.__import__
+
+    def reject_rdkit_draw(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "rdkit.Chem" and "Draw" in fromlist:
+            raise ImportError("rdkit.Chem.Draw is unavailable")
+        if name.startswith("rdkit.Chem.Draw"):
+            raise ImportError("rdkit.Chem.Draw is unavailable")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", reject_rdkit_draw)
+    molecules = [Chem.MolFromSmiles("CCO"), Chem.MolFromSmiles("c1ccccc1Cl")]
+    records = [{"id": "ethanol"}, {"id": "chlorobenzene"}]
+
+    preview = chemistry_workflow.build_molecule_grid_image(
+        molecules, [record["id"] for record in records]
+    )
+
+    assert isinstance(preview, Image)
+    assert preview.mode == "RGB"
+    assert preview.size == (320, 120)
+    assert any(channel_min < 255 for channel_min, _ in preview.getextrema())
+
+
+@pytest.mark.parametrize(
+    ("molecules", "legends", "options", "message"),
+    [
+        ([], [], {}, "at least one molecule"),
+        ([Chem.MolFromSmiles("CCO")], [], {}, "one legend per molecule"),
+        (
+            [Chem.MolFromSmiles("CCO")],
+            ["ethanol"],
+            {"molecules_per_row": 0},
+            "molecules per row must be positive",
+        ),
+        (
+            [Chem.MolFromSmiles("CCO")],
+            ["ethanol"],
+            {"sub_image_size": (0, 120)},
+            "sub-image dimensions must be positive",
+        ),
+    ],
+)
+def test_molecule_grid_rejects_invalid_public_inputs(
+    molecules, legends, options, message
+):
+    with pytest.raises(ValueError, match=message):
+        chemistry_workflow.build_molecule_grid_image(
+            molecules,
+            legends,
+            **options,
+        )
+
+
+def test_molecule_grid_does_not_mutate_source_molecules():
+    molecule = Chem.MolFromSmiles("F[C@H](Cl)Br")
+    before = {
+        "smiles": Chem.MolToSmiles(molecule, isomericSmiles=True),
+        "conformer_count": molecule.GetNumConformers(),
+        "bond_directions": tuple(bond.GetBondDir() for bond in molecule.GetBonds()),
+    }
+
+    chemistry_workflow.build_molecule_grid_image([molecule], ["chiral"])
+
+    assert Chem.MolToSmiles(molecule, isomericSmiles=True) == before["smiles"]
+    assert molecule.GetNumConformers() == before["conformer_count"]
+    assert (
+        tuple(bond.GetBondDir() for bond in molecule.GetBonds())
+        == before["bond_directions"]
+    )
+
+
+def test_molecule_grid_uses_rdkit_wedge_and_dash_directions(monkeypatch):
+    original_wedge_mol_bonds = Chem.WedgeMolBonds
+    observed_directions = []
+
+    def capture_wedge_directions(molecule, conformer):
+        original_wedge_mol_bonds(molecule, conformer)
+        observed_directions.append(
+            tuple(bond.GetBondDir() for bond in molecule.GetBonds())
+        )
+
+    monkeypatch.setattr(Chem, "WedgeMolBonds", capture_wedge_directions)
+    wedge_molecule = Chem.MolFromSmiles("F[C@H](Cl)Br")
+    dash_molecule = Chem.MolFromSmiles("F[C@@H](Cl)Br")
+
+    wedge = chemistry_workflow.build_molecule_grid_image([wedge_molecule], ["chiral"])
+    dash = chemistry_workflow.build_molecule_grid_image([dash_molecule], ["chiral"])
+
+    assert any(
+        Chem.BondDir.BEGINWEDGE in directions for directions in observed_directions
+    )
+    assert any(
+        Chem.BondDir.BEGINDASH in directions for directions in observed_directions
+    )
+    assert wedge.tobytes() != dash.tobytes()
 
 
 def test_inspection_preview_failure_preserves_new_state(tmp_path: Path, monkeypatch):
@@ -355,10 +462,10 @@ def test_inspection_preview_failure_preserves_new_state(tmp_path: Path, monkeypa
     state = WorkflowState(summaries={"sentinel": {"kept": True}})
     before = _state_snapshot(state)
 
-    def fail_preview(molecules, records):
+    def fail_preview(molecules, legends, **options):
         raise RuntimeError("preview failed")
 
-    monkeypatch.setattr(chemistry_workflow, "_build_molecule_preview", fail_preview)
+    monkeypatch.setattr(chemistry_workflow, "build_molecule_grid_image", fail_preview)
 
     with pytest.raises(RuntimeError, match="preview failed"):
         inspect_library(state, sample, expected_rows=1)
@@ -435,9 +542,9 @@ def fake_gpu(monkeypatch):
         calls["similarity"].append(fingerprints)
         return similarity_result
 
-    def cluster(fingerprints, *, cutoff):
-        calls["cluster"].append((fingerprints, cutoff))
-        return [[0, 2], [1]], [2, 1]
+    def cluster(similarity_matrix, *, cutoff):
+        calls["cluster"].append((np.array(similarity_matrix, copy=True), cutoff))
+        return ((0, 2), (1,))
 
     def sync():
         calls["sync"] += 1
@@ -446,7 +553,7 @@ def fake_gpu(monkeypatch):
         chemistry_workflow, "_morgan_generator_class", lambda: Generator
     )
     monkeypatch.setattr(chemistry_workflow, "_cross_tanimoto_similarity", similarity)
-    monkeypatch.setattr(chemistry_workflow, "_fused_butina", cluster)
+    monkeypatch.setattr(chemistry_workflow, "_rdkit_butina_clusters", cluster)
     monkeypatch.setattr(chemistry_workflow, "_synchronize_cuda", sync)
     return calls, fingerprint_result, similarity_result
 
@@ -512,8 +619,17 @@ def test_similarity_chain_records_gpu_calls_summaries_figures_and_eligibility(
     assert calls["similarity"] == [fingerprint_result]
     assert inspected_state.phase is WorkflowPhase.COMPARED
 
-    clusters = discover_fused_butina_clusters(inspected_state, cluster_cutoff=0.47)
-    assert clusters.summary["entry_point"] == "fused_butina"
+    clusters = discover_fused_butina_clusters(
+        inspected_state,
+        cluster_cutoff=0.47,
+        backend="rdkit",
+    )
+    assert clusters.summary["entry_point"] == "Butina.ClusterData"
+    assert clusters.summary["executor"] == "RDKit CPU"
+    assert (
+        clusters.summary["distance_source"]
+        == "nvMolKit crossTanimotoSimilarity GPU matrix"
+    )
     assert clusters.summary["cluster_cutoff"] == 0.47
     assert clusters.summary["cluster_count"] == 2
     assert clusters.summary["singleton_count"] == 1
@@ -539,18 +655,22 @@ def test_similarity_chain_records_gpu_calls_summaries_figures_and_eligibility(
             },
         ],
     }
-    assert (
-        clusters.display_label == "nvMolKit fused_butina with RDKit MMFF94 eligibility"
+    assert clusters.display_label == (
+        "RDKit Butina on nvMolKit GPU Tanimoto distances with RDKit MMFF94 eligibility"
     )
     assert len(clusters.figures) == 1
     cluster_axes = clusters.figures[0].axes
     assert len(cluster_axes) == 1
-    assert cluster_axes[0].get_title() == "Largest fused Butina clusters"
+    assert cluster_axes[0].get_title() == "Largest Butina clusters"
     assert [patch.get_height() for patch in cluster_axes[0].patches] == [2, 1]
     assert inspected_state.clusters == [[0, 2], [1]]
     assert inspected_state.cluster_cutoff == 0.47
-    assert calls["cluster"] == [(fingerprint_result.tensor, 0.47)]
-    assert calls["sync"] == 3
+    assert inspected_state.cluster_backend == "rdkit"
+    assert len(calls["cluster"]) == 1
+    cluster_matrix, cluster_cutoff = calls["cluster"][0]
+    assert np.array_equal(cluster_matrix, similarity_result.tensor.values)
+    assert cluster_cutoff == 0.47
+    assert calls["sync"] == 2
     assert inspected_state.phase is WorkflowPhase.CLUSTERED
     assert all(
         json.loads(json.dumps(result.summary, allow_nan=False)) == result.summary
@@ -558,12 +678,173 @@ def test_similarity_chain_records_gpu_calls_summaries_figures_and_eligibility(
     )
 
 
+def test_cluster_stage_uses_rdkit_butina_with_exact_distance_cutoff(
+    monkeypatch,
+):
+    from rdkit.ML.Cluster import Butina
+
+    similarity = np.array(
+        [
+            [1.0, 0.60, 0.599999, 0.10],
+            [0.60, 1.0, 0.10, 0.10],
+            [0.599999, 0.10, 1.0, 0.80],
+            [0.10, 0.10, 0.80, 1.0],
+        ],
+        dtype=float,
+    )
+
+    def make_state() -> WorkflowState:
+        smiles = ("C", "CC", "CCC", "CCCC")
+        return WorkflowState(
+            phase=WorkflowPhase.COMPARED,
+            records=[
+                {"id": f"mol-{index}", "smiles": value, "source_row": index}
+                for index, value in enumerate(smiles)
+            ],
+            molecules=[Chem.MolFromSmiles(value) for value in smiles],
+            fingerprints=object(),
+            similarity=_FakeGpuResult(similarity),
+        )
+
+    real_cluster_data = Butina.ClusterData
+    calls: list[dict[str, object]] = []
+
+    def recording_cluster_data(
+        data,
+        n_points,
+        distance_cutoff,
+        *,
+        isDistData,
+        reordering,
+    ):
+        calls.append(
+            {
+                "data": np.array(data, copy=True),
+                "n_points": n_points,
+                "distance_cutoff": distance_cutoff,
+                "is_distance_data": isDistData,
+                "reordering": reordering,
+            }
+        )
+        return real_cluster_data(
+            data,
+            n_points,
+            distance_cutoff,
+            isDistData=isDistData,
+            reordering=reordering,
+        )
+
+    def reject_fused_butina(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("ACS clustering must not call nvMolKit fused_butina")
+
+    monkeypatch.setattr(Butina, "ClusterData", recording_cluster_data)
+    monkeypatch.setattr(
+        chemistry_workflow,
+        "_fused_butina",
+        reject_fused_butina,
+        raising=False,
+    )
+
+    first_state = make_state()
+    first = discover_fused_butina_clusters(
+        first_state,
+        cluster_cutoff=0.40,
+        backend="rdkit",
+    )
+    second_state = make_state()
+    second = discover_fused_butina_clusters(
+        second_state,
+        cluster_cutoff=0.40,
+        backend="rdkit",
+    )
+
+    assert first_state.clusters == [[3, 2], [1, 0]]
+    assert second_state.clusters == first_state.clusters
+    assert sorted(index for group in first_state.clusters for index in group) == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert first.summary == second.summary
+    assert first.summary["entry_point"] == "Butina.ClusterData"
+    assert first.summary["executor"] == "RDKit CPU"
+    assert (
+        first.summary["distance_source"]
+        == "nvMolKit crossTanimotoSimilarity GPU matrix"
+    )
+    assert first.display_label == (
+        "RDKit Butina on nvMolKit GPU Tanimoto distances with RDKit MMFF94 eligibility"
+    )
+    assert len(calls) == 2
+    for call in calls:
+        assert call["n_points"] == 4
+        assert call["distance_cutoff"] == 0.40
+        assert call["is_distance_data"] is True
+        assert call["reordering"] is True
+        distance_matrix = call["data"]
+        assert isinstance(distance_matrix, np.ndarray)
+        assert distance_matrix[0, 1] == pytest.approx(0.40)
+        assert distance_matrix[0, 2] > 0.40
+        assert np.array_equal(np.diag(distance_matrix), np.zeros(4))
+
+
+def test_default_cluster_backend_remains_nvmolkit_fused(monkeypatch):
+    similarity = np.eye(3, dtype=float)
+    state = WorkflowState(
+        phase=WorkflowPhase.COMPARED,
+        records=[
+            {"id": f"mol-{index}", "smiles": smiles, "source_row": index}
+            for index, smiles in enumerate(("C", "CC", "CCC"))
+        ],
+        molecules=[Chem.MolFromSmiles(smiles) for smiles in ("C", "CC", "CCC")],
+        fingerprints=_FakeGpuResult(np.zeros((3, 32), dtype=np.int32)),
+        similarity=_FakeGpuResult(similarity),
+    )
+    calls: list[tuple[object, float]] = []
+    synchronizations: list[None] = []
+
+    def fused(fingerprints, *, cutoff):
+        calls.append((fingerprints, cutoff))
+        return ([[0, 1], [2]], [2, 1])
+
+    monkeypatch.setattr(chemistry_workflow, "_fused_butina", fused)
+    monkeypatch.setattr(
+        chemistry_workflow,
+        "_rdkit_butina_clusters",
+        lambda *args, **kwargs: pytest.fail("default backend must remain fused"),
+    )
+    monkeypatch.setattr(
+        chemistry_workflow,
+        "_synchronize_cuda",
+        lambda: synchronizations.append(None),
+    )
+
+    result = discover_fused_butina_clusters(state, cluster_cutoff=0.40)
+
+    assert len(calls) == 1
+    assert calls[0][0] is state.fingerprints.tensor
+    assert calls[0][1] == 0.40
+    assert synchronizations == [None]
+    assert result.summary["entry_point"] == "fused_butina"
+    assert state.cluster_backend == "fused"
+    assert result.display_label == (
+        "nvMolKit fused_butina with RDKit MMFF94 eligibility"
+    )
+    assert result.figures[0].axes[0].get_title() == "Largest fused Butina clusters"
+
+
 def test_embedding_count_figure_keeps_long_molecule_ids_readable():
     records = [
         {"molecule_id": molecule_id, "generated_conformer_count": 5}
         for molecule_id in (
-            "CHEMBL266886", "CHEMBL414196", "CHEMBL6329",
-            "CHEMBL6312", "CHEMBL6291", "CHEMBL267678",
+            "CHEMBL266886",
+            "CHEMBL414196",
+            "CHEMBL6329",
+            "CHEMBL6312",
+            "CHEMBL6291",
+            "CHEMBL267678",
         )
     ]
 
@@ -664,7 +945,11 @@ def test_cluster_cutoff_is_bounded_before_gpu_execution(
     inspected_state.similarity = similarity_result
     before = _state_snapshot(inspected_state)
     with pytest.raises(ValueError, match="0.40 through 0.60"):
-        discover_fused_butina_clusters(inspected_state, cluster_cutoff=cutoff)
+        discover_fused_butina_clusters(
+            inspected_state,
+            cluster_cutoff=cutoff,
+            backend="rdkit",
+        )
     assert calls["cluster"] == []
     assert _state_snapshot(inspected_state) == before
 
@@ -678,9 +963,16 @@ def test_cluster_cutoff_inclusive_boundaries_execute_and_are_forwarded_unchanged
     inspected_state.fingerprints = fingerprint_result
     inspected_state.similarity = similarity_result
 
-    result = discover_fused_butina_clusters(inspected_state, cluster_cutoff=cutoff)
+    result = discover_fused_butina_clusters(
+        inspected_state,
+        cluster_cutoff=cutoff,
+        backend="rdkit",
+    )
 
-    assert calls["cluster"] == [(fingerprint_result.tensor, cutoff)]
+    assert len(calls["cluster"]) == 1
+    cluster_matrix, forwarded_cutoff = calls["cluster"][0]
+    assert np.array_equal(cluster_matrix, similarity_result.tensor.values)
+    assert forwarded_cutoff == cutoff
     assert result.summary["cluster_cutoff"] == cutoff
     assert inspected_state.phase is WorkflowPhase.CLUSTERED
 
@@ -702,15 +994,18 @@ def test_cluster_rejects_incomplete_duplicate_or_out_of_range_assignment_atomica
     inspected_state.similarity = similarity_result
     monkeypatch.setattr(
         chemistry_workflow,
-        "_fused_butina",
-        lambda fingerprints, *, cutoff: (
-            clusters,
-            [len(cluster) for cluster in clusters],
+        "_rdkit_butina_clusters",
+        lambda similarity_matrix, *, cutoff: tuple(
+            tuple(cluster) for cluster in clusters
         ),
     )
     before = _state_snapshot(inspected_state)
     with pytest.raises(RuntimeError, match="assigned exactly once"):
-        discover_fused_butina_clusters(inspected_state, cluster_cutoff=0.5)
+        discover_fused_butina_clusters(
+            inspected_state,
+            cluster_cutoff=0.5,
+            backend="rdkit",
+        )
     assert _state_snapshot(inspected_state) == before
 
 
@@ -808,13 +1103,13 @@ def test_representative_selection_reports_shortfall_and_rejects_fewer_than_three
 
     state.clusters = state.clusters[:2]
     with pytest.raises(RuntimeError, match="at least 3 eligible distinct clusters"):
-        select_representatives(
-            state, 3, RepresentativePolicy.LARGEST_CLUSTERS_FIRST
-        )
+        select_representatives(state, 3, RepresentativePolicy.LARGEST_CLUSTERS_FIRST)
 
 
 class _FakeOptimizationResult:
-    def __init__(self, molecules, *, pairs=None, energies=None, converged=None, coordinates=None):
+    def __init__(
+        self, molecules, *, pairs=None, energies=None, converged=None, coordinates=None
+    ):
         expected_pairs = [
             (mol_index, conf_index)
             for mol_index, molecule in enumerate(molecules)
@@ -832,7 +1127,9 @@ class _FakeOptimizationResult:
         if coordinates is None:
             coordinates = [
                 [
-                    np.full((molecule.GetNumAtoms(), 3), conf_index + mol_index, dtype=float)
+                    np.full(
+                        (molecule.GetNumAtoms(), 3), conf_index + mol_index, dtype=float
+                    )
                     for conf_index in range(molecule.GetNumConformers())
                 ]
                 for mol_index, molecule in enumerate(molecules)
@@ -850,7 +1147,13 @@ def conformer_gpu(monkeypatch):
 
     def embed(molecules, parameters, *, confsPerMolecule, maxIterations):
         calls["embed"].append(
-            (molecules, parameters.randomSeed, parameters.useRandomCoords, confsPerMolecule, maxIterations)
+            (
+                molecules,
+                parameters.randomSeed,
+                parameters.useRandomCoords,
+                confsPerMolecule,
+                maxIterations,
+            )
         )
         for molecule, count in zip(molecules, generated_counts):
             molecule.RemoveAllConformers()
@@ -958,14 +1261,19 @@ def _embedded_state(conformer_gpu) -> WorkflowState:
     return state
 
 
-def test_optimization_reconciles_pairs_selects_within_molecule_and_builds_figures(conformer_gpu):
+def test_optimization_reconciles_pairs_selects_within_molecule_and_builds_figures(
+    conformer_gpu,
+):
     state = _embedded_state(conformer_gpu)
     result = optimize_conformers_mmff94(state)
     assert result.summary["entry_point"] == "MMFFOptimizeMoleculesConfs"
     assert result.summary["attempted_conformer_count"] == 5
     assert result.summary["converged_conformer_count"] == 3
     assert result.summary["unconverged_conformer_count"] == 2
-    assert [record["selected_conformer_id"] for record in result.summary["selected_conformer_records"]] == [
+    assert [
+        record["selected_conformer_id"]
+        for record in result.summary["selected_conformer_records"]
+    ] == [
         "mol-1:conf-1",
         "mol-3:conf-1",
     ]
@@ -1036,7 +1344,12 @@ def test_workflow_report_has_exact_frozen_e01_e06_schemas(conformer_gpu):
     optimize_conformers_mmff94(state)
     report = build_workflow_report(state)
     assert [record.key for record in report.evidence] == [
-        "E01", "E02", "E03", "E04", "E05", "E06"
+        "E01",
+        "E02",
+        "E03",
+        "E04",
+        "E05",
+        "E06",
     ]
     assert [record.provenance for record in report.evidence] == [
         "RDKit input validation",
@@ -1046,13 +1359,67 @@ def test_workflow_report_has_exact_frozen_e01_e06_schemas(conformer_gpu):
         "EmbedMolecules",
         "MMFFOptimizeMoleculesConfs",
     ]
+    assert report.evidence[3].label == "Fused Butina clusters"
     expected_keys = [
-        {"raw_count", "valid_count", "invalid_count", "invalid_ids", "preview_count", "count_unit"},
-        {"fingerprint_radius", "fingerprint_size_bits", "packed_shape", "molecule_count", "active_bits_min", "active_bits_median", "active_bits_max", "executor", "size_unit"},
-        {"matrix_shape", "q1", "median", "q3", "p90", "max_off_diagonal", "most_similar_pair", "similarity_unit"},
-        {"cutoff", "cluster_count", "singleton_count", "singleton_fraction", "largest_cluster_sizes", "assignment_count", "cutoff_unit"},
-        {"requested_representative_count", "selected_representative_count", "selection_shortfall", "representative_policy", "representatives", "requested_conformers_per_representative", "generated_conformer_count", "partial_embedding_ids", "zero_embedding_ids", "count_unit"},
-        {"attempted_conformer_count", "converged_conformer_count", "unconverged_conformer_count", "per_conformer_records", "selected_conformer_records", "energy_unit", "comparison_scope"},
+        {
+            "raw_count",
+            "valid_count",
+            "invalid_count",
+            "invalid_ids",
+            "preview_count",
+            "count_unit",
+        },
+        {
+            "fingerprint_radius",
+            "fingerprint_size_bits",
+            "packed_shape",
+            "molecule_count",
+            "active_bits_min",
+            "active_bits_median",
+            "active_bits_max",
+            "executor",
+            "size_unit",
+        },
+        {
+            "matrix_shape",
+            "q1",
+            "median",
+            "q3",
+            "p90",
+            "max_off_diagonal",
+            "most_similar_pair",
+            "similarity_unit",
+        },
+        {
+            "cutoff",
+            "cluster_count",
+            "singleton_count",
+            "singleton_fraction",
+            "largest_cluster_sizes",
+            "assignment_count",
+            "cutoff_unit",
+        },
+        {
+            "requested_representative_count",
+            "selected_representative_count",
+            "selection_shortfall",
+            "representative_policy",
+            "representatives",
+            "requested_conformers_per_representative",
+            "generated_conformer_count",
+            "partial_embedding_ids",
+            "zero_embedding_ids",
+            "count_unit",
+        },
+        {
+            "attempted_conformer_count",
+            "converged_conformer_count",
+            "unconverged_conformer_count",
+            "per_conformer_records",
+            "selected_conformer_records",
+            "energy_unit",
+            "comparison_scope",
+        },
     ]
     for record, keys in zip(report.evidence, expected_keys):
         payload = json.loads(record.payload_json)
@@ -1062,8 +1429,14 @@ def test_workflow_report_has_exact_frozen_e01_e06_schemas(conformer_gpu):
         )
     assert json.loads(report.evidence[0].payload_json)["count_unit"] == "rows"
     assert json.loads(report.evidence[1].payload_json)["size_unit"] == "bits"
-    assert json.loads(report.evidence[2].payload_json)["similarity_unit"] == "Tanimoto coefficient"
-    assert json.loads(report.evidence[3].payload_json)["cutoff_unit"] == "Tanimoto distance"
+    assert (
+        json.loads(report.evidence[2].payload_json)["similarity_unit"]
+        == "Tanimoto coefficient"
+    )
+    assert (
+        json.loads(report.evidence[3].payload_json)["cutoff_unit"]
+        == "Tanimoto distance"
+    )
     assert json.loads(report.evidence[4].payload_json)["count_unit"] == "conformers"
     e06 = json.loads(report.evidence[5].payload_json)
     assert e06["energy_unit"] == "kcal/mol"
@@ -1078,6 +1451,46 @@ def test_workflow_report_is_derived_from_artifacts_not_mutable_stage_summaries(
     expected = build_workflow_report(state)
     state.summaries.clear()
     assert build_workflow_report(state) == expected
+
+
+def test_rdkit_workflow_report_retains_backend_when_summaries_are_cleared(
+    conformer_gpu,
+):
+    state = _embedded_state(conformer_gpu)
+    state.cluster_backend = "rdkit"
+    state.summaries["discover_fused_butina_clusters"]["entry_point"] = (
+        "Butina.ClusterData"
+    )
+    optimize_conformers_mmff94(state)
+    expected = build_workflow_report(state)
+
+    state.summaries.clear()
+    report = build_workflow_report(state)
+
+    assert report == expected
+    assert report.evidence[3].label == "Butina clusters from GPU Tanimoto distances"
+    assert report.evidence[3].provenance == (
+        "RDKit Butina.ClusterData on nvMolKit crossTanimotoSimilarity"
+    )
+
+
+def test_rdkit_workflow_report_rejects_tampered_backend_summary(conformer_gpu):
+    state = _embedded_state(conformer_gpu)
+    state.cluster_backend = "rdkit"
+    optimize_conformers_mmff94(state)
+    state.summaries["discover_fused_butina_clusters"]["entry_point"] = "fused_butina"
+
+    with pytest.raises(RuntimeError, match="cluster backend"):
+        build_workflow_report(state)
+
+
+def test_workflow_report_rejects_missing_cluster_backend(conformer_gpu):
+    state = _embedded_state(conformer_gpu)
+    optimize_conformers_mmff94(state)
+    state.cluster_backend = None
+
+    with pytest.raises(RuntimeError, match="cluster backend artifact"):
+        build_workflow_report(state)
 
 
 @pytest.mark.parametrize("bad_count", [3.5, "3", None])
@@ -1172,7 +1585,10 @@ def test_workflow_report_requires_retained_fingerprint_and_similarity_artifacts(
     state = _embedded_state(conformer_gpu)
     optimize_conformers_mmff94(state)
     setattr(state, artifact_name, None)
-    with pytest.raises(RuntimeError, match=f"{artifact_name[:-1] if artifact_name.endswith('s') else artifact_name} artifact"):
+    with pytest.raises(
+        RuntimeError,
+        match=f"{artifact_name[:-1] if artifact_name.endswith('s') else artifact_name} artifact",
+    ):
         build_workflow_report(state)
 
 

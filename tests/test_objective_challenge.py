@@ -1,10 +1,11 @@
-import itertools
+import builtins
 import json
 from dataclasses import replace
 from decimal import Decimal, ROUND_FLOOR
 
 import numpy as np
 import pytest
+from PIL.Image import Image
 
 from chemistry_workflow import WorkflowPhase, WorkflowState
 import objective_challenge
@@ -12,11 +13,9 @@ from objective_challenge import (
     CANDIDATE_COUNT,
     MAX_ATTEMPTS,
     PANEL_SIZE,
-    ObjectiveAttempt,
     ObjectiveCandidate,
     ObjectiveContext,
     ObjectiveRun,
-    ObjectiveSwap,
     TerminationReason,
     accepted_maxima,
     baseline_terminal_run,
@@ -39,7 +38,6 @@ from objective_fixtures import (
     controlled_context,
     controlled_context_with_ranked_swaps,
     controlled_context_with_tied_paths,
-    controlled_context_with_three_misses,
     controlled_context_with_action_count,
     controlled_context_without_improving_swaps,
     optimized_state,
@@ -887,6 +885,26 @@ def test_objective_figures_show_trajectory_final_structures_and_heatmap():
 
 
 
+
+
+def test_objective_figures_render_without_rdkit_draw(monkeypatch):
+    original_import = builtins.__import__
+
+    def reject_rdkit_draw(name, globals=None, locals=None, fromlist=(), level=0):
+        blocked = {"Draw", "rdMolDraw2D"}
+        if name == "rdkit.Chem" and blocked.intersection(fromlist):
+            raise ImportError("RDKit drawing extensions are unavailable")
+        if name.startswith(("rdkit.Chem.Draw", "rdkit.Chem.rdMolDraw2D")):
+            raise ImportError("RDKit drawing extensions are unavailable")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", reject_rdkit_draw)
+    state, run = successful_run()
+
+    _, structures, _ = objective_figures(run, state)
+
+    assert isinstance(structures, Image)
+    assert structures.size == (720, 150)
 
 
 def test_objective_context_rejects_cross_context_cluster_conflicts():

@@ -238,9 +238,12 @@ STAGE_SPECS: Final = {
     ),
     "discover_fused_butina_clusters": StageSpec(
         directory=STAGE_DIRECTORIES["discover_fused_butina_clusters"],
-        question="How does fused Butina partition the library?",
-        method="nvMolKit fused_butina with RDKit MMFF94 eligibility",
-        limit="clusters depend on this fingerprint and cutoff",
+        question="How does Butina clustering partition the library?",
+        method="RDKit Butina on nvMolKit GPU Tanimoto distances",
+        limit=(
+            "clusters depend on this fingerprint, Tanimoto-distance cutoff, "
+            "and deterministic input order"
+        ),
         image_names=("cluster_sizes.png",),
     ),
     "embed_representative_conformers": StageSpec(
@@ -540,7 +543,13 @@ def execute_workflow_prefix(
     if stage_index >= 2:
         results.append(measure_tanimoto_similarity(state))
     if stage_index >= 3:
-        results.append(discover_fused_butina_clusters(state, cluster_cutoff=0.40))
+        results.append(
+            discover_fused_butina_clusters(
+                state,
+                cluster_cutoff=0.40,
+                backend="rdkit",
+            )
+        )
     if stage_index >= 4:
         results.append(
             embed_representative_conformers(

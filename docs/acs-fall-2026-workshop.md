@@ -91,7 +91,7 @@ MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/01-inspection/library_previe
 
 <!-- ACS_PROMPT:02-relationships-and-groups:BEGIN -->
 ~~~text
-Question: Which molecules are similar, and how does fused Butina group them?
+Question: Which molecules are similar, and how does Butina group them from the GPU-computed Tanimoto distances?
 
 Work only in `/sandbox/.openclaw/workspace`.
 Do not read or edit files.
@@ -110,7 +110,7 @@ Meaning
 Scientific limit
 Image and download location
 
-Use at most three measured facts. State that cutoff `0.40` is Tanimoto distance. State that the result depends on the radius-2, 1024-bit hashed fingerprint and that similarity `1.0` does not prove molecular identity. Report real GPU execution, not acceleration or speedup. Say that the current bundle is in **Download Results** at `workshop/results.zip`.
+Use at most three measured facts. State that cutoff `0.40` is Tanimoto distance. State that the result depends on the radius-2, 1024-bit hashed fingerprint and that similarity `1.0` does not prove molecular identity. Report real GPU fingerprint and similarity execution followed by CPU RDKit clustering; do not claim acceleration or speedup. Say that the current bundle is in **Download Results** at `workshop/results.zip`.
 
 End with this exact line:
 MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/04-clusters/cluster_sizes.png

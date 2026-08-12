@@ -15,6 +15,7 @@ readonly key_dir="${HOME}/.config/acs-phase-zero"
 readonly key_file="${key_dir}/NVIDIA_INFERENCE_API_KEY"
 readonly state_dir="${HOME}/.local/state/acs-nemoclaw-launchable"
 readonly ready_marker="${state_dir}/ready"
+readonly workflow_smoke_log="${state_dir}/workflow-smoke.log"
 readonly proxy_pid_file="${state_dir}/openclaw-secure-link-proxy.pid"
 readonly artifact_forward_pid_file="${state_dir}/artifact-forward.pid"
 readonly artifact_sentinel_name=".acs-artifact-service-ready"
@@ -488,6 +489,40 @@ finally:
 "${nemoclaw}" "${sandbox_name}" exec -- env \
   PYTHONPATH=/tmp/.local/lib/python3.13/site-packages \
   python3 /sandbox/.openclaw/workspace/acs_workshop_runner.py --help >/dev/null 2>&1
+install -m 600 /dev/null "${workflow_smoke_log}"
+if ! "${nemoclaw}" "${sandbox_name}" exec --no-tty --timeout 600 -- env \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONPATH="${workspace}:/tmp/.local/lib/python3.13/site-packages" \
+  MPLCONFIGDIR=/tmp/acs-workshop-smoke-mpl \
+  python3 -c '
+import acs_workshop_runner as runner
+import torch
+from chemistry_workflow import WorkflowPhase
+
+runner.verify_manifest(runner.DEFAULT_PATHS)
+execution = runner.execute_workflow_prefix("optimize_conformers_mmff94")
+expected_stages = (
+    "inspect_library",
+    "generate_morgan_fingerprints",
+    "measure_tanimoto_similarity",
+    "discover_fused_butina_clusters",
+    "embed_representative_conformers",
+    "optimize_conformers_mmff94",
+)
+if tuple(result.stage for result in execution.stage_results) != expected_stages:
+    raise SystemExit("the workshop smoke did not execute the exact six stages")
+if execution.state.phase is not WorkflowPhase.OPTIMIZED:
+    raise SystemExit("the workshop smoke did not reach the optimized phase")
+if (
+    torch.cuda.device_count() != 1
+    or torch.cuda.get_device_name(0) != "NVIDIA L4"
+    or execution.gpu is None
+    or execution.gpu.name != "NVIDIA L4"
+):
+    raise SystemExit("the workshop smoke did not use exactly one NVIDIA L4")
+' >"${workflow_smoke_log}" 2>&1; then
+  die "the full workshop smoke failed; inspect ${workflow_smoke_log}."
+fi
 
 "${nemoclaw}" "${sandbox_name}" exec -- env \
   ACS_ARTIFACT_SENTINEL_CONTENT="${artifact_sentinel_content}" \

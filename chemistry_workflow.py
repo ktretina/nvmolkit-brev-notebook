@@ -57,6 +57,7 @@ class WorkflowState:
     similarity: Any = None
     clusters: list[list[int]] = field(default_factory=list)
     cluster_cutoff: float | None = None
+    cluster_backend: str | None = None
     representative_records: list[dict[str, Any]] = field(default_factory=list)
     conformer_molecules: list[Any] = field(default_factory=list)
     optimization_result: Any = None
@@ -80,15 +81,176 @@ def eligible_stage(state: WorkflowState) -> str:
     return _NEXT_STAGE[state.phase]
 
 
-def _build_molecule_preview(molecules: list[Any], records: list[dict[str, Any]]):
-    from rdkit.Chem import Draw
+def build_molecule_grid_image(
+    molecules: list[Any],
+    legends: list[str],
+    *,
+    molecules_per_row: int = 6,
+    sub_image_size: tuple[int, int] = (160, 120),
+):
+    if not molecules:
+        raise ValueError("molecule grid requires at least one molecule.")
+    if len(legends) != len(molecules):
+        raise ValueError("molecule grid requires one legend per molecule.")
+    if not isinstance(molecules_per_row, int) or molecules_per_row <= 0:
+        raise ValueError("molecules per row must be positive.")
+    if (
+        not isinstance(sub_image_size, tuple)
+        or len(sub_image_size) != 2
+        or any(not isinstance(value, int) or value <= 0 for value in sub_image_size)
+    ):
+        raise ValueError("sub-image dimensions must be positive integers.")
 
-    return Draw.MolsToGridImage(
-        molecules,
-        legends=[record["id"] for record in records],
-        molsPerRow=6,
-        subImgSize=(160, 120),
+    from PIL import Image, ImageDraw, ImageFont
+    from rdkit.Chem import rdDepictor
+
+    cell_width, cell_height = sub_image_size
+    molecule_height = cell_height - 42
+    column_count = min(molecules_per_row, len(molecules))
+    row_count = (len(molecules) + molecules_per_row - 1) // molecules_per_row
+    preview = Image.new(
+        "RGB", (column_count * cell_width, row_count * cell_height), "white"
     )
+    draw = ImageDraw.Draw(preview)
+    font = ImageFont.load_default()
+    atom_colors = {
+        "N": "#3050F8",
+        "O": "#FF0D0D",
+        "F": "#1FF01F",
+        "Cl": "#1FF01F",
+        "Br": "#A62929",
+        "I": "#940094",
+        "P": "#FF8000",
+        "S": "#C6A700",
+    }
+
+    for index, (molecule, legend) in enumerate(zip(molecules, legends, strict=True)):
+        depicted = Chem.Mol(molecule)
+        Chem.KekulizeIfPossible(depicted, clearAromaticFlags=True)
+        rdDepictor.Compute2DCoords(depicted)
+        conformer = depicted.GetConformer()
+        Chem.WedgeMolBonds(depicted, conformer)
+        coordinates = np.asarray(
+            [
+                [
+                    conformer.GetAtomPosition(atom_index).x,
+                    conformer.GetAtomPosition(atom_index).y,
+                ]
+                for atom_index in range(depicted.GetNumAtoms())
+            ],
+            dtype=float,
+        )
+        minimum = coordinates.min(axis=0)
+        maximum = coordinates.max(axis=0)
+        span = maximum - minimum
+        scale = min(
+            min(cell_width, cell_height) * 0.3,
+            (cell_width - 28) / max(float(span[0]), 0.01),
+            molecule_height / max(float(span[1]), 0.01),
+        )
+        scaled_span = span * scale
+        column = index % molecules_per_row
+        row = index // molecules_per_row
+        origin_x = column * cell_width + (cell_width - scaled_span[0]) / 2
+        origin_y = row * cell_height + 6 + (molecule_height - scaled_span[1]) / 2
+        points = [
+            (
+                float(origin_x + (x - minimum[0]) * scale),
+                float(origin_y + (maximum[1] - y) * scale),
+            )
+            for x, y in coordinates
+        ]
+
+        for bond in depicted.GetBonds():
+            start = points[bond.GetBeginAtomIdx()]
+            end = points[bond.GetEndAtomIdx()]
+            delta_x, delta_y = end[0] - start[0], end[1] - start[1]
+            length = max((delta_x**2 + delta_y**2) ** 0.5, 1.0)
+            normal_x, normal_y = -delta_y / length, delta_x / length
+            if bond.GetBondDir() == Chem.BondDir.BEGINWEDGE:
+                draw.polygon(
+                    (
+                        start,
+                        (end[0] + normal_x * 5, end[1] + normal_y * 5),
+                        (end[0] - normal_x * 5, end[1] - normal_y * 5),
+                    ),
+                    fill="black",
+                )
+                continue
+            if bond.GetBondDir() == Chem.BondDir.BEGINDASH:
+                for fraction in (0.2, 0.4, 0.6, 0.8, 1.0):
+                    center_x = start[0] + delta_x * fraction
+                    center_y = start[1] + delta_y * fraction
+                    half_width = 5 * fraction
+                    draw.line(
+                        (
+                            center_x + normal_x * half_width,
+                            center_y + normal_y * half_width,
+                            center_x - normal_x * half_width,
+                            center_y - normal_y * half_width,
+                        ),
+                        fill="black",
+                        width=1,
+                    )
+                continue
+            if bond.GetIsAromatic():
+                offsets = (0.0,)
+            elif bond.GetBondTypeAsDouble() >= 2.5:
+                offsets = (-3.0, 0.0, 3.0)
+            elif bond.GetBondTypeAsDouble() >= 1.75:
+                offsets = (-2.0, 2.0)
+            else:
+                offsets = (0.0,)
+            for offset in offsets:
+                draw.line(
+                    (
+                        start[0] + normal_x * offset,
+                        start[1] + normal_y * offset,
+                        end[0] + normal_x * offset,
+                        end[1] + normal_y * offset,
+                    ),
+                    fill="black",
+                    width=2,
+                )
+
+        for atom, point in zip(depicted.GetAtoms(), points, strict=True):
+            symbol = atom.GetSymbol()
+            if symbol == "C" and atom.GetDegree() and not atom.GetFormalCharge():
+                continue
+            label = f"{atom.GetIsotope() or ''}{symbol}"
+            hydrogen_count = atom.GetTotalNumHs()
+            if hydrogen_count:
+                label += "H" + (str(hydrogen_count) if hydrogen_count > 1 else "")
+            charge = atom.GetFormalCharge()
+            if charge:
+                label += (str(abs(charge)) if abs(charge) > 1 else "") + (
+                    "+" if charge > 0 else "-"
+                )
+            text_box = draw.textbbox(point, label, font=font, anchor="mm")
+            draw.rectangle(
+                (text_box[0] - 1, text_box[1] - 1, text_box[2] + 1, text_box[3] + 1),
+                fill="white",
+            )
+            draw.text(
+                point,
+                label,
+                fill=atom_colors.get(symbol, "black"),
+                font=font,
+                anchor="mm",
+            )
+
+        draw.text(
+            (
+                column * cell_width + cell_width / 2,
+                row * cell_height + cell_height - 15,
+            ),
+            str(legend),
+            fill="black",
+            font=font,
+            anchor="mm",
+        )
+
+    return preview
 
 
 def inspect_library(
@@ -130,8 +292,9 @@ def inspect_library(
         raise ValueError("input library produced zero valid molecules")
 
     preview_count = min(len(molecules), 24)
-    preview = _build_molecule_preview(
-        molecules[:preview_count], records[:preview_count]
+    preview = build_molecule_grid_image(
+        molecules[:preview_count],
+        [record["id"] for record in records[:preview_count]],
     )
     summary: dict[str, Any] = {
         "raw_count": int(len(raw_records)),
@@ -174,6 +337,25 @@ def _fused_butina(fingerprints, *, cutoff: float):
     from nvmolkit.clustering import fused_butina
 
     return fused_butina(fingerprints, cutoff=cutoff)
+
+
+def _rdkit_butina_clusters(
+    similarity_matrix: np.ndarray,
+    *,
+    cutoff: float,
+) -> tuple[tuple[int, ...], ...]:
+    from rdkit.ML.Cluster import Butina
+
+    distance_matrix = np.clip(1.0 - similarity_matrix, 0.0, 1.0)
+    np.fill_diagonal(distance_matrix, 0.0)
+    return Butina.ClusterData(
+        distance_matrix,
+        int(distance_matrix.shape[0]),
+        cutoff,
+        isDistData=True,
+        reordering=True,
+    )
+
 
 
 def _embed_molecules(molecules, parameters, *, confsPerMolecule: int, maxIterations: int):
@@ -308,7 +490,7 @@ def _similarity_heatmap_figure(similarity_matrix: np.ndarray):
     return figure
 
 
-def _cluster_size_figure(cluster_sizes: list[int]):
+def _cluster_size_figure(cluster_sizes: list[int], *, title: str):
     from matplotlib.figure import Figure
 
     largest = sorted(cluster_sizes, reverse=True)[:15]
@@ -317,7 +499,7 @@ def _cluster_size_figure(cluster_sizes: list[int]):
     axes.bar(range(1, len(largest) + 1), largest)
     axes.set_xlabel("Cluster rank by descending size")
     axes.set_ylabel("Molecule count")
-    axes.set_title("Largest fused Butina clusters")
+    axes.set_title(title)
     return figure
 
 
@@ -501,8 +683,9 @@ def discover_fused_butina_clusters(
     state: WorkflowState,
     *,
     cluster_cutoff: float,
+    backend: str = "fused",
 ) -> StageResult:
-    """Run nvMolKit fused Butina and validate one assignment per molecule."""
+    """Cluster molecules with the notebook or ACS workshop backend."""
     if state.phase is not WorkflowPhase.COMPARED:
         raise RuntimeError(
             "discover_fused_butina_clusters requires a state in the COMPARED phase"
@@ -515,9 +698,31 @@ def discover_fused_butina_clusters(
         raise ValueError("cluster cutoff must be 0.40 through 0.60 inclusive")
 
     cutoff = float(cluster_cutoff)
-    cluster_result = _fused_butina(state.fingerprints.torch(), cutoff=cutoff)
-    _synchronize_cuda()
-    clusters_raw = cluster_result[0]
+    if backend == "fused":
+        cluster_backend = "fused"
+        clusters_raw = _fused_butina(state.fingerprints.torch(), cutoff=cutoff)[0]
+        _synchronize_cuda()
+        backend_summary: dict[str, Any] = {"entry_point": "fused_butina"}
+        display_label = "nvMolKit fused_butina with RDKit MMFF94 eligibility"
+        figure_title = "Largest fused Butina clusters"
+    elif backend == "rdkit":
+        cluster_backend = "rdkit"
+        clusters_raw = _rdkit_butina_clusters(
+            validated_similarity_matrix(state),
+            cutoff=cutoff,
+        )
+        backend_summary = {
+            "entry_point": "Butina.ClusterData",
+            "executor": "RDKit CPU",
+            "distance_source": "nvMolKit crossTanimotoSimilarity GPU matrix",
+        }
+        display_label = (
+            "RDKit Butina on nvMolKit GPU Tanimoto distances "
+            "with RDKit MMFF94 eligibility"
+        )
+        figure_title = "Largest Butina clusters"
+    else:
+        raise ValueError("cluster backend must be 'fused' or 'rdkit'")
     clusters = [
         [int(molecule_index) for molecule_index in cluster] for cluster in clusters_raw
     ]
@@ -531,7 +736,7 @@ def discover_fused_butina_clusters(
     cluster_metrics = _cluster_artifact_metrics(clusters, molecule_count, cutoff)
     groups = _eligibility_groups(state.records, state.molecules, clusters)
     summary: dict[str, Any] = {
-        "entry_point": "fused_butina",
+        **backend_summary,
         **cluster_metrics,
         "representative_eligibility": {
             "eligible_cluster_count": len(groups),
@@ -540,25 +745,33 @@ def discover_fused_butina_clusters(
             "candidates_by_cluster": [
                 {
                     "cluster_id": group["cluster_id"],
-                    "candidate_ids": [member["molecule_id"] for member in group["members"]],
-                    "source_rows": [member["source_row"] for member in group["members"]],
+                    "candidate_ids": [
+                        member["molecule_id"] for member in group["members"]
+                    ],
+                    "source_rows": [
+                        member["source_row"] for member in group["members"]
+                    ],
                     "is_singleton": group["is_singleton"],
                 }
                 for group in sorted(groups, key=lambda group: group["cluster_id"])
             ],
         },
     }
-    figure = _cluster_size_figure([len(cluster) for cluster in clusters])
+    figure = _cluster_size_figure(
+        [len(cluster) for cluster in clusters],
+        title=figure_title,
+    )
     summaries = dict(state.summaries)
     summaries["discover_fused_butina_clusters"] = summary
 
     state.clusters = clusters
     state.cluster_cutoff = cutoff
+    state.cluster_backend = cluster_backend
     state.summaries = summaries
     state.phase = WorkflowPhase.CLUSTERED
     return StageResult(
         stage="discover_fused_butina_clusters",
-        display_label="nvMolKit fused_butina with RDKit MMFF94 eligibility",
+        display_label=display_label,
         summary=summary,
         figures=(figure,),
     )
@@ -1141,44 +1354,79 @@ def build_workflow_report(state: WorkflowState) -> WorkflowReport:
         state.clusters, molecule_count, state.cluster_cutoff
     )
     embedding = _representative_evidence(state)
-    optimization = _optimization_evidence(
-        state, embedding["generated_conformer_count"]
-    )
+    optimization = _optimization_evidence(state, embedding["generated_conformer_count"])
+    cluster_contracts = {
+        "fused": ("fused_butina", "Fused Butina clusters", "fused_butina"),
+        "rdkit": (
+            "Butina.ClusterData",
+            "Butina clusters from GPU Tanimoto distances",
+            "RDKit Butina.ClusterData on nvMolKit crossTanimotoSimilarity",
+        ),
+    }
+    try:
+        expected_entry_point, cluster_label, cluster_provenance = cluster_contracts[
+            state.cluster_backend
+        ]
+    except (KeyError, TypeError) as error:
+        raise RuntimeError("cluster backend artifact is missing or invalid.") from error
+    cluster_summary = state.summaries.get("discover_fused_butina_clusters")
+    if cluster_summary is not None and (
+        not isinstance(cluster_summary, dict)
+        or cluster_summary.get("entry_point") != expected_entry_point
+    ):
+        raise RuntimeError("cluster backend artifact does not match the stage summary.")
 
     payloads = (
-        ("E01", "Library inspection", {
-            "raw_count": molecule_count + len(state.invalid_ids),
-            "valid_count": molecule_count,
-            "invalid_count": len(state.invalid_ids),
-            "invalid_ids": list(state.invalid_ids),
-            "preview_count": min(molecule_count, 24),
-            "count_unit": "rows",
-        }, "RDKit input validation"),
-        ("E02", "Morgan fingerprints", {
-            "fingerprint_radius": radius,
-            "fingerprint_size_bits": fingerprint_size,
-            "packed_shape": fingerprint["packed_shape"],
-            "molecule_count": fingerprint["molecule_count"],
-            "active_bits_min": fingerprint["active_bits_min"],
-            "active_bits_median": fingerprint["active_bits_median"],
-            "active_bits_max": fingerprint["active_bits_max"],
-            "executor": "nvMolKit GPU",
-            "size_unit": "bits",
-        }, "MorganFingerprintGenerator"),
+        (
+            "E01",
+            "Library inspection",
+            {
+                "raw_count": molecule_count + len(state.invalid_ids),
+                "valid_count": molecule_count,
+                "invalid_count": len(state.invalid_ids),
+                "invalid_ids": list(state.invalid_ids),
+                "preview_count": min(molecule_count, 24),
+                "count_unit": "rows",
+            },
+            "RDKit input validation",
+        ),
+        (
+            "E02",
+            "Morgan fingerprints",
+            {
+                "fingerprint_radius": radius,
+                "fingerprint_size_bits": fingerprint_size,
+                "packed_shape": fingerprint["packed_shape"],
+                "molecule_count": fingerprint["molecule_count"],
+                "active_bits_min": fingerprint["active_bits_min"],
+                "active_bits_median": fingerprint["active_bits_median"],
+                "active_bits_max": fingerprint["active_bits_max"],
+                "executor": "nvMolKit GPU",
+                "size_unit": "bits",
+            },
+            "MorganFingerprintGenerator",
+        ),
         ("E03", "Tanimoto similarity", similarity, "crossTanimotoSimilarity"),
-        ("E04", "Fused Butina clusters", {
-            "cutoff": cluster["cluster_cutoff"],
-            "cluster_count": cluster["cluster_count"],
-            "singleton_count": cluster["singleton_count"],
-            "singleton_fraction": cluster["singleton_fraction"],
-            "largest_cluster_sizes": cluster["largest_cluster_sizes"],
-            "assignment_count": cluster["assignment_count"],
-            "cutoff_unit": "Tanimoto distance",
-        }, "fused_butina"),
+        (
+            "E04",
+            cluster_label,
+            {
+                "cutoff": cluster["cluster_cutoff"],
+                "cluster_count": cluster["cluster_count"],
+                "singleton_count": cluster["singleton_count"],
+                "singleton_fraction": cluster["singleton_fraction"],
+                "largest_cluster_sizes": cluster["largest_cluster_sizes"],
+                "assignment_count": cluster["assignment_count"],
+                "cutoff_unit": "Tanimoto distance",
+            },
+            cluster_provenance,
+        ),
         ("E05", "Representative embedding", embedding, "EmbedMolecules"),
         ("E06", "MMFF94 optimization", optimization, "MMFFOptimizeMoleculesConfs"),
     )
-    return WorkflowReport(tuple(
-        EvidenceRecord(key, label, _canonical_json(payload), provenance)
-        for key, label, payload, provenance in payloads
-    ))
+    return WorkflowReport(
+        tuple(
+            EvidenceRecord(key, label, _canonical_json(payload), provenance)
+            for key, label, payload, provenance in payloads
+        )
+    )

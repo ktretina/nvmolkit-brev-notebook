@@ -83,9 +83,12 @@ EXPECTED_STAGE_METADATA = {
         "similarity does not establish activity, binding, efficacy, or safety",
     ),
     "discover_fused_butina_clusters": (
-        "How does fused Butina partition the library?",
-        "nvMolKit fused_butina with RDKit MMFF94 eligibility",
-        "clusters depend on this fingerprint and cutoff",
+        "How does Butina clustering partition the library?",
+        "RDKit Butina on nvMolKit GPU Tanimoto distances",
+        (
+            "clusters depend on this fingerprint, Tanimoto-distance cutoff, "
+            "and deterministic input order"
+        ),
     ),
     "embed_representative_conformers": (
         "Did ETKDGv3 generate the requested representative conformers?",
@@ -341,11 +344,6 @@ def fake_workshop_gpu(monkeypatch: pytest.MonkeyPatch) -> np.ndarray:
             assert len(molecules) == 256
             return fingerprint_result
 
-    def cluster(_fingerprints: _FakeTensor, *, cutoff: float):
-        assert cutoff == 0.40
-        clusters = [list(range(start, start + 32)) for start in range(0, 256, 32)]
-        return clusters, [len(cluster_members) for cluster_members in clusters]
-
     def embed(
         molecules: list[Chem.Mol],
         parameters: object,
@@ -379,7 +377,6 @@ def fake_workshop_gpu(monkeypatch: pytest.MonkeyPatch) -> np.ndarray:
         "_cross_tanimoto_similarity",
         lambda fingerprints: similarity_result,
     )
-    monkeypatch.setattr(chemistry_workflow, "_fused_butina", cluster)
     monkeypatch.setattr(chemistry_workflow, "_embed_molecules", embed)
     monkeypatch.setattr(chemistry_workflow, "_optimize_mmff94", optimize)
     monkeypatch.setattr(
@@ -470,6 +467,7 @@ def workflow_executions() -> dict[str, runner.WorkflowExecution]:
         similarity=_FakeGpuResult(np.eye(256, dtype=float)),
         clusters=clusters,
         cluster_cutoff=0.40,
+        cluster_backend="rdkit",
         representative_records=representative_records,
         conformer_molecules=conformer_molecules,
         optimization_result=optimization_result,
@@ -572,10 +570,14 @@ def test_cluster_assignments_cover_each_molecule_once(
     assert rows["molecule_index"].tolist() == list(range(256))
     assert rows["molecule_id"].is_unique
     assert rows["source_row"].tolist() == list(range(256))
-    assert rows.groupby("cluster_id")["molecule_index"].count().to_dict() == {
-        cluster_id: 32 for cluster_id in range(8)
-    }
-    assert rows["cluster_size"].tolist() == [32] * 256
+    observed_sizes = rows.groupby("cluster_id")["molecule_index"].count()
+    assert int(observed_sizes.sum()) == 256
+    assert (observed_sizes > 0).all()
+    assert all(
+        group["cluster_size"].nunique() == 1
+        and int(group["cluster_size"].iloc[0]) == len(group)
+        for _, group in rows.groupby("cluster_id")
+    )
 
 
 def test_mmff94_csv_and_sdf_have_matching_provenance(
@@ -632,6 +634,11 @@ def test_workflow_evidence_has_parsed_e01_through_e06(
         for record in payload["evidence"]
     )
     assert all(type(record["payload"]) is dict for record in payload["evidence"])
+    e04 = payload["evidence"][3]
+    assert e04["label"] == "Butina clusters from GPU Tanimoto distances"
+    assert e04["provenance"] == (
+        "RDKit Butina.ClusterData on nvMolKit crossTanimotoSimilarity"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1468,7 +1475,7 @@ def test_workflow_prefix_uses_exact_order_and_fixed_values(
         (
             "discover_fused_butina_clusters",
             (),
-            {"cluster_cutoff": 0.40},
+            {"cluster_cutoff": 0.40, "backend": "rdkit"},
         ),
         (
             "embed_representative_conformers",

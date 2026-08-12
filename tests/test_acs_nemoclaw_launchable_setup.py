@@ -249,6 +249,65 @@ def test_setup_creates_the_exact_atomic_read_only_manifest_before_quiet_help() -
     assert source.index("chmod 0444 -- \\\n") < help_smoke
 
 
+def test_setup_runs_full_workflow_smoke_after_manifest_before_services() -> None:
+    source = _source()
+    manifest = source.index("os.chmod(manifest, 0o444)")
+    smoke_import = source.index("import acs_workshop_runner as runner")
+    smoke_command = source.rfind('"${nemoclaw}"', manifest, smoke_import)
+    smoke_end = source.index('>"${workflow_smoke_log}" 2>&1; then', smoke_import)
+    artifact_sentinel = source.index("ACS_ARTIFACT_SENTINEL_CONTENT=", smoke_end)
+    services = source.index('phase "Start attendee services"', artifact_sentinel)
+    ready = source.index('mv -f -- "${ready_temp}" "${ready_marker}"', services)
+    block = source[smoke_command:smoke_end]
+
+    assert manifest < smoke_command < smoke_import < smoke_end
+    assert smoke_end < artifact_sentinel < services < ready
+    assert "PYTHONDONTWRITEBYTECODE=1" in block
+    assert 'PYTHONPATH="${workspace}:/tmp/.local/lib/python3.13/site-packages"' in block
+    assert "runner.verify_manifest(runner.DEFAULT_PATHS)" in block
+    assert 'runner.execute_workflow_prefix("optimize_conformers_mmff94")' in block
+    assert "from chemistry_workflow import WorkflowPhase" in block
+    assert "execution.state.phase is not WorkflowPhase.OPTIMIZED" in block
+    assert "runner.WorkflowPhase" not in block
+    assert "torch.cuda.device_count() != 1" in block
+    assert 'torch.cuda.get_device_name(0) != "NVIDIA L4"' in block
+    for stage_name in (
+        "inspect_library",
+        "generate_morgan_fingerprints",
+        "measure_tanimoto_similarity",
+        "discover_fused_butina_clusters",
+        "embed_representative_conformers",
+        "optimize_conformers_mmff94",
+    ):
+        assert f'"{stage_name}"' in block
+    assert "_publish" not in block
+    assert "run_lesson" not in block
+    assert source[smoke_end:].startswith('>"${workflow_smoke_log}" 2>&1; then')
+
+
+def test_setup_keeps_private_full_smoke_diagnostics() -> None:
+    source = _source()
+    log_declaration = source.index(
+        'readonly workflow_smoke_log="${state_dir}/workflow-smoke.log"'
+    )
+    log_creation = source.index(
+        'install -m 600 /dev/null "${workflow_smoke_log}"', log_declaration
+    )
+    smoke_command = source.index(
+        'if ! "${nemoclaw}" "${sandbox_name}" exec --no-tty --timeout 600',
+        log_creation,
+    )
+    log_redirect = source.index('>"${workflow_smoke_log}" 2>&1; then', smoke_command)
+    safe_failure = source.index(
+        'die "the full workshop smoke failed; inspect ${workflow_smoke_log}."',
+        log_redirect,
+    )
+    artifact_sentinel = source.index("ACS_ARTIFACT_SENTINEL_CONTENT=", safe_failure)
+
+    assert log_creation < smoke_command < log_redirect < safe_failure < artifact_sentinel
+    assert "NVIDIA_INFERENCE_API_KEY" not in source[smoke_command:log_redirect]
+
+
 def test_setup_script_requires_a_loopback_dashboard_and_exposes_only_the_proxy() -> (
     None
 ):

@@ -85,6 +85,7 @@ def optimized_state(baseline_optimal: bool = False) -> WorkflowState:
         similarity=FakeGpuResult(1.0 - distance),
         clusters=[[index] for index in range(CANDIDATE_COUNT)],
         cluster_cutoff=0.4,
+        cluster_backend="fused",
         representative_records=representative_records,
         conformer_molecules=conformer_molecules,
         optimization_result=FakeOptimizationResult(),
