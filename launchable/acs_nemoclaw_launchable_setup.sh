@@ -128,6 +128,7 @@ fi
 readonly nemoclaw="${HOME}/.local/bin/nemoclaw"
 readonly openshell="${HOME}/.local/bin/openshell"
 [[ -x "${nemoclaw}" && -x "${openshell}" ]] || die "NemoClaw or OpenShell is missing."
+export PATH="${HOME}/.local/bin:${PATH}"
 node_candidates=()
 for candidate in "${HOME}"/.nvm/versions/node/*/bin/node; do
   [[ -x "${candidate}" ]] && node_candidates+=("${candidate}")

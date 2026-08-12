@@ -83,6 +83,24 @@ def test_setup_script_has_the_complete_secret_safe_contract() -> None:
     assert "gateway-token --quiet" in source
 
 
+def test_setup_prepends_local_bin_before_first_nemoclaw_config_command() -> None:
+    source = _source()
+    nemoclaw_path = 'readonly nemoclaw="${HOME}/.local/bin/nemoclaw"'
+    openshell_path = 'readonly openshell="${HOME}/.local/bin/openshell"'
+    executable_check = (
+        '[[ -x "${nemoclaw}" && -x "${openshell}" ]] || '
+        'die "NemoClaw or OpenShell is missing."'
+    )
+    path_export = 'export PATH="${HOME}/.local/bin:${PATH}"'
+    first_config_command = '"${nemoclaw}" "${sandbox_name}" config set'
+
+    assert source.count(path_export) == 1
+    assert source.index(nemoclaw_path) < source.index(executable_check)
+    assert source.index(openshell_path) < source.index(executable_check)
+    assert source.index(executable_check) < source.index(path_export)
+    assert source.index(path_export) < source.index(first_config_command)
+
+
 def test_setup_applies_verified_host_provider_timeout_before_runtime_checks() -> None:
     source = _source()
     executable_check = (
