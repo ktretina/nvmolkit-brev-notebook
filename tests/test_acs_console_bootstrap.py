@@ -8,16 +8,40 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "launchable" / "acs_console_bootstrap.sh.in"
+PUBLIC_BOOTSTRAP = ROOT / "launchable" / "acs_console_bootstrap.sh"
 AUTHORING_SHEET = ROOT / "launchable" / "ACS_LAUNCHABLE_FIELDS.md"
 PLACEHOLDER = "@REVIEWED_PUBLIC_COMMIT_SHA@"
 REPO_URL = "https://github.com/ktretina/nvmolkit-brev-notebook.git"
 DUMMY_COMMIT = "a" * 40
+PINNED_SETUP_COMMIT = "d11754852df39f611ef87783c148d1864e3a70d4"
 
 
 def _rendered_bootstrap() -> str:
     source = TEMPLATE.read_text(encoding="utf-8")
     assert source.count(PLACEHOLDER) == 1
     return source.replace(PLACEHOLDER, DUMMY_COMMIT)
+
+
+def test_public_console_bootstrap_is_exact_pinned_and_below_brev_limit() -> None:
+    expected = TEMPLATE.read_text(encoding="utf-8").replace(
+        PLACEHOLDER, PINNED_SETUP_COMMIT
+    )
+    published = PUBLIC_BOOTSTRAP.read_text(encoding="utf-8")
+
+    assert published == expected
+    assert published.startswith("#!/usr/bin/env bash\n")
+    assert published.count(PINNED_SETUP_COMMIT) == 1
+    assert PLACEHOLDER not in published
+    assert len(published.encode("utf-8")) <= 16_384
+
+    completed = subprocess.run(
+        ["bash", "-n", str(PUBLIC_BOOTSTRAP)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_console_bootstrap_is_syntax_valid_and_pins_a_detached_checkout(
