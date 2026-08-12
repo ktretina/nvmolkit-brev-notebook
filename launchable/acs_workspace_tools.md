@@ -1,7 +1,8 @@
 # ACS chemistry workshop
 
-Read the installed `nvmolkit-usage` skill once before the first lesson. Use only
-the commands below. Run the three lessons in order.
+The installed `nvmolkit-usage` skill remains available after the bounded exercise.
+Do not read files during these four prompts. Use only the commands below. Run the
+three lessons in order.
 
 ```bash
 env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages python3 /sandbox/.openclaw/workspace/acs_workshop_runner.py run-lesson data-and-representation

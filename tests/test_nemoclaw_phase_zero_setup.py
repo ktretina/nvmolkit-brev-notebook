@@ -329,6 +329,9 @@ def test_workspace_note_exposes_only_the_bounded_workshop_commands_and_artifacts
     source = WORKSPACE_TOOLS.read_text()
 
     assert "nvmolkit-usage" in source
+    assert "remains available after the bounded exercise" in source
+    assert "Read the installed" not in source
+    assert "Do not read files" in source
     runner = (
         "env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages python3 "
         "/sandbox/.openclaw/workspace/acs_workshop_runner.py"

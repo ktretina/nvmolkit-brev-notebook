@@ -52,6 +52,13 @@ or a successful fresh setup. This page makes no live-readiness or timing claim.
 4. Paste the four prompts below in order into that same session. Wait for each
    answer before sending the next prompt.
 
+The installed `nvmolkit-usage` skill remains available after the bounded
+exercise for optional exploration. The required prompts do not read it.
+
+If an LLM request times out, start a new session and retry the whole prompt
+once. Do not retry individual commands. After a second timeout, ask the
+facilitator.
+
 ## Four prompts
 
 <!-- ACS_PROMPT:01-data-and-representation:BEGIN -->
@@ -59,11 +66,11 @@ or a successful fresh setup. This page makes no live-readiness or timing claim.
 Question: What is in the fixed molecule library, and how is it represented for comparison?
 
 Work only in `/sandbox/.openclaw/workspace`.
-Before chemistry work, read `/sandbox/.openclaw/skills/nvmolkit-usage/SKILL.md` once.
+Do not read or edit files.
 Do not install software or use the network.
-Do not edit any fixed file or run an alternate command.
+Do not run an alternate command.
 
-Run this command exactly once:
+Run only this exact command, once:
 env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages python3 /sandbox/.openclaw/workspace/acs_workshop_runner.py run-lesson data-and-representation
 
 If the command fails, report the error and stop. Do not repair or retry.
@@ -87,10 +94,11 @@ MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/01-inspection/library_previe
 Question: Which molecules are similar, and how does fused Butina group them?
 
 Work only in `/sandbox/.openclaw/workspace`.
+Do not read or edit files.
 Do not install software or use the network.
-Do not edit any fixed file or run an alternate command.
+Do not run an alternate command.
 
-Run this command exactly once:
+Run only this exact command, once:
 env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages python3 /sandbox/.openclaw/workspace/acs_workshop_runner.py run-lesson relationships-and-groups
 
 If the command fails, report the error and stop. Do not repair or retry.
@@ -114,10 +122,11 @@ MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/04-clusters/cluster_sizes.pn
 Question: What sampled 3D geometries were generated and optimized?
 
 Work only in `/sandbox/.openclaw/workspace`.
+Do not read or edit files.
 Do not install software or use the network.
-Do not edit any fixed file or run an alternate command.
+Do not run an alternate command.
 
-Run this command exactly once:
+Run only this exact command, once:
 env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages python3 /sandbox/.openclaw/workspace/acs_workshop_runner.py run-lesson sampled-3d-geometry
 
 If the command fails, report the error and stop. Do not repair or retry.
@@ -141,8 +150,11 @@ MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/06-mmff94/optimized_structur
 Question: Can a bounded agent improve the weakest-link diversity of a four-molecule panel?
 
 Work only in `/sandbox/.openclaw/workspace`.
+Do not read or edit files.
 Do not install software or use the network.
-Do not edit any fixed file or run an alternate command.
+Do not run an alternate command.
+
+Run only the exact commands below.
 
 Run `objective-start` exactly once with this command:
 env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages python3 /sandbox/.openclaw/workspace/acs_workshop_runner.py objective-start

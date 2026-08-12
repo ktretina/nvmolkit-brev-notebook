@@ -148,6 +148,21 @@ def test_lab_roles_hardware_and_signed_in_boundary_are_explicit() -> None:
     assert "do not prove signed-in deployability" in source
 
 
+def test_timeout_recovery_retries_one_whole_prompt_outside_prompt_blocks() -> None:
+    source = _source()
+    normalized = " ".join(source.split())
+    recovery = (
+        "If an LLM request times out, start a new session and retry the whole prompt "
+        "once. Do not retry individual commands. After a second timeout, ask the "
+        "facilitator."
+    )
+
+    assert normalized.count(recovery) == 1
+    assert source.index("If an LLM request times out") < source.index("## Four prompts")
+    for block in _prompt_blocks(source).values():
+        assert "retry the whole prompt" not in block
+
+
 def test_exactly_four_self_contained_prompts_use_only_the_fixed_runner() -> None:
     source = _source()
     blocks = _prompt_blocks(source)
@@ -164,14 +179,19 @@ def test_exactly_four_self_contained_prompts_use_only_the_fixed_runner() -> None
     assert "--output" not in source
 
     skill_path = "/sandbox/.openclaw/skills/nvmolkit-usage/SKILL.md"
-    assert blocks["01-data-and-representation"].count(skill_path) == 1
-    for prompt_id in PROMPT_IDS[1:]:
+    for prompt_id in PROMPT_IDS:
         assert skill_path not in blocks[prompt_id]
+    assert "The installed `nvmolkit-usage` skill remains available" in source
+
+    for prompt_id in PROMPT_IDS[:3]:
+        assert "Run only this exact command, once:" in blocks[prompt_id]
+    assert "Run only the exact commands below." in blocks["04-objective"]
 
     for prompt_id, block in blocks.items():
         assert "Work only in `/sandbox/.openclaw/workspace`." in block
+        assert "Do not read or edit files." in block
         assert "Do not install software or use the network." in block
-        assert "Do not edit any fixed file or run an alternate command." in block
+        assert "Do not run an alternate command." in block
         assert "report the error and stop" in block
         assert "Do not repair or retry" in block
         heading_positions = [block.index(heading) for heading in RESPONSE_HEADINGS]
