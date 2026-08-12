@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly repo_url="https://github.com/ktretina/nvmolkit-brev-notebook.git"
-readonly repo_commit="d11754852df39f611ef87783c148d1864e3a70d4"
+readonly repo_commit="4d7fcaac2cbb4d3048140501ccc97aa931ff23da"
 readonly source_root="${HOME}/.local/share/acs-nemoclaw-launchable"
 readonly checkout_dir="${source_root}/source-${repo_commit}"
 
