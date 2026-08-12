@@ -13,7 +13,7 @@ AUTHORING_SHEET = ROOT / "launchable" / "ACS_LAUNCHABLE_FIELDS.md"
 PLACEHOLDER = "@REVIEWED_PUBLIC_COMMIT_SHA@"
 REPO_URL = "https://github.com/ktretina/nvmolkit-brev-notebook.git"
 DUMMY_COMMIT = "a" * 40
-PINNED_SETUP_COMMIT = "4f0ce9a487a4f361cf64e08a45bc034f72bb1396"
+PINNED_SETUP_COMMIT = "89288d907b59878fa88afaaad5bbf5e24c889260"
 
 
 def _rendered_bootstrap() -> str:
