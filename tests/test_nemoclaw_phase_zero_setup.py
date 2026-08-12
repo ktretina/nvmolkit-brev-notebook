@@ -13,6 +13,138 @@ WORKSPACE_TOOLS = ROOT / "launchable" / "acs_workspace_tools.md"
 ARTIFACT_SERVER = ROOT / "launchable" / "start_artifact_server.sh"
 
 
+def _write_executable(path: Path, source: str) -> None:
+    path.write_text(source)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def _run_detached_phase_zero(
+    tmp_path: Path,
+    *,
+    installer_exit: int = 1,
+    failure_step: str = "provider_selection",
+    interrupted: bool = True,
+    install_nemoclaw: bool = True,
+    resumable: bool = True,
+    resume_exit: int = 0,
+    session_is_object: bool = True,
+    symlink_session: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    state_dir = tmp_path / "state"
+    fake_bin.mkdir()
+    (home / ".config" / "acs-phase-zero").mkdir(parents=True)
+
+    key_file = home / ".config" / "acs-phase-zero" / "NVIDIA_INFERENCE_API_KEY"
+    key_file.write_text("nvapi-test-secret\n")
+    key_file.chmod(0o600)
+
+    resume_log = tmp_path / "resume.log"
+    openshell_log = tmp_path / "openshell.log"
+    fake_installer = tmp_path / "installer.sh"
+    fake_session = tmp_path / "onboard-session.json"
+    fake_nemoclaw = tmp_path / "nemoclaw"
+    fake_openshell = tmp_path / "openshell"
+
+    if session_is_object:
+        fake_session.write_text(
+            "{\n"
+            '  "status": "failed",\n'
+            f'  "resumable": {str(resumable).lower()},\n'
+            '  "failure": {\n'
+            f'    "step": "{failure_step}",\n'
+            f'    "interrupted": {str(interrupted).lower()}\n'
+            "  }\n"
+            "}\n"
+        )
+    else:
+        fake_session.write_text("[]\n")
+    _write_executable(
+        fake_nemoclaw,
+        "#!/usr/bin/env bash\n"
+        '[[ "${NVIDIA_INFERENCE_API_KEY:-}" == "nvapi-test-secret" ]] || exit 91\n'
+        '[[ "${NEMOCLAW_ONBOARD_VALIDATION_TIMEOUT_SECONDS:-}" == 60 ]] || exit 92\n'
+        'printf \'%s\\n\' "$*" >> "$RESUME_LOG"\n'
+        'openshell "$@"\n',
+    )
+    _write_executable(
+        fake_openshell,
+        "#!/usr/bin/env bash\n"
+        'printf \'%s\\n\' "$*" >> "$OPENSHELL_LOG"\n'
+        'exit "$RESUME_EXIT"\n',
+    )
+    _write_executable(
+        fake_installer,
+        "#!/usr/bin/env bash\n"
+        '/bin/mkdir -p "$HOME/.local/bin" "$HOME/.nemoclaw"\n'
+        'if [[ "$INSTALL_NEMOCLAW" == 1 ]]; then\n'
+        '  /bin/cp "$FAKE_NEMOCLAW" "$HOME/.local/bin/nemoclaw"\n'
+        '  /bin/chmod 700 "$HOME/.local/bin/nemoclaw"\n'
+        "fi\n"
+        '/bin/cp "$FAKE_OPENSHELL" "$HOME/.local/bin/openshell"\n'
+        '/bin/chmod 700 "$HOME/.local/bin/openshell"\n'
+        'if [[ "$SYMLINK_SESSION" == 1 ]]; then\n'
+        '  /bin/ln -s "$FAKE_SESSION" "$HOME/.nemoclaw/onboard-session.json"\n'
+        "else\n"
+        '  /bin/cp "$FAKE_SESSION" "$HOME/.nemoclaw/onboard-session.json"\n'
+        "fi\n"
+        'exit "$INSTALLER_EXIT"\n',
+    )
+    _write_executable(
+        fake_bin / "curl",
+        "#!/usr/bin/env bash\n"
+        "while (( $# )); do\n"
+        '  if [[ "$1" == -o ]]; then /bin/cp "$FAKE_INSTALLER" "$2"; exit 0; fi\n'
+        "  shift\n"
+        "done\n"
+        "exit 2\n",
+    )
+    _write_executable(
+        fake_bin / "sha256sum",
+        "#!/usr/bin/env bash\n/bin/cat >/dev/null\n",
+    )
+    _write_executable(
+        fake_bin / "stat",
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == -c && "$2" == %a ]]; then\n'
+        '  /usr/bin/stat -f %Lp "$3"\n'
+        "else\n"
+        '  /usr/bin/stat "$@"\n'
+        "fi\n",
+    )
+
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "ACS_PHASE_ZERO_DETACHED": "1",
+            "ACS_PHASE_ZERO_KEY_FILE": str(key_file),
+            "ACS_PHASE_ZERO_STATE_DIR": str(state_dir),
+            "FAKE_INSTALLER": str(fake_installer),
+            "FAKE_NEMOCLAW": str(fake_nemoclaw),
+            "FAKE_OPENSHELL": str(fake_openshell),
+            "FAKE_SESSION": str(fake_session),
+            "HOME": str(home),
+            "INSTALLER_EXIT": str(installer_exit),
+            "INSTALL_NEMOCLAW": "1" if install_nemoclaw else "0",
+            "OPENSHELL_LOG": str(openshell_log),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "RESUME_LOG": str(resume_log),
+            "RESUME_EXIT": str(resume_exit),
+            "SYMLINK_SESSION": "1" if symlink_session else "0",
+        }
+    )
+    completed = subprocess.run(
+        ["bash", str(SCRIPT)],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed, state_dir, resume_log
+
+
 def test_phase_zero_setup_is_pinned_and_removes_transport_key_before_install():
     completed = subprocess.run(
         ["bash", "-n", str(SCRIPT)],
@@ -66,6 +198,82 @@ def test_phase_zero_setup_detaches_before_reading_the_key(tmp_path):
     assert "new-session -d -s acs-phase-zero-install" in commands
     assert "send-keys -t acs-phase-zero-install" in commands
     assert "NemoClaw installation started" in completed.stdout
+
+
+def test_phase_zero_resumes_one_interrupted_provider_selection_failure(tmp_path):
+    completed, state_dir, resume_log = _run_detached_phase_zero(tmp_path)
+    key_file = (
+        tmp_path / "home" / ".config" / "acs-phase-zero" / "NVIDIA_INFERENCE_API_KEY"
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert not key_file.exists()
+    assert "nvapi-test-secret" not in completed.stdout
+    assert "nvapi-test-secret" not in completed.stderr
+    assert (state_dir / "install.first.exit").read_text() == "1\n"
+    assert (state_dir / "install.resume.exit").read_text() == "0\n"
+    assert (state_dir / "install.exit").read_text() == "0\n"
+    assert stat.S_IMODE((state_dir / "install.first.exit").stat().st_mode) == 0o600
+    assert stat.S_IMODE((state_dir / "install.resume.exit").stat().st_mode) == 0o600
+    assert resume_log.read_text() == (
+        "onboard --resume --non-interactive --yes --yes-i-accept-third-party-software\n"
+    )
+
+
+def test_phase_zero_preserves_the_single_resume_failure_as_final_status(tmp_path):
+    completed, state_dir, resume_log = _run_detached_phase_zero(
+        tmp_path,
+        resume_exit=17,
+    )
+    key_file = (
+        tmp_path / "home" / ".config" / "acs-phase-zero" / "NVIDIA_INFERENCE_API_KEY"
+    )
+
+    assert completed.returncode == 17
+    assert not key_file.exists()
+    assert "nvapi-test-secret" not in completed.stdout
+    assert "nvapi-test-secret" not in completed.stderr
+    assert (state_dir / "install.first.exit").read_text() == "1\n"
+    assert (state_dir / "install.resume.exit").read_text() == "17\n"
+    assert (state_dir / "install.exit").read_text() == "17\n"
+    assert resume_log.read_text().count("onboard --resume") == 1
+
+
+def test_phase_zero_does_not_resume_a_nonstandard_installer_failure(tmp_path):
+    completed, state_dir, resume_log = _run_detached_phase_zero(
+        tmp_path,
+        installer_exit=2,
+    )
+
+    assert completed.returncode == 2
+    assert (state_dir / "install.first.exit").read_text() == "2\n"
+    assert not (state_dir / "install.resume.exit").exists()
+    assert (state_dir / "install.exit").read_text() == "2\n"
+    assert not resume_log.exists()
+
+
+def test_phase_zero_does_not_resume_an_unsafe_or_unrelated_failure(tmp_path):
+    for case, options in (
+        ("unsafe-session", {"symlink_session": True}),
+        ("wrong-step", {"failure_step": "gateway"}),
+        ("not-interrupted", {"interrupted": False}),
+        ("not-resumable", {"resumable": False}),
+        ("non-object-session", {"session_is_object": False}),
+        ("missing-cli", {"install_nemoclaw": False}),
+    ):
+        case_dir = tmp_path / case
+        case_dir.mkdir()
+        completed, state_dir, resume_log = _run_detached_phase_zero(
+            case_dir,
+            **options,
+        )
+
+        assert completed.returncode == 1, case
+        assert (state_dir / "install.first.exit").read_text() == "1\n", case
+        assert not (state_dir / "install.resume.exit").exists(), case
+        assert (state_dir / "install.exit").read_text() == "1\n", case
+        assert not resume_log.exists(), case
+        assert completed.stderr == "", case
 
 
 def test_pytorch_policy_is_narrow_and_read_only():

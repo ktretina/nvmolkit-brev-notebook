@@ -21,13 +21,58 @@ umask 077
 readonly key_file="${ACS_PHASE_ZERO_KEY_FILE:-${HOME}/.config/acs-phase-zero/NVIDIA_INFERENCE_API_KEY}"
 readonly state_dir="${ACS_PHASE_ZERO_STATE_DIR:-${HOME}/.local/state/acs-phase-zero}"
 readonly status_file="${state_dir}/install.exit"
+readonly first_status_file="${state_dir}/install.first.exit"
+readonly resume_status_file="${state_dir}/install.resume.exit"
 readonly install_ref="0d1cb93888c817daec44b2cc996afa75eebcbd46"
 readonly installer_sha="b52f053a550fab90ab1dff4ab7f3a0b55b2506aeafd2062832e65632fdbcae70"
 readonly install_url="https://raw.githubusercontent.com/NVIDIA/NemoClaw/${install_ref}/install.sh"
 installer=""
 
 mkdir -p -- "${state_dir}"
-rm -f -- "${status_file}"
+rm -f -- "${status_file}" "${first_status_file}" "${resume_status_file}"
+
+record_status() {
+  local path="$1"
+  local exit_code="$2"
+  rm -f -- "${path}"
+  printf '%s\n' "${exit_code}" > "${path}"
+  chmod 600 "${path}"
+}
+
+is_interrupted_provider_selection() {
+  local session_file="${HOME}/.nemoclaw/onboard-session.json"
+  [[ -f "${session_file}" && ! -L "${session_file}" && -O "${session_file}" ]] || return 1
+  python3 - "${session_file}" <<'PY'
+import json
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+try:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, encoding="utf-8") as stream:
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise ValueError("unsafe session file")
+        session = json.load(stream)
+except (OSError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+if not isinstance(session, dict):
+    raise SystemExit(1)
+failure = session.get("failure")
+if not isinstance(failure, dict):
+    raise SystemExit(1)
+if not (
+    session.get("status") == "failed"
+    and session.get("resumable") is True
+    and failure.get("step") == "provider_selection"
+    and failure.get("interrupted") is True
+):
+    raise SystemExit(1)
+PY
+}
 
 cleanup() {
   local exit_code=$?
@@ -36,7 +81,7 @@ cleanup() {
     rm -f -- "${installer}"
   fi
   unset NVIDIA_INFERENCE_API_KEY || true
-  printf '%s\n' "${exit_code}" > "${status_file}"
+  record_status "${status_file}" "${exit_code}"
 }
 trap cleanup EXIT
 
@@ -74,4 +119,27 @@ export NEMOCLAW_WEB_SEARCH_PROVIDER=none
 export NEMOCLAW_SANDBOX_GPU=1
 export NEMOCLAW_DASHBOARD_PORT=18789
 
-bash "${installer}"
+if bash "${installer}"; then
+  install_exit=0
+else
+  install_exit=$?
+fi
+record_status "${first_status_file}" "${install_exit}"
+
+final_exit="${install_exit}"
+if [[ "${install_exit}" == 1 \
+  && -x "${HOME}/.local/bin/nemoclaw" ]] \
+  && is_interrupted_provider_selection; then
+  export PATH="${HOME}/.local/bin:${PATH}"
+  if NEMOCLAW_ONBOARD_VALIDATION_TIMEOUT_SECONDS=60 \
+    nemoclaw onboard --resume --non-interactive --yes \
+      --yes-i-accept-third-party-software; then
+    resume_exit=0
+  else
+    resume_exit=$?
+  fi
+  record_status "${resume_status_file}" "${resume_exit}"
+  final_exit="${resume_exit}"
+fi
+
+exit "${final_exit}"
