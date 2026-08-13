@@ -249,6 +249,25 @@ def test_setup_creates_the_exact_atomic_read_only_manifest_before_quiet_help() -
     assert source.index("chmod 0444 -- \\\n") < help_smoke
 
 
+def test_setup_clears_inherited_state_directory_special_bits_before_use() -> None:
+    source = _source()
+    state_create = source.index('mkdir -m 700 -- "${workspace}/.acs-workshop-state"')
+    clear_setgid = source.index(
+        'exec -- chmod g-s -- "${workspace}/.acs-workshop-state"', state_create
+    )
+    normalize_mode = source.index(
+        'exec -- chmod 0700 -- "${workspace}/.acs-workshop-state"', clear_setgid
+    )
+    verify_mode = source.index(
+        'test "$(stat -c "%a" '
+        '/sandbox/.openclaw/workspace/.acs-workshop-state)" = "700"',
+        normalize_mode,
+    )
+    manifest_create = source.index('ACS_EXPECTED_RUNNER_SHA="${expected_runner_sha}"')
+
+    assert state_create < clear_setgid < normalize_mode < verify_mode < manifest_create
+
+
 def test_setup_runs_full_workflow_smoke_after_manifest_before_services() -> None:
     source = _source()
     manifest = source.index("os.chmod(manifest, 0o444)")
@@ -304,7 +323,9 @@ def test_setup_keeps_private_full_smoke_diagnostics() -> None:
     )
     artifact_sentinel = source.index("ACS_ARTIFACT_SENTINEL_CONTENT=", safe_failure)
 
-    assert log_creation < smoke_command < log_redirect < safe_failure < artifact_sentinel
+    assert (
+        log_creation < smoke_command < log_redirect < safe_failure < artifact_sentinel
+    )
     assert "NVIDIA_INFERENCE_API_KEY" not in source[smoke_command:log_redirect]
 
 

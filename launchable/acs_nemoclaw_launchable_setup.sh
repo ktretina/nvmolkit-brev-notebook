@@ -422,6 +422,13 @@ phase "Prepare workshop files"
 
 "${nemoclaw}" "${sandbox_name}" exec -- mkdir -m 700 -- "${workspace}/.acs-workshop-state" \
   >/dev/null 2>&1
+"${nemoclaw}" "${sandbox_name}" exec -- chmod g-s -- "${workspace}/.acs-workshop-state" \
+  >/dev/null 2>&1
+"${nemoclaw}" "${sandbox_name}" exec -- chmod 0700 -- "${workspace}/.acs-workshop-state" \
+  >/dev/null 2>&1
+"${nemoclaw}" "${sandbox_name}" exec -- bash -c \
+  'test "$(stat -c "%a" /sandbox/.openclaw/workspace/.acs-workshop-state)" = "700"' \
+  >/dev/null 2>&1
 "${nemoclaw}" "${sandbox_name}" exec -- env \
   ACS_EXPECTED_RUNNER_SHA="${expected_runner_sha}" \
   ACS_EXPECTED_OBJECTIVE_SHA="${expected_objective_sha}" \
