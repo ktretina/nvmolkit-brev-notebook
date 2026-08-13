@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -102,6 +103,8 @@ def test_page_has_the_short_attendee_order_and_current_links() -> None:
         "https://build.nvidia.com/settings/api-keys",
         "https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b?nim=hosted",
         "https://github.com/ktretina/nvmolkit-brev-notebook",
+        "https://github.com/NVIDIA-BioNeMo/bionemo-agent-toolkit",
+        "https://github.com/NVIDIA-BioNeMo/nvMolKit",
         "https://brev.nvidia.com/launchable/deploy/now?launchableID="
         "env-3HJtJW3qHg4Dw1I3xt75BfpBmZW",
         "https://brev.nvidia.com/launchable/deploy/now?launchableID="
@@ -112,6 +115,73 @@ def test_page_has_the_short_attendee_order_and_current_links() -> None:
         "https://docs.nvidia.com/brev/concepts/gpu-instances",
     ):
         assert url in source
+
+
+def test_agentic_ai_sandbox_and_chemistry_roles_are_clear() -> None:
+    source = _source()
+    intro = " ".join(source[: source.index("## Before the workshop")].split())
+    required_lab = " ".join(
+        source[
+            source.index("**Required hands-on lab:**") : source.index(
+                "As of August 11, 2026"
+            )
+        ].split()
+    )
+    official_links = source[source.index("## Official links") :]
+
+    assert "bounded agentic AI workflow for chemistry" in intro
+    assert "follows the pattern presented by the" in intro
+    assert (
+        "[NVIDIA BioNeMo Agent Toolkit](https://github.com/NVIDIA-BioNeMo/"
+        "bionemo-agent-toolkit)" in intro
+    )
+    assert (
+        "a model plans and reasons, approved tools execute the work, and validation "
+        "keeps the results grounded" in intro
+    )
+    assert (
+        "hosted NVIDIA Nemotron reasons about chemistry questions, and OpenClaw "
+        "coordinates approved tools inside an OpenShell sandbox" in intro
+    )
+    assert "components from" not in intro
+
+    for role in (
+        "GPU Morgan fingerprints",
+        "Tanimoto similarity",
+        "ETKDG conformer generation",
+        "MMFF94 optimization",
+        "CPU Butina clustering",
+    ):
+        assert role in intro
+
+    assert "sandboxed conversational workspace" in required_lab
+    assert "configured agentic chemistry analyses" in required_lab
+    assert "four preset prompts below are tested starting points" in required_lab
+    assert (
+        "change the questions and the requested interpretation about these analyses"
+        in required_lab
+    )
+    assert "approved tools, fixed data, and configured" in required_lab
+    assert "https://github.com/NVIDIA-BioNeMo/nvMolKit" in required_lab
+    assert "directions that interest you" not in required_lab
+
+    assert "https://github.com/NVIDIA-BioNeMo/bionemo-agent-toolkit" in official_links
+    assert "https://github.com/NVIDIA-BioNeMo/nvMolKit" in official_links
+
+
+def test_marked_prompt_blocks_are_byte_locked() -> None:
+    expected_hashes = {
+        "01-data-and-representation": "ccea479eb0762db9adb25f7fcc3e4a60758400f55646714ec8489ad2d474e482",
+        "02-relationships-and-groups": "048c34ac064ee30dce7df1be1ec37a9e6ebc002d552cf21bef67401325e40ee4",
+        "03-sampled-3d-geometry": "357706bafd1eb73e852bc72da419c37dd0f1a5f6d234edf12e24df104ad2e724",
+        "04-objective": "00b83de39a40a93344749b1a379537285f7b502fb38050cb7824cac774727f75",
+    }
+
+    blocks = _prompt_blocks(_source())
+    assert {
+        prompt_id: hashlib.sha256(block.encode("utf-8")).hexdigest()
+        for prompt_id, block in blocks.items()
+    } == expected_hashes
 
 
 def test_prework_is_one_account_secret_safe_and_cost_aware() -> None:

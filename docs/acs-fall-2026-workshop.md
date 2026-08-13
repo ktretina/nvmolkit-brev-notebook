@@ -1,8 +1,16 @@
 # ACS Fall 2026 GPU chemistry workshop
 
-Use one conversational workspace to answer four bounded chemistry questions with
-OpenClaw, hosted NVIDIA Nemotron, nvMolKit, and one NVIDIA L4. No local coding
-setup is required.
+This workshop demonstrates a bounded agentic AI workflow for chemistry. It
+follows the pattern presented by the
+[NVIDIA BioNeMo Agent Toolkit](https://github.com/NVIDIA-BioNeMo/bionemo-agent-toolkit):
+a model plans and reasons, approved tools execute the work, and validation keeps
+the results grounded. Here, hosted NVIDIA Nemotron reasons about chemistry
+questions, and OpenClaw coordinates approved tools inside an OpenShell sandbox.
+
+The [nvMolKit library](https://github.com/NVIDIA-BioNeMo/nvMolKit) runs GPU
+Morgan fingerprints, Tanimoto similarity, ETKDG conformer generation, and
+MMFF94 optimization on one NVIDIA L4. RDKit supports input handling,
+visualization, and CPU Butina clustering. No local coding setup is required.
 
 ## Before the workshop
 
@@ -36,8 +44,12 @@ It presents the fixed analysis in notebook form. It is not required for the hand
 
 **Required hands-on lab:**
 [open the conversational OpenClaw Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Hlp4pHBlTTlfDxfH41KkGhTeCV).
-It is designed to let Nemotron use a fixed runner while nvMolKit performs the
-chemistry work on the L4.
+Use this sandboxed conversational workspace to explore the configured agentic
+chemistry analyses. The four preset prompts below are tested starting points.
+You can change the questions and the requested interpretation about these
+analyses, while the sandbox keeps execution within the approved tools, fixed
+data, and configured
+[nvMolKit](https://github.com/NVIDIA-BioNeMo/nvMolKit) capabilities.
 
 As of August 11, 2026, public HTTP checks confirmed that both links load a Brev
 web application. These public HTTP checks do not prove signed-in deployability
@@ -49,11 +61,14 @@ or a successful fresh setup. This page makes no live-readiness or timing claim.
    x86-64, 4 CPUs, 16 GiB RAM, and 128 GiB disk. The row does not need to show `g6.xlarge`.
 2. Enter the API key in `NVIDIA_INFERENCE_API_KEY`, then deploy.
 3. Wait until setup is ready. Open **Open Chemistry Agent** and create one new session.
-4. Paste the four prompts below in order into that same session. Wait for each
-   answer before sending the next prompt.
+4. For the tested workshop path, paste the four prompts below unchanged and in
+   order into that same session. Wait for each answer before sending the next
+   prompt.
 
-The installed `nvmolkit-usage` skill remains available after the bounded
-exercise for optional exploration. The required prompts do not read it.
+The installed `nvmolkit-usage` skill remains available for optional exploration
+after the tested exercise. It describes the supported
+[nvMolKit](https://github.com/NVIDIA-BioNeMo/nvMolKit) functions in this
+environment. The four tested prompts do not read it.
 
 If an LLM request times out, start a new session and retry the whole prompt
 once. Do not retry individual commands. After a second timeout, ask the
@@ -214,6 +229,8 @@ efficacy, safety, synthetic feasibility, or clinical value.
 ## Official links
 
 - [Workshop repository](https://github.com/ktretina/nvmolkit-brev-notebook)
+- [NVIDIA BioNeMo Agent Toolkit](https://github.com/NVIDIA-BioNeMo/bionemo-agent-toolkit)
+- [NVIDIA nvMolKit library](https://github.com/NVIDIA-BioNeMo/nvMolKit)
 - [NVIDIA Brev quickstart](https://docs.nvidia.com/brev/getting-started/quickstart)
 - [Official NVIDIA account and API-key instructions](https://docs.nvidia.com/ai-workbench/user-guide/latest/how-to/integrations/nvidia-integrations.html)
 - [Brev stop, storage, and deletion guidance](https://docs.nvidia.com/brev/concepts/gpu-instances)
