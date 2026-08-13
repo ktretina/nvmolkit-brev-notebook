@@ -950,6 +950,176 @@ def test_run_lesson_executes_one_terminal_prefix_and_returns_closed_compact_item
     assert (workshop_paths.output_root / "04-clusters").is_dir()
 
 
+def test_run_lessons_build_complete_archive_and_objective_state_in_order(
+    workshop_paths: runner.WorkshopPaths,
+    fake_workshop_gpu: np.ndarray,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del fake_workshop_gpu
+    runner.run_lesson("data-and-representation", paths=workshop_paths)
+
+    result = runner.run_lesson("relationships-and-groups", paths=workshop_paths)
+
+    assert result["status"] == "complete"
+    monkeypatch.setattr(
+        runner,
+        "build_objective_context",
+        lambda _state: target_achieved_context(),
+    )
+    result = runner.run_lesson("sampled-3d-geometry", paths=workshop_paths)
+
+    assert result["status"] == "complete"
+    with zipfile.ZipFile(workshop_paths.output_root / "results.zip") as archive:
+        members = set(archive.namelist())
+    assert {
+        f"{runner.STAGE_DIRECTORIES[stage_name]}/summary.json"
+        for stage_name in runner.STAGE_ORDER
+    } <= members
+    pending = runner.objective_start(paths=workshop_paths)
+    assert pending["status"] == "pending"
+    assert pending["terminal"] is False
+    assert workshop_paths.context_path.is_file()
+    assert workshop_paths.history_path.is_file()
+
+
+def test_run_lesson_rejects_current_stage_mutation_before_zip_build(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execute = lambda stage: workflow_executions[stage]  # noqa: E731
+    runner.run_lesson(
+        "data-and-representation",
+        paths=workshop_paths,
+        workflow_executor=execute,
+    )
+    archive_path = workshop_paths.output_root / "results.zip"
+    archive_before = archive_path.read_bytes()
+    target = workshop_paths.output_root / "03-similarity/similarity_heatmap.png"
+    real_rebuild = runner._rebuild_results_zip
+    mutated = b""
+
+    def mutate_then_rebuild(*args, **kwargs):
+        nonlocal mutated
+        Image.new("RGB", (8, 8), color="red").save(target, format="PNG")
+        mutated = target.read_bytes()
+        return real_rebuild(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_rebuild_results_zip", mutate_then_rebuild)
+    with pytest.raises(RuntimeError, match=r"^Workshop stage artifacts are invalid\.$"):
+        runner.run_lesson(
+            "relationships-and-groups",
+            paths=workshop_paths,
+            workflow_executor=execute,
+        )
+
+    assert target.read_bytes() == mutated
+    assert archive_path.read_bytes() == archive_before
+
+
+def test_run_lesson_rejects_missing_current_stage_before_zip_build(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execute = lambda stage: workflow_executions[stage]  # noqa: E731
+    runner.run_lesson(
+        "data-and-representation",
+        paths=workshop_paths,
+        workflow_executor=execute,
+    )
+    archive_path = workshop_paths.output_root / "results.zip"
+    archive_before = archive_path.read_bytes()
+    target = workshop_paths.output_root / "03-similarity"
+    real_rebuild = runner._rebuild_results_zip
+
+    def delete_then_rebuild(*args, **kwargs):
+        for child in target.iterdir():
+            child.unlink()
+        target.rmdir()
+        return real_rebuild(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_rebuild_results_zip", delete_then_rebuild)
+    with pytest.raises(RuntimeError, match=r"^Workshop stage artifacts are invalid\.$"):
+        runner.run_lesson(
+            "relationships-and-groups",
+            paths=workshop_paths,
+            workflow_executor=execute,
+        )
+
+    assert not target.exists()
+    assert archive_path.read_bytes() == archive_before
+
+
+def test_run_lesson_rejects_mutation_before_initial_public_stage_binding(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_directory = workshop_paths.output_root / "03-similarity"
+    target_image = target_directory / "similarity_heatmap.png"
+    real_replace = runner.os.replace
+    mutated = b""
+
+    def mutate_then_replace(source: object, destination: object) -> None:
+        nonlocal mutated
+        if Path(destination) == target_directory:
+            private_image = Path(source) / target_image.name
+            Image.new("RGB", (8, 8), color="red").save(private_image, format="PNG")
+            mutated = private_image.read_bytes()
+        real_replace(source, destination)
+
+    monkeypatch.setattr(runner.os, "replace", mutate_then_replace)
+    with pytest.raises(RuntimeError, match=r"^Workshop stage artifacts are invalid\.$"):
+        runner.run_lesson(
+            "relationships-and-groups",
+            paths=workshop_paths,
+            workflow_executor=lambda stage: workflow_executions[stage],
+        )
+
+    assert target_image.read_bytes() == mutated
+    assert not (workshop_paths.output_root / "results.zip").exists()
+
+
+def test_results_zip_uses_trusted_snapshot_after_public_stage_comparison(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = workshop_paths.output_root / "03-similarity/similarity_heatmap.png"
+    member_name = "03-similarity/similarity_heatmap.png"
+    real_read = runner._read_regular_file
+    public_reads = 0
+    trusted = b""
+    mutated = b""
+
+    def read_then_mutate(path: Path) -> bytes:
+        nonlocal public_reads, trusted, mutated
+        contents = real_read(path)
+        if path == target:
+            public_reads += 1
+            if public_reads == 1:
+                trusted = contents
+                Image.new("RGB", (8, 8), color="red").save(target, format="PNG")
+                mutated = target.read_bytes()
+        return contents
+
+    monkeypatch.setattr(runner, "_read_regular_file", read_then_mutate)
+    result = runner.run_lesson(
+        "relationships-and-groups",
+        paths=workshop_paths,
+        workflow_executor=lambda stage: workflow_executions[stage],
+    )
+
+    assert result["status"] == "complete"
+    with zipfile.ZipFile(workshop_paths.output_root / "results.zip") as archive:
+        archived = archive.read(member_name)
+    assert public_reads == 1
+    assert archived == trusted
+    assert target.read_bytes() == mutated
+    assert archived != mutated
+
+
 def test_run_lesson_failure_does_not_publish_a_partial_fixed_stage(
     workshop_paths: runner.WorkshopPaths,
     workflow_executions: dict[str, runner.WorkflowExecution],

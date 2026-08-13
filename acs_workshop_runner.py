@@ -1337,12 +1337,45 @@ def _stage_directories_match(
             raise RuntimeError("Workshop stage artifacts are invalid.")
 
 
+def _stage_directory_snapshot(stage_name: str, directory: Path) -> dict[str, bytes]:
+    names = _stage_artifact_names(stage_name, STAGE_SPECS[stage_name])
+    try:
+        mode = os.lstat(directory).st_mode
+        observed_names = {entry.name for entry in directory.iterdir()}
+    except OSError as error:
+        raise RuntimeError("Workshop stage artifacts are invalid.") from error
+    if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode) or observed_names != set(names):
+        raise RuntimeError("Workshop stage artifacts are invalid.")
+    return {
+        name: _read_regular_file(_regular_stage_file(directory, name)) for name in names
+    }
+
+
+def _stage_snapshot_digest(stage_name: str, snapshot: dict[str, bytes]) -> str:
+    names = _stage_artifact_names(stage_name, STAGE_SPECS[stage_name])
+    if set(snapshot) != set(names):
+        raise RuntimeError("Workshop stage artifacts are invalid.")
+    digest = hashlib.sha256()
+    for name in names:
+        encoded_name = name.encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(4, "big"))
+        digest.update(encoded_name)
+        digest.update(hashlib.sha256(snapshot[name]).digest())
+    return digest.hexdigest()
+
+
+def _stage_directory_digest(stage_name: str, directory: Path) -> str:
+    return _stage_snapshot_digest(
+        stage_name, _stage_directory_snapshot(stage_name, directory)
+    )
+
+
 def _publish_stage(
     stage_name: str,
     execution: WorkflowExecution,
     *,
     paths: WorkshopPaths,
-) -> tuple[dict[str, Any], Path, StageSpec]:
+) -> tuple[dict[str, Any], Path, StageSpec, str]:
     summary_payload, readme_text, stage_spec, data_exports = _stage_publication(
         stage_name, execution, paths=paths
     )
@@ -1367,6 +1400,7 @@ def _publish_stage(
             expected_summary=summary_payload,
             expected_readme=readme_text,
         )
+        expected_digest = _stage_directory_digest(stage_name, temporary_directory)
         try:
             os.lstat(stage_directory)
         except FileNotFoundError:
@@ -1385,7 +1419,7 @@ def _publish_stage(
     finally:
         if temporary_directory is not None:
             _remove_task_owned_stage_directory(temporary_directory, output_root)
-    return summary_payload, stage_directory, stage_spec
+    return summary_payload, stage_directory, stage_spec, expected_digest
 
 
 def run_stage(
@@ -1401,7 +1435,7 @@ def run_stage(
         execution = execute_workflow_prefix(stage_name, paths=paths)
     else:
         execution = workflow_executor(stage_name)
-    stage_summary_payload, stage_directory, stage_spec = _publish_stage(
+    stage_summary_payload, stage_directory, stage_spec, _ = _publish_stage(
         stage_name,
         execution,
         paths=paths,
@@ -2059,15 +2093,21 @@ def _zip_member(archive: zipfile.ZipFile, name: str, contents: bytes) -> None:
 
 
 def _build_results_zip_candidate(
-    paths: WorkshopPaths, execution: WorkflowExecution
+    paths: WorkshopPaths,
+    execution: WorkflowExecution,
+    *,
+    validated_stage_digests: dict[str, str] | None = None,
 ) -> Path:
     output_root = _safe_output_root(paths)
-    present: list[tuple[str, Path]] = []
+    expected_digests = validated_stage_digests or {}
+    present: list[tuple[str, dict[str, bytes]]] = []
     for stage_name in STAGE_ORDER:
         directory = output_root / STAGE_DIRECTORIES[stage_name]
         try:
             os.lstat(directory)
         except FileNotFoundError:
+            if stage_name in expected_digests:
+                raise RuntimeError("Workshop stage artifacts are invalid.")
             continue
         except OSError as error:
             raise RuntimeError("Workshop stage artifacts are invalid.") from error
@@ -2075,10 +2115,16 @@ def _build_results_zip_candidate(
             stage_execution = _prefix_execution_for_stage(stage_name, execution)
         except RuntimeError:
             continue
-        _, validated_directory, _ = _publish_stage(
-            stage_name, stage_execution, paths=paths
-        )
-        present.append((stage_name, validated_directory))
+        if stage_name in expected_digests:
+            expected_digest = expected_digests[stage_name]
+        else:
+            _, directory, _, expected_digest = _publish_stage(
+                stage_name, stage_execution, paths=paths
+            )
+        snapshot = _stage_directory_snapshot(stage_name, directory)
+        if _stage_snapshot_digest(stage_name, snapshot) != expected_digest:
+            raise RuntimeError("Workshop stage artifacts are invalid.")
+        present.append((stage_name, snapshot))
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".acs-results-", suffix=".zip", dir=output_root
     )
@@ -2100,14 +2146,14 @@ def _build_results_zip_candidate(
                 _zip_member(
                     archive, source_name, (paths.root / source_name).read_bytes()
                 )
-            for stage_name, directory in present:
+            for stage_name, snapshot in present:
                 for artifact_name in _stage_artifact_names(
                     stage_name, STAGE_SPECS[stage_name]
                 ):
                     _zip_member(
                         archive,
                         f"{STAGE_DIRECTORIES[stage_name]}/{artifact_name}",
-                        _read_regular_file(directory / artifact_name),
+                        snapshot[artifact_name],
                     )
     except Exception:
         try:
@@ -2119,9 +2165,18 @@ def _build_results_zip_candidate(
     return temporary_path
 
 
-def _rebuild_results_zip(paths: WorkshopPaths, execution: WorkflowExecution) -> Path:
+def _rebuild_results_zip(
+    paths: WorkshopPaths,
+    execution: WorkflowExecution,
+    *,
+    validated_stage_digests: dict[str, str] | None = None,
+) -> Path:
     output_root = _safe_output_root(paths)
-    temporary_path = _build_results_zip_candidate(paths, execution)
+    temporary_path = _build_results_zip_candidate(
+        paths,
+        execution,
+        validated_stage_digests=validated_stage_digests,
+    )
     archive_path = output_root / "results.zip"
     try:
         os.replace(temporary_path, archive_path)
@@ -2514,19 +2569,25 @@ def run_lesson(
     else:
         execution = workflow_executor(terminal_stage)
     completed_stages: list[dict[str, Any]] = []
+    validated_stage_digests: dict[str, str] = {}
     for stage_name in lesson_stages:
         stage_execution = _lesson_execution_for_stage(
             stage_name, execution, lesson_stages
         )
-        summary, directory, stage_spec = _publish_stage(
+        summary, directory, stage_spec, expected_digest = _publish_stage(
             stage_name, stage_execution, paths=paths
         )
         completed_stages.append(
             _compact_stage_item(stage_name, summary, directory, stage_spec)
         )
+        validated_stage_digests[stage_name] = expected_digest
     if lesson == "sampled-3d-geometry":
         output_root = _safe_output_root(paths)
-        temporary_archive = _build_results_zip_candidate(paths, execution)
+        temporary_archive = _build_results_zip_candidate(
+            paths,
+            execution,
+            validated_stage_digests=validated_stage_digests,
+        )
         try:
             _initialize_objective_state(paths, execution, temporary_archive)
             _, _, _, _, objective_run, _ = _load_objective_state(paths)
@@ -2545,7 +2606,11 @@ def run_lesson(
         if objective_run is not None:
             _publish_objective(paths, objective_run)
     else:
-        archive_path = _rebuild_results_zip(paths, execution)
+        archive_path = _rebuild_results_zip(
+            paths,
+            execution,
+            validated_stage_digests=validated_stage_digests,
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "complete",
