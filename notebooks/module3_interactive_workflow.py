@@ -12,7 +12,7 @@ from IPython.display import display as ipython_display
 from workshop_llm_agent import PanelAgentRun, PanelDesignAgent, PanelPlan
 
 
-MODULE3_WORKFLOW_VERSION = "2026.08.18.1"
+MODULE3_WORKFLOW_VERSION = "2026.08.18.2"
 
 
 def _safe_text(value: Any, limit: int = 6000) -> str:
@@ -71,7 +71,10 @@ class InteractivePanelDesignWorkflow:
         self.approve_button.disabled = True
 
         self._cards = widgets.VBox()
-        self.root = widgets.VBox((self.start_button, self._cards))
+        self.result_output = widgets.Output(
+            layout=widgets.Layout(border="1px solid #b8b8b8", padding="8px")
+        )
+        self.root = widgets.VBox((self.start_button, self._cards, self.result_output))
 
     def display(self) -> widgets.VBox:
         ipython_display(self.root)
@@ -200,18 +203,19 @@ class InteractivePanelDesignWorkflow:
             if self.agent_run.success and not self._completion_callback_called:
                 self._completion_callback_called = True
                 if self._on_complete is not None:
-                    try:
-                        self._on_complete(self.agent_run)
-                    except Exception as error:
-                        message = _safe_text(f"{type(error).__name__}: {error}")
-                        self._line(f"Completion display failed: {message}")
-                        self._append(
-                            self._html_card(
-                                "Completion display failed",
-                                "<p>The validated scientific result is unchanged.</p>"
-                                f"<pre>{escape(message)}</pre>",
+                    with self.result_output:
+                        try:
+                            self._on_complete(self.agent_run)
+                        except Exception as error:
+                            message = _safe_text(f"{type(error).__name__}: {error}")
+                            self._line(f"Completion display failed: {message}")
+                            self._append(
+                                self._html_card(
+                                    "Completion display failed",
+                                    "<p>The validated scientific result is unchanged.</p>"
+                                    f"<pre>{escape(message)}</pre>",
+                                )
                             )
-                        )
         except Exception as error:
             self.status = "failed"
             self._error_card("Agent run stopped safely", error)
@@ -301,6 +305,7 @@ class InteractivePanelDesignWorkflow:
             )
         elif event == "audit_completed":
             audit = payload["audit"]
+            self._line("Analysis validated; audit complete")
             body = (
                 f"<p><b>Assessment:</b> {escape(audit['result_assessment'])}</p>"
                 f"<p><b>Important observation:</b> {escape(audit['surprising_result'])}</p>"
@@ -309,6 +314,7 @@ class InteractivePanelDesignWorkflow:
             )
             self._append(self._html_card("Audit complete", body))
         elif event == "audit_failed":
+            self._line("Analysis validated; audit unavailable")
             self._append(
                 self._html_card(
                     "Optional audit unavailable",
@@ -318,6 +324,11 @@ class InteractivePanelDesignWorkflow:
 
     def _show_final_result(self, run: PanelAgentRun) -> None:
         if run.success:
+            status = (
+                "Analysis validated; audit complete"
+                if run.audit is not None
+                else "Analysis validated; audit unavailable"
+            )
             body = (
                 "<p><b>Success:</b> the rendered analysis produced artifacts that passed "
                 "independent validation.</p>"
@@ -327,7 +338,8 @@ class InteractivePanelDesignWorkflow:
                 f"<li>Trace: <code>{escape(str(run.trace_path))}</code></li></ul>"
                 "<p>The shared completion renderer can now display these validated artifacts.</p>"
             )
-            self._append(self._html_card("Agent workflow complete", body))
+            self._line(status)
+            self._append(self._html_card(status, body))
         else:
             self._append(
                 self._html_card(

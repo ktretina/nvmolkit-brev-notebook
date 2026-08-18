@@ -8,6 +8,7 @@ import traceback
 from types import SimpleNamespace
 import ast
 
+import ipywidgets as widgets
 import pytest
 
 
@@ -74,6 +75,33 @@ def _load_workflow(agent_module):
         else:
             sys.modules["workshop_llm_agent"] = previous
     return module
+
+
+class _RecordingOutput(widgets.Output):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.enter_count = 0
+        self.rendered_errors = []
+
+    def __enter__(self):
+        self.enter_count += 1
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_value is not None:
+            self.rendered_errors.append(f"{exc_type.__name__}: {exc_value}")
+        return True
+
+
+def _widget_text(widget):
+    text = []
+    for attribute in ("description", "value"):
+        value = getattr(widget, attribute, None)
+        if isinstance(value, str):
+            text.append(value)
+    for child in getattr(widget, "children", ()):
+        text.append(_widget_text(child))
+    return "\n".join(text)
 
 
 def _write_candidate_workspace(path, *, count=96):
@@ -1115,7 +1143,93 @@ def test_panel_artifacts_reject_symlinks_wrong_counts_malformed_and_stale_files(
         )
 
 
-def test_interactive_workflow_waits_and_callback_cannot_change_success(
+@pytest.mark.parametrize(
+    ("audit_payload", "expected_status"),
+    [
+        (_panel_audit_payload(), "Analysis validated; audit complete"),
+        (None, "Analysis validated; audit unavailable"),
+    ],
+)
+def test_module3_widget_captures_callback_and_truthfully_labels_audit_state(
+    monkeypatch, tmp_path, audit_payload, expected_status
+):
+    agent = _load_agent()
+    workflow_module = _load_workflow(agent)
+    plan = agent.PanelPlan.model_validate(_panel_plan_payload())
+    audit = (
+        agent.PanelAudit.model_validate(audit_payload)
+        if audit_payload is not None
+        else None
+    )
+    run = agent.PanelAgentRun(
+        success=True,
+        approved_strategy=1,
+        attempts=(),
+        analysis_path=tmp_path / "analysis.py",
+        panel_path=tmp_path / "panel.csv",
+        report_path=tmp_path / "report.json",
+        trace_path=tmp_path / "agent_trace.json",
+        audit=audit,
+    )
+
+    class FakeAgent:
+        def __init__(self):
+            self.plan_calls = 0
+            self.run_calls = []
+
+        def request_plan(self):
+            self.plan_calls += 1
+            return plan
+
+        def run(self, **kwargs):
+            self.run_calls.append(kwargs["approved_strategy"])
+            if audit is None:
+                kwargs["progress_callback"](
+                    "audit_failed", {"message": "optional audit unavailable"}
+                )
+            else:
+                kwargs["progress_callback"](
+                    "audit_completed", {"audit": audit.model_dump()}
+                )
+            return run
+
+    fake_agent = FakeAgent()
+    callback_calls = []
+
+    monkeypatch.setattr(workflow_module.widgets, "Output", _RecordingOutput)
+    monkeypatch.setattr(workflow_module, "ipython_display", lambda value: value)
+    workflow = workflow_module.launch_interactive_panel_design(
+        fake_agent,
+        expected_panel_size=24,
+        on_complete=callback_calls.append,
+    )
+
+    assert workflow.status == "awaiting_approval"
+    assert workflow.agent_run is None
+    workflow.strategy_control.value = 1
+    workflow._approve_and_run(workflow.approve_button)
+
+    assert workflow.result_output in workflow.root.children
+    assert workflow.result_output.enter_count == 1
+    assert fake_agent.plan_calls == 1
+    assert fake_agent.run_calls == [1]
+    assert callback_calls == [run]
+    assert workflow.plan.recommended_strategy == 2
+    assert workflow.agent_run.approved_strategy == 1
+
+    visible_text = _widget_text(workflow.root)
+    assert expected_status in visible_text
+    assert expected_status in workflow.transcript_text
+    if run.audit is None:
+        assert "Agent workflow complete" not in visible_text
+
+    workflow._approve_and_run(workflow.approve_button)
+    assert fake_agent.plan_calls == 1
+    assert fake_agent.run_calls == [1]
+    assert callback_calls == [run]
+
+
+def test_module3_widget_redacts_callback_error_without_changing_success(
     monkeypatch, tmp_path
 ):
     agent = _load_agent()
@@ -1146,6 +1260,7 @@ def test_interactive_workflow_waits_and_callback_cannot_change_success(
         callback_calls.append(result)
         raise RuntimeError(f"renderer rejected {secret}")
 
+    monkeypatch.setattr(workflow_module.widgets, "Output", _RecordingOutput)
     monkeypatch.setattr(workflow_module, "ipython_display", lambda value: value)
     workflow = workflow_module.launch_interactive_panel_design(
         FakeAgent(),
@@ -1153,18 +1268,19 @@ def test_interactive_workflow_waits_and_callback_cannot_change_success(
         on_complete=failing_callback,
     )
 
-    assert workflow.status == "awaiting_approval"
-    assert workflow.agent_run is None
     workflow._approve_and_run(workflow.approve_button)
 
     assert workflow.status == "completed"
     assert workflow.agent_run is run
+    assert workflow.result_output.enter_count == 1
     assert callback_calls == [run]
+    assert workflow.result_output.rendered_errors == []
     assert secret not in workflow.transcript_text
+    assert secret not in _widget_text(workflow.root)
+    assert "renderer rejected nvapi-[hidden]" in workflow.transcript_text
+    assert "renderer rejected nvapi-[hidden]" in _widget_text(workflow.root)
     assert "Completion display failed" in workflow.transcript_text
-
-    workflow._approve_and_run(workflow.approve_button)
-    assert callback_calls == [run]
+    assert "Completion display failed" in _widget_text(workflow.root)
 
 
 def test_module3_trace_records_reference_mode(monkeypatch, tmp_path):

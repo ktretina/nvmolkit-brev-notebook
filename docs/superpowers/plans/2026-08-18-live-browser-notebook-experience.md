@@ -210,14 +210,17 @@ git commit -m "fix: clarify the neighborhood lesson"
 - Modify: `notebooks/module3_interactive_workflow.py`
 - Modify: `notebooks/03_full_agent_reframe_panel_design.ipynb` cell `m3-setup` only for the helper version lock
 - Modify: `tests/test_workshop_llm_agent.py`
+- Modify: `docs/superpowers/plans/2026-08-18-live-browser-notebook-experience.md` only for the approved review repair that keeps callback exception redaction inside the output context
 
 - [ ] **Step 1: Add failing live-output and status tests**
 
 Replace the narrow callback test with a parameterized test named
 `test_module3_widget_captures_callback_and_truthfully_labels_audit_state`.
-Use an `ipywidgets.Output` subclass that records `__enter__`, a fake plan that
-recommends strategy 2, and a fake agent that records `request_plan` and `run`
-calls. Set the radio control to strategy 1 before approval.
+Use an `ipywidgets.Output` subclass that records `__enter__`, records any
+exception received by `__exit__`, and returns `True` to emulate Jupyter
+exception suppression. Use a fake plan that recommends strategy 2 and a fake
+agent that records `request_plan` and `run` calls. Set the radio control to
+strategy 1 before approval.
 
 The core assertions are:
 
@@ -252,7 +255,9 @@ Parameter cases:
 (None, "Analysis validated; audit unavailable"),
 ```
 
-Keep the existing callback-error redaction assertion as a separate case.
+Keep the existing callback-error redaction assertion as a separate case. Assert
+that the raw exception never reaches the output context, transcript, or card,
+while the redacted failure card appears and the successful run stays unchanged.
 
 - [ ] **Step 2: Run the widget test and witness RED**
 
@@ -290,19 +295,19 @@ Run the completion renderer only inside that context:
 
 ```python
 if self._on_complete is not None:
-    try:
-        with self.result_output:
+    with self.result_output:
+        try:
             self._on_complete(self.agent_run)
-    except Exception as error:
-        message = _safe_text(f"{type(error).__name__}: {error}")
-        self._line(f"Completion display failed: {message}")
-        self._append(
-            self._html_card(
-                "Completion display failed",
-                "<p>The validated scientific result is unchanged.</p>"
-                f"<pre>{escape(message)}</pre>",
+        except Exception as error:
+            message = _safe_text(f"{type(error).__name__}: {error}")
+            self._line(f"Completion display failed: {message}")
+            self._append(
+                self._html_card(
+                    "Completion display failed",
+                    "<p>The validated scientific result is unchanged.</p>"
+                    f"<pre>{escape(message)}</pre>",
+                )
             )
-        )
 ```
 
 In `_progress`, append these transcript lines before the existing cards:
@@ -354,13 +359,14 @@ git diff --check
 git status --short
 ```
 
-Expected: only the helper, Module 3 notebook version lock, and focused test are
-modified.
+Expected: only the approved plan review repair, helper, Module 3 notebook
+version lock, and focused test are modified.
 
 Commit:
 
 ```bash
-git add notebooks/module3_interactive_workflow.py \
+git add docs/superpowers/plans/2026-08-18-live-browser-notebook-experience.md \
+  notebooks/module3_interactive_workflow.py \
   notebooks/03_full_agent_reframe_panel_design.ipynb \
   tests/test_workshop_llm_agent.py
 git commit -m "fix: capture the panel workflow result"
