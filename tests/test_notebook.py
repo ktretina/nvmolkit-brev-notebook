@@ -235,7 +235,12 @@ def test_fixed_artifacts_and_skill_provenance_are_intact():
     assert subprocess.run(
         ["git", "ls-files", "--", "*.ipynb"], cwd=REPO_ROOT, check=True,
         capture_output=True, text=True,
-    ).stdout.splitlines() == ["notebooks/nvmolkit_nemotron_demo.ipynb"]
+    ).stdout.splitlines() == [
+        "notebooks/01_direct_nvmolkit_reframe.ipynb",
+        "notebooks/02_agent_assisted_reframe_neighborhoods.ipynb",
+        "notebooks/03_full_agent_reframe_panel_design.ipynb",
+        "notebooks/nvmolkit_nemotron_demo.ipynb",
+    ]
     provenance = (REPO_ROOT / "skills" / "nvmolkit" / "PROVENANCE.md").read_text(encoding="utf-8")
     skill_bytes = (REPO_ROOT / "skills" / "nvmolkit" / "SKILL.md").read_bytes()
     assert "ce151c15470991c8cb9a0efdd531a124c346ca5b" in provenance

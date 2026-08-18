@@ -9,11 +9,17 @@ from nbconvert.preprocessors import ExecutePreprocessor
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK_DIR = REPO_ROOT / "notebooks"
-PRIMARY_NOTEBOOK_NAMES = {
+README_PATH = REPO_ROOT / "README.md"
+LAUNCHABLE_FIELDS_PATH = REPO_ROOT / "launchable" / "fields.md"
+FIXED_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
+ORDERED_NOTEBOOK_NAMES = (
     "01_direct_nvmolkit_reframe.ipynb",
     "02_agent_assisted_reframe_neighborhoods.ipynb",
     "03_full_agent_reframe_panel_design.ipynb",
     "nvmolkit_nemotron_demo.ipynb",
+)
+PRIMARY_NOTEBOOK_NAMES = {
+    *ORDERED_NOTEBOOK_NAMES,
 }
 GENERATED_DIRECTORY_NAMES = {
     ".ipynb_checkpoints",
@@ -28,6 +34,29 @@ def test_primary_notebook_inventory_is_exact():
     assert {
         path.name for path in NOTEBOOK_DIR.glob("*.ipynb")
     } == PRIMARY_NOTEBOOK_NAMES
+
+
+def test_release_docs_publish_the_four_notebook_path_and_launch_contract():
+    readme = README_PATH.read_text(encoding="utf-8")
+    fields = LAUNCHABLE_FIELDS_PATH.read_text(encoding="utf-8")
+    readme_opening = readme.split("## Four-notebook workshop path", 1)[0]
+
+    assert "four-notebook workshop" in readme_opening.lower()
+    assert "direct nvMolKit" in readme_opening
+    assert "companion demo" in readme_opening.lower()
+
+    for document in (readme, fields):
+        notebook_positions = [document.index(name) for name in ORDERED_NOTEBOOK_NAMES]
+        assert notebook_positions == sorted(notebook_positions)
+        assert "Module 1" in document
+        assert "recommended" in document.lower()
+        assert "hosted mode" in document.lower()
+        assert "reference mode" in document.lower()
+        assert FIXED_MODEL in document
+        assert "NVIDIA_API_KEY" in document
+        assert "8888" in document
+        assert "75 GiB" in document
+        assert "Only my organization" in document
 
 
 def test_primary_notebooks_are_clean_python_312_notebooks():
@@ -103,6 +132,13 @@ def test_module1_default_and_advanced_controls_are_bounded():
     assert "ADVANCED_SAMPLE_SIZE = 10_000" in source
     assert 'source="live"' in source
     assert "limit_mib=512" in source
+
+
+def test_module1_computation_summary_does_not_claim_unrun_3d_methods():
+    summary = _module1_cell_source("cell-e2551a466884")
+
+    assert "ETKDG" not in summary
+    assert "MMFF" not in summary
 
 
 def test_module1_checks_memory_immediately_before_condensed_distance_allocation():

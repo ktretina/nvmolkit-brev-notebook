@@ -60,6 +60,30 @@ VALID_ARGS = {
 }
 
 
+@pytest.fixture
+def fake_supported_runtime_imports(monkeypatch):
+    """Make preflight reach the API-key checks on a non-GPU test host."""
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+    entry_points = dict(demo_agent._NVMOLKIT_CAPABILITIES)
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "torch":
+            return SimpleNamespace(cuda=FakeCuda())
+        if name in entry_points:
+            return SimpleNamespace(**{entry_points[name]: object()})
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(sys, "implementation", SimpleNamespace(name="cpython"))
+    monkeypatch.setattr(sys, "version_info", (3, 12, 0, "final", 0))
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+
 def call(name, arguments, call_id=None, call_type="function"):
     return SimpleNamespace(
         id=call_id or f"call-{name}",
@@ -188,7 +212,7 @@ def test_notebook_preflight_reads_protected_launch_key_without_prompt(
 
 
 def test_notebook_preflight_fails_closed_when_launch_key_is_missing(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, fake_supported_runtime_imports
 ):
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
     monkeypatch.setattr(
@@ -210,7 +234,7 @@ def test_notebook_preflight_fails_closed_when_launch_key_is_missing(
 
 
 def test_notebook_preflight_rejects_launch_key_with_unsafe_permissions(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, fake_supported_runtime_imports
 ):
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
     key_path = tmp_path / "NVIDIA_API_KEY"

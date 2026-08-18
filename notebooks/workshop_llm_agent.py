@@ -9,11 +9,16 @@ from __future__ import annotations
 import ast
 import csv
 import getpass
+import hashlib
+import io
 import json
 import math
 import os
+import re
+import stat
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from collections import Counter
@@ -30,6 +35,16 @@ DEFAULT_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
 NEMOTRON_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
 WORKSHOP_AGENT_VERSION = "2026.08.18.4"
 WORKSHOP_MODE_ENV = "NVMOLKIT_WORKSHOP_MODE"
+_NVIDIA_API_KEY_PATH = Path.home() / ".config" / "nvmolkit" / "NVIDIA_API_KEY"
+_MAX_API_KEY_FILE_BYTES = 4096
+_MAX_CANDIDATE_FILE_BYTES = 1024 * 1024
+_PANEL_REPORT_LIMITATIONS = (
+    "Fingerprint diversity is representation- and parameter-dependent.",
+    "The first 24 rows are a deterministic teaching baseline, not an optimum.",
+    "Structural diversity does not establish biological activity or safety.",
+)
+_KEY_SHAPED_PATTERN = re.compile(r"nvapi-[A-Za-z0-9._~+/=-]+")
+_NAMED_KEY_PATTERN = re.compile(r"(?i)(NVIDIA_API_KEY\s*[:=]\s*)[^\s,;]+")
 _PANEL_CHILD_ENVIRONMENT_ALLOWLIST = frozenset(
     {
         "CUDA_DEVICE_ORDER",
@@ -152,10 +167,75 @@ _TOOL_DESCRIPTIONS = {
 }
 
 
+def _load_protected_workshop_api_key() -> str | None:
+    """Load the Launchable key securely, or return None when it is absent."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ValueError(
+            "The stored NVIDIA_API_KEY cannot be opened securely on this platform."
+        )
+    try:
+        descriptor = os.open(_NVIDIA_API_KEY_PATH, os.O_RDONLY | nofollow)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ValueError(
+            "The stored NVIDIA_API_KEY could not be opened securely. Redeploy "
+            "the Brev Launchable."
+        ) from None
+
+    try:
+        try:
+            file_status = os.fstat(descriptor)
+        except OSError:
+            raise ValueError(
+                "The stored NVIDIA_API_KEY could not be inspected securely. "
+                "Redeploy the Brev Launchable."
+            ) from None
+        if not stat.S_ISREG(file_status.st_mode):
+            raise ValueError("The stored NVIDIA_API_KEY must be a regular file.")
+        if file_status.st_uid != os.getuid():
+            raise ValueError("The stored NVIDIA_API_KEY must be owned by this user.")
+        if stat.S_IMODE(file_status.st_mode) != 0o600:
+            raise ValueError("The stored NVIDIA_API_KEY must have mode 0600.")
+        if file_status.st_size > _MAX_API_KEY_FILE_BYTES:
+            raise ValueError("The stored NVIDIA_API_KEY is unexpectedly large.")
+        try:
+            with os.fdopen(descriptor, "rb") as key_file:
+                descriptor = -1
+                key_bytes = key_file.read(_MAX_API_KEY_FILE_BYTES + 1)
+        except OSError:
+            raise ValueError(
+                "The stored NVIDIA_API_KEY could not be read securely. Redeploy "
+                "the Brev Launchable."
+            ) from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    if len(key_bytes) > _MAX_API_KEY_FILE_BYTES:
+        raise ValueError("The stored NVIDIA_API_KEY is unexpectedly large.")
+    try:
+        candidate = key_bytes.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        raise ValueError("The stored NVIDIA_API_KEY is not valid text.") from None
+    if not candidate:
+        raise ValueError(
+            "The saved Launchable setup script did not store NVIDIA_API_KEY. "
+            "Redeploy the Brev Launchable."
+        )
+    return candidate
+
+
 def get_workshop_api_key(api_key: str | None = None, *, prompt: bool = True) -> str:
-    """Return a hidden hosted key without imposing demo_agent's full GPU preflight."""
-    candidate = api_key if api_key is not None else os.environ.get("NVIDIA_API_KEY", "")
-    candidate = candidate.strip()
+    """Return an explicit, environment, or securely stored hosted key."""
+    if api_key is not None:
+        candidate = api_key.strip()
+    else:
+        candidate = os.environ.get("NVIDIA_API_KEY", "").strip()
+        if not candidate:
+            saved_key = _load_protected_workshop_api_key()
+            candidate = saved_key or ""
     if not candidate and prompt:
         candidate = getpass.getpass(
             "Hosted NVIDIA Developer API key (nvapi-; input hidden): "
@@ -398,6 +478,52 @@ def bind_neighborhood_builder(
     return local_namespace["build_neighborhood_atlas"]
 
 
+def _read_candidate_bytes(path: Path) -> bytes:
+    """Read one owner-bound regular candidate file without following links."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise WorkshopAgentError(
+            "The Module 3 candidate input cannot be opened securely on this platform."
+        )
+    try:
+        descriptor = os.open(path, os.O_RDONLY | nofollow)
+    except OSError:
+        raise WorkshopAgentError(
+            "The Module 3 candidate input could not be opened securely."
+        ) from None
+    try:
+        try:
+            file_status = os.fstat(descriptor)
+        except OSError:
+            raise WorkshopAgentError(
+                "The Module 3 candidate input could not be inspected securely."
+            ) from None
+        if not stat.S_ISREG(file_status.st_mode) or file_status.st_uid != os.getuid():
+            raise WorkshopAgentError(
+                "The Module 3 candidate input must be an owner-bound regular file."
+            )
+        if file_status.st_size > _MAX_CANDIDATE_FILE_BYTES:
+            raise WorkshopAgentError(
+                "The Module 3 candidate input exceeds the fixed size limit."
+            )
+        try:
+            with os.fdopen(descriptor, "rb") as handle:
+                descriptor = -1
+                content = handle.read(_MAX_CANDIDATE_FILE_BYTES + 1)
+        except OSError:
+            raise WorkshopAgentError(
+                "The Module 3 candidate input could not be read securely."
+            ) from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(content) > _MAX_CANDIDATE_FILE_BYTES:
+        raise WorkshopAgentError(
+            "The Module 3 candidate input exceeds the fixed size limit."
+        )
+    return content
+
+
 def _quantile(values: list[float], fraction: float) -> float | None:
     clean = sorted(value for value in values if math.isfinite(value))
     if not clean:
@@ -410,10 +536,14 @@ def _quantile(values: list[float], fraction: float) -> float | None:
     return clean[lower] * (upper - position) + clean[upper] * (position - lower)
 
 
-def profile_candidate_csv(path: Path) -> dict[str, Any]:
-    """Create a small deterministic profile without sending molecule rows wholesale."""
-    with path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
+def _profile_candidate_bytes(content: bytes) -> dict[str, Any]:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise WorkshopAgentError(
+            "The Module 3 candidate input is not valid UTF-8 text."
+        ) from None
+    rows = list(csv.DictReader(io.StringIO(text, newline="")))
     if not rows:
         raise WorkshopAgentError("The Module 3 candidate CSV is empty.")
     columns = list(rows[0])
@@ -441,6 +571,11 @@ def profile_candidate_csv(path: Path) -> dict[str, Any]:
         "status_counts": dict(statuses.most_common(10)),
         "descriptor_quantiles": descriptor_quantiles,
     }
+
+
+def profile_candidate_csv(path: Path) -> dict[str, Any]:
+    """Create a small deterministic profile without sending molecule rows wholesale."""
+    return _profile_candidate_bytes(_read_candidate_bytes(path))
 
 
 def minimum_pairwise_distance(similarity_matrix: Any) -> float:
@@ -548,19 +683,58 @@ def _strict_report_number(value: Any, field: str) -> float:
     return number
 
 
+def _validated_candidate_molecules(rows: list[dict[str, str]]) -> list[Any]:
+    """Parse candidate SMILES and independently verify all three descriptors."""
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import Crippen, Descriptors, rdMolDescriptors
+    except ImportError:
+        raise WorkshopAgentError(
+            "RDKit is required for independent Module 3 artifact validation."
+        ) from None
+
+    molecules = []
+    for row in rows:
+        molecule = Chem.MolFromSmiles(str(row.get("smile", "")))
+        if molecule is None:
+            raise WorkshopAgentError(
+                "Module 3 artifacts contain an invalid SMILES value."
+            )
+        expected = {
+            "MolWt": float(Descriptors.MolWt(molecule)),
+            "cLogP": float(Crippen.MolLogP(molecule)),
+            "TPSA": float(rdMolDescriptors.CalcTPSA(molecule)),
+        }
+        for column, calculated in expected.items():
+            try:
+                observed = float(row[column])
+            except (KeyError, TypeError, ValueError):
+                raise WorkshopAgentError(
+                    "Candidate descriptors must be finite numeric values."
+                ) from None
+            if not math.isfinite(observed) or not math.isclose(
+                observed,
+                calculated,
+                rel_tol=1e-9,
+                abs_tol=1e-6,
+            ):
+                raise WorkshopAgentError(
+                    "Candidate descriptors do not match independent RDKit calculation."
+                )
+        molecules.append(molecule)
+    return molecules
+
+
 def _rdkit_similarity_matrix(
-    rows: list[dict[str, str]], radius: int, fp_bits: int
+    molecules: list[Any], radius: int, fp_bits: int
 ) -> list[list[float]]:
     try:
-        from rdkit import Chem, DataStructs
+        from rdkit import DataStructs
         from rdkit.Chem import rdFingerprintGenerator
     except ImportError:
         raise WorkshopAgentError(
             "RDKit is required for independent Module 3 artifact validation."
         ) from None
-    molecules = [Chem.MolFromSmiles(str(row.get("smile", ""))) for row in rows]
-    if any(molecule is None for molecule in molecules):
-        raise WorkshopAgentError("Module 3 artifacts contain an invalid SMILES value.")
     generator = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=fp_bits)
     fingerprints = list(generator.GetFingerprints(molecules, numThreads=0))
     return [
@@ -570,6 +744,118 @@ def _rdkit_similarity_matrix(
         ]
         for query in fingerprints
     ]
+
+
+def _expected_panel_backend() -> str:
+    """Mirror the exact renderer's bounded backend availability check."""
+    try:
+        import torch
+
+        capabilities = (
+            ("nvmolkit.clustering", "fused_butina"),
+            ("nvmolkit.fingerprints", "MorganFingerprintGenerator"),
+            ("nvmolkit.similarity", "crossTanimotoSimilarity"),
+        )
+        for module_name, entry_point in capabilities:
+            module = __import__(module_name, fromlist=(entry_point,))
+            if not hasattr(module, entry_point):
+                raise ImportError
+        if bool(torch.cuda.is_available()):
+            return "nvmolkit-gpu"
+    except (ImportError, RuntimeError):
+        pass
+    return "rdkit-cpu-reference (not GPU evidence)"
+
+
+def _descriptor_quantiles(rows: list[dict[str, str]]) -> dict[str, Any]:
+    return {
+        column: {
+            "p05": _quantile(_descriptor_values(rows, column), 0.05),
+            "median": _quantile(_descriptor_values(rows, column), 0.50),
+            "p95": _quantile(_descriptor_values(rows, column), 0.95),
+        }
+        for column in ("MolWt", "cLogP", "TPSA")
+    }
+
+
+def _require_report_number_mapping(
+    observed: Any,
+    expected: dict[str, float | int | None],
+    field: str,
+    *,
+    absolute_tolerance: float,
+) -> None:
+    if not isinstance(observed, dict) or set(observed) != set(expected):
+        raise WorkshopAgentError(f"report.json {field} is malformed.")
+    for name, expected_value in expected.items():
+        value = _strict_report_number(observed.get(name), f"{field}.{name}")
+        if expected_value is None or not math.isclose(
+            value,
+            float(expected_value),
+            rel_tol=0.0,
+            abs_tol=absolute_tolerance,
+        ):
+            raise WorkshopAgentError(
+                f"report.json {field} does not match independent validation."
+            )
+
+
+def _independent_cluster_coverage(
+    candidate_similarity: list[list[float]],
+    candidates: list[dict[str, str]],
+    panel: list[dict[str, str]],
+) -> tuple[dict[str, int], dict[str, int]]:
+    try:
+        from rdkit.ML.Cluster import Butina
+    except ImportError:
+        raise WorkshopAgentError(
+            "RDKit is required for independent Module 3 artifact validation."
+        ) from None
+    distances = []
+    for row_index in range(1, len(candidate_similarity)):
+        distances.extend(
+            1.0 - candidate_similarity[row_index][column_index]
+            for column_index in range(row_index)
+        )
+    clusters = Butina.ClusterData(
+        distances,
+        len(candidate_similarity),
+        0.55,
+        isDistData=True,
+        reordering=True,
+    )
+    cluster_by_key: dict[str, int] = {}
+    for cluster_id, members in enumerate(clusters):
+        for member in members:
+            cluster_by_key[candidates[int(member)]["canonical_ikey"].strip()] = (
+                cluster_id
+            )
+    panel_clusters = {cluster_by_key[row["canonical_ikey"].strip()] for row in panel}
+    return (
+        {
+            "candidate_clusters": len(clusters),
+            "panel_clusters": len(panel_clusters),
+        },
+        cluster_by_key,
+    )
+
+
+def _panel_cluster_membership_matches(
+    panel: list[dict[str, str]], independent_cluster_by_key: dict[str, int]
+) -> bool:
+    """Compare the selected partition without depending on numeric label IDs."""
+    try:
+        keys = [row["canonical_ikey"].strip() for row in panel]
+        observed_labels = [int(row["method_cluster"]) for row in panel]
+        expected_labels = [independent_cluster_by_key[key] for key in keys]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return all(
+        (observed_labels[left] == observed_labels[right])
+        == (expected_labels[left] == expected_labels[right])
+        for left in range(len(keys))
+        for right in range(left + 1, len(keys))
+    )
 
 
 def _validate_panel_artifacts_snapshot(
@@ -629,6 +915,7 @@ def _validate_panel_artifacts_snapshot(
         raise WorkshopAgentError(
             "The candidate input must contain exactly 96 unique connectivity keys."
         )
+    candidate_molecules = _validated_candidate_molecules(candidates)
     if len(panel) != expected_panel_size:
         raise WorkshopAgentError(
             f"panel.csv has {len(panel)} rows; expected {expected_panel_size}."
@@ -722,11 +1009,10 @@ def _validate_panel_artifacts_snapshot(
         raise WorkshopAgentError("report.json row counts do not match the artifacts.")
     if report["seed"] != 2026 or type(report["seed"]) is not int:
         raise WorkshopAgentError("report.json seed must equal 2026.")
-    if report["backend"] not in {
-        "nvmolkit-gpu",
-        "rdkit-cpu-reference (not GPU evidence)",
-    }:
-        raise WorkshopAgentError("report.json backend is not approved.")
+    if report["backend"] != _expected_panel_backend():
+        raise WorkshopAgentError(
+            "report.json backend does not match independent runtime validation."
+        )
     if report["files"] != {
         "analysis": "analysis.py",
         "panel": "panel.csv",
@@ -736,8 +1022,16 @@ def _validate_panel_artifacts_snapshot(
             "report.json files must name only the required artifacts."
         )
     parameters = report["parameters"]
-    if not isinstance(parameters, dict):
-        raise WorkshopAgentError("report.json parameters must be a mapping.")
+    required_parameter_keys = {
+        "strategy",
+        "radius",
+        "fp_bits",
+        "distance_cutoff",
+        "baseline",
+        "raw_similarity_range",
+    }
+    if not isinstance(parameters, dict) or set(parameters) != required_parameter_keys:
+        raise WorkshopAgentError("report.json parameters must be an exact mapping.")
     radius = parameters.get("radius")
     fp_bits = parameters.get("fp_bits")
     if type(radius) is not int or radius not in (2, 3):
@@ -755,19 +1049,25 @@ def _validate_panel_artifacts_snapshot(
         )
     if parameters.get("baseline") != "first_24_stable_source_rows":
         raise WorkshopAgentError("report.json does not name the fixed baseline.")
-    if not isinstance(report["descriptor_quantiles"], dict) or set(
-        report["descriptor_quantiles"]
-    ) != {"candidate", "panel"}:
-        raise WorkshopAgentError("report.json descriptor_quantiles are malformed.")
-    if not isinstance(report["pairwise_similarity"], dict):
-        raise WorkshopAgentError("report.json pairwise_similarity is malformed.")
-    if not isinstance(report["limitations"], list) or not all(
-        isinstance(item, str) and item.strip() for item in report["limitations"]
-    ):
-        raise WorkshopAgentError("report.json limitations are malformed.")
+    expected_distance_cutoff = 0.55 if strategy == "cluster_aware_max_min" else None
+    if parameters.get("distance_cutoff") != expected_distance_cutoff:
+        raise WorkshopAgentError(
+            "report.json distance_cutoff does not match the approved strategy."
+        )
+    raw_similarity_range = parameters.get("raw_similarity_range")
+    if not isinstance(raw_similarity_range, list) or len(raw_similarity_range) != 2:
+        raise WorkshopAgentError(
+            "report.json raw_similarity_range must contain two numbers."
+        )
 
-    candidate_similarity = _rdkit_similarity_matrix(candidates, radius, fp_bits)
-    selected_similarity = _rdkit_similarity_matrix(panel, radius, fp_bits)
+    candidate_similarity = _rdkit_similarity_matrix(
+        candidate_molecules, radius, fp_bits
+    )
+    candidate_index_by_key = {key: index for index, key in enumerate(candidate_keys)}
+    selected_molecules = [
+        candidate_molecules[candidate_index_by_key[key]] for key in panel_keys
+    ]
+    selected_similarity = _rdkit_similarity_matrix(selected_molecules, radius, fp_bits)
     baseline = candidates[:expected_panel_size]
     baseline_similarity = [
         row[:expected_panel_size] for row in candidate_similarity[:expected_panel_size]
@@ -790,6 +1090,109 @@ def _validate_panel_artifacts_snapshot(
             "The selected panel does not meet the fixed first-24 baseline contract."
         )
 
+    expected_raw_range = [
+        min(min(row) for row in candidate_similarity),
+        max(max(row) for row in candidate_similarity),
+    ]
+    for index, expected in enumerate(expected_raw_range):
+        observed = _strict_report_number(
+            raw_similarity_range[index],
+            f"parameters.raw_similarity_range[{index}]",
+        )
+        if not math.isclose(observed, expected, rel_tol=0.0, abs_tol=1e-5):
+            raise WorkshopAgentError(
+                "report.json raw_similarity_range does not match independent validation."
+            )
+
+    expected_quantiles = {
+        "candidate": _descriptor_quantiles(candidates),
+        "panel": _descriptor_quantiles(panel),
+    }
+    descriptor_quantiles = report["descriptor_quantiles"]
+    if not isinstance(descriptor_quantiles, dict) or set(descriptor_quantiles) != set(
+        expected_quantiles
+    ):
+        raise WorkshopAgentError("report.json descriptor_quantiles are malformed.")
+    for scope, expected_summary in expected_quantiles.items():
+        observed_summary = descriptor_quantiles.get(scope)
+        if not isinstance(observed_summary, dict) or set(observed_summary) != set(
+            expected_summary
+        ):
+            raise WorkshopAgentError("report.json descriptor_quantiles are malformed.")
+        for column, expected_values in expected_summary.items():
+            _require_report_number_mapping(
+                observed_summary.get(column),
+                expected_values,
+                f"descriptor_quantiles.{scope}.{column}",
+                absolute_tolerance=1e-6,
+            )
+
+    upper_triangle = [
+        selected_similarity[row_index][column_index]
+        for row_index in range(expected_panel_size)
+        for column_index in range(row_index + 1, expected_panel_size)
+    ]
+    expected_pairwise = {
+        "median": _quantile(upper_triangle, 0.50),
+        "p95": _quantile(upper_triangle, 0.95),
+        "maximum": max(upper_triangle),
+        "minimum_distance": selected_minimum_distance,
+    }
+    pairwise = report["pairwise_similarity"]
+    expected_pairwise_keys = {"pair_count", *expected_pairwise}
+    if not isinstance(pairwise, dict) or set(pairwise) != expected_pairwise_keys:
+        raise WorkshopAgentError("report.json pairwise_similarity is malformed.")
+    if type(pairwise.get("pair_count")) is not int or pairwise["pair_count"] != len(
+        upper_triangle
+    ):
+        raise WorkshopAgentError(
+            "report.json pairwise_similarity pair_count is incorrect."
+        )
+    _require_report_number_mapping(
+        {name: pairwise.get(name) for name in expected_pairwise},
+        expected_pairwise,
+        "pairwise_similarity",
+        absolute_tolerance=1e-5,
+    )
+
+    if strategy == "cluster_aware_max_min":
+        (
+            expected_cluster_coverage,
+            independent_cluster_by_key,
+        ) = _independent_cluster_coverage(candidate_similarity, candidates, panel)
+        expected_selection_reason = (
+            "Descriptor-extrema seed plus cluster-aware max-min selection"
+        )
+        if not _panel_cluster_membership_matches(panel, independent_cluster_by_key):
+            raise WorkshopAgentError(
+                "panel.csv method_cluster membership does not match independent "
+                "validation."
+            )
+    else:
+        expected_cluster_coverage = {
+            "method": "not_clustered",
+            "selected_compounds": expected_panel_size,
+        }
+        expected_selection_reason = (
+            "Descriptor-extrema seed plus deterministic max-min selection"
+        )
+        if any(row.get("method_cluster") != "not_clustered" for row in panel):
+            raise WorkshopAgentError(
+                "panel.csv method_cluster does not match the approved strategy."
+            )
+    if any(row.get("selection_reason") != expected_selection_reason for row in panel):
+        raise WorkshopAgentError(
+            "panel.csv selection_reason does not match the approved strategy."
+        )
+    if report["cluster_coverage"] != expected_cluster_coverage:
+        raise WorkshopAgentError(
+            "report.json cluster_coverage does not match independent validation."
+        )
+    if report["limitations"] != list(_PANEL_REPORT_LIMITATIONS):
+        raise WorkshopAgentError(
+            "report.json limitations do not match the fixed scientific boundaries."
+        )
+
     acceptance = report["acceptance"]
     expected_acceptance = {
         "baseline_minimum_distance": baseline_minimum_distance,
@@ -797,7 +1200,11 @@ def _validate_panel_artifacts_snapshot(
         "baseline_descriptor_coverage": baseline_descriptor_coverage,
         "selected_descriptor_coverage": selected_descriptor_coverage,
     }
-    if not isinstance(acceptance, dict) or acceptance.get("passed") is not True:
+    if (
+        not isinstance(acceptance, dict)
+        or set(acceptance) != {"passed", *expected_acceptance}
+        or acceptance.get("passed") is not True
+    ):
         raise WorkshopAgentError("report.json acceptance receipt did not pass.")
     for field, expected in expected_acceptance.items():
         observed = _strict_report_number(acceptance.get(field), f"acceptance.{field}")
@@ -805,19 +1212,6 @@ def _validate_panel_artifacts_snapshot(
             raise WorkshopAgentError(
                 "report.json acceptance metrics do not match independent validation."
             )
-    reported_minimum_distance = _strict_report_number(
-        report["pairwise_similarity"].get("minimum_distance"),
-        "pairwise_similarity.minimum_distance",
-    )
-    if not math.isclose(
-        reported_minimum_distance,
-        selected_minimum_distance,
-        rel_tol=0.0,
-        abs_tol=1e-6,
-    ):
-        raise WorkshopAgentError(
-            "report.json minimum distance does not match independent validation."
-        )
     receipt = {
         "candidate_count": 96,
         "panel_count": 24,
@@ -1318,6 +1712,38 @@ def _remove_previous_regular_output(path: Path) -> None:
         path.unlink()
 
 
+def _write_exact_text_artifact(path: Path, text: str) -> None:
+    """Atomically replace one public text artifact with controller-owned bytes."""
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        text=False,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(text.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _redact_sensitive_text(value: Any) -> str:
+    """Remove key-shaped values from child output before it becomes a receipt."""
+    text = value if isinstance(value, str) else str(value or "")
+    text = _NAMED_KEY_PATTERN.sub(r"\1[REDACTED]", text)
+    return _KEY_SHAPED_PATTERN.sub("[REDACTED]", text)
+
+
 def _panel_child_environment() -> dict[str, str]:
     """Return only the fixed runtime variables needed by the analysis child."""
     return {
@@ -1357,7 +1783,9 @@ class PanelDesignAgent:
         self.workdir = resolved
         self.mission = mission_text
         self.mode: Literal["hosted", "reference"] = mode
-        self.data_profile = profile_candidate_csv(candidate_path)
+        self._candidate_bytes = _read_candidate_bytes(candidate_path)
+        self._candidate_sha256 = hashlib.sha256(self._candidate_bytes).hexdigest()
+        self.data_profile = _profile_candidate_bytes(self._candidate_bytes)
         if (
             self.data_profile["row_count"] != 96
             or self.data_profile["unique_canonical_ikeys"] != 96
@@ -1503,8 +1931,8 @@ class PanelDesignAgent:
         report_path = self.workdir / "report.json"
         for path in (analysis_path, rendered_path, trace_path, panel_path, report_path):
             _remove_previous_regular_output(path)
-        analysis_path.write_text(source, encoding="utf-8")
-        rendered_path.write_text(source, encoding="utf-8")
+        _write_exact_text_artifact(analysis_path, source)
+        _write_exact_text_artifact(rendered_path, source)
         notify(
             "source_rendered",
             attempt=1,
@@ -1516,26 +1944,44 @@ class PanelDesignAgent:
         notify("source_validated", attempt=1, source_file=rendered_path.name)
 
         child_environment = _panel_child_environment()
-        not_before_ns = time.time_ns()
         notify(
             "execution_started",
             attempt=1,
             timeout_seconds=timeout_seconds,
         )
+        for path in (analysis_path, rendered_path, trace_path, panel_path, report_path):
+            _remove_previous_regular_output(path)
+        _write_exact_text_artifact(analysis_path, source)
+        _write_exact_text_artifact(rendered_path, source)
+        current_candidate_bytes = _read_candidate_bytes(
+            self.workdir / "reframe_candidates.csv"
+        )
+        if (
+            hashlib.sha256(current_candidate_bytes).hexdigest()
+            != self._candidate_sha256
+            or current_candidate_bytes != self._candidate_bytes
+        ):
+            raise WorkshopAgentError(
+                "The Module 3 candidate input changed after agent initialization."
+            )
+        not_before_ns = time.time_ns()
         started = time.perf_counter()
         completed = None
         attempt: AgentAttempt
         try:
             completed = subprocess.run(
-                [executable, "-I", "analysis.py"],
+                [executable, "-I", "-"],
                 cwd=self.workdir,
                 env=child_environment,
                 capture_output=True,
+                input=source,
                 text=True,
                 timeout=timeout_seconds,
                 check=False,
             )
             elapsed = time.perf_counter() - started
+            safe_stdout_tail = _redact_sensitive_text(completed.stdout)[-3000:]
+            safe_stderr_tail = _redact_sensitive_text(completed.stderr)[-3000:]
             if completed.returncode:
                 raise WorkshopAgentError(
                     f"analysis.py exited with code {completed.returncode}."
@@ -1552,8 +1998,8 @@ class PanelDesignAgent:
                 elapsed_seconds=elapsed,
                 passed=True,
                 message=json.dumps(receipt, sort_keys=True),
-                stdout_tail=completed.stdout[-3000:],
-                stderr_tail=completed.stderr[-3000:],
+                stdout_tail=safe_stdout_tail,
+                stderr_tail=safe_stderr_tail,
                 implementation_summary=strategy.approach,
                 expected_tradeoffs=(strategy.tradeoff,),
             )
@@ -1562,7 +2008,7 @@ class PanelDesignAgent:
                 attempt=1,
                 elapsed_seconds=elapsed,
                 receipt=receipt,
-                stdout_tail=completed.stdout[-3000:],
+                stdout_tail=safe_stdout_tail,
             )
         except subprocess.TimeoutExpired:
             elapsed = time.perf_counter() - started
@@ -1588,7 +2034,17 @@ class PanelDesignAgent:
             )
         except Exception as error:
             elapsed = time.perf_counter() - started
-            message = f"{type(error).__name__}: {error}"
+            message = _redact_sensitive_text(f"{type(error).__name__}: {error}")
+            safe_stdout_tail = (
+                _redact_sensitive_text(completed.stdout)[-3000:]
+                if completed is not None
+                else ""
+            )
+            safe_stderr_tail = (
+                _redact_sensitive_text(completed.stderr)[-3000:]
+                if completed is not None
+                else ""
+            )
             attempt = AgentAttempt(
                 number=1,
                 source_file=rendered_path.name,
@@ -1596,8 +2052,8 @@ class PanelDesignAgent:
                 elapsed_seconds=elapsed,
                 passed=False,
                 message=message[-6000:],
-                stdout_tail=(completed.stdout[-3000:] if completed is not None else ""),
-                stderr_tail=(completed.stderr[-3000:] if completed is not None else ""),
+                stdout_tail=safe_stdout_tail,
+                stderr_tail=safe_stderr_tail,
                 implementation_summary=strategy.approach,
                 expected_tradeoffs=(strategy.tradeoff,),
             )
@@ -1636,7 +2092,7 @@ class PanelDesignAgent:
             "audit": audit.model_dump(mode="json") if audit is not None else None,
             "audit_error": audit_error,
         }
-        trace_path.write_text(json.dumps(trace_payload, indent=2), encoding="utf-8")
+        _write_exact_text_artifact(trace_path, json.dumps(trace_payload, indent=2))
         result = PanelAgentRun(
             success=success,
             approved_strategy=approved_strategy,
@@ -1653,4 +2109,6 @@ class PanelDesignAgent:
             attempt_count=1,
             trace_path=str(trace_path),
         )
+        _write_exact_text_artifact(analysis_path, source)
+        _write_exact_text_artifact(rendered_path, source)
         return result

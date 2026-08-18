@@ -1,10 +1,21 @@
 # nvMolKit + Nemotron Notebook
 
-This standalone project asks one presentation-sized question: **can an AI chemistry agent use nvMolKit to autonomously execute a real cheminformatics workflow?** One stateful, bounded Nemotron conversation follows a fixed dependency chain:
+This standalone four-notebook workshop shows a progression from direct nvMolKit calls to two bounded Nemotron agent exercises and a compact companion demo. The companion demo asks one presentation-sized question: **can an AI chemistry agent use nvMolKit to execute a bounded cheminformatics workflow?** One stateful Nemotron conversation follows a fixed dependency chain:
 
 `plan → RDKit inspect → MorganFingerprintGenerator → crossTanimotoSimilarity → fused_butina → EmbedMolecules → MMFFOptimizeMoleculesConfs → objective attempts → evidence-linked, schema-checked conclusion`
 
-The pinned BioNeMo Agent Toolkit nvMolKit skill grounds the conversation's initial context. Reading it is not an agent tool call and does not permanently teach or modify the model. The compact presentation is one plan, six approvals, six completed command receipts/result cards, one objective challenge, and one conclusion. The user may override only bounded scientific parameters through the supplied dropdowns and sliders. Python validates and executes approved calls, renders results, and preserves exact artifact-grounded evidence records E01–E06 plus the objective ledger O01; credentials, RDKit molecules, tensors, matrices, and coordinates remain local. The conclusion uses a Python-owned headline and facts with Nemotron-selected predicate-true emphasis.
+For the companion demo, the pinned BioNeMo Agent Toolkit nvMolKit skill grounds the conversation's initial context. Reading it is not an agent tool call and does not permanently teach or modify the model. The compact presentation is one plan, six approvals, six completed command receipts/result cards, one objective challenge, and one conclusion. The user may override only bounded scientific parameters through the supplied dropdowns and sliders. Python validates and executes approved calls, renders results, and preserves exact artifact-grounded evidence records E01–E06 plus the objective ledger O01; credentials, RDKit molecules, tensors, matrices, and coordinates remain local. The conclusion uses a Python-owned headline and facts with Nemotron-selected predicate-true emphasis.
+
+## Four-notebook workshop path
+
+Start with **Module 1**. It is the recommended entry point and introduces the direct library calls before the agent exercises.
+
+1. [`notebooks/01_direct_nvmolkit_reframe.ipynb`](notebooks/01_direct_nvmolkit_reframe.ipynb) — use nvMolKit directly for fingerprints, similarity, and clustering.
+2. [`notebooks/02_agent_assisted_reframe_neighborhoods.ipynb`](notebooks/02_agent_assisted_reframe_neighborhoods.ipynb) — let Nemotron choose between bounded neighborhood-analysis policies while Python owns the executable implementation.
+3. [`notebooks/03_full_agent_reframe_panel_design.ipynb`](notebooks/03_full_agent_reframe_panel_design.ipynb) — use a bounded planning, approval, execution, and audit loop to design a 24-compound panel.
+4. [`notebooks/nvmolkit_nemotron_demo.ipynb`](notebooks/nvmolkit_nemotron_demo.ipynb) — run the compact companion demo with the original six-stage workflow and objective challenge.
+
+**Hosted mode** (`interactive` in `NVMOLKIT_WORKSHOP_MODE`) is the attendee path for the agent exercises in Modules 2 and 3. It uses the fixed `nvidia/nemotron-3-nano-30b-a3b` endpoint and the protected `NVIDIA_API_KEY`; the model selects only within Python-owned bounds. The companion demo also uses the same hosted model and key. **Reference mode** is the deterministic recovery and local-acceptance path for Modules 2 and 3. It makes no hosted client call, needs no API key, and is not evidence of hosted inference. Module 1 is a direct library exercise and does not call the hosted model.
 
 ## What runs where
 
@@ -28,7 +39,7 @@ Use Linux x86-64 with CPython 3.12 in VM mode. Enable Jupyter in the Brev Consol
 2. Keep only one Launch parameter: required `NVIDIA_API_KEY`, with no default. Remove `NEMOTRON_MODEL` and `JUPYTER_PORT` from Setup values.
 3. Enable Jupyter and keep access set to **Only my organization** with a Secure Link on the fixed port `8888`; do not expose unrestricted public TCP. The hosted model is fixed to `nvidia/nemotron-3-nano-30b-a3b`.
 4. From the Nemotron model page on build.nvidia.com, generate a hosted NVIDIA Developer API key beginning with `nvapi-`. Enter it once in Setup values when you deploy. The setup script stores it outside the repository in `${HOME}/.config/nvmolkit/NVIDIA_API_KEY` with file mode `0600`, and notebook preflight loads it automatically without a prompt. This is distinct from an NGC personal key. Never expose the key in notebook outputs, logs, screenshots, or chat.
-5. Open JupyterLab through the Secure Link and run `notebooks/nvmolkit_nemotron_demo.ipynb`.
+5. Open JupyterLab through the Secure Link and start with `notebooks/01_direct_nvmolkit_reframe.ipynb`.
 
 **Qualification:** This demo is designed for fresh deployment only and is not yet live-qualified. GPU execution, hosted inference, rendered visuals, Secure Link access, and credential persistence each require live acceptance. The protected key file remains on the VM disk until the environment is deleted or the file is removed. After a VM stop/start, verify the managed Jupyter service, restart the notebook kernel, and rerun the notebook; do not claim automatic restart without live evidence.
 

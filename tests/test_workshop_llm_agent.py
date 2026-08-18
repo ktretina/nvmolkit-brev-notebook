@@ -138,6 +138,99 @@ def _client_for(payload):
     return SimpleNamespace(chat=SimpleNamespace(completions=completions)), completions
 
 
+def test_workshop_key_loads_protected_launch_file_without_prompt(monkeypatch, tmp_path):
+    agent = _load_agent()
+    saved_key = "nvapi-" + "saved" * 5
+    key_path = tmp_path / "NVIDIA_API_KEY"
+    key_path.write_text(saved_key, encoding="utf-8")
+    key_path.chmod(0o600)
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.setattr(agent, "_NVIDIA_API_KEY_PATH", key_path, raising=False)
+    monkeypatch.setattr(
+        agent.getpass,
+        "getpass",
+        lambda prompt: pytest.fail("a valid protected key must not prompt"),
+    )
+
+    assert agent.get_workshop_api_key() == saved_key
+
+
+def test_workshop_key_precedence_does_not_inspect_protected_file(monkeypatch, tmp_path):
+    agent = _load_agent()
+    unsafe_path = tmp_path / "NVIDIA_API_KEY"
+    unsafe_path.write_text("nvapi-unsafe-file", encoding="utf-8")
+    unsafe_path.chmod(0o644)
+    monkeypatch.setattr(agent, "_NVIDIA_API_KEY_PATH", unsafe_path, raising=False)
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-environment-key")
+
+    assert agent.get_workshop_api_key("nvapi-explicit-key") == "nvapi-explicit-key"
+    assert agent.get_workshop_api_key() == "nvapi-environment-key"
+
+
+@pytest.mark.parametrize("unsafe_kind", ["mode", "symlink", "oversize"])
+def test_workshop_key_rejects_unsafe_protected_file_without_prompt(
+    monkeypatch, tmp_path, unsafe_kind
+):
+    agent = _load_agent()
+    secret = "nvapi-" + "do-not-leak" * 400
+    target = tmp_path / "target"
+    target.write_text(secret, encoding="utf-8")
+    target.chmod(0o600)
+    key_path = tmp_path / "NVIDIA_API_KEY"
+    if unsafe_kind == "mode":
+        key_path.write_text(secret, encoding="utf-8")
+        key_path.chmod(0o644)
+    elif unsafe_kind == "symlink":
+        key_path.symlink_to(target)
+    else:
+        key_path.write_text(secret, encoding="utf-8")
+        key_path.chmod(0o600)
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.setattr(agent, "_NVIDIA_API_KEY_PATH", key_path, raising=False)
+    monkeypatch.setattr(
+        agent.getpass,
+        "getpass",
+        lambda prompt: pytest.fail("an unsafe protected file must not prompt"),
+    )
+
+    with pytest.raises(ValueError) as captured:
+        agent.get_workshop_api_key()
+
+    assert secret not in str(captured.value)
+    if unsafe_kind == "mode":
+        assert "mode 0600" in str(captured.value)
+    elif unsafe_kind == "symlink":
+        assert "opened securely" in str(captured.value)
+    else:
+        assert "unexpectedly large" in str(captured.value)
+
+
+def test_workshop_key_prompts_only_when_protected_file_is_missing(
+    monkeypatch, tmp_path
+):
+    agent = _load_agent()
+    prompted_key = "nvapi-local-fallback"
+    prompts = []
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.setattr(
+        agent,
+        "_NVIDIA_API_KEY_PATH",
+        tmp_path / "missing" / "NVIDIA_API_KEY",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent.getpass,
+        "getpass",
+        lambda prompt: prompts.append(prompt) or prompted_key,
+    )
+
+    assert agent.get_workshop_api_key(prompt=True) == prompted_key
+    assert len(prompts) == 1
+    with pytest.raises(ValueError, match="NVIDIA_API_KEY"):
+        agent.get_workshop_api_key(prompt=False)
+    assert len(prompts) == 1
+
+
 def test_workshop_mode_defaults_to_interactive_and_accepts_only_two_modes(monkeypatch):
     agent = _load_agent()
 
@@ -646,6 +739,147 @@ def test_panel_child_process_does_not_receive_hosted_key(monkeypatch, tmp_path):
     assert "NVIDIA_API_KEY" not in child_environments[0]
 
 
+def test_panel_executes_validated_source_after_callback_mutation_and_redacts_output(
+    monkeypatch, tmp_path
+):
+    agent = _load_agent()
+    _write_candidate_workspace(tmp_path)
+    panel_agent = agent.PanelDesignAgent(
+        workdir=tmp_path,
+        mission="bounded mission",
+        mode="reference",
+    )
+    panel_agent.request_plan()
+    expected_source = agent._render_panel_analysis(2, 24)
+    secret = "nvapi-" + "callback-file-secret" * 2
+    executed_sources = []
+    progress_events = []
+
+    def mutate_public_artifact(event, payload):
+        if event == "source_validated":
+            (tmp_path / "analysis.py").write_text(
+                f"print({secret!r})\n", encoding="utf-8"
+            )
+        progress_events.append((event, payload))
+
+    def record_execution(arguments, **kwargs):
+        if kwargs.get("input") is not None:
+            executed_source = kwargs["input"]
+        else:
+            executed_path = Path(kwargs["cwd"]) / arguments[-1]
+            executed_source = executed_path.read_text(encoding="utf-8")
+        executed_sources.append(executed_source)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=f"untrusted output {secret}",
+            stderr=f"NVIDIA_API_KEY={secret}",
+        )
+
+    monkeypatch.setattr(agent.subprocess, "run", record_execution)
+    monkeypatch.setattr(
+        agent,
+        "_validate_panel_artifacts_snapshot",
+        lambda *args, **kwargs: (
+            {
+                "candidate_count": 96,
+                "panel_count": 24,
+                "acceptance_passed": True,
+            },
+            "{}",
+        ),
+    )
+    monkeypatch.setattr(
+        panel_agent, "_request_audit", lambda strategy, report_snapshot: None
+    )
+
+    run = panel_agent.run(
+        approved_strategy=2,
+        expected_panel_size=24,
+        progress_callback=mutate_public_artifact,
+    )
+
+    assert run.success
+    assert executed_sources == [expected_source]
+    assert run.analysis_path.read_text(encoding="utf-8") == expected_source
+    trace_text = run.trace_path.read_text(encoding="utf-8")
+    visible = repr(run.attempts) + repr(progress_events) + trace_text
+    assert secret not in visible
+    assert "[REDACTED]" in visible
+
+
+def test_panel_rejects_candidate_mutation_after_preexecution_callback(
+    monkeypatch, tmp_path
+):
+    agent = _load_agent()
+    _write_candidate_workspace(tmp_path)
+    panel_agent = agent.PanelDesignAgent(
+        workdir=tmp_path,
+        mission="bounded mission",
+        mode="reference",
+    )
+    panel_agent.request_plan()
+
+    def mutate_candidate(event, payload):
+        if event == "execution_started":
+            candidate_path = tmp_path / "reframe_candidates.csv"
+            source = candidate_path.read_text(encoding="utf-8")
+            candidate_path.write_text(source + "\n", encoding="utf-8")
+
+    called = []
+
+    def forbidden_child(*args, **kwargs):
+        called.append(True)
+        return SimpleNamespace(returncode=1, stdout="", stderr="must not run")
+
+    monkeypatch.setattr(agent.subprocess, "run", forbidden_child)
+
+    with pytest.raises(agent.WorkshopAgentError, match="candidate input changed"):
+        panel_agent.run(
+            approved_strategy=2,
+            expected_panel_size=24,
+            progress_callback=mutate_candidate,
+        )
+
+    assert called == []
+
+
+def test_panel_preexecution_cleanup_never_follows_output_symlink(monkeypatch, tmp_path):
+    agent = _load_agent()
+    _write_candidate_workspace(tmp_path)
+    panel_agent = agent.PanelDesignAgent(
+        workdir=tmp_path,
+        mission="bounded mission",
+        mode="reference",
+    )
+    panel_agent.request_plan()
+    protected_path = tmp_path / "protected-key"
+    protected_value = "nvapi-protected-file-must-not-change"
+    protected_path.write_text(protected_value, encoding="utf-8")
+
+    def install_output_symlink(event, payload):
+        if event == "execution_started":
+            (tmp_path / "panel.csv").symlink_to(protected_path)
+
+    called = []
+
+    def unsafe_child(*args, **kwargs):
+        called.append(True)
+        (tmp_path / "panel.csv").write_text("overwritten", encoding="utf-8")
+        return SimpleNamespace(returncode=1, stdout="", stderr="unsafe")
+
+    monkeypatch.setattr(agent.subprocess, "run", unsafe_child)
+
+    with pytest.raises(agent.WorkshopAgentError, match="output paths"):
+        panel_agent.run(
+            approved_strategy=2,
+            expected_panel_size=24,
+            progress_callback=install_output_symlink,
+        )
+
+    assert called == []
+    assert protected_path.read_text(encoding="utf-8") == protected_value
+
+
 def test_panel_child_isolated_from_pythonpath_sitecustomize_and_unrelated_secrets(
     monkeypatch, tmp_path
 ):
@@ -693,7 +927,7 @@ def test_panel_child_isolated_from_pythonpath_sitecustomize_and_unrelated_secret
     assert run.success, run.attempts[0].message
     assert child_arguments_path.read_text(encoding="utf-8").splitlines() == [
         "-I",
-        "analysis.py",
+        "-",
     ]
     child_environment = child_environment_path.read_text(encoding="utf-8")
     assert "PYTHONPATH=" not in child_environment
@@ -927,3 +1161,148 @@ def test_both_panel_strategies_beat_the_fixed_first_24_baseline(
     )
     assert trace["mode"] == "reference"
     assert trace["model"] is None
+
+
+def test_panel_validator_recomputes_all_candidate_descriptors(tmp_path):
+    import pandas as pd
+
+    agent = _load_agent()
+    _write_candidate_workspace(tmp_path)
+    panel_agent = agent.PanelDesignAgent(
+        workdir=tmp_path,
+        mission="bounded mission",
+        mode="reference",
+    )
+    panel_agent.request_plan()
+    run = panel_agent.run(
+        approved_strategy=2,
+        expected_panel_size=24,
+        timeout_seconds=120,
+    )
+    assert run.success, run.attempts[0].message
+
+    candidate_path = tmp_path / "reframe_candidates.csv"
+    original = pd.read_csv(candidate_path)
+    selected_keys = set(pd.read_csv(run.panel_path)["canonical_ikey"])
+    accepted_forged_descriptors = []
+    for column in ("MolWt", "cLogP", "TPSA"):
+        forged = original.copy()
+        eligible = forged.loc[
+            ~forged["canonical_ikey"].isin(selected_keys)
+            & forged[column].ne(forged[column].min())
+            & forged[column].ne(forged[column].max())
+        ]
+        assert not eligible.empty
+        forged_index = eligible.index[0]
+        forged.loc[forged_index, column] += 0.123456
+        forged.to_csv(candidate_path, index=False)
+        try:
+            agent.validate_panel_artifacts(tmp_path, expected_panel_size=24)
+        except agent.WorkshopAgentError:
+            pass
+        else:
+            accepted_forged_descriptors.append(column)
+
+    assert accepted_forged_descriptors == []
+
+
+def test_panel_validator_rejects_forged_values_in_every_report_category(tmp_path):
+    agent = _load_agent()
+    _write_candidate_workspace(tmp_path)
+    panel_agent = agent.PanelDesignAgent(
+        workdir=tmp_path,
+        mission="bounded mission",
+        mode="reference",
+    )
+    panel_agent.request_plan()
+    run = panel_agent.run(
+        approved_strategy=2,
+        expected_panel_size=24,
+        timeout_seconds=120,
+    )
+    assert run.success, run.attempts[0].message
+    report_path = run.report_path
+    original = json.loads(report_path.read_text(encoding="utf-8"))
+
+    def alternate_backend(report):
+        report["backend"] = (
+            "nvmolkit-gpu"
+            if report["backend"] != "nvmolkit-gpu"
+            else "rdkit-cpu-reference (not GPU evidence)"
+        )
+
+    def forge_strategy(report):
+        report["parameters"].update(
+            {
+                "strategy": "cluster_aware_max_min",
+                "radius": 2,
+                "fp_bits": 1024,
+                "distance_cutoff": 0.55,
+            }
+        )
+
+    def forge_raw_range(report):
+        report["parameters"]["raw_similarity_range"] = [0.25, 0.75]
+
+    def forge_distance_cutoff(report):
+        report["parameters"]["distance_cutoff"] = 0.55
+
+    def forge_quantiles(report):
+        report["descriptor_quantiles"]["candidate"]["MolWt"]["median"] += 100.0
+
+    def forge_pairwise(report):
+        report["pairwise_similarity"].update(
+            {"pair_count": 1, "median": 0.99, "p95": 0.99, "maximum": 0.99}
+        )
+
+    def forge_cluster_coverage(report):
+        report["cluster_coverage"]["selected_compounds"] = 23
+
+    def forge_limitations(report):
+        report["limitations"] = ["Forged limitation"]
+
+    forgeries = {
+        "backend": alternate_backend,
+        "strategy": forge_strategy,
+        "raw_similarity_range": forge_raw_range,
+        "distance_cutoff": forge_distance_cutoff,
+        "descriptor_quantiles": forge_quantiles,
+        "pairwise_similarity": forge_pairwise,
+        "cluster_coverage": forge_cluster_coverage,
+        "limitations": forge_limitations,
+    }
+    accepted_forgeries = []
+    for label, mutate in forgeries.items():
+        forged = json.loads(json.dumps(original))
+        mutate(forged)
+        report_path.write_text(json.dumps(forged), encoding="utf-8")
+        try:
+            agent.validate_panel_artifacts(tmp_path, expected_panel_size=24)
+        except agent.WorkshopAgentError:
+            pass
+        else:
+            accepted_forgeries.append(label)
+
+    assert accepted_forgeries == []
+
+
+def test_panel_cluster_membership_is_key_bound_but_label_invariant():
+    agent = _load_agent()
+    independent = {"key-a": 0, "key-b": 0, "key-c": 1, "key-d": 1}
+    globally_renumbered = [
+        {"canonical_ikey": "key-a", "method_cluster": "900"},
+        {"canonical_ikey": "key-b", "method_cluster": "900"},
+        {"canonical_ikey": "key-c", "method_cluster": "100"},
+        {"canonical_ikey": "key-d", "method_cluster": "100"},
+    ]
+    swapped_across_clusters = [
+        {"canonical_ikey": "key-a", "method_cluster": "900"},
+        {"canonical_ikey": "key-b", "method_cluster": "100"},
+        {"canonical_ikey": "key-c", "method_cluster": "900"},
+        {"canonical_ikey": "key-d", "method_cluster": "100"},
+    ]
+
+    assert agent._panel_cluster_membership_matches(globally_renumbered, independent)
+    assert not agent._panel_cluster_membership_matches(
+        swapped_across_clusters, independent
+    )

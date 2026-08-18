@@ -8,7 +8,72 @@ from nbconvert.preprocessors import ExecutePreprocessor
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK_DIR = REPO_ROOT / "notebooks"
+MODULE2_PATH = NOTEBOOK_DIR / "02_agent_assisted_reframe_neighborhoods.ipynb"
 MODULE3_PATH = NOTEBOOK_DIR / "03_full_agent_reframe_panel_design.ipynb"
+
+
+def test_module2_reference_executes_cleanly_without_key_or_hosted_client(
+    monkeypatch, tmp_path
+):
+    notebook = nbformat.read(MODULE2_PATH, as_version=4)
+    first_code = next(
+        index for index, cell in enumerate(notebook.cells) if cell.cell_type == "code"
+    )
+    notebook.cells.insert(
+        first_code,
+        nbformat.v4.new_code_cell(
+            f"import sys\nsys.path.insert(0, {str(NOTEBOOK_DIR)!r})\n",
+            id="test-module2-import-path",
+        ),
+    )
+    setup_index = next(
+        index
+        for index, cell in enumerate(notebook.cells)
+        if cell.cell_type == "code" and "import workshop_llm_agent" in cell.source
+    )
+    notebook.cells.insert(
+        setup_index + 1,
+        nbformat.v4.new_code_cell(
+            "_blocked_client_calls = []\n"
+            "def _forbidden_client(*args, **kwargs):\n"
+            "    _blocked_client_calls.append((args, kwargs))\n"
+            "    raise AssertionError('reference mode created a hosted client')\n"
+            "_workshop_llm_agent._client = _forbidden_client\n"
+            "_workshop_llm_agent.get_workshop_api_key = _forbidden_client\n",
+            id="test-module2-client-blocker",
+        ),
+    )
+    notebook.cells.append(
+        nbformat.v4.new_code_cell(
+            "assert _blocked_client_calls == []\n",
+            id="test-module2-client-assertion",
+        )
+    )
+
+    matplotlib_dir = tmp_path / "matplotlib"
+    ipython_dir = tmp_path / "ipython"
+    matplotlib_dir.mkdir()
+    ipython_dir.mkdir()
+    monkeypatch.setenv("MPLCONFIGDIR", str(matplotlib_dir))
+    monkeypatch.setenv("IPYTHONDIR", str(ipython_dir))
+    monkeypatch.setenv("NVMOLKIT_WORKSHOP_MODE", "reference")
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+
+    executor = ExecutePreprocessor(timeout=300, kernel_name="python3")
+    executor.preprocess(notebook, {"metadata": {"path": str(tmp_path)}})
+
+    output_path = tmp_path / "module2-reference-executed.ipynb"
+    nbformat.write(notebook, output_path)
+    assert output_path.is_file()
+
+    stream_text = "\n".join(
+        output.get("text", "")
+        for cell in notebook.cells
+        for output in cell.get("outputs", [])
+        if output.output_type == "stream"
+    )
+    assert "NVMOLKIT_WORKSHOP_MODE=reference" in stream_text
+    assert "Implementation label: reference" in stream_text
 
 
 def _module3_notebook():
