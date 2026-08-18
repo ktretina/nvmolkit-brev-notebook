@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from html import escape
 import re
-from typing import Any
+from typing import Any, Callable
 
 import ipywidgets as widgets
 from IPython.display import display as ipython_display
@@ -12,7 +12,7 @@ from IPython.display import display as ipython_display
 from workshop_llm_agent import PanelAgentRun, PanelDesignAgent, PanelPlan
 
 
-MODULE3_WORKFLOW_VERSION = "2026.08.14.4"
+MODULE3_WORKFLOW_VERSION = "2026.08.18.1"
 
 
 def _safe_text(value: Any, limit: int = 6000) -> str:
@@ -31,6 +31,7 @@ class InteractivePanelDesignWorkflow:
         expected_panel_size: int,
         max_revisions: int = 0,
         timeout_seconds: int = 480,
+        on_complete: Callable[[PanelAgentRun], None] | None = None,
     ) -> None:
         self.agent = agent
         self.expected_panel_size = expected_panel_size
@@ -39,6 +40,8 @@ class InteractivePanelDesignWorkflow:
         self.agent_run: PanelAgentRun | None = None
         self.transcript_text = ""
         self._busy = False
+        self._on_complete = on_complete
+        self._completion_callback_called = False
 
         self.start_button = widgets.Button(
             description="Start Agent", button_style="primary", icon="play"
@@ -51,9 +54,8 @@ class InteractivePanelDesignWorkflow:
             layout=widgets.Layout(width="280px"),
             style={"description_width": "70px"},
         )
-        # Kept in the constructor for compatibility with older notebook calls. Source
-        # is now rendered locally, so hosted code-repair attempts are unnecessary.
-        del max_revisions
+        if type(max_revisions) is not int or max_revisions != 0:
+            raise ValueError("max_revisions must be 0 for controller-owned source.")
         self.timeout_control = widgets.Dropdown(
             options=(("5 minutes", 300), ("8 minutes", 480), ("10 minutes", 600)),
             value=timeout_seconds,
@@ -195,6 +197,21 @@ class InteractivePanelDesignWorkflow:
             )
             self.status = "completed" if self.agent_run.success else "failed"
             self._show_final_result(self.agent_run)
+            if self.agent_run.success and not self._completion_callback_called:
+                self._completion_callback_called = True
+                if self._on_complete is not None:
+                    try:
+                        self._on_complete(self.agent_run)
+                    except Exception as error:
+                        message = _safe_text(f"{type(error).__name__}: {error}")
+                        self._line(f"Completion display failed: {message}")
+                        self._append(
+                            self._html_card(
+                                "Completion display failed",
+                                "<p>The validated scientific result is unchanged.</p>"
+                                f"<pre>{escape(message)}</pre>",
+                            )
+                        )
         except Exception as error:
             self.status = "failed"
             self._error_card("Agent run stopped safely", error)
@@ -213,15 +230,7 @@ class InteractivePanelDesignWorkflow:
                     "and performs one bounded execution.</p>",
                 )
             )
-        elif event == "generation_started":
-            self._append(
-                self._html_card(
-                    f"Attempt {attempt}: rendering implementation",
-                    "<p>The controller is translating the approved scientific strategy "
-                    "into the tested standalone analysis.</p>",
-                )
-            )
-        elif event == "source_received":
+        elif event == "source_rendered":
             tradeoffs = "".join(
                 f"<li>{escape(item)}</li>"
                 for item in payload.get("expected_tradeoffs", ())
@@ -240,12 +249,12 @@ class InteractivePanelDesignWorkflow:
                 "<p>The executable source is preserved before validation and execution.</p>",
             )
             self._append(widgets.VBox((summary, accordion)))
-            self._line(f"Received and preserved {payload['source_file']}.")
-        elif event == "source_generated":
+            self._line(f"Rendered and preserved {payload['source_file']}.")
+        elif event == "source_validated":
             self._append(
                 self._html_card(
                     f"Attempt {attempt}: source passed static checks",
-                    "<p>The normalized script satisfies the bounded source contract. "
+                    "<p>The exact controller script satisfies the bounded source contract. "
                     "The controller will run it without the hosted API key and validate "
                     "its artifacts independently.</p>",
                 )
@@ -279,7 +288,9 @@ class InteractivePanelDesignWorkflow:
                     f"<pre>{escape(_safe_text(payload['message']))}</pre><p>{escape(action)}</p>",
                 )
             )
-            self._line(f"Attempt {attempt} failed; revise={payload.get('will_revise')}.")
+            self._line(
+                f"Attempt {attempt} failed; revise={payload.get('will_revise')}."
+            )
         elif event == "audit_started":
             self._append(
                 self._html_card(
@@ -314,7 +325,7 @@ class InteractivePanelDesignWorkflow:
                 f"<li>Panel: <code>{escape(str(run.panel_path))}</code></li>"
                 f"<li>Report: <code>{escape(str(run.report_path))}</code></li>"
                 f"<li>Trace: <code>{escape(str(run.trace_path))}</code></li></ul>"
-                "<p>Continue to the next notebook cell to load and independently inspect the panel.</p>"
+                "<p>The shared completion renderer can now display these validated artifacts.</p>"
             )
             self._append(self._html_card("Agent workflow complete", body))
         else:
@@ -322,7 +333,7 @@ class InteractivePanelDesignWorkflow:
                 self._html_card(
                     "Agent workflow did not pass",
                     f"<p>All bounded attempts were used. Inspect <code>{escape(str(run.trace_path))}</code>. "
-                    "The notebook will use its labeled reference baseline.</p>",
+                    "No panel is available until a validated run succeeds.</p>",
                 )
             )
 
@@ -333,6 +344,7 @@ def launch_interactive_panel_design(
     expected_panel_size: int,
     max_revisions: int = 0,
     timeout_seconds: int = 480,
+    on_complete: Callable[[PanelAgentRun], None] | None = None,
 ) -> InteractivePanelDesignWorkflow:
     """Display and return the Module 3 interactive workflow."""
     workflow = InteractivePanelDesignWorkflow(
@@ -340,6 +352,8 @@ def launch_interactive_panel_design(
         expected_panel_size=expected_panel_size,
         max_revisions=max_revisions,
         timeout_seconds=timeout_seconds,
+        on_complete=on_complete,
     )
     workflow.display()
+    workflow._start(workflow.start_button)
     return workflow

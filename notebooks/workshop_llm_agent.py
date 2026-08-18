@@ -7,7 +7,6 @@ function in Python. Module 3 remains a separately bounded analysis controller.
 from __future__ import annotations
 
 import ast
-import builtins
 import csv
 import getpass
 import json
@@ -29,8 +28,26 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 DEFAULT_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
 NEMOTRON_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
-WORKSHOP_AGENT_VERSION = "2026.08.18.3"
+WORKSHOP_AGENT_VERSION = "2026.08.18.4"
 WORKSHOP_MODE_ENV = "NVMOLKIT_WORKSHOP_MODE"
+_PANEL_CHILD_ENVIRONMENT_ALLOWLIST = frozenset(
+    {
+        "CUDA_DEVICE_ORDER",
+        "CUDA_VISIBLE_DEVICES",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LD_LIBRARY_PATH",
+        "NVIDIA_DRIVER_CAPABILITIES",
+        "NVIDIA_VISIBLE_DEVICES",
+        "PATH",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "TZ",
+        "VIRTUAL_ENV",
+    }
+)
 AUTH_GUIDANCE = (
     "NVIDIA_API_KEY must be a hosted NVIDIA Developer API key beginning with "
     "nvapi-. Generate it from the Nemotron model page on build.nvidia.com."
@@ -86,12 +103,6 @@ class PanelPlan(_StrictModel):
     recommendation_reason: str = Field(min_length=30)
 
 
-class GeneratedAnalysis(_StrictModel):
-    analysis_source: str = Field(min_length=500)
-    implementation_summary: str = Field(min_length=40)
-    expected_tradeoffs: list[str] = Field(min_length=1, max_length=4)
-
-
 class PanelAudit(_StrictModel):
     result_assessment: str = Field(min_length=40)
     surprising_result: str = Field(min_length=20)
@@ -111,7 +122,6 @@ class AgentAttempt:
     stderr_tail: str
     implementation_summary: str
     expected_tradeoffs: tuple[str, ...]
-    generated_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -134,10 +144,6 @@ _TOOL_DESCRIPTIONS = {
     "submit_panel_plan": (
         "Return exactly two scientifically defensible panel-design strategies and "
         "recommend one after inspecting the supplied bounded data profile."
-    ),
-    "submit_panel_analysis": (
-        "Return a complete standalone analysis.py implementation, a short summary, "
-        "and its main expected tradeoffs. Return Python source without fences."
     ),
     "submit_panel_audit": (
         "Inspect validated panel-design receipts and report the result, one surprising "
@@ -392,559 +398,6 @@ def bind_neighborhood_builder(
     return local_namespace["build_neighborhood_atlas"]
 
 
-_FORBIDDEN_CALLS = {
-    "breakpoint",
-    "compile",
-    "delattr",
-    "eval",
-    "exec",
-    "getattr",
-    "globals",
-    "input",
-    "locals",
-    "open",
-    "setattr",
-    "vars",
-    "__import__",
-}
-_ALWAYS_FORBIDDEN_ATTRIBUTES = {
-    "chmod",
-    "chown",
-    "hardlink_to",
-    "popen",
-    "rmdir",
-    "spawn",
-    "symlink_to",
-    "system",
-    "unlink",
-}
-_PATH_MUTATION_ATTRIBUTES = {"rename", "replace"}
-
-
-def _is_safe_report_open(call: ast.Call) -> bool:
-    """Allow only a literal, text-mode write of the required JSON artifact."""
-    if not call.args or len(call.args) > 2:
-        return False
-    target = call.args[0]
-    if not isinstance(target, ast.Constant) or target.value != "report.json":
-        return False
-    mode_node = call.args[1] if len(call.args) == 2 else None
-    for keyword in call.keywords:
-        if keyword.arg == "mode" and mode_node is None:
-            mode_node = keyword.value
-        elif keyword.arg == "encoding":
-            if not (
-                isinstance(keyword.value, ast.Constant)
-                and keyword.value.value in {"utf-8", "UTF-8"}
-            ):
-                return False
-        else:
-            return False
-    return isinstance(mode_node, ast.Constant) and mode_node.value in {"w", "wt"}
-
-
-def _looks_like_path_receiver(node: ast.AST) -> bool:
-    """Recognize direct Path construction and conventional path variable names."""
-    if isinstance(node, ast.Name):
-        lowered = node.id.lower()
-        return lowered == "path" or lowered.endswith(("_path", "_file"))
-    if isinstance(node, ast.Call):
-        function = node.func
-        return (isinstance(function, ast.Name) and function.id == "Path") or (
-            isinstance(function, ast.Attribute) and function.attr == "Path"
-        )
-    if isinstance(node, ast.Attribute):
-        return _looks_like_path_receiver(node.value)
-    return False
-
-
-def _validate_safe_tree(tree: ast.AST) -> None:
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name) and node.func.id == "open":
-                if not _is_safe_report_open(node):
-                    raise WorkshopAgentError(
-                        "Generated code may call open() only to write the literal "
-                        "report.json artifact in text mode. The controller writes "
-                        "analysis.py itself."
-                    )
-            elif isinstance(node.func, ast.Name) and node.func.id in _FORBIDDEN_CALLS:
-                raise WorkshopAgentError(
-                    f"Generated code may not call {node.func.id}()."
-                )
-            if (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr in _ALWAYS_FORBIDDEN_ATTRIBUTES
-            ):
-                raise WorkshopAgentError(
-                    f"Generated code may not call .{node.func.attr}()."
-                )
-            if (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr in _PATH_MUTATION_ATTRIBUTES
-                and _looks_like_path_receiver(node.func.value)
-            ):
-                raise WorkshopAgentError(
-                    f"Generated code may not call Path.{node.func.attr}()."
-                )
-        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
-            raise WorkshopAgentError("Generated code may not access dunder attributes.")
-        if isinstance(node, (ast.Global, ast.Nonlocal)):
-            raise WorkshopAgentError(
-                "Generated code may not mutate global or nonlocal state."
-            )
-
-
-def _module_bindings_before(tree: ast.AST, line_number: int) -> set[str]:
-    """Collect names available before one top-level generated-code statement."""
-    bindings = set(dir(builtins))
-
-    def bind_target(target: ast.AST) -> None:
-        if isinstance(target, ast.Name):
-            bindings.add(target.id)
-        elif isinstance(target, (ast.Tuple, ast.List)):
-            for element in target.elts:
-                bind_target(element)
-
-    class BindingVisitor(ast.NodeVisitor):
-        def visit_Import(self, node: ast.Import) -> None:
-            if node.lineno < line_number:
-                for alias in node.names:
-                    bindings.add(alias.asname or alias.name.split(".")[0])
-
-        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-            if node.lineno < line_number:
-                for alias in node.names:
-                    bindings.add(alias.asname or alias.name)
-
-        def visit_Assign(self, node: ast.Assign) -> None:
-            if node.lineno < line_number:
-                for target in node.targets:
-                    bind_target(target)
-            self.visit(node.value)
-
-        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-            if node.lineno < line_number:
-                bind_target(node.target)
-            if node.value is not None:
-                self.visit(node.value)
-
-        def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
-            if node.lineno < line_number:
-                bind_target(node.target)
-            self.visit(node.value)
-
-        def visit_For(self, node: ast.For) -> None:
-            if node.lineno < line_number:
-                bind_target(node.target)
-            self.visit(node.iter)
-            for statement in (*node.body, *node.orelse):
-                self.visit(statement)
-
-        visit_AsyncFor = visit_For
-
-        def visit_With(self, node: ast.With) -> None:
-            for item in node.items:
-                self.visit(item.context_expr)
-                if item.optional_vars is not None and node.lineno < line_number:
-                    bind_target(item.optional_vars)
-            for statement in node.body:
-                self.visit(statement)
-
-        visit_AsyncWith = visit_With
-
-        def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
-            if node.name and node.lineno < line_number:
-                bindings.add(node.name)
-            for statement in node.body:
-                self.visit(statement)
-
-        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-            if node.lineno < line_number:
-                bindings.add(node.name)
-            # Function-local assignments are not module bindings.
-
-        visit_AsyncFunctionDef = visit_FunctionDef
-
-        def visit_ClassDef(self, node: ast.ClassDef) -> None:
-            if node.lineno < line_number:
-                bindings.add(node.name)
-            # Class-body assignments are not module bindings.
-
-        def visit_Lambda(self, node: ast.Lambda) -> None:
-            return
-
-        def visit_comprehension(self, node: ast.comprehension) -> None:
-            # Comprehension targets do not leak into module scope in Python 3.
-            self.visit(node.iter)
-            for condition in node.ifs:
-                self.visit(condition)
-
-    visitor = BindingVisitor()
-    for statement in tree.body:
-        if getattr(statement, "lineno", line_number) >= line_number:
-            break
-        visitor.visit(statement)
-    return bindings
-
-
-def _panel_api_issues(tree: ast.AST) -> list[str]:
-    """Report common generated-code mistakes before spending a GPU execution attempt."""
-    issues: list[str] = []
-    name_assignments = {
-        target.id: node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Assign)
-        for target in node.targets
-        if isinstance(target, ast.Name)
-    }
-    assigned_names = {
-        target.id
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.Assign, ast.AnnAssign))
-        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
-        if isinstance(target, ast.Name)
-    }
-    dict_assignments = {
-        name: value
-        for name, value in name_assignments.items()
-        if isinstance(value, ast.Dict)
-    }
-    if "valid_mols" in assigned_names and "valid_df" not in assigned_names:
-        issues.append(
-            "when invalid molecules are removed, create an aligned valid_df and reset "
-            "its index so rows, molecules, fingerprints, and similarities stay aligned"
-        )
-
-    available_position_names: set[str] = set()
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and isinstance(node.value, ast.Subscript)
-            and isinstance(node.value.value, ast.Name)
-            and node.value.value.id == "available_indices"
-        ):
-            available_position_names.add(node.targets[0].id)
-    if any(
-        isinstance(node, ast.Subscript)
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "available_indices"
-        and isinstance(node.slice, ast.Name)
-        and node.slice.id in available_position_names
-        for node in ast.walk(tree)
-    ):
-        issues.append(
-            "do not index available_indices twice; keep the argmin as a position and "
-            "convert it to one candidate index exactly once"
-        )
-
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.For)
-            and isinstance(node.iter, ast.Call)
-            and isinstance(node.iter.func, ast.Name)
-            and node.iter.func.id == "range"
-            and node.iter.args
-            and isinstance(node.iter.args[0], ast.Constant)
-            and node.iter.args[0].value == 96
-            and any(isinstance(child, ast.Continue) for child in ast.walk(node))
-        ):
-            issues.append(
-                "a for range(96) loop with continue can select fewer than 96 compounds; "
-                "continue until 96 are selected or the candidate pool is exhausted"
-            )
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "max_similarity"
-            for target in node.targets
-        ):
-            value = node.value
-            if (
-                isinstance(value, ast.Call)
-                and isinstance(value.func, ast.Attribute)
-                and value.func.attr == "full"
-                and len(value.args) >= 2
-                and isinstance(value.args[1], ast.Constant)
-                and value.args[1].value in {1, 1.0}
-            ):
-                issues.append(
-                    "initialize max_similarity with zeros for greedy max-min selection; "
-                    "starting at 1 prevents np.maximum updates"
-                )
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Subscript)
-            and isinstance(target.value, ast.Name)
-            and target.value.id == "max_similarity"
-            and not (
-                isinstance(node.value, ast.Constant)
-                and isinstance(node.value.value, (int, float))
-                and not isinstance(node.value.value, bool)
-            )
-            for target in node.targets
-        ):
-            issues.append(
-                "do not assign a similarity row or vector to one max_similarity element; "
-                "update the complete vector with max_similarity = np.maximum("
-                "max_similarity, similarity_matrix[:, selected_idx]) and only use a "
-                "numeric scalar when masking selected indices"
-            )
-        if (
-            isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name) and target.id == "max_similarity"
-                for target in node.targets
-            )
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Attribute)
-            and node.value.func.attr == "maximum"
-            and not (
-                len(node.value.args) == 2
-                and isinstance(node.value.args[0], ast.Name)
-                and node.value.args[0].id == "max_similarity"
-                and isinstance(node.value.args[1], ast.Subscript)
-                and isinstance(node.value.args[1].value, ast.Name)
-                and node.value.args[1].value.id == "similarity_matrix"
-                and isinstance(node.value.args[1].slice, ast.Tuple)
-                and len(node.value.args[1].slice.elts) == 2
-                and isinstance(node.value.args[1].slice.elts[0], ast.Slice)
-                and isinstance(node.value.args[1].slice.elts[1], ast.Name)
-                and node.value.args[1].slice.elts[1].id == "selected_idx"
-            )
-        ):
-            issues.append(
-                "update greedy similarities with the full candidate column "
-                "similarity_matrix[:, selected_idx], which has the same 1-D length as "
-                "max_similarity"
-            )
-        if (
-            isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name) and target.id == "max_similarity"
-                for target in node.targets
-            )
-            and isinstance(node.value, ast.Subscript)
-            and isinstance(node.value.value, ast.Name)
-            and node.value.value.id == "similarity_matrix"
-        ):
-            issues.append(
-                "do not replace max_similarity with a similarity-matrix row or subset; "
-                "retain its full candidate length and update it with np.maximum"
-            )
-        if (
-            isinstance(node, ast.Subscript)
-            and isinstance(node.slice, ast.Tuple)
-            and len(node.slice.elts) > 2
-        ):
-            root = node.value
-            while isinstance(root, ast.Subscript):
-                root = root.value
-            if isinstance(root, ast.Name) and root.id == "similarity_matrix":
-                issues.append(
-                    "similarity_matrix is 2-D; extract the panel matrix with "
-                    "similarity_matrix[np.ix_(selected_indices, selected_indices)]"
-                )
-        if (
-            isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.Dict)
-            and any(
-                isinstance(target, ast.Name) and target.id in {"report", "report_data"}
-                for target in node.targets
-            )
-        ):
-            if node not in tree.body:
-                issues.append(
-                    "construct report at module scope after all report inputs are defined"
-                )
-            else:
-                report_bindings = _module_bindings_before(tree, node.lineno)
-                report_local_names = {
-                    child.id
-                    for child in ast.walk(node.value)
-                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
-                }
-                undefined_report_names = sorted(
-                    {
-                        child.id
-                        for child in ast.walk(node.value)
-                        if isinstance(child, ast.Name)
-                        and isinstance(child.ctx, ast.Load)
-                        and child.id not in report_bindings
-                        and child.id not in report_local_names
-                    }
-                )
-                if undefined_report_names:
-                    issues.append(
-                        "define every report input before constructing report; names used "
-                        "before definition: " + ", ".join(undefined_report_names)
-                    )
-            report_fields = {
-                key.value: value
-                for key, value in zip(node.value.keys, node.value.values)
-                if isinstance(key, ast.Constant) and isinstance(key.value, str)
-            }
-            seed_value = report_fields.get("seed")
-            if not (isinstance(seed_value, ast.Constant) and seed_value.value == 2026):
-                issues.append("report must record seed=2026 at the top level")
-            parameters = report_fields.get("parameters")
-            if isinstance(parameters, ast.Name):
-                parameters = dict_assignments.get(parameters.id)
-            if not isinstance(parameters, ast.Dict) or not parameters.keys:
-                issues.append("report parameters must be a non-empty mapping")
-            descriptor_quantiles = report_fields.get("descriptor_quantiles")
-            if isinstance(descriptor_quantiles, ast.Name):
-                descriptor_quantiles = dict_assignments.get(descriptor_quantiles.id)
-            descriptor_keys = (
-                {
-                    key.value
-                    for key in descriptor_quantiles.keys
-                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
-                }
-                if isinstance(descriptor_quantiles, ast.Dict)
-                else set()
-            )
-            if not {"candidate", "panel"}.issubset(descriptor_keys):
-                issues.append(
-                    "report descriptor_quantiles must contain separate candidate and "
-                    "panel mappings"
-                )
-            candidate_count = report_fields.get("candidate_count")
-            if candidate_count is not None and any(
-                token in ast.unparse(candidate_count).lower()
-                for token in ("available", "filtered", "valid")
-            ):
-                issues.append(
-                    "report candidate_count must use the complete input table, not an "
-                    "available, filtered, or valid-molecule subset"
-                )
-            unique_ikeys = report_fields.get("unique_ikeys")
-            if isinstance(unique_ikeys, ast.Name):
-                unique_ikeys = name_assignments.get(unique_ikeys.id, unique_ikeys)
-            expected_unique_expression = False
-            if (
-                isinstance(unique_ikeys, ast.Call)
-                and isinstance(unique_ikeys.func, ast.Name)
-                and unique_ikeys.func.id == "int"
-                and len(unique_ikeys.args) == 1
-            ):
-                count_call = unique_ikeys.args[0]
-                expected_unique_expression = (
-                    isinstance(count_call, ast.Call)
-                    and isinstance(count_call.func, ast.Attribute)
-                    and count_call.func.attr == "nunique"
-                    and "panel_df" in ast.unparse(count_call.func.value)
-                    and "canonical_ikey" in ast.unparse(count_call.func.value)
-                )
-            if not expected_unique_expression:
-                issues.append(
-                    "set report unique_ikeys exactly to "
-                    "int(panel_df['canonical_ikey'].nunique()), an integer count for "
-                    "the final panel rather than a boolean, list, string, or candidate "
-                    "table count"
-                )
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "panel_df"
-            for target in node.targets
-        ):
-            value = node.value
-            if (
-                isinstance(value, ast.Call)
-                and isinstance(value.func, ast.Attribute)
-                and value.func.attr == "copy"
-            ):
-                value = value.func.value
-            if (
-                isinstance(value, ast.Subscript)
-                and isinstance(value.value, ast.Attribute)
-                and isinstance(value.value.value, ast.Name)
-                and value.value.value.id in {"df", "records"}
-                and "selected_indices" in ast.unparse(value.slice)
-            ):
-                issues.append(
-                    "build panel_df from the aligned valid_df used for fingerprints, not "
-                    "from the original unfiltered table with filtered-table indices"
-                )
-        if not isinstance(node, ast.Call):
-            continue
-        if (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr == "numpy"
-            and isinstance(node.func.value, ast.Name)
-            and "tensor" in node.func.value.id.lower()
-        ):
-            issues.append(
-                "do not call .numpy() directly on a CUDA torch tensor; use the "
-                "nvMolKit result's .numpy() or tensor.detach().cpu().numpy()"
-            )
-        if (
-            isinstance(node.func, ast.Name)
-            and node.func.id == "fused_butina"
-            and node.args
-            and "numpy" in ast.unparse(node.args[0]).lower()
-        ):
-            issues.append(
-                "fused_butina requires the packed CUDA fingerprint tensor, not NumPy"
-            )
-        if (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr in {"write_text", "write_bytes"}
-            and isinstance(node.func.value, ast.Call)
-            and isinstance(node.func.value.func, ast.Name)
-            and node.func.value.func.id == "Path"
-            and node.func.value.args
-            and isinstance(node.func.value.args[0], ast.Constant)
-            and node.func.value.args[0].value == "analysis.py"
-        ):
-            issues.append(
-                "the generated script must not write analysis.py; the controller owns it"
-            )
-    string_values = {
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
-    }
-    optional_artifacts = {
-        "panel_representatives.sdf",
-        "geometry_summary.csv",
-    }
-    if string_values.intersection(optional_artifacts):
-        issues.append(
-            "omit optional 3D artifacts from the bounded agent run; the simplified "
-            "notebook uses a bounded 2D structure gallery in Step 4"
-        )
-    has_similarity_panel_slice = any(
-        isinstance(node, ast.Subscript)
-        and "similarity_matrix" in ast.unparse(node)
-        and "selected_indices" in ast.unparse(node)
-        for node in ast.walk(tree)
-    )
-    has_np_ix = any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "ix_"
-        for node in ast.walk(tree)
-    )
-    if has_similarity_panel_slice and not has_np_ix:
-        issues.append(
-            "extract the square panel similarity matrix with "
-            "similarity_matrix[np.ix_(selected_indices, selected_indices)]"
-        )
-    if any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in {"mean", "min", "max", "median"}
-        and node.args
-        and isinstance(node.args[0], ast.Name)
-        and node.args[0].id == "panel_similarity_matrix"
-        for node in ast.walk(tree)
-    ):
-        issues.append(
-            "summarize only the off-diagonal upper triangle of the panel similarity "
-            "matrix so self-similarities of 1.0 are excluded"
-        )
-    return list(dict.fromkeys(issues))
-
-
 def _quantile(values: list[float], fraction: float) -> float | None:
     clean = sorted(value for value in values if math.isfinite(value))
     if not clean:
@@ -984,169 +437,262 @@ def profile_candidate_csv(path: Path) -> dict[str, Any]:
         "columns": columns,
         "unique_canonical_ikeys": len(set(keys)),
         "duplicate_canonical_ikey_rows": len(keys) - len(set(keys)),
+        "blank_canonical_ikey_rows": sum(not key.strip() for key in keys),
         "status_counts": dict(statuses.most_common(10)),
         "descriptor_quantiles": descriptor_quantiles,
     }
 
 
-_ALLOWED_IMPORT_ROOTS = {
-    "collections",
-    "itertools",
-    "json",
-    "math",
-    "nvmolkit",
-    "numpy",
-    "pandas",
-    "pathlib",
-    "rdkit",
-    "torch",
-}
-
-
-def validate_panel_analysis_source(source: str) -> str:
-    """Apply conservative static checks to the standalone Module 3 script."""
-    if len(source.splitlines()) > 550:
-        raise WorkshopAgentError("The generated analysis exceeds the 550-line cap.")
+def minimum_pairwise_distance(similarity_matrix: Any) -> float:
+    """Return the minimum upper-triangle value of one minus similarity."""
     try:
-        tree = ast.parse(source)
-    except SyntaxError as exc:
-        raise WorkshopAgentError(
-            f"Generated analysis has invalid syntax: {exc}"
-        ) from exc
-    local_issues = _panel_api_issues(tree)
+        rows = [list(row) for row in similarity_matrix]
+    except TypeError:
+        raise TypeError("similarity_matrix must be a square numeric matrix.") from None
+    size = len(rows)
+    if size < 2 or any(len(row) != size for row in rows):
+        raise ValueError("similarity_matrix must be square with at least two rows.")
+    distances: list[float] = []
+    for row_index in range(size):
+        for column_index in range(row_index + 1, size):
+            value = rows[row_index][column_index]
+            if isinstance(value, bool):
+                raise TypeError("similarity_matrix values must be numeric.")
+            try:
+                similarity = float(value)
+            except (TypeError, ValueError):
+                raise TypeError("similarity_matrix values must be numeric.") from None
+            if not math.isfinite(similarity) or not 0.0 <= similarity <= 1.0:
+                raise ValueError(
+                    "similarity_matrix values must be finite and in [0, 1]."
+                )
+            distances.append(1.0 - similarity)
+    return min(distances)
+
+
+def _descriptor_values(records: Any, column: str) -> list[float]:
     try:
-        _validate_safe_tree(tree)
-    except WorkshopAgentError as exc:
-        local_issues.insert(0, str(exc))
-    if local_issues:
-        details = "\n".join(f"- {issue}" for issue in local_issues)
-        raise WorkshopAgentError(f"Generated analysis failed local checks:\n{details}")
-
-    imported_roots: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported_roots.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            if node.level:
-                raise WorkshopAgentError(
-                    "Generated analysis may not use relative imports."
-                )
-            imported_roots.add((node.module or "").split(".")[0])
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            value = node.value.strip()
-            if value.startswith(("/", "~")) or ".." in Path(value).parts:
-                raise WorkshopAgentError(
-                    "Generated analysis may not contain absolute or parent-relative paths."
-                )
-    disallowed = imported_roots - _ALLOWED_IMPORT_ROOTS
-    if disallowed:
-        raise WorkshopAgentError(
-            f"Generated analysis uses disallowed imports: {sorted(disallowed)}"
-        )
-    if "nvmolkit" not in imported_roots:
-        raise WorkshopAgentError("Generated analysis must import installed nvMolKit.")
-    required_api_names = {"MorganFingerprintGenerator"}
-    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
-    if not required_api_names.issubset(names):
-        raise WorkshopAgentError(
-            "Generated analysis must use MorganFingerprintGenerator."
-        )
-    second_operations = {
-        "crossTanimotoSimilarity",
-        "fused_butina",
-        "EmbedMolecules",
-        "MMFFOptimizeMoleculesConfs",
-    }
-    if not names.intersection(second_operations):
-        raise WorkshopAgentError(
-            "Generated analysis must use a second approved nvMolKit batch operation."
-        )
-    string_values = {
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
-    }
-    required_files = {"reframe_candidates.csv", "panel.csv", "report.json"}
-    if not required_files.issubset(string_values):
-        raise WorkshopAgentError(
-            "Generated analysis must use the three required workspace filenames."
-        )
-    return source
-
-
-def _similarity_values(value: Any, key: str = "") -> list[float]:
+        raw_values = records[column]
+    except (KeyError, TypeError):
+        try:
+            raw_values = [row[column] for row in records]
+        except (KeyError, TypeError):
+            raise ValueError(
+                "Descriptor records must contain MolWt, cLogP, and TPSA."
+            ) from None
     values: list[float] = []
-    if isinstance(value, dict):
-        for child_key, child in value.items():
-            lowered = str(child_key).lower()
-            if any(token in lowered for token in ("count", "pairs", "size", "n_")):
-                continue
-            values.extend(_similarity_values(child, lowered))
-    elif isinstance(value, list):
-        for child in value:
-            values.extend(_similarity_values(child, key))
-    elif isinstance(value, (int, float)) and not isinstance(value, bool):
-        values.append(float(value))
+    for value in raw_values:
+        if isinstance(value, bool):
+            raise TypeError("Descriptor values must be numeric.")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            raise TypeError("Descriptor values must be numeric.") from None
+        if not math.isfinite(numeric):
+            raise ValueError("Descriptor values must be finite.")
+        values.append(numeric)
+    if not values:
+        raise ValueError("Descriptor records must not be empty.")
     return values
 
 
-def validate_panel_artifacts(
-    workdir: Path, *, expected_panel_size: int
-) -> dict[str, Any]:
-    """Validate agent artifacts independently of the generated analysis."""
-    candidate_path = workdir / "reframe_candidates.csv"
-    panel_path = workdir / "panel.csv"
-    report_path = workdir / "report.json"
-    missing = [path.name for path in (panel_path, report_path) if not path.exists()]
-    if missing:
-        raise WorkshopAgentError(f"Missing required artifacts: {missing}")
+def descriptor_range_coverage(candidates: Any, selected: Any) -> float:
+    """Return mean selected/candidate range for MolWt, cLogP, and TPSA."""
+    normalized_ranges: list[float] = []
+    for column in ("MolWt", "cLogP", "TPSA"):
+        candidate_values = _descriptor_values(candidates, column)
+        selected_values = _descriptor_values(selected, column)
+        candidate_range = max(candidate_values) - min(candidate_values)
+        selected_range = max(selected_values) - min(selected_values)
+        if selected_range > candidate_range + 1e-12:
+            raise ValueError(
+                "Selected descriptor values must come from the candidates."
+            )
+        normalized_ranges.append(
+            1.0 if candidate_range == 0.0 else selected_range / candidate_range
+        )
+    return sum(normalized_ranges) / len(normalized_ranges)
 
-    with candidate_path.open(newline="", encoding="utf-8") as handle:
-        candidates = list(csv.DictReader(handle))
-    with panel_path.open(newline="", encoding="utf-8") as handle:
-        panel = list(csv.DictReader(handle))
-    if not panel:
-        raise WorkshopAgentError("panel.csv is empty.")
-    required_columns = {
+
+def validate_panel_analysis_source(
+    source: str, *, approved_strategy: int, expected_panel_size: int
+) -> str:
+    """Accept only the exact controller-rendered implementation."""
+    expected = _render_panel_analysis(approved_strategy, expected_panel_size)
+    if source != expected:
+        raise WorkshopAgentError(
+            "Module 3 accepts only the exact controller-rendered implementation."
+        )
+    try:
+        compile(source, "<workshop-panel-renderer>", "exec")
+    except SyntaxError:
+        raise WorkshopAgentError(
+            "The exact controller-rendered implementation is not valid Python."
+        ) from None
+    return source
+
+
+def _require_plain_artifact(path: Path) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise WorkshopAgentError(
+            "Module 3 artifacts must be present as regular files in the workspace."
+        )
+
+
+def _strict_report_number(value: Any, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise WorkshopAgentError(f"report.json {field} must be numeric.")
+    number = float(value)
+    if not math.isfinite(number):
+        raise WorkshopAgentError(f"report.json {field} must be finite.")
+    return number
+
+
+def _rdkit_similarity_matrix(
+    rows: list[dict[str, str]], radius: int, fp_bits: int
+) -> list[list[float]]:
+    try:
+        from rdkit import Chem, DataStructs
+        from rdkit.Chem import rdFingerprintGenerator
+    except ImportError:
+        raise WorkshopAgentError(
+            "RDKit is required for independent Module 3 artifact validation."
+        ) from None
+    molecules = [Chem.MolFromSmiles(str(row.get("smile", ""))) for row in rows]
+    if any(molecule is None for molecule in molecules):
+        raise WorkshopAgentError("Module 3 artifacts contain an invalid SMILES value.")
+    generator = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=fp_bits)
+    fingerprints = list(generator.GetFingerprints(molecules, numThreads=0))
+    return [
+        [
+            float(value)
+            for value in DataStructs.BulkTanimotoSimilarity(query, fingerprints)
+        ]
+        for query in fingerprints
+    ]
+
+
+def _validate_panel_artifacts_snapshot(
+    workdir: Path,
+    *,
+    expected_panel_size: int,
+    not_before_ns: int | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Validate artifacts and return a receipt plus the exact report snapshot."""
+    if type(expected_panel_size) is not int or expected_panel_size != 24:
+        raise ValueError("expected_panel_size must be exactly 24.")
+    if not_before_ns is not None and (
+        type(not_before_ns) is not int or not_before_ns < 0
+    ):
+        raise TypeError("not_before_ns must be a non-negative integer or None.")
+
+    resolved = Path(workdir).resolve()
+    candidate_path = resolved / "reframe_candidates.csv"
+    panel_path = resolved / "panel.csv"
+    report_path = resolved / "report.json"
+    for path in (candidate_path, panel_path, report_path):
+        _require_plain_artifact(path)
+    if not_before_ns is not None and any(
+        path.stat(follow_symlinks=False).st_mtime_ns < not_before_ns
+        for path in (panel_path, report_path)
+    ):
+        raise WorkshopAgentError(
+            "Module 3 output artifacts are not from the current execution."
+        )
+
+    try:
+        with candidate_path.open(newline="", encoding="utf-8") as handle:
+            candidates = list(csv.DictReader(handle))
+        with panel_path.open(newline="", encoding="utf-8") as handle:
+            panel = list(csv.DictReader(handle))
+    except (OSError, csv.Error):
+        raise WorkshopAgentError("Module 3 CSV artifacts could not be read.") from None
+
+    if len(candidates) != 96:
+        raise WorkshopAgentError("reframe_candidates.csv must contain exactly 96 rows.")
+    candidate_required_columns = {
         "smile",
         "canonical_ikey",
         "name",
+        "status",
         "reframedb_url",
-        "selection_reason",
-        "method_cluster",
-        "selection_order",
+        "MolWt",
+        "cLogP",
+        "TPSA",
     }
-    missing_columns = required_columns - set(panel[0])
-    if missing_columns:
+    if not candidates or candidate_required_columns - set(candidates[0]):
         raise WorkshopAgentError(
-            f"panel.csv is missing columns: {sorted(missing_columns)}"
+            "reframe_candidates.csv is missing required candidate columns."
+        )
+    candidate_keys = [row.get("canonical_ikey", "").strip() for row in candidates]
+    if any(not key for key in candidate_keys) or len(set(candidate_keys)) != 96:
+        raise WorkshopAgentError(
+            "The candidate input must contain exactly 96 unique connectivity keys."
         )
     if len(panel) != expected_panel_size:
         raise WorkshopAgentError(
             f"panel.csv has {len(panel)} rows; expected {expected_panel_size}."
         )
-    candidate_keys = {row.get("canonical_ikey", "") for row in candidates}
-    panel_keys = [row.get("canonical_ikey", "") for row in panel]
-    if (
-        len(set(panel_keys)) != expected_panel_size
-        or not set(panel_keys) <= candidate_keys
+    required_columns = {
+        "smile",
+        "canonical_ikey",
+        "name",
+        "reframedb_url",
+        "MolWt",
+        "cLogP",
+        "TPSA",
+        "selection_reason",
+        "method_cluster",
+        "selection_order",
+    }
+    if not panel or required_columns - set(panel[0]):
+        raise WorkshopAgentError("panel.csv is missing required panel-design columns.")
+    panel_keys = [row.get("canonical_ikey", "").strip() for row in panel]
+    if len(set(panel_keys)) != expected_panel_size or not set(panel_keys) < set(
+        candidate_keys
     ):
         raise WorkshopAgentError(
-            "Panel connectivity keys are not unique input members."
+            "Panel connectivity keys must be a unique strict subset of the input."
         )
-    if any(not row.get("reframedb_url", "").strip() for row in panel):
-        raise WorkshopAgentError("Every selected compound must retain its ReFRAME URL.")
+    candidate_by_key = {row["canonical_ikey"].strip(): row for row in candidates}
+    for row in panel:
+        source_row = candidate_by_key[row["canonical_ikey"].strip()]
+        if (
+            row.get("smile") != source_row.get("smile")
+            or row.get("name") != source_row.get("name")
+            or row.get("reframedb_url", "").strip()
+            != source_row.get("reframedb_url", "").strip()
+        ):
+            raise WorkshopAgentError(
+                "Panel membership or ReFRAME provenance does not match the input."
+            )
+        try:
+            descriptors_match = all(
+                math.isclose(
+                    float(row[column]),
+                    float(source_row[column]),
+                    rel_tol=0.0,
+                    abs_tol=1e-10,
+                )
+                for column in ("MolWt", "cLogP", "TPSA")
+            )
+        except (TypeError, ValueError):
+            descriptors_match = False
+        if not descriptors_match:
+            raise WorkshopAgentError(
+                "Panel descriptors do not match the candidate input."
+            )
     try:
         orders = sorted(int(row["selection_order"]) for row in panel)
-    except (TypeError, ValueError) as exc:
-        raise WorkshopAgentError("selection_order must contain integers.") from exc
+    except (TypeError, ValueError):
+        raise WorkshopAgentError("selection_order must contain integers.") from None
     if orders != list(range(1, expected_panel_size + 1)):
         raise WorkshopAgentError("selection_order must be contiguous and one-based.")
 
     try:
         report = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise WorkshopAgentError("report.json is not valid JSON.") from exc
+    except (OSError, json.JSONDecodeError):
+        raise WorkshopAgentError("report.json is not valid JSON.") from None
     required_report_keys = {
         "seed",
         "backend",
@@ -1157,80 +703,186 @@ def validate_panel_artifacts(
         "descriptor_quantiles",
         "pairwise_similarity",
         "cluster_coverage",
+        "acceptance",
         "limitations",
         "files",
     }
-    missing_report = required_report_keys - set(report)
-    if missing_report:
+    if not isinstance(report, dict) or set(report) != required_report_keys:
         raise WorkshopAgentError(
-            f"report.json is missing keys: {sorted(missing_report)}"
+            "report.json must contain exactly the required fields."
         )
-    if report["candidate_count"] != len(candidates):
-        raise WorkshopAgentError(
-            "report.json candidate_count does not match the input."
-        )
-    if report["panel_count"] != expected_panel_size:
-        raise WorkshopAgentError("report.json panel_count does not match panel.csv.")
-    unique_value = report["unique_ikeys"]
-    if type(unique_value) is not int or unique_value != expected_panel_size:
-        raise WorkshopAgentError(
-            "report.json unique_ikeys must be the integer count of distinct panel "
-            f"canonical_ikey values ({expected_panel_size})."
-        )
-    similarities = _similarity_values(report["pairwise_similarity"])
-    if not similarities:
-        raise WorkshopAgentError("report.json has no numeric similarity summaries.")
-    if any(
-        not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in similarities
+    if (
+        report["candidate_count"] != 96
+        or report["panel_count"] != 24
+        or report["unique_ikeys"] != 24
+        or type(report["candidate_count"]) is not int
+        or type(report["panel_count"]) is not int
+        or type(report["unique_ikeys"]) is not int
     ):
-        raise WorkshopAgentError("Similarity summaries must be finite and in [0, 1].")
-    if report["seed"] != 2026:
-        raise WorkshopAgentError("report.json seed must equal the workshop seed 2026.")
-    if not isinstance(report["parameters"], dict) or not report["parameters"]:
-        raise WorkshopAgentError("report.json parameters must be a non-empty mapping.")
-    descriptor_quantiles = report["descriptor_quantiles"]
-    if not isinstance(descriptor_quantiles, dict) or not {
-        "candidate",
-        "panel",
-    }.issubset(descriptor_quantiles):
+        raise WorkshopAgentError("report.json row counts do not match the artifacts.")
+    if report["seed"] != 2026 or type(report["seed"]) is not int:
+        raise WorkshopAgentError("report.json seed must equal 2026.")
+    if report["backend"] not in {
+        "nvmolkit-gpu",
+        "rdkit-cpu-reference (not GPU evidence)",
+    }:
+        raise WorkshopAgentError("report.json backend is not approved.")
+    if report["files"] != {
+        "analysis": "analysis.py",
+        "panel": "panel.csv",
+        "report": "report.json",
+    }:
         raise WorkshopAgentError(
-            "report.json descriptor_quantiles must contain candidate and panel entries."
+            "report.json files must name only the required artifacts."
         )
-    return {
-        "candidate_count": len(candidates),
-        "panel_count": len(panel),
-        "similarity_summaries_checked": len(similarities),
+    parameters = report["parameters"]
+    if not isinstance(parameters, dict):
+        raise WorkshopAgentError("report.json parameters must be a mapping.")
+    radius = parameters.get("radius")
+    fp_bits = parameters.get("fp_bits")
+    if type(radius) is not int or radius not in (2, 3):
+        raise WorkshopAgentError("report.json radius is not approved.")
+    if type(fp_bits) is not int or fp_bits not in (1024, 2048):
+        raise WorkshopAgentError("report.json fp_bits is not approved.")
+    strategy = parameters.get("strategy")
+    approved_parameters = {
+        "cluster_aware_max_min": (2, 1024),
+        "descriptor_seeded_max_min": (3, 2048),
     }
+    if approved_parameters.get(strategy) != (radius, fp_bits):
+        raise WorkshopAgentError(
+            "report.json strategy parameters are not an allow-listed combination."
+        )
+    if parameters.get("baseline") != "first_24_stable_source_rows":
+        raise WorkshopAgentError("report.json does not name the fixed baseline.")
+    if not isinstance(report["descriptor_quantiles"], dict) or set(
+        report["descriptor_quantiles"]
+    ) != {"candidate", "panel"}:
+        raise WorkshopAgentError("report.json descriptor_quantiles are malformed.")
+    if not isinstance(report["pairwise_similarity"], dict):
+        raise WorkshopAgentError("report.json pairwise_similarity is malformed.")
+    if not isinstance(report["limitations"], list) or not all(
+        isinstance(item, str) and item.strip() for item in report["limitations"]
+    ):
+        raise WorkshopAgentError("report.json limitations are malformed.")
+
+    candidate_similarity = _rdkit_similarity_matrix(candidates, radius, fp_bits)
+    selected_similarity = _rdkit_similarity_matrix(panel, radius, fp_bits)
+    baseline = candidates[:expected_panel_size]
+    baseline_similarity = [
+        row[:expected_panel_size] for row in candidate_similarity[:expected_panel_size]
+    ]
+    baseline_minimum_distance = minimum_pairwise_distance(baseline_similarity)
+    selected_minimum_distance = minimum_pairwise_distance(selected_similarity)
+    baseline_descriptor_coverage = descriptor_range_coverage(candidates, baseline)
+    selected_descriptor_coverage = descriptor_range_coverage(candidates, panel)
+    tolerance = 1e-12
+    passed = (
+        selected_minimum_distance + tolerance >= baseline_minimum_distance
+        and selected_descriptor_coverage + tolerance >= baseline_descriptor_coverage
+        and (
+            selected_minimum_distance > baseline_minimum_distance + tolerance
+            or selected_descriptor_coverage > baseline_descriptor_coverage + tolerance
+        )
+    )
+    if not passed:
+        raise WorkshopAgentError(
+            "The selected panel does not meet the fixed first-24 baseline contract."
+        )
+
+    acceptance = report["acceptance"]
+    expected_acceptance = {
+        "baseline_minimum_distance": baseline_minimum_distance,
+        "selected_minimum_distance": selected_minimum_distance,
+        "baseline_descriptor_coverage": baseline_descriptor_coverage,
+        "selected_descriptor_coverage": selected_descriptor_coverage,
+    }
+    if not isinstance(acceptance, dict) or acceptance.get("passed") is not True:
+        raise WorkshopAgentError("report.json acceptance receipt did not pass.")
+    for field, expected in expected_acceptance.items():
+        observed = _strict_report_number(acceptance.get(field), f"acceptance.{field}")
+        if not math.isclose(observed, expected, rel_tol=0.0, abs_tol=1e-6):
+            raise WorkshopAgentError(
+                "report.json acceptance metrics do not match independent validation."
+            )
+    reported_minimum_distance = _strict_report_number(
+        report["pairwise_similarity"].get("minimum_distance"),
+        "pairwise_similarity.minimum_distance",
+    )
+    if not math.isclose(
+        reported_minimum_distance,
+        selected_minimum_distance,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise WorkshopAgentError(
+            "report.json minimum distance does not match independent validation."
+        )
+    receipt = {
+        "candidate_count": 96,
+        "panel_count": 24,
+        "strict_subset": True,
+        "baseline_minimum_distance": baseline_minimum_distance,
+        "selected_minimum_distance": selected_minimum_distance,
+        "baseline_descriptor_coverage": baseline_descriptor_coverage,
+        "selected_descriptor_coverage": selected_descriptor_coverage,
+        "acceptance_passed": True,
+    }
+    report_snapshot = json.dumps(report, sort_keys=True, separators=(",", ":"))
+    return receipt, report_snapshot
+
+
+def validate_panel_artifacts(
+    workdir: Path,
+    *,
+    expected_panel_size: int,
+    not_before_ns: int | None = None,
+) -> dict[str, Any]:
+    """Validate the fixed 96-to-24 artifact contract independently."""
+    receipt, _ = _validate_panel_artifacts_snapshot(
+        workdir,
+        expected_panel_size=expected_panel_size,
+        not_before_ns=not_before_ns,
+    )
+    return receipt
 
 
 def _render_panel_analysis(approved_strategy: int, expected_panel_size: int) -> str:
-    """Render a tested standalone analysis for one sponsor-approved strategy."""
+    """Render one exact, tested 96-to-24 panel analysis."""
     if approved_strategy not in (1, 2):
         raise ValueError("approved_strategy must be 1 or 2.")
-    if expected_panel_size < 1:
-        raise ValueError("expected_panel_size must be positive.")
-
-    common_prefix = textwrap.dedent(
+    if type(expected_panel_size) is not int or expected_panel_size != 24:
+        raise ValueError("expected_panel_size must be exactly 24.")
+    radius = 2 if approved_strategy == 1 else 3
+    fp_bits = 1024 if approved_strategy == 1 else 2048
+    strategy_name = (
+        "cluster_aware_max_min"
+        if approved_strategy == 1
+        else "descriptor_seeded_max_min"
+    )
+    return textwrap.dedent(
         f"""\
         from pathlib import Path
         import json
+
         import numpy as np
         import pandas as pd
-        import torch
-        from rdkit import Chem
-        from nvmolkit.fingerprints import MorganFingerprintGenerator
-        from nvmolkit.clustering import fused_butina
-        from nvmolkit.similarity import crossTanimotoSimilarity
+        from rdkit import Chem, DataStructs
+        from rdkit.Chem import rdFingerprintGenerator
+        from rdkit.ML.Cluster import Butina
+
 
         SEED = 2026
-        PANEL_SIZE = {int(expected_panel_size)}
-        RADIUS = {2 if approved_strategy == 1 else 3}
-        FP_BITS = {1024 if approved_strategy == 1 else 2048}
+        CANDIDATE_COUNT = 96
+        PANEL_SIZE = 24
+        RADIUS = {radius}
+        FP_BITS = {fp_bits}
         DISTANCE_CUTOFF = 0.55
         SIMILARITY_TOLERANCE = 1e-5
+        STRATEGY = {strategy_name!r}
 
 
-        def summarize_descriptors(frame):
+        def descriptor_summary(frame):
             return {{
                 column: {{
                     "p05": float(frame[column].quantile(0.05)),
@@ -1241,43 +893,124 @@ def _render_panel_analysis(approved_strategy: int, expected_panel_size: int) -> 
             }}
 
 
+        def minimum_distance(matrix):
+            upper = matrix[np.triu_indices(len(matrix), k=1)]
+            if len(upper) == 0:
+                raise ValueError("At least two rows are required for distance")
+            return float(np.min(1.0 - upper))
+
+
+        def descriptor_coverage(candidates, selected):
+            normalized_ranges = []
+            for column in ("MolWt", "cLogP", "TPSA"):
+                candidate_range = float(
+                    candidates[column].max() - candidates[column].min()
+                )
+                selected_range = float(
+                    selected[column].max() - selected[column].min()
+                )
+                normalized_ranges.append(
+                    1.0
+                    if candidate_range == 0.0
+                    else selected_range / candidate_range
+                )
+            return float(np.mean(normalized_ranges))
+
+
+        def rdkit_fingerprints_and_similarity(molecules):
+            generator = rdFingerprintGenerator.GetMorganGenerator(
+                radius=RADIUS, fpSize=FP_BITS
+            )
+            fingerprints = list(
+                generator.GetFingerprints(molecules, numThreads=0)
+            )
+            similarity = np.asarray(
+                [
+                    DataStructs.BulkTanimotoSimilarity(query, fingerprints)
+                    for query in fingerprints
+                ],
+                dtype=float,
+            )
+            return fingerprints, similarity
+
+
+        def rdkit_clusters(fingerprints):
+            distances = []
+            for row_index in range(1, len(fingerprints)):
+                distances.extend(
+                    DataStructs.BulkTanimotoSimilarity(
+                        fingerprints[row_index],
+                        fingerprints[:row_index],
+                        returnDistance=True,
+                    )
+                )
+            return Butina.ClusterData(
+                distances,
+                len(fingerprints),
+                DISTANCE_CUTOFF,
+                isDistData=True,
+                reordering=True,
+            )
+
+
         df = pd.read_csv("reframe_candidates.csv")
         required_columns = {{
-            "smile", "canonical_ikey", "name", "status", "reframedb_url",
-            "MolWt", "cLogP", "TPSA",
+            "smile",
+            "canonical_ikey",
+            "name",
+            "status",
+            "reframedb_url",
+            "MolWt",
+            "cLogP",
+            "TPSA",
         }}
-        missing_columns = required_columns - set(df.columns)
-        if missing_columns:
-            raise ValueError(f"Missing input columns: {{sorted(missing_columns)}}")
+        if required_columns - set(df.columns):
+            raise ValueError("Candidate input is missing required columns")
+        if len(df) != CANDIDATE_COUNT:
+            raise ValueError("Candidate input must contain exactly 96 rows")
+        if df["canonical_ikey"].isna().any() or df["canonical_ikey"].nunique() != 96:
+            raise ValueError("Candidate connectivity keys must be unique")
+        if not np.isfinite(df[["MolWt", "cLogP", "TPSA"]].to_numpy(dtype=float)).all():
+            raise ValueError("Candidate descriptors must be finite")
 
-        parsed_molecules = [Chem.MolFromSmiles(str(smile)) for smile in df["smile"]]
-        valid_mask = np.asarray([molecule is not None for molecule in parsed_molecules])
-        valid_df = df.loc[valid_mask].copy().reset_index(drop=True)
-        molecules = [molecule for molecule in parsed_molecules if molecule is not None]
-        if len(valid_df) < PANEL_SIZE:
-            raise ValueError("Too few valid molecules for the requested panel size")
+        molecules = [Chem.MolFromSmiles(str(smile)) for smile in df["smile"]]
+        if any(molecule is None for molecule in molecules):
+            raise ValueError("Every candidate SMILES must parse")
 
-        status_text = valid_df["status"].fillna("").str.lower()
-        valid_df["_availability_rank"] = np.select(
-            [
-                status_text.eq("plated and available for follow-up"),
-                status_text.eq("not plated but available for one-off testing"),
-            ],
-            [0, 1],
-            default=2,
-        )
+        nvmolkit_ready = False
+        nvmolkit_fingerprints = None
+        try:
+            import torch
+            from nvmolkit.clustering import fused_butina
+            from nvmolkit.fingerprints import MorganFingerprintGenerator
+            from nvmolkit.similarity import crossTanimotoSimilarity
 
-        fingerprint_generator = MorganFingerprintGenerator(radius=RADIUS, fpSize=FP_BITS)
-        fingerprint_result = fingerprint_generator.GetFingerprints(
-            molecules, num_threads=0
-        )
-        fingerprint_tensor = fingerprint_result.torch()
-        if fingerprint_tensor.shape[0] != len(valid_df):
-            raise ValueError("Fingerprint rows are not aligned with valid_df")
-        similarity_matrix = crossTanimotoSimilarity(
-            fingerprint_result, fingerprint_result
-        ).numpy()
-        if similarity_matrix.shape != (len(valid_df), len(valid_df)):
+            nvmolkit_ready = bool(torch.cuda.is_available())
+        except (ImportError, RuntimeError):
+            nvmolkit_ready = False
+
+        if nvmolkit_ready:
+            generator = MorganFingerprintGenerator(radius=RADIUS, fpSize=FP_BITS)
+            nvmolkit_fingerprints = generator.GetFingerprints(
+                molecules, num_threads=0
+            )
+            fingerprint_tensor = (
+                nvmolkit_fingerprints
+                if isinstance(nvmolkit_fingerprints, torch.Tensor)
+                else nvmolkit_fingerprints.torch()
+            )
+            similarity_matrix = crossTanimotoSimilarity(
+                nvmolkit_fingerprints, nvmolkit_fingerprints
+            ).numpy()
+            backend = "nvmolkit-gpu"
+            rdkit_fingerprints = None
+        else:
+            rdkit_fingerprints, similarity_matrix = (
+                rdkit_fingerprints_and_similarity(molecules)
+            )
+            backend = "rdkit-cpu-reference (not GPU evidence)"
+
+        if similarity_matrix.shape != (CANDIDATE_COUNT, CANDIDATE_COUNT):
             raise ValueError("Unexpected all-pairs similarity shape")
         if not np.isfinite(similarity_matrix).all():
             raise ValueError("Similarity matrix contains non-finite values")
@@ -1287,206 +1020,183 @@ def _render_panel_analysis(approved_strategy: int, expected_panel_size: int) -> 
             raw_similarity_min < -SIMILARITY_TOLERANCE
             or raw_similarity_max > 1.0 + SIMILARITY_TOLERANCE
         ):
-            raise ValueError(
-                "Similarity matrix is meaningfully outside [0, 1]: "
-                f"observed range [{{raw_similarity_min:.8g}}, "
-                f"{{raw_similarity_max:.8g}}]"
-            )
-        # Tanimoto is mathematically bounded; remove only harmless GPU roundoff.
+            raise ValueError("Similarity matrix is outside the Tanimoto range")
         similarity_matrix = np.clip(similarity_matrix, 0.0, 1.0)
-        """
-    )
 
-    if approved_strategy == 1:
-        strategy_block = textwrap.dedent(
-            """\
-            clusters, _, _ = fused_butina(
-                fingerprint_tensor,
-                cutoff=DISTANCE_CUTOFF,
-                return_centroids=True,
-            )
-            cluster_labels = np.full(len(valid_df), -1, dtype=int)
+        descriptor_extrema = []
+        for column in ("MolWt", "cLogP", "TPSA"):
+            for index in (int(df[column].idxmin()), int(df[column].idxmax())):
+                if index not in descriptor_extrema:
+                    descriptor_extrema.append(index)
+
+        cluster_labels = np.full(CANDIDATE_COUNT, -1, dtype=int)
+        cluster_sizes = np.ones(CANDIDATE_COUNT, dtype=int)
+        centroid_indices = list(range(CANDIDATE_COUNT))
+        if {approved_strategy} == 1:
+            if nvmolkit_ready:
+                clusters, _, _ = fused_butina(
+                    fingerprint_tensor,
+                    cutoff=DISTANCE_CUTOFF,
+                    return_centroids=True,
+                )
+            else:
+                clusters = rdkit_clusters(rdkit_fingerprints)
             centroid_indices = []
             for cluster_id, members in enumerate(clusters):
                 member_indices = [int(index) for index in members]
+                if not member_indices:
+                    raise ValueError("Cluster output contains an empty cluster")
                 cluster_labels[member_indices] = cluster_id
+                cluster_sizes[member_indices] = len(member_indices)
                 centroid_indices.append(member_indices[0])
             if (cluster_labels < 0).any():
-                raise ValueError("Every valid molecule must receive a cluster label")
+                raise ValueError("Every candidate must receive a cluster label")
 
-            valid_df["method_cluster"] = cluster_labels
-            cluster_sizes = np.bincount(cluster_labels)
-            valid_df["_cluster_size"] = cluster_sizes[cluster_labels]
-            valid_df["_mw_band"] = pd.cut(
-                valid_df["MolWt"],
-                [-np.inf, 300.0, 500.0, np.inf],
-                labels=["low", "middle", "high"],
-            )
-
-            centroid_frame = valid_df.iloc[centroid_indices].copy()
-            band_queues = {}
-            for band in ("low", "middle", "high"):
-                ordered = centroid_frame.loc[centroid_frame["_mw_band"] == band].sort_values(
-                    ["_availability_rank", "_cluster_size", "canonical_ikey"],
-                    ascending=[True, False, True],
-                )
-                band_queues[band] = [int(index) for index in ordered.index]
-
-            selected_indices = []
-            while len(selected_indices) < min(PANEL_SIZE, len(centroid_indices)):
-                selected_this_round = False
-                for band in ("low", "middle", "high"):
-                    if band_queues[band] and len(selected_indices) < PANEL_SIZE:
-                        selected_indices.append(band_queues[band].pop(0))
-                        selected_this_round = True
-                if not selected_this_round:
-                    break
-
-            if len(selected_indices) < PANEL_SIZE:
-                remaining = valid_df.loc[~valid_df.index.isin(selected_indices)].sort_values(
-                    ["_availability_rank", "_cluster_size", "canonical_ikey"],
-                    ascending=[True, False, True],
-                )
-                selected_indices.extend(
-                    int(index)
-                    for index in remaining.index[: PANEL_SIZE - len(selected_indices)]
-                )
-
-            centroid_set = set(centroid_indices)
-            panel_df = valid_df.iloc[selected_indices].copy()
-            panel_df["selection_reason"] = [
-                "Butina centroid with molecular-weight-band coverage"
-                if index in centroid_set
-                else "Deterministic availability-ranked cluster fill"
-                for index in selected_indices
-            ]
-            strategy_name = "cluster_first_butina"
-            """
+        status_text = df["status"].fillna("").str.lower()
+        availability_rank = np.where(
+            status_text.str.contains("available", regex=False), 0, 1
         )
-    else:
-        strategy_block = textwrap.dedent(
-            """\
-            preferred_mask = valid_df["_availability_rank"].to_numpy() <= 1
-            if int(preferred_mask.sum()) < PANEL_SIZE:
-                preferred_mask = np.ones(len(valid_df), dtype=bool)
+        selected_indices = list(descriptor_extrema)
+        selected_set = set(selected_indices)
+        maximum_similarity = similarity_matrix[:, selected_indices].max(axis=1)
 
-            descriptor_columns = ["MolWt", "cLogP", "TPSA"]
-            descriptor_center = valid_df[descriptor_columns].median()
-            descriptor_scale = valid_df[descriptor_columns].std().replace(0.0, 1.0)
-            property_distance = (
-                (valid_df[descriptor_columns] - descriptor_center) / descriptor_scale
-            ).abs().sum(axis=1)
-
-            selected_indices = []
-            selected_mask = np.zeros(len(valid_df), dtype=bool)
-            max_similarity = np.zeros(len(valid_df), dtype=float)
-            while len(selected_indices) < PANEL_SIZE:
-                available_indices = np.flatnonzero(preferred_mask & ~selected_mask)
-                if len(available_indices) == 0:
-                    available_indices = np.flatnonzero(~selected_mask)
-                if len(available_indices) == 0:
-                    raise ValueError("Candidate pool was exhausted before filling the panel")
-
-                if not selected_indices:
-                    selected_idx = int(min(
-                        available_indices,
-                        key=lambda index: (
-                            float(property_distance.iloc[int(index)]),
-                            str(valid_df.iloc[int(index)]["canonical_ikey"]),
-                        ),
-                    ))
-                else:
-                    scores = max_similarity[available_indices]
-                    minimum_score = float(scores.min())
-                    tied_indices = available_indices[
-                        np.isclose(scores, minimum_score, rtol=0.0, atol=1e-12)
+        while len(selected_indices) < PANEL_SIZE:
+            if {approved_strategy} == 1:
+                pool = [
+                    index
+                    for index in centroid_indices
+                    if index not in selected_set
+                ]
+                if not pool:
+                    pool = [
+                        index
+                        for index in range(CANDIDATE_COUNT)
+                        if index not in selected_set
                     ]
-                    selected_idx = int(min(
-                        tied_indices,
-                        key=lambda index: str(
-                            valid_df.iloc[int(index)]["canonical_ikey"]
-                        ),
-                    ))
-
-                selected_indices.append(selected_idx)
-                selected_mask[selected_idx] = True
-                max_similarity = np.maximum(
-                    max_similarity, similarity_matrix[:, selected_idx]
+                next_index = min(
+                    pool,
+                    key=lambda index: (
+                        float(maximum_similarity[index]),
+                        -int(cluster_sizes[index]),
+                        int(availability_rank[index]),
+                        str(df.iloc[index]["canonical_ikey"]),
+                    ),
                 )
-                max_similarity[selected_indices] = 1.0
-
-            panel_df = valid_df.iloc[selected_indices].copy()
-            panel_df["method_cluster"] = "not_clustered"
-            panel_df["selection_reason"] = (
-                "Greedy max-min fingerprint diversity with availability preference"
+            else:
+                pool = [
+                    index
+                    for index in range(CANDIDATE_COUNT)
+                    if index not in selected_set
+                ]
+                next_index = min(
+                    pool,
+                    key=lambda index: (
+                        float(maximum_similarity[index]),
+                        int(availability_rank[index]),
+                        str(df.iloc[index]["canonical_ikey"]),
+                    ),
+                )
+            selected_indices.append(int(next_index))
+            selected_set.add(int(next_index))
+            maximum_similarity = np.maximum(
+                maximum_similarity, similarity_matrix[:, next_index]
             )
-            strategy_name = "greedy_max_min_similarity"
-            """
-        )
 
-    common_suffix = textwrap.dedent(
-        f"""\
-        if len(selected_indices) != PANEL_SIZE:
-            raise ValueError("Selection did not produce the requested panel size")
+        panel_df = df.iloc[selected_indices].copy().reset_index(drop=True)
         panel_df["selection_order"] = np.arange(1, PANEL_SIZE + 1)
-        panel_df = panel_df.drop(
-            columns=["_availability_rank", "_cluster_size", "_mw_band"],
-            errors="ignore",
-        ).reset_index(drop=True)
-        if panel_df["canonical_ikey"].nunique() != PANEL_SIZE:
-            raise ValueError("Selected connectivity keys are not unique")
-        panel_df.to_csv("panel.csv", index=False)
-
-        panel_similarity_matrix = similarity_matrix[
-            np.ix_(selected_indices, selected_indices)
-        ]
-        upper_triangle = panel_similarity_matrix[
-            np.triu_indices(PANEL_SIZE, k=1)
-        ]
-        candidate_descriptor_quantiles = summarize_descriptors(df)
-        panel_descriptor_quantiles = summarize_descriptors(panel_df)
-
         if {approved_strategy} == 1:
+            panel_df["method_cluster"] = cluster_labels[selected_indices]
+            panel_df["selection_reason"] = (
+                "Descriptor-extrema seed plus cluster-aware max-min selection"
+            )
             cluster_coverage = {{
-                "candidate_clusters": int(len(clusters)),
-                "panel_clusters": int(panel_df["method_cluster"].nunique()),
+                "candidate_clusters": int(len(set(cluster_labels.tolist()))),
+                "panel_clusters": int(
+                    len(set(cluster_labels[selected_indices].tolist()))
+                ),
             }}
         else:
+            panel_df["method_cluster"] = "not_clustered"
+            panel_df["selection_reason"] = (
+                "Descriptor-extrema seed plus deterministic max-min selection"
+            )
             cluster_coverage = {{
                 "method": "not_clustered",
-                "selected_compounds": int(len(panel_df)),
+                "selected_compounds": PANEL_SIZE,
             }}
 
+        panel_similarity = similarity_matrix[np.ix_(selected_indices, selected_indices)]
+        baseline_similarity = similarity_matrix[:PANEL_SIZE, :PANEL_SIZE]
+        baseline_df = df.iloc[:PANEL_SIZE]
+        baseline_minimum_distance = minimum_distance(baseline_similarity)
+        selected_minimum_distance = minimum_distance(panel_similarity)
+        baseline_descriptor_coverage = descriptor_coverage(df, baseline_df)
+        selected_descriptor_coverage = descriptor_coverage(df, panel_df)
+        tolerance = 1e-12
+        acceptance_passed = (
+            selected_minimum_distance + tolerance >= baseline_minimum_distance
+            and selected_descriptor_coverage + tolerance
+            >= baseline_descriptor_coverage
+            and (
+                selected_minimum_distance > baseline_minimum_distance + tolerance
+                or selected_descriptor_coverage
+                > baseline_descriptor_coverage + tolerance
+            )
+        )
+        if not acceptance_passed:
+            raise ValueError(
+                "Selected panel did not meet the fixed first-24 baseline contract"
+            )
+        if len(panel_df) != PANEL_SIZE or panel_df["canonical_ikey"].nunique() != 24:
+            raise ValueError("Panel must contain 24 unique connectivity keys")
+        if not set(panel_df["canonical_ikey"]) < set(df["canonical_ikey"]):
+            raise ValueError("Panel connectivity keys must be a strict subset")
+
+        panel_df.to_csv("panel.csv", index=False)
+        upper_triangle = panel_similarity[
+            np.triu_indices(PANEL_SIZE, k=1)
+        ]
         report = {{
-            "seed": 2026,
-            "backend": "nvmolkit",
+            "seed": SEED,
+            "backend": backend,
             "parameters": {{
-                "strategy": strategy_name,
+                "strategy": STRATEGY,
                 "radius": RADIUS,
                 "fp_bits": FP_BITS,
-                "distance_cutoff": DISTANCE_CUTOFF if {approved_strategy} == 1 else None,
-                "similarity_tolerance": SIMILARITY_TOLERANCE,
+                "distance_cutoff": (
+                    DISTANCE_CUTOFF if {approved_strategy} == 1 else None
+                ),
+                "baseline": "first_24_stable_source_rows",
                 "raw_similarity_range": [
                     raw_similarity_min,
                     raw_similarity_max,
                 ],
             }},
-            "candidate_count": int(len(df)),
-            "panel_count": int(len(panel_df)),
+            "candidate_count": CANDIDATE_COUNT,
+            "panel_count": PANEL_SIZE,
             "unique_ikeys": int(panel_df["canonical_ikey"].nunique()),
             "descriptor_quantiles": {{
-                "candidate": candidate_descriptor_quantiles,
-                "panel": panel_descriptor_quantiles,
+                "candidate": descriptor_summary(df),
+                "panel": descriptor_summary(panel_df),
             }},
             "pairwise_similarity": {{
                 "pair_count": int(len(upper_triangle)),
                 "median": float(np.median(upper_triangle)),
                 "p95": float(np.quantile(upper_triangle, 0.95)),
                 "maximum": float(np.max(upper_triangle)),
+                "minimum_distance": selected_minimum_distance,
             }},
             "cluster_coverage": cluster_coverage,
+            "acceptance": {{
+                "baseline_minimum_distance": baseline_minimum_distance,
+                "selected_minimum_distance": selected_minimum_distance,
+                "baseline_descriptor_coverage": baseline_descriptor_coverage,
+                "selected_descriptor_coverage": selected_descriptor_coverage,
+                "passed": True,
+            }},
             "limitations": [
                 "Fingerprint diversity is representation- and parameter-dependent.",
+                "The first 24 rows are a deterministic teaching baseline, not an optimum.",
                 "Structural diversity does not establish biological activity or safety.",
             ],
             "files": {{
@@ -1498,10 +1208,123 @@ def _render_panel_analysis(approved_strategy: int, expected_panel_size: int) -> 
         Path("report.json").write_text(
             json.dumps(report, indent=2), encoding="utf-8"
         )
-        print(f"Selected {{len(panel_df)}} compounds with {{strategy_name}}")
+        print(
+            f"Selected {{PANEL_SIZE}} of {{CANDIDATE_COUNT}} candidates "
+            f"with {{STRATEGY}} using {{backend}}"
+        )
         """
     )
-    return common_prefix + "\n" + strategy_block + "\n" + common_suffix
+
+
+def reference_panel_plan() -> PanelPlan:
+    """Return the fixed, Python-owned Module 3 reference plan."""
+    return PanelPlan.model_validate(
+        {
+            "data_observations": [
+                "The fixed teaching input contains 96 unique connectivity keys.",
+                "The audit compares every selection with the first 24 stable source rows.",
+                "MolWt, cLogP, and TPSA ranges measure bounded descriptor coverage.",
+            ],
+            "strategies": [
+                {
+                    "title": "Cluster-aware max-min",
+                    "approach": (
+                        "Seed descriptor extrema, then select separated Butina "
+                        "representatives with deterministic cluster-aware tie breaks."
+                    ),
+                    "property_coverage_measure": (
+                        "Mean normalized MolWt, cLogP, and TPSA ranges."
+                    ),
+                    "cluster_balance": (
+                        "Prefer separated cluster representatives and larger clusters "
+                        "only after the max-similarity criterion."
+                    ),
+                    "tradeoff": (
+                        "Cluster membership depends on the fingerprint and cutoff."
+                    ),
+                },
+                {
+                    "title": "Descriptor-seeded max-min",
+                    "approach": (
+                        "Seed descriptor extrema, then add deterministic farthest "
+                        "fingerprint points from the complete fixed candidate set."
+                    ),
+                    "property_coverage_measure": (
+                        "Mean normalized MolWt, cLogP, and TPSA ranges."
+                    ),
+                    "cluster_balance": (
+                        "Use fingerprint separation without assigning cluster labels."
+                    ),
+                    "tradeoff": (
+                        "Farthest-point selection can favor unusual structural features."
+                    ),
+                },
+            ],
+            "recommended_strategy": 2,
+            "recommendation_reason": (
+                "The descriptor-seeded max-min strategy directly targets the fixed "
+                "distance contract while preserving all three measured ranges."
+            ),
+        }
+    )
+
+
+def reference_panel_audit(report: dict[str, Any]) -> PanelAudit:
+    """Build the fixed reference audit from an already validated report."""
+    try:
+        acceptance = report["acceptance"]
+        if (
+            report["candidate_count"] != 96
+            or report["panel_count"] != 24
+            or acceptance["passed"] is not True
+        ):
+            raise KeyError
+        minimum_distance = float(acceptance["selected_minimum_distance"])
+        coverage = float(acceptance["selected_descriptor_coverage"])
+        if not math.isfinite(minimum_distance) or not math.isfinite(coverage):
+            raise KeyError
+    except (KeyError, TypeError, ValueError):
+        raise WorkshopAgentError(
+            "The validated report cannot support the reference audit."
+        ) from None
+    return PanelAudit.model_validate(
+        {
+            "result_assessment": (
+                "The fixed 24-member panel passed the independently checked "
+                "first-24 baseline contract."
+            ),
+            "surprising_result": (
+                f"The selected minimum distance is {minimum_distance:.3f} and the "
+                f"normalized descriptor coverage is {coverage:.3f}."
+            ),
+            "scientific_boundaries": (
+                "The result measures fingerprint separation and three computed "
+                "descriptors; it does not establish biological activity or safety."
+            ),
+            "next_iteration": (
+                "Repeat the bounded comparison with another fingerprint representation "
+                "and add declared assay constraints before experimental selection."
+            ),
+        }
+    )
+
+
+def _remove_previous_regular_output(path: Path) -> None:
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise WorkshopAgentError(
+            "Module 3 output paths must be regular workspace files."
+        )
+    if path.exists():
+        path.unlink()
+
+
+def _panel_child_environment() -> dict[str, str]:
+    """Return only the fixed runtime variables needed by the analysis child."""
+    return {
+        name: os.environ[name]
+        for name in _PANEL_CHILD_ENVIRONMENT_ALLOWLIST
+        if name in os.environ
+    }
 
 
 class PanelDesignAgent:
@@ -1512,102 +1335,120 @@ class PanelDesignAgent:
         *,
         workdir: Path,
         mission: str,
-        api_key: str,
+        mode: Literal["hosted", "reference"] = "hosted",
+        api_key: str | None = None,
         client: Any = None,
     ) -> None:
+        if type(mode) is not str or mode not in {"hosted", "reference"}:
+            raise ValueError("mode must be 'hosted' or 'reference'.")
         resolved = Path(workdir).resolve()
-        if not resolved.is_dir() or not (resolved / "reframe_candidates.csv").is_file():
-            raise ValueError("The agent workspace must contain reframe_candidates.csv.")
+        candidate_path = resolved / "reframe_candidates.csv"
+        if (
+            not resolved.is_dir()
+            or candidate_path.is_symlink()
+            or not candidate_path.is_file()
+        ):
+            raise ValueError(
+                "The agent workspace must contain a regular reframe_candidates.csv."
+            )
+        mission_text = mission.strip()
+        if not mission_text:
+            raise ValueError("mission must not be empty.")
         self.workdir = resolved
-        self.mission = mission.strip()
-        self.api_key = get_workshop_api_key(api_key, prompt=False)
-        self.client = client or _client(self.api_key)
-        self.data_profile = profile_candidate_csv(resolved / "reframe_candidates.csv")
+        self.mission = mission_text
+        self.mode: Literal["hosted", "reference"] = mode
+        self.data_profile = profile_candidate_csv(candidate_path)
+        if (
+            self.data_profile["row_count"] != 96
+            or self.data_profile["unique_canonical_ikeys"] != 96
+            or self.data_profile["duplicate_canonical_ikey_rows"] != 0
+            or self.data_profile["blank_canonical_ikey_rows"] != 0
+        ):
+            raise WorkshopAgentError(
+                "Module 3 requires exactly 96 unique candidate connectivity keys."
+            )
         self.plan: PanelPlan | None = None
 
+        if mode == "reference":
+            if api_key is not None or client is not None:
+                raise ValueError("Reference mode requires no API key or client.")
+            self.api_key: str | None = None
+            self.client = None
+        else:
+            if client is None:
+                protected_key = get_workshop_api_key(api_key)
+                self.api_key = protected_key
+                self.client = _client(protected_key)
+            else:
+                self.api_key = (
+                    get_workshop_api_key(api_key, prompt=False)
+                    if api_key is not None
+                    else None
+                )
+                self.client = client
+
     def request_plan(self) -> PanelPlan:
-        """Ask Nemotron for two strategies without writing or running code."""
+        """Return the fixed reference plan or request the strict hosted plan."""
+        if self.mode == "reference":
+            self.plan = reference_panel_plan()
+            return self.plan
         prompt = (
             f"Mission:\n{self.mission}\n\n"
             "Deterministic input profile:\n"
             f"{json.dumps(self.data_profile, indent=2, sort_keys=True)}\n\n"
-            "Evaluate exactly these two implementation families against the observed "
-            "data profile. Strategy 1 is cluster-first: Morgan radius 2, 1024 bits, "
-            "fused Butina distance cutoff 0.55, followed by molecular-weight-band "
-            "interleaving. Strategy 2 is greedy max-min: Morgan radius 3, 2048 bits, "
-            "all-pairs Tanimoto similarity, availability preference, and deterministic "
-            "farthest-point selection. Explain the scientific tradeoffs, recommend one, "
-            "and do not write code. The local controller owns the tested implementation."
+            "Compare exactly these controller-owned strategies. Strategy 1 is "
+            "descriptor-extrema seeding plus cluster-aware max-min selection with "
+            "Morgan radius 2, 1024 bits, and Butina distance cutoff 0.55. Strategy 2 "
+            "is descriptor-extrema seeding plus greedy max-min selection with Morgan "
+            "radius 3 and 2048 bits. The fixed baseline is the first 24 stable source "
+            "rows. Do not write code; the controller owns all executable source."
         )
         self.plan = _structured_request(
-            api_key=self.api_key,
+            api_key=self.api_key or "",
             client=self.client,
             system_prompt=(
-                "You are a scientific coding agent proposing an auditable chemical-"
-                "library panel design. A human sponsor must approve a strategy before "
-                "the local controller renders code. Molecular similarity is not "
-                "biological activity."
+                "You are a bounded chemistry planning assistant. Return only the "
+                "strict PanelPlan schema. Fingerprint separation is not activity."
             ),
             user_prompt=prompt,
             tool_name="submit_panel_plan",
             response_model=PanelPlan,
-            max_tokens=2200,
+            max_tokens=1800,
         )
         return self.plan
 
-    def _generation_prompt(self, approved_strategy: int) -> str:
+    def _request_audit(
+        self, approved_strategy: int, validated_report_snapshot: str
+    ) -> PanelAudit:
         if self.plan is None:
-            raise WorkshopAgentError("Request a plan before approving a strategy.")
-        strategy = self.plan.strategies[approved_strategy - 1]
-        return (
-            "The sponsor approved this agent-proposed strategy. Render the matching "
-            "tested local implementation and preserve the scientific rationale as a "
-            "receipt. No hosted model will write executable source at this stage.\n\n"
-            f"Approved strategy {approved_strategy}:\n"
-            f"{json.dumps(strategy.model_dump(mode='json'), indent=2)}"
-        )
-
-    def _request_analysis(
-        self,
-        prompt: str,
-        approved_strategy: int,
-        expected_panel_size: int = 96,
-    ) -> GeneratedAnalysis:
-        del prompt
-        source = _render_panel_analysis(approved_strategy, expected_panel_size)
-        strategy = self.plan.strategies[approved_strategy - 1]
-        return GeneratedAnalysis.model_construct(
-            analysis_source=source,
-            implementation_summary=(
-                "Controller-rendered implementation of the sponsor-approved strategy: "
-                + strategy.approach
-            ),
-            expected_tradeoffs=[strategy.tradeoff],
-        )
-
-    def _request_audit(self, approved_strategy: int) -> PanelAudit:
-        report_text = (self.workdir / "report.json").read_text(encoding="utf-8")
+            raise WorkshopAgentError("Request a plan before auditing a strategy.")
+        try:
+            report = json.loads(validated_report_snapshot)
+        except (TypeError, json.JSONDecodeError):
+            raise WorkshopAgentError(
+                "The validated report is unavailable for audit."
+            ) from None
+        if self.mode == "reference":
+            return reference_panel_audit(report)
         prompt = (
-            "Review the independently validated result of the approved panel-design "
-            "strategy. Identify an important or surprising observation even if the "
-            "result is acceptable. Do not infer binding, activity, efficacy, safety, "
-            "or clinical relevance.\n\n"
+            "Review only this independently validated panel report. State the measured "
+            "tradeoff and scientific boundaries. Do not infer binding, activity, "
+            "efficacy, safety, or clinical relevance.\n\n"
             f"Approved strategy {approved_strategy}:\n"
-            f"{json.dumps(self.plan.strategies[approved_strategy - 1].model_dump(mode='json'), indent=2)}\n\n"
-            f"Validated report.json:\n{report_text[:16000]}"
+            f"{json.dumps(self.plan.strategies[approved_strategy - 1].model_dump(mode='json'), sort_keys=True)}\n\n"
+            f"Validated report:\n{json.dumps(report, sort_keys=True)}"
         )
         return _structured_request(
-            api_key=self.api_key,
+            api_key=self.api_key or "",
             client=self.client,
             system_prompt=(
-                "You are the final scientific reviewer for a computational chemistry "
-                "workshop. Interpret only the supplied structural and physicochemical "
-                "receipts, state limitations explicitly, and propose a bounded next step."
+                "You are a bounded scientific reviewer. Return only the strict "
+                "PanelAudit schema and use only the validated receipt."
             ),
             user_prompt=prompt,
             tool_name="submit_panel_audit",
             response_model=PanelAudit,
-            max_tokens=1600,
+            max_tokens=1200,
         )
 
     def run(
@@ -1620,195 +1461,177 @@ class PanelDesignAgent:
         python_executable: str | None = None,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> PanelAgentRun:
-        """Render, run, and independently validate one approved strategy."""
+        """Render and execute one exact controller-owned strategy."""
         if self.plan is None:
             raise WorkshopAgentError(
                 "Request and review a plan before running the agent."
             )
         if approved_strategy not in (1, 2):
             raise ValueError("approved_strategy must be 1 or 2.")
-        if max_revisions not in range(0, 4):
-            raise ValueError("max_revisions must be between 0 and 3.")
+        if type(expected_panel_size) is not int or expected_panel_size != 24:
+            raise ValueError("expected_panel_size must be exactly 24.")
+        if type(max_revisions) is not int or max_revisions != 0:
+            raise ValueError("max_revisions must be 0 for controller-owned source.")
+        if type(timeout_seconds) is not int or timeout_seconds < 1:
+            raise ValueError("timeout_seconds must be a positive integer.")
         executable = python_executable or sys.executable
-        attempts: list[AgentAttempt] = []
-        source = ""
-        failure = ""
+        strategy = self.plan.strategies[approved_strategy - 1]
 
         def notify(event: str, **payload: Any) -> None:
-            """Send optional presentation updates without changing scientific execution."""
             if progress_callback is None:
                 return
             try:
                 progress_callback(event, payload)
             except Exception:
-                # A notebook rendering problem must not alter the agent's analysis.
                 pass
 
         notify(
             "run_started",
             approved_strategy=approved_strategy,
             expected_panel_size=expected_panel_size,
-            max_attempts=1,
         )
+        source = _render_panel_analysis(approved_strategy, expected_panel_size)
+        source = validate_panel_analysis_source(
+            source,
+            approved_strategy=approved_strategy,
+            expected_panel_size=expected_panel_size,
+        )
+        analysis_path = self.workdir / "analysis.py"
+        rendered_path = self.workdir / "analysis_attempt_1_rendered.py"
+        trace_path = self.workdir / "agent_trace.json"
+        panel_path = self.workdir / "panel.csv"
+        report_path = self.workdir / "report.json"
+        for path in (analysis_path, rendered_path, trace_path, panel_path, report_path):
+            _remove_previous_regular_output(path)
+        analysis_path.write_text(source, encoding="utf-8")
+        rendered_path.write_text(source, encoding="utf-8")
+        notify(
+            "source_rendered",
+            attempt=1,
+            source_file=rendered_path.name,
+            source=source,
+            implementation_summary=strategy.approach,
+            expected_tradeoffs=[strategy.tradeoff],
+        )
+        notify("source_validated", attempt=1, source_file=rendered_path.name)
 
-        # Executable source is controller-rendered, so model repair attempts no longer
-        # exist.  The parameter remains accepted for older notebook callers.
-        for attempt_number in (1,):
-            elapsed = 0.0
-            generated_summary = ""
-            generated_tradeoffs: tuple[str, ...] = ()
-            attempt_generated_source = ""
-            attempt_source_name = "(no source file)"
-            prompt = self._generation_prompt(approved_strategy)
-            notify(
-                "generation_started",
-                attempt=attempt_number,
-                is_revision=False,
+        child_environment = _panel_child_environment()
+        not_before_ns = time.time_ns()
+        notify(
+            "execution_started",
+            attempt=1,
+            timeout_seconds=timeout_seconds,
+        )
+        started = time.perf_counter()
+        completed = None
+        attempt: AgentAttempt
+        try:
+            completed = subprocess.run(
+                [executable, "-I", "analysis.py"],
+                cwd=self.workdir,
+                env=child_environment,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
             )
-            try:
-                generated = self._request_analysis(
-                    prompt, approved_strategy, expected_panel_size
+            elapsed = time.perf_counter() - started
+            if completed.returncode:
+                raise WorkshopAgentError(
+                    f"analysis.py exited with code {completed.returncode}."
                 )
-                attempt_generated_source = generated.analysis_source
-                generated_summary = generated.implementation_summary
-                generated_tradeoffs = tuple(generated.expected_tradeoffs)
-                rendered_source_path = (
-                    self.workdir / f"analysis_attempt_{attempt_number}_rendered.py"
-                )
-                rendered_source_path.write_text(
-                    attempt_generated_source, encoding="utf-8"
-                )
-                attempt_source_name = rendered_source_path.name
-                notify(
-                    "source_received",
-                    attempt=attempt_number,
-                    source_file=rendered_source_path.name,
-                    source=attempt_generated_source,
-                    implementation_summary=generated_summary,
-                    expected_tradeoffs=list(generated_tradeoffs),
-                )
-                source = validate_panel_analysis_source(attempt_generated_source)
-                rendered_source_path.write_text(source, encoding="utf-8")
-                attempt_source = rendered_source_path
-                (self.workdir / "analysis.py").write_text(source, encoding="utf-8")
-                notify(
-                    "source_generated",
-                    attempt=attempt_number,
-                    source_file=attempt_source.name,
-                    source=source,
-                    implementation_summary=generated_summary,
-                    expected_tradeoffs=list(generated_tradeoffs),
-                )
+            receipt, validated_report_snapshot = _validate_panel_artifacts_snapshot(
+                self.workdir,
+                expected_panel_size=expected_panel_size,
+                not_before_ns=not_before_ns,
+            )
+            attempt = AgentAttempt(
+                number=1,
+                source_file=rendered_path.name,
+                return_code=completed.returncode,
+                elapsed_seconds=elapsed,
+                passed=True,
+                message=json.dumps(receipt, sort_keys=True),
+                stdout_tail=completed.stdout[-3000:],
+                stderr_tail=completed.stderr[-3000:],
+                implementation_summary=strategy.approach,
+                expected_tradeoffs=(strategy.tradeoff,),
+            )
+            notify(
+                "attempt_passed",
+                attempt=1,
+                elapsed_seconds=elapsed,
+                receipt=receipt,
+                stdout_tail=completed.stdout[-3000:],
+            )
+        except subprocess.TimeoutExpired:
+            elapsed = time.perf_counter() - started
+            message = f"analysis.py exceeded the {timeout_seconds}-second limit."
+            attempt = AgentAttempt(
+                number=1,
+                source_file=rendered_path.name,
+                return_code=None,
+                elapsed_seconds=elapsed,
+                passed=False,
+                message=message,
+                stdout_tail="",
+                stderr_tail="",
+                implementation_summary=strategy.approach,
+                expected_tradeoffs=(strategy.tradeoff,),
+            )
+            notify(
+                "attempt_failed",
+                attempt=1,
+                elapsed_seconds=elapsed,
+                message=message,
+                will_revise=False,
+            )
+        except Exception as error:
+            elapsed = time.perf_counter() - started
+            message = f"{type(error).__name__}: {error}"
+            attempt = AgentAttempt(
+                number=1,
+                source_file=rendered_path.name,
+                return_code=(completed.returncode if completed is not None else None),
+                elapsed_seconds=elapsed,
+                passed=False,
+                message=message[-6000:],
+                stdout_tail=(completed.stdout[-3000:] if completed is not None else ""),
+                stderr_tail=(completed.stderr[-3000:] if completed is not None else ""),
+                implementation_summary=strategy.approach,
+                expected_tradeoffs=(strategy.tradeoff,),
+            )
+            notify(
+                "attempt_failed",
+                attempt=1,
+                elapsed_seconds=elapsed,
+                message=message[-6000:],
+                will_revise=False,
+            )
 
-                # Exact outputs are cleared so stale artifacts cannot pass a later attempt.
-                for artifact_name in ("panel.csv", "report.json"):
-                    artifact = self.workdir / artifact_name
-                    if artifact.exists():
-                        artifact.unlink()
-
-                child_environment = dict(os.environ)
-                child_environment.pop("NVIDIA_API_KEY", None)
-                notify(
-                    "execution_started",
-                    attempt=attempt_number,
-                    timeout_seconds=timeout_seconds,
-                )
-                started = time.perf_counter()
-                try:
-                    completed = subprocess.run(
-                        [executable, "analysis.py"],
-                        cwd=self.workdir,
-                        env=child_environment,
-                        capture_output=True,
-                        text=True,
-                        timeout=timeout_seconds,
-                        check=False,
-                    )
-                    elapsed = time.perf_counter() - started
-                    if completed.returncode:
-                        raise WorkshopAgentError(
-                            f"analysis.py exited with code {completed.returncode}.\n"
-                            f"STDERR:\n{completed.stderr[-6000:]}"
-                        )
-                    receipt = validate_panel_artifacts(
-                        self.workdir, expected_panel_size=expected_panel_size
-                    )
-                    attempts.append(
-                        AgentAttempt(
-                            attempt_number,
-                            attempt_source.name,
-                            completed.returncode,
-                            elapsed,
-                            True,
-                            json.dumps(receipt, sort_keys=True),
-                            completed.stdout[-3000:],
-                            completed.stderr[-3000:],
-                            generated_summary,
-                            generated_tradeoffs,
-                            attempt_generated_source,
-                        )
-                    )
-                    notify(
-                        "attempt_passed",
-                        attempt=attempt_number,
-                        elapsed_seconds=elapsed,
-                        receipt=receipt,
-                        stdout_tail=completed.stdout[-3000:],
-                    )
-                    failure = ""
-                    break
-                except subprocess.TimeoutExpired as exc:
-                    elapsed = time.perf_counter() - started
-                    raise WorkshopAgentError(
-                        f"analysis.py exceeded the {timeout_seconds}-second limit."
-                    ) from exc
-            except Exception as exc:
-                failure = f"{type(exc).__name__}: {exc}"
-                attempts.append(
-                    AgentAttempt(
-                        attempt_number,
-                        attempt_source_name,
-                        None,
-                        float(elapsed),
-                        False,
-                        failure[-6000:],
-                        "",
-                        "",
-                        generated_summary,
-                        generated_tradeoffs,
-                        attempt_generated_source,
-                    )
-                )
-                notify(
-                    "attempt_failed",
-                    attempt=attempt_number,
-                    elapsed_seconds=elapsed,
-                    message=failure[-6000:],
-                    will_revise=False,
-                )
-                break
-
-        success = bool(attempts and attempts[-1].passed)
+        success = attempt.passed
         audit: PanelAudit | None = None
         audit_error = ""
         if success:
             notify("audit_started")
             try:
-                audit = self._request_audit(approved_strategy)
+                audit = self._request_audit(
+                    approved_strategy, validated_report_snapshot
+                )
                 notify("audit_completed", audit=audit.model_dump(mode="json"))
-            except Exception as exc:
-                # Valid artifacts remain usable even if the qualitative audit is unavailable.
-                audit_error = f"{type(exc).__name__}: {exc}"
+            except Exception:
+                audit_error = "The optional scientific audit was unavailable."
                 notify("audit_failed", message=audit_error)
-        trace_path = self.workdir / "agent_trace.json"
+
         trace_payload = {
             "workshop_agent_version": WORKSHOP_AGENT_VERSION,
-            "model": DEFAULT_MODEL,
-            "analysis_transport": "deterministic_strategy_renderer",
+            "mode": self.mode,
+            "model": DEFAULT_MODEL if self.mode == "hosted" else None,
+            "analysis_transport": "exact_controller_renderer",
             "data_profile": self.data_profile,
             "plan": self.plan.model_dump(mode="json"),
             "approved_strategy": approved_strategy,
-            "attempts": [asdict(item) for item in attempts],
+            "attempts": [asdict(attempt)],
             "success": success,
             "audit": audit.model_dump(mode="json") if audit is not None else None,
             "audit_error": audit_error,
@@ -1817,17 +1640,17 @@ class PanelDesignAgent:
         result = PanelAgentRun(
             success=success,
             approved_strategy=approved_strategy,
-            attempts=tuple(attempts),
-            analysis_path=self.workdir / "analysis.py",
-            panel_path=self.workdir / "panel.csv",
-            report_path=self.workdir / "report.json",
+            attempts=(attempt,),
+            analysis_path=analysis_path,
+            panel_path=panel_path,
+            report_path=report_path,
             trace_path=trace_path,
             audit=audit,
         )
         notify(
             "run_completed",
             success=success,
-            attempt_count=len(attempts),
+            attempt_count=1,
             trace_path=str(trace_path),
         )
         return result

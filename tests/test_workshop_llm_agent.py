@@ -1,6 +1,8 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shlex
 import sys
 import traceback
 from types import SimpleNamespace
@@ -14,6 +16,11 @@ MODULE_PATH = REPO_ROOT / "notebooks" / "workshop_llm_agent.py"
 NOTEBOOK_PATH = (
     REPO_ROOT / "notebooks" / "02_agent_assisted_reframe_neighborhoods.ipynb"
 )
+MODULE3_NOTEBOOK_PATH = (
+    REPO_ROOT / "notebooks" / "03_full_agent_reframe_panel_design.ipynb"
+)
+WORKFLOW_PATH = REPO_ROOT / "notebooks" / "module3_interactive_workflow.py"
+SNAPSHOT_PATH = REPO_ROOT / "notebooks" / "data" / "reframe_teaching_snapshot.csv"
 
 
 def _load_agent():
@@ -28,6 +35,84 @@ def _load_agent():
     finally:
         sys.modules.pop(spec.name, None)
     return module
+
+
+def _load_workflow(agent_module):
+    spec = importlib.util.spec_from_file_location(
+        "module3_interactive_workflow_test", WORKFLOW_PATH
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    previous = sys.modules.get("workshop_llm_agent")
+    sys.modules["workshop_llm_agent"] = agent_module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            sys.modules.pop("workshop_llm_agent", None)
+        else:
+            sys.modules["workshop_llm_agent"] = previous
+    return module
+
+
+def _write_candidate_workspace(path, *, count=96):
+    import pandas as pd
+    from rdkit import Chem
+    from rdkit.Chem import Descriptors
+
+    frame = pd.read_csv(SNAPSHOT_PATH).iloc[:count].copy()
+    molecules = [Chem.MolFromSmiles(smile) for smile in frame["smile"]]
+    assert all(molecule is not None for molecule in molecules)
+    frame["MolWt"] = [Descriptors.MolWt(molecule) for molecule in molecules]
+    frame["cLogP"] = [Descriptors.MolLogP(molecule) for molecule in molecules]
+    frame["TPSA"] = [Descriptors.TPSA(molecule) for molecule in molecules]
+    frame.to_csv(path / "reframe_candidates.csv", index=False)
+    return frame
+
+
+def _panel_plan_payload():
+    return {
+        "data_observations": [
+            "The fixed candidate pool contains 96 unique connectivity keys.",
+            "Molecular weight, cLogP, and TPSA define the bounded coverage audit.",
+        ],
+        "strategies": [
+            {
+                "title": "Cluster-first coverage",
+                "approach": "Select deterministic Butina representatives, then retain descriptor-range coverage.",
+                "property_coverage_measure": "Mean normalized MolWt, cLogP, and TPSA ranges.",
+                "cluster_balance": "Prefer separated representatives across the fixed pool.",
+                "tradeoff": "Cluster representatives depend on fingerprint parameters.",
+            },
+            {
+                "title": "Greedy max-min coverage",
+                "approach": "Seed descriptor extrema, then add deterministic farthest fingerprint points.",
+                "property_coverage_measure": "Mean normalized MolWt, cLogP, and TPSA ranges.",
+                "cluster_balance": "Favor separation while retaining the measured descriptor range.",
+                "tradeoff": "Farthest-point selection can favor unusual structural features.",
+            },
+        ],
+        "recommended_strategy": 2,
+        "recommendation_reason": (
+            "The fixed candidate set supports a direct audited comparison with the "
+            "first 24 source rows."
+        ),
+    }
+
+
+def _panel_audit_payload():
+    return {
+        "result_assessment": (
+            "The validated panel meets the fixed structural-distance and descriptor-coverage contract."
+        ),
+        "surprising_result": "Descriptor extrema can improve coverage without reducing the baseline distance.",
+        "scientific_boundaries": (
+            "These fingerprint and descriptor results do not establish biological activity, safety, or efficacy."
+        ),
+        "next_iteration": (
+            "Test representation sensitivity and add assay-specific constraints before experimental use."
+        ),
+    }
 
 
 class _Completions:
@@ -316,3 +401,529 @@ def test_module2_discussion_and_answer_key_pair_the_three_semantic_items():
     assert "selected `skip` would continue" in answer_key
     assert "lowest top-10 Jaccard overlap" in answer_key
     assert "binding, activity, ADMET, efficacy, or safety" in answer_key
+
+
+def test_panel_metric_definitions_match_the_approved_contract():
+    import pandas as pd
+
+    agent = _load_agent()
+    similarities = [
+        [1.0, 0.25, 0.80],
+        [0.25, 1.0, 0.40],
+        [0.80, 0.40, 1.0],
+    ]
+    candidates = pd.DataFrame(
+        {
+            "MolWt": [10.0, 20.0, 30.0],
+            "cLogP": [2.0, 2.0, 2.0],
+            "TPSA": [0.0, 50.0, 100.0],
+        }
+    )
+    selected = candidates.iloc[[0, 2]]
+
+    assert agent.minimum_pairwise_distance(similarities) == pytest.approx(0.20)
+    assert agent.descriptor_range_coverage(candidates, selected) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("mode", [None, "interactive", "Reference", True, 1])
+def test_panel_agent_accepts_only_exact_hosted_or_reference_modes(tmp_path, mode):
+    agent = _load_agent()
+    _write_candidate_workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="mode must be 'hosted' or 'reference'"):
+        agent.PanelDesignAgent(workdir=tmp_path, mission="bounded mission", mode=mode)
+
+
+@pytest.mark.parametrize(
+    ("api_key", "client"),
+    [("nvapi-" + "x" * 24, None), (None, object())],
+)
+def test_panel_reference_mode_rejects_any_key_or_client(tmp_path, api_key, client):
+    agent = _load_agent()
+    _write_candidate_workspace(tmp_path)
+
+    with pytest.raises(
+        ValueError, match="Reference mode requires no API key or client"
+    ):
+        agent.PanelDesignAgent(
+            workdir=tmp_path,
+            mission="bounded mission",
+            mode="reference",
+            api_key=api_key,
+            client=client,
+        )
+
+
+def test_panel_reference_mode_is_key_free_and_makes_zero_client_calls(
+    monkeypatch, tmp_path
+):
+    agent = _load_agent()
+    _write_candidate_workspace(tmp_path)
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-" + "ambient-secret" * 2)
+    monkeypatch.setattr(
+        agent,
+        "get_workshop_api_key",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("reference mode requested a hosted key")
+        ),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_client",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("reference mode created a hosted client")
+        ),
+    )
+
+    panel_agent = agent.PanelDesignAgent(
+        workdir=tmp_path,
+        mission="bounded mission",
+        mode="reference",
+    )
+    plan = panel_agent.request_plan()
+
+    assert isinstance(plan, agent.PanelPlan)
+    assert len(plan.strategies) == 2
+    assert panel_agent.mode == "reference"
+    assert panel_agent.api_key is None
+    assert panel_agent.client is None
+
+
+def test_panel_agent_requires_exact_fixed_candidate_inventory(tmp_path):
+    agent = _load_agent()
+    _write_candidate_workspace(tmp_path, count=95)
+
+    with pytest.raises(
+        agent.WorkshopAgentError,
+        match="exactly 96 unique candidate connectivity keys",
+    ):
+        agent.PanelDesignAgent(
+            workdir=tmp_path,
+            mission="bounded mission",
+            mode="reference",
+        )
+
+
+def test_hosted_panel_agent_calls_only_strict_plan_and_audit_schemas(tmp_path):
+    agent = _load_agent()
+    _write_candidate_workspace(tmp_path)
+    calls = []
+
+    class PanelCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            name = kwargs["tool_choice"]["function"]["name"]
+            payload = (
+                _panel_plan_payload()
+                if name == "submit_panel_plan"
+                else _panel_audit_payload()
+            )
+            tool_call = SimpleNamespace(
+                function=SimpleNamespace(name=name, arguments=json.dumps(payload))
+            )
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(message=SimpleNamespace(tool_calls=[tool_call]))
+                ]
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=PanelCompletions()))
+    panel_agent = agent.PanelDesignAgent(
+        workdir=tmp_path,
+        mission="bounded mission",
+        mode="hosted",
+        api_key="nvapi-" + "x" * 24,
+        client=client,
+    )
+    panel_agent.request_plan()
+    report_snapshot = json.dumps(
+        {
+            "candidate_count": 96,
+            "panel_count": 24,
+            "acceptance": {
+                "baseline_minimum_distance": 0.2,
+                "selected_minimum_distance": 0.3,
+                "baseline_descriptor_coverage": 0.4,
+                "selected_descriptor_coverage": 0.8,
+                "passed": True,
+            },
+        }
+    )
+    audit = panel_agent._request_audit(2, report_snapshot)
+
+    assert isinstance(audit, agent.PanelAudit)
+    assert [call["tool_choice"]["function"]["name"] for call in calls] == [
+        "submit_panel_plan",
+        "submit_panel_audit",
+    ]
+    for call in calls:
+        function = call["tools"][0]["function"]
+        assert function["strict"] is True
+        assert function["parameters"]["additionalProperties"] is False
+
+
+def test_module3_has_no_model_source_schema_or_ingestion_path():
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    definitions = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    for removed in (
+        "GeneratedAnalysis",
+        "submit_panel_analysis",
+        "_request_analysis",
+        "_generation_prompt",
+        "generated_source",
+    ):
+        assert removed not in source
+        assert removed not in definitions
+
+
+@pytest.mark.parametrize("approved_strategy", [1, 2])
+def test_panel_source_is_exactly_controller_rendered(approved_strategy):
+    agent = _load_agent()
+    source = agent._render_panel_analysis(approved_strategy, 24)
+
+    assert (
+        agent.validate_panel_analysis_source(
+            source,
+            approved_strategy=approved_strategy,
+            expected_panel_size=24,
+        )
+        == source
+    )
+    with pytest.raises(
+        agent.WorkshopAgentError,
+        match="exact controller-rendered implementation",
+    ):
+        agent.validate_panel_analysis_source(
+            source + "\n# hosted or local mutation\n",
+            approved_strategy=approved_strategy,
+            expected_panel_size=24,
+        )
+
+
+def test_panel_child_process_does_not_receive_hosted_key(monkeypatch, tmp_path):
+    agent = _load_agent()
+    _write_candidate_workspace(tmp_path)
+    panel_agent = agent.PanelDesignAgent(
+        workdir=tmp_path,
+        mission="bounded mission",
+        mode="reference",
+    )
+    panel_agent.request_plan()
+    child_environments = []
+
+    def fake_run(*args, **kwargs):
+        child_environments.append(kwargs["env"])
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-" + "secret" * 5)
+    monkeypatch.setattr(agent.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        agent,
+        "_validate_panel_artifacts_snapshot",
+        lambda *args, **kwargs: (
+            {
+                "candidate_count": 96,
+                "panel_count": 24,
+                "acceptance_passed": True,
+            },
+            "{}",
+        ),
+    )
+    monkeypatch.setattr(
+        panel_agent, "_request_audit", lambda strategy, report_snapshot: None
+    )
+
+    run = panel_agent.run(approved_strategy=2, expected_panel_size=24)
+
+    assert run.success
+    assert len(child_environments) == 1
+    assert "NVIDIA_API_KEY" not in child_environments[0]
+
+
+def test_panel_child_isolated_from_pythonpath_sitecustomize_and_unrelated_secrets(
+    monkeypatch, tmp_path
+):
+    agent = _load_agent()
+    _write_candidate_workspace(tmp_path)
+    panel_agent = agent.PanelDesignAgent(
+        workdir=tmp_path,
+        mission="bounded mission",
+        mode="reference",
+    )
+    panel_agent.request_plan()
+
+    hostile_pythonpath = tmp_path / "hostile-pythonpath"
+    hostile_pythonpath.mkdir()
+    sitecustomize_marker = tmp_path / "sitecustomize-ran.txt"
+    sentinel_value = "workshop-secret-must-not-reach-analysis"
+    (hostile_pythonpath / "sitecustomize.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        f"Path({str(sitecustomize_marker)!r}).write_text("
+        "os.environ.get('WORKSHOP_SENTINEL_SECRET', 'missing'), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    child_environment_path = tmp_path / "child-environment.txt"
+    child_arguments_path = tmp_path / "child-arguments.txt"
+    python_wrapper = tmp_path / "recording-python"
+    python_wrapper.write_text(
+        "#!/bin/sh\n"
+        f"/usr/bin/env > {shlex.quote(str(child_environment_path))}\n"
+        f"printf '%s\\n' \"$@\" > {shlex.quote(str(child_arguments_path))}\n"
+        f'exec {shlex.quote(sys.executable)} "$@"\n',
+        encoding="utf-8",
+    )
+    python_wrapper.chmod(0o700)
+    monkeypatch.setenv("PYTHONPATH", str(hostile_pythonpath))
+    monkeypatch.setenv("WORKSHOP_SENTINEL_SECRET", sentinel_value)
+
+    run = panel_agent.run(
+        approved_strategy=2,
+        expected_panel_size=24,
+        python_executable=str(python_wrapper),
+        timeout_seconds=120,
+    )
+
+    assert run.success, run.attempts[0].message
+    assert child_arguments_path.read_text(encoding="utf-8").splitlines() == [
+        "-I",
+        "analysis.py",
+    ]
+    child_environment = child_environment_path.read_text(encoding="utf-8")
+    assert "PYTHONPATH=" not in child_environment
+    assert "WORKSHOP_SENTINEL_SECRET=" not in child_environment
+    assert sentinel_value not in child_environment
+    assert not sitecustomize_marker.exists()
+
+
+def test_panel_audit_uses_validated_report_snapshot_before_progress_callback(
+    tmp_path,
+):
+    agent = _load_agent()
+    _write_candidate_workspace(tmp_path)
+    calls = []
+
+    class PanelCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            name = kwargs["tool_choice"]["function"]["name"]
+            payload = (
+                _panel_plan_payload()
+                if name == "submit_panel_plan"
+                else _panel_audit_payload()
+            )
+            tool_call = SimpleNamespace(
+                function=SimpleNamespace(name=name, arguments=json.dumps(payload))
+            )
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(message=SimpleNamespace(tool_calls=[tool_call]))
+                ]
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=PanelCompletions()))
+    panel_agent = agent.PanelDesignAgent(
+        workdir=tmp_path,
+        mission="bounded mission",
+        mode="hosted",
+        api_key="nvapi-" + "x" * 24,
+        client=client,
+    )
+    panel_agent.request_plan()
+    replacement_marker = "callback-replaced-unvalidated-report"
+
+    def replace_report(event, payload):
+        if event == "attempt_passed":
+            (tmp_path / "report.json").write_text(
+                json.dumps({"marker": replacement_marker}), encoding="utf-8"
+            )
+
+    run = panel_agent.run(
+        approved_strategy=2,
+        expected_panel_size=24,
+        timeout_seconds=120,
+        progress_callback=replace_report,
+    )
+
+    assert run.success, run.attempts[0].message
+    audit_call = next(
+        call
+        for call in calls
+        if call["tool_choice"]["function"]["name"] == "submit_panel_audit"
+    )
+    audit_prompt = audit_call["messages"][1]["content"]
+    assert '"candidate_count": 96' in audit_prompt
+    assert '"panel_count": 24' in audit_prompt
+    assert replacement_marker not in audit_prompt
+
+
+def test_panel_artifacts_reject_symlinks_wrong_counts_malformed_and_stale_files(
+    tmp_path,
+):
+    agent = _load_agent()
+    frame = _write_candidate_workspace(tmp_path)
+    panel = frame.iloc[:24].copy()
+    panel["selection_reason"] = "test"
+    panel["method_cluster"] = range(24)
+    panel["selection_order"] = range(1, 25)
+    panel.to_csv(tmp_path / "valid-panel.csv", index=False)
+    (tmp_path / "report.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "panel.csv").symlink_to(tmp_path / "valid-panel.csv")
+
+    with pytest.raises(agent.WorkshopAgentError, match="regular files"):
+        agent.validate_panel_artifacts(tmp_path, expected_panel_size=24)
+
+    (tmp_path / "panel.csv").unlink()
+    panel.iloc[:23].to_csv(tmp_path / "panel.csv", index=False)
+    with pytest.raises(agent.WorkshopAgentError, match="23 rows; expected 24"):
+        agent.validate_panel_artifacts(tmp_path, expected_panel_size=24)
+
+    panel.to_csv(tmp_path / "panel.csv", index=False)
+    (tmp_path / "report.json").write_text("{not-json", encoding="utf-8")
+    with pytest.raises(agent.WorkshopAgentError, match="not valid JSON"):
+        agent.validate_panel_artifacts(tmp_path, expected_panel_size=24)
+
+    (tmp_path / "report.json").write_text("{}", encoding="utf-8")
+    old_seconds = 1_600_000_000
+    os.utime(tmp_path / "panel.csv", (old_seconds, old_seconds))
+    os.utime(tmp_path / "report.json", (old_seconds, old_seconds))
+    with pytest.raises(agent.WorkshopAgentError, match="current execution"):
+        agent.validate_panel_artifacts(
+            tmp_path,
+            expected_panel_size=24,
+            not_before_ns=1_700_000_000_000_000_000,
+        )
+
+
+def test_interactive_workflow_waits_and_callback_cannot_change_success(
+    monkeypatch, tmp_path
+):
+    agent = _load_agent()
+    workflow_module = _load_workflow(agent)
+    plan = agent.PanelPlan.model_validate(_panel_plan_payload())
+    run = agent.PanelAgentRun(
+        success=True,
+        approved_strategy=2,
+        attempts=(),
+        analysis_path=tmp_path / "analysis.py",
+        panel_path=tmp_path / "panel.csv",
+        report_path=tmp_path / "report.json",
+        trace_path=tmp_path / "agent_trace.json",
+        audit=None,
+    )
+
+    class FakeAgent:
+        def request_plan(self):
+            return plan
+
+        def run(self, **kwargs):
+            return run
+
+    secret = "nvapi-" + "callback-secret" * 2
+    callback_calls = []
+
+    def failing_callback(result):
+        callback_calls.append(result)
+        raise RuntimeError(f"renderer rejected {secret}")
+
+    monkeypatch.setattr(workflow_module, "ipython_display", lambda value: value)
+    workflow = workflow_module.launch_interactive_panel_design(
+        FakeAgent(),
+        expected_panel_size=24,
+        on_complete=failing_callback,
+    )
+
+    assert workflow.status == "awaiting_approval"
+    assert workflow.agent_run is None
+    workflow._approve_and_run(workflow.approve_button)
+
+    assert workflow.status == "completed"
+    assert workflow.agent_run is run
+    assert callback_calls == [run]
+    assert secret not in workflow.transcript_text
+    assert "Completion display failed" in workflow.transcript_text
+
+    workflow._approve_and_run(workflow.approve_button)
+    assert callback_calls == [run]
+
+
+def test_module3_trace_records_reference_mode(monkeypatch, tmp_path):
+    agent = _load_agent()
+    _write_candidate_workspace(tmp_path)
+    panel_agent = agent.PanelDesignAgent(
+        workdir=tmp_path,
+        mission="bounded mission",
+        mode="reference",
+    )
+    panel_agent.request_plan()
+    monkeypatch.setattr(
+        agent.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr="bounded test failure"
+        ),
+    )
+
+    run = panel_agent.run(approved_strategy=1, expected_panel_size=24)
+    trace = json.loads(run.trace_path.read_text(encoding="utf-8"))
+
+    assert trace["mode"] == "reference"
+
+
+@pytest.mark.parametrize("approved_strategy", [1, 2])
+def test_both_panel_strategies_beat_the_fixed_first_24_baseline(
+    tmp_path, approved_strategy
+):
+    agent = _load_agent()
+    candidate_frame = _write_candidate_workspace(tmp_path)
+    panel_agent = agent.PanelDesignAgent(
+        workdir=tmp_path,
+        mission="bounded mission",
+        mode="reference",
+    )
+    panel_agent.request_plan()
+
+    run = panel_agent.run(
+        approved_strategy=approved_strategy,
+        expected_panel_size=24,
+        timeout_seconds=120,
+    )
+
+    assert run.success, run.attempts[0].message
+    panel_rows = run.panel_path.read_text(encoding="utf-8").splitlines()
+    report = json.loads(run.report_path.read_text(encoding="utf-8"))
+    trace = json.loads(run.trace_path.read_text(encoding="utf-8"))
+    acceptance = report["acceptance"]
+    candidate_keys = set(candidate_frame["canonical_ikey"].tolist())
+    import pandas as pd
+
+    selected_keys = set(pd.read_csv(run.panel_path)["canonical_ikey"].tolist())
+
+    assert len(panel_rows) == 25
+    assert report["candidate_count"] == 96
+    assert report["panel_count"] == 24
+    assert report["unique_ikeys"] == 24
+    assert len(selected_keys) == 24
+    assert selected_keys < candidate_keys
+    assert (
+        acceptance["selected_minimum_distance"]
+        >= acceptance["baseline_minimum_distance"]
+    )
+    assert (
+        acceptance["selected_descriptor_coverage"]
+        >= acceptance["baseline_descriptor_coverage"]
+    )
+    assert (
+        acceptance["selected_minimum_distance"]
+        > acceptance["baseline_minimum_distance"]
+        or acceptance["selected_descriptor_coverage"]
+        > acceptance["baseline_descriptor_coverage"]
+    )
+    assert trace["mode"] == "reference"
+    assert trace["model"] is None
