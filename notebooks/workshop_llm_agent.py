@@ -1,8 +1,7 @@
-"""Bounded hosted coding agents for ACS workshop Modules 2 and 3.
+"""Bounded hosted policy and analysis helpers for ACS workshop Modules 2 and 3.
 
-The hosted LLM proposes Python source, but deterministic local code decides what
-may execute and whether the resulting artifacts pass.  This is intentionally a
-small workshop controller rather than a general shell-capable coding agent.
+Module 2 accepts only structured policy values, then renders its executable
+function in Python. Module 3 remains a separately bounded analysis controller.
 """
 
 from __future__ import annotations
@@ -14,12 +13,10 @@ import getpass
 import json
 import math
 import os
-import re
 import subprocess
 import sys
 import textwrap
 import time
-import tokenize
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -32,8 +29,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 DEFAULT_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
 NEMOTRON_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
-WORKSHOP_AGENT_VERSION = "2026.08.14.22"
-NEIGHBORHOOD_FUNCTION_LINE_CAP = 70
+WORKSHOP_AGENT_VERSION = "2026.08.18.3"
+WORKSHOP_MODE_ENV = "NVMOLKIT_WORKSHOP_MODE"
 AUTH_GUIDANCE = (
     "NVIDIA_API_KEY must be a hosted NVIDIA Developer API key beginning with "
     "nvapi-. Generate it from the Nemotron model page on build.nvidia.com."
@@ -48,22 +45,30 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
-class GeneratedFunction(_StrictModel):
-    function_source: str = Field(min_length=80)
-    design_choices: list[str] = Field(min_length=2, max_length=2)
+class NeighborhoodPolicy(_StrictModel):
+    """The complete, non-executable hosted decision surface for Module 2."""
+
+    model_config = ConfigDict(
+        extra="forbid", str_strip_whitespace=True, populate_by_name=True
+    )
+
+    missing_anchor: Literal["raise", "skip"] = Field(alias="MISSING_ANCHOR")
+    invalid_matrix: Literal["raise", "skip"] = Field(alias="INVALID_MATRIX")
+    missing_anchor_explanation: str = Field(
+        min_length=12, max_length=240, alias="MISSING_ANCHOR_EXPLANATION"
+    )
+    invalid_matrix_explanation: str = Field(
+        min_length=12, max_length=240, alias="INVALID_MATRIX_EXPLANATION"
+    )
 
 
-class NeighborhoodCodePlan(_StrictModel):
-    missing_anchor: Literal["raise", "skip"]
-    invalid_matrix: Literal["raise", "skip"]
-    design_choices: list[str] = Field(min_length=2, max_length=2)
+@dataclass(frozen=True)
+class NeighborhoodImplementation:
+    """A Python-rendered Module 2 implementation and its policy receipt."""
 
-
-class NeighborhoodReview(_StrictModel):
-    software_failure_mode: str = Field(min_length=20)
-    representation_limitation: str = Field(min_length=20)
-    unsupported_biological_inference: str = Field(min_length=20)
-    proposed_tests: list[str] = Field(min_length=3, max_length=3)
+    label: Literal["reference", "hosted_nemotron"]
+    policy: NeighborhoodPolicy
+    function_source: str
 
 
 class PanelStrategy(_StrictModel):
@@ -122,10 +127,9 @@ class PanelAgentRun:
 
 
 _TOOL_DESCRIPTIONS = {
-    "submit_neighborhood_review": (
-        "Return a skeptical review with one software failure mode, one molecular-"
-        "representation limitation, one unsupported biological inference, and "
-        "exactly three concrete proposed tests."
+    "submit_neighborhood_policy": (
+        "Return only the two bounded policies and one concise explanation for each. "
+        "Do not return executable source."
     ),
     "submit_panel_plan": (
         "Return exactly two scientifically defensible panel-design strategies and "
@@ -160,9 +164,9 @@ def _client(api_key: str) -> OpenAI:
 
 
 def _tool_definition(name: str, response_model: type[BaseModel]) -> dict[str, Any]:
-    schema = response_model.model_json_schema()
+    schema = response_model.model_json_schema(by_alias=True)
     schema["additionalProperties"] = False
-    schema["required"] = list(response_model.model_fields)
+    schema["required"] = list(schema["properties"])
     return {
         "type": "function",
         "function": {
@@ -186,6 +190,8 @@ def _structured_request(
 ) -> _StrictModel:
     """Make one forced schema-checked Nemotron tool call."""
     active_client = client or _client(get_workshop_api_key(api_key, prompt=False))
+    request_failure: str | None = None
+    response = None
     try:
         response = active_client.chat.completions.create(
             model=DEFAULT_MODEL,
@@ -201,217 +207,189 @@ def _structured_request(
             stream=False,
         )
     except (AuthenticationError, PermissionDeniedError):
-        raise ValueError(AUTH_GUIDANCE) from None
-    except Exception as exc:
-        raise WorkshopAgentError(
+        request_failure = AUTH_GUIDANCE
+    except Exception:
+        request_failure = (
             "The hosted Nemotron request failed; check network and model availability."
-        ) from exc
+        )
+    if request_failure == AUTH_GUIDANCE:
+        raise ValueError(request_failure)
+    if request_failure:
+        raise WorkshopAgentError(request_failure)
 
+    schema_failure = False
+    result = None
     try:
+        assert response is not None
         message = response.choices[0].message
         calls = getattr(message, "tool_calls", None)
         if isinstance(calls, (list, tuple)) and len(calls) == 1:
             call = calls[0]
             function = getattr(call, "function", None)
             if function is None or getattr(function, "name", None) != tool_name:
-                raise WorkshopAgentError("The hosted response called an unexpected tool.")
+                raise WorkshopAgentError(
+                    "The hosted response called an unexpected tool."
+                )
             payload = json.loads(function.arguments)
         else:
             # Some compatible endpoints return the forced arguments as JSON content.
             content = getattr(message, "content", None)
             if not isinstance(content, str):
-                raise WorkshopAgentError("The hosted response did not contain tool arguments.")
+                raise WorkshopAgentError(
+                    "The hosted response did not contain tool arguments."
+                )
             payload = json.loads(content)
-        return response_model.model_validate(payload)
-    except (AttributeError, IndexError, json.JSONDecodeError, ValidationError) as exc:
+        result = response_model.model_validate(payload)
+    except (AttributeError, IndexError, json.JSONDecodeError, ValidationError):
+        schema_failure = True
+    if schema_failure:
         raise WorkshopAgentError(
             "The hosted response did not satisfy the workshop's required schema."
-        ) from exc
-
-
-def _plain_text_request(
-    *,
-    api_key: str,
-    system_prompt: str,
-    user_prompt: str,
-    max_tokens: int,
-    client: Any = None,
-) -> str:
-    """Request ordinary multiline text without a structured-tool string cap."""
-    active_client = client or _client(get_workshop_api_key(api_key, prompt=False))
-    try:
-        response = active_client.chat.completions.create(
-            model=DEFAULT_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            extra_body=NEMOTRON_EXTRA_BODY,
-            temperature=0.0,
-            max_tokens=max_tokens,
-            stream=False,
         )
-    except (AuthenticationError, PermissionDeniedError):
-        raise ValueError(AUTH_GUIDANCE) from None
-    except Exception as exc:
-        raise WorkshopAgentError(
-            "The hosted Nemotron request failed; check network and model availability."
-        ) from exc
-
-    try:
-        content = response.choices[0].message.content
-    except (AttributeError, IndexError) as exc:
-        raise WorkshopAgentError(
-            "The hosted response did not contain a text message."
-        ) from exc
-    if not isinstance(content, str) or not content.strip():
-        raise WorkshopAgentError("The hosted response did not contain multiline text.")
-    return content.strip()
+    assert result is not None
+    return result
 
 
-def _neighborhood_text_request(
-    *,
-    api_key: str,
-    system_prompt: str,
-    user_prompt: str,
-    max_tokens: int,
-    client: Any = None,
-) -> str:
-    """Backward-compatible Module 2 wrapper around ordinary text generation."""
-    return _plain_text_request(
-        api_key=api_key,
-        client=client,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        max_tokens=max_tokens,
-    )
+def workshop_mode() -> Literal["interactive", "reference"]:
+    """Return the only supported Module 2 execution mode."""
+    mode = os.environ.get(WORKSHOP_MODE_ENV, "interactive").strip().lower()
+    if mode not in {"interactive", "reference"}:
+        raise ValueError(f"{WORKSHOP_MODE_ENV} must be interactive or reference.")
+    return mode  # type: ignore[return-value]
 
 
-def _parse_neighborhood_text_response(content: str) -> NeighborhoodCodePlan:
-    """Extract two bounded policies and their explanations."""
-    policies = {}
-    for field in ("MISSING_ANCHOR", "INVALID_MATRIX"):
-        match = re.search(rf"(?im)^\s*{field}\s*:\s*(raise|skip)\s*$", content)
-        if match:
-            policies[field] = match.group(1).lower()
-    choices_by_number: dict[int, str] = {}
-    for match in re.finditer(
-        r"(?im)^\s*(?:[-*]\s*)?(?:DESIGN_?)?CHOICE[_ ]?([12])\s*:\s*(.+?)\s*$",
-        content,
-    ):
-        choices_by_number[int(match.group(1))] = match.group(2).strip()
-    if set(policies) != {"MISSING_ANCHOR", "INVALID_MATRIX"}:
-        raise WorkshopAgentError(
-            "The hosted response must select raise or skip for both bounded policies."
-        )
-    if set(choices_by_number) != {1, 2}:
-        raise WorkshopAgentError(
-            "The hosted response did not include exactly two marked design choices."
-        )
-
-    try:
-        return NeighborhoodCodePlan(
-            missing_anchor=policies["MISSING_ANCHOR"],
-            invalid_matrix=policies["INVALID_MATRIX"],
-            design_choices=[choices_by_number[1], choices_by_number[2]],
-        )
-    except ValidationError as exc:
-        raise WorkshopAgentError(
-            "The hosted response contained an invalid policy or design choice."
-        ) from exc
+_REFERENCE_NEIGHBORHOOD_POLICY = NeighborhoodPolicy.model_validate(
+    {
+        "MISSING_ANCHOR": "raise",
+        "INVALID_MATRIX": "raise",
+        "MISSING_ANCHOR_EXPLANATION": "Stop when a named anchor is absent from the fixed sample.",
+        "INVALID_MATRIX_EXPLANATION": "Stop when similarity rows cannot be matched to the input records.",
+    }
+)
 
 
-def _render_neighborhood_function(plan: NeighborhoodCodePlan) -> str:
-    """Render a tested neighborhood workflow from the agent's bounded policies."""
+def _render_neighborhood_function(policy: NeighborhoodPolicy) -> str:
+    """Render the sole executable Module 2 function from two validated choices."""
     missing_action = (
         "raise ValueError(f'Anchor not found: {term}')"
-        if plan.missing_anchor == "raise"
+        if policy.missing_anchor == "raise"
         else "continue"
     )
     invalid_action = (
-        "raise RuntimeError('Unexpected similarity matrix')"
-        if plan.invalid_matrix == "raise"
+        "raise RuntimeError(f'Unexpected similarity matrix: {similarities.shape}')"
+        if policy.invalid_matrix == "raise"
         else "continue"
     )
-    return f'''def build_neighborhood_atlas(records, anchor_terms, radii=(2, 3), fp_bits=1024, top_k=10):
-    """Build a tidy, multi-radius structural-neighborhood atlas."""
-    required = {{'_mol', 'name', 'canonical_ikey', 'reframedb_url'}}
-    missing = required - set(records.columns)
-    if missing:
-        raise ValueError(f'records is missing {{sorted(missing)}}')
-    query_indices = []
-    for term in anchor_terms:
-        matches = records[records['name'].str.contains(term, case=False, regex=False)]
-        if matches.empty:
-            {missing_action}
-        query_indices.append(int(matches.index[0]))
-    if not query_indices:
-        raise ValueError('No anchor compounds were found')
-    rows = []
-    molecules = records['_mol'].tolist()
-    query_molecules = records.loc[query_indices, '_mol'].tolist()
-    # Compare the same queries with molecular context at each radius.
-    for radius in radii:
-        library_fps = make_fingerprints(molecules, radius=radius, fp_bits=fp_bits)
-        query_fps = make_fingerprints(query_molecules, radius=radius, fp_bits=fp_bits)
-        similarities = tanimoto_matrix(query_fps, library_fps)
-        expected_shape = (len(query_indices), len(records))
-        invalid_matrix = (similarities.shape != expected_shape or
-                          not np.isfinite(similarities).all() or
-                          similarities.min() < 0 or similarities.max() > 1)
-        if invalid_matrix:
-            {invalid_action}
-        for query_position, query_index in enumerate(query_indices):
-            query = records.loc[query_index]
-            order = np.argsort(-similarities[query_position], kind='stable')
-            # Exclude the reference itself before selecting the reported neighbors.
-            order = [int(idx) for idx in order
-                     if records.iloc[idx]['canonical_ikey'] != query['canonical_ikey']][:top_k]
-            for rank, library_index in enumerate(order, start=1):
-                neighbor = records.iloc[library_index]
-                rows.append({{'radius': int(radius), 'query': query['name'],
-                             'query_ikey': query['canonical_ikey'], 'rank': rank,
-                             'neighbor': neighbor['name'],
-                             'neighbor_ikey': neighbor['canonical_ikey'],
-                             'tanimoto': float(similarities[query_position, library_index]),
-                             'profile': neighbor['reframedb_url']}})
-    columns = ['radius', 'query', 'query_ikey', 'rank', 'neighbor',
-               'neighbor_ikey', 'tanimoto', 'profile']
-    result = pd.DataFrame(rows, columns=columns)
-    return result.sort_values(['radius', 'query', 'rank'], ignore_index=True)
-'''
-
-
-def _strip_code_fence(source: str) -> str:
-    """Extract Python from common hosted-response envelopes."""
-    source = source.lstrip("\ufeff").strip()
-    fenced_blocks = re.findall(
-        r"```(?:python|py)?[ \t]*\r?\n(.*?)```",
-        source,
-        flags=re.IGNORECASE | re.DOTALL,
+    return textwrap.dedent(
+        f'''\
+        def build_neighborhood_atlas(records, anchor_terms, radii=(2, 3), fp_bits=1024, top_k=10):
+            """Build a deterministic, multi-radius structural-neighborhood atlas."""
+            required = {{"_mol", "name", "canonical_ikey", "reframedb_url"}}
+            missing = required - set(records.columns)
+            if missing:
+                raise ValueError(f"records is missing {{sorted(missing)}}")
+            query_indices = []
+            for term in anchor_terms:
+                matches = records[records["name"].str.contains(term, case=False, regex=False)]
+                if matches.empty:
+                    {missing_action}
+                else:
+                    query_indices.append(int(matches.index[0]))
+            molecules = records["_mol"].tolist()
+            query_molecules = records.loc[query_indices, "_mol"].tolist()
+            rows = []
+            for radius in radii:
+                library_fps = make_fingerprints(molecules, radius=radius, fp_bits=fp_bits)
+                query_fps = make_fingerprints(query_molecules, radius=radius, fp_bits=fp_bits)
+                similarities = tanimoto_matrix(query_fps, library_fps)
+                if similarities.shape != (len(query_indices), len(records)) or not np.isfinite(similarities).all() or not ((similarities >= 0) & (similarities <= 1)).all():
+                    {invalid_action}
+                for query_position, query_index in enumerate(query_indices):
+                    query = records.loc[query_index]
+                    order = np.argsort(-similarities[query_position], kind="stable")
+                    order = [int(index) for index in order if records.iloc[index]["canonical_ikey"] != query["canonical_ikey"]][:top_k]
+                    for rank, library_index in enumerate(order, start=1):
+                        neighbor = records.iloc[library_index]
+                        rows.append({{"radius": int(radius), "query": query["name"], "query_ikey": query["canonical_ikey"], "rank": rank, "neighbor": neighbor["name"], "neighbor_ikey": neighbor["canonical_ikey"], "tanimoto": float(similarities[query_position, library_index]), "profile": neighbor["reframedb_url"]}})
+            columns = ["radius", "query", "query_ikey", "rank", "neighbor", "neighbor_ikey", "tanimoto", "profile"]
+            return pd.DataFrame(rows, columns=columns).sort_values(["radius", "query", "rank"], ignore_index=True)
+        '''
     )
-    if fenced_blocks:
-        # Prefer the block that contains the required chemistry entry point.
-        source = next(
-            (
-                block
-                for block in fenced_blocks
-                if "MorganFingerprintGenerator" in block
-            ),
-            fenced_blocks[0],
-        ).strip()
 
-    lines = source.splitlines()
-    while lines and lines[0].strip().lower() in {
-        "python",
-        "python:",
-        "analysis.py",
-        "analysis.py:",
-        "source:",
-        "code:",
-    }:
-        lines.pop(0)
-    return "\n".join(lines).strip() + "\n"
+
+def validate_rendered_neighborhood_function(
+    policy: NeighborhoodPolicy, function_source: str
+) -> str:
+    """Validate only the exact source rendered locally for a validated policy."""
+    expected = _render_neighborhood_function(policy)
+    if function_source != expected:
+        raise WorkshopAgentError(
+            "Module 2 accepts only locally rendered function source."
+        )
+    try:
+        tree = ast.parse(function_source)
+    except SyntaxError as exc:
+        raise WorkshopAgentError(
+            "The local Module 2 renderer produced invalid syntax."
+        ) from exc
+    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.FunctionDef):
+        raise WorkshopAgentError(
+            "The local Module 2 renderer produced an invalid function."
+        )
+    return function_source
+
+
+def select_neighborhood_implementation(
+    prompt: str,
+    *,
+    mode: Literal["interactive", "reference"] | None = None,
+    api_key: str | None = None,
+    client: Any = None,
+) -> NeighborhoodImplementation:
+    """Choose a bounded policy and return only Python-owned rendered source."""
+    active_mode = workshop_mode() if mode is None else mode
+    if active_mode not in {"interactive", "reference"}:
+        raise ValueError(f"{WORKSHOP_MODE_ENV} must be interactive or reference.")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("A non-empty Module 2 policy prompt is required.")
+    if active_mode == "reference":
+        policy = _REFERENCE_NEIGHBORHOOD_POLICY
+        label: Literal["reference", "hosted_nemotron"] = "reference"
+    else:
+        protected_key = get_workshop_api_key(api_key, prompt=True)
+        policy = _structured_request(
+            api_key=protected_key,
+            client=client,
+            system_prompt=(
+                "You are a bounded chemistry policy assistant. Return exactly two "
+                "raise-or-skip policies and concise explanations. Never return code."
+            ),
+            user_prompt=prompt.strip(),
+            tool_name="submit_neighborhood_policy",
+            response_model=NeighborhoodPolicy,
+            max_tokens=500,
+        )
+        label = "hosted_nemotron"
+    function_source = _render_neighborhood_function(policy)
+    return NeighborhoodImplementation(
+        label=label,
+        policy=policy,
+        function_source=validate_rendered_neighborhood_function(
+            policy, function_source
+        ),
+    )
+
+
+def bind_neighborhood_builder(
+    implementation: NeighborhoodImplementation, namespace: dict[str, Any]
+) -> Any:
+    """Execute only the exact, Python-rendered Module 2 function."""
+    source = validate_rendered_neighborhood_function(
+        implementation.policy, implementation.function_source
+    )
+    local_namespace = dict(namespace)
+    exec(compile(source, "<workshop-neighborhood-renderer>", "exec"), local_namespace)
+    return local_namespace["build_neighborhood_atlas"]
 
 
 _FORBIDDEN_CALLS = {
@@ -462,10 +440,7 @@ def _is_safe_report_open(call: ast.Call) -> bool:
                 return False
         else:
             return False
-    return (
-        isinstance(mode_node, ast.Constant)
-        and mode_node.value in {"w", "wt"}
-    )
+    return isinstance(mode_node, ast.Constant) and mode_node.value in {"w", "wt"}
 
 
 def _looks_like_path_receiver(node: ast.AST) -> bool:
@@ -475,9 +450,7 @@ def _looks_like_path_receiver(node: ast.AST) -> bool:
         return lowered == "path" or lowered.endswith(("_path", "_file"))
     if isinstance(node, ast.Call):
         function = node.func
-        return (
-            isinstance(function, ast.Name) and function.id == "Path"
-        ) or (
+        return (isinstance(function, ast.Name) and function.id == "Path") or (
             isinstance(function, ast.Attribute) and function.attr == "Path"
         )
     if isinstance(node, ast.Attribute):
@@ -496,7 +469,9 @@ def _validate_safe_tree(tree: ast.AST) -> None:
                         "analysis.py itself."
                     )
             elif isinstance(node.func, ast.Name) and node.func.id in _FORBIDDEN_CALLS:
-                raise WorkshopAgentError(f"Generated code may not call {node.func.id}().")
+                raise WorkshopAgentError(
+                    f"Generated code may not call {node.func.id}()."
+                )
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr in _ALWAYS_FORBIDDEN_ATTRIBUTES
@@ -515,7 +490,9 @@ def _validate_safe_tree(tree: ast.AST) -> None:
         if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
             raise WorkshopAgentError("Generated code may not access dunder attributes.")
         if isinstance(node, (ast.Global, ast.Nonlocal)):
-            raise WorkshopAgentError("Generated code may not mutate global or nonlocal state.")
+            raise WorkshopAgentError(
+                "Generated code may not mutate global or nonlocal state."
+            )
 
 
 def _module_bindings_before(tree: ast.AST, line_number: int) -> set[str]:
@@ -625,13 +602,12 @@ def _panel_api_issues(tree: ast.AST) -> list[str]:
         target.id
         for node in ast.walk(tree)
         if isinstance(node, (ast.Assign, ast.AnnAssign))
-        for target in (
-            node.targets if isinstance(node, ast.Assign) else [node.target]
-        )
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
         if isinstance(target, ast.Name)
     }
     dict_assignments = {
-        name: value for name, value in name_assignments.items()
+        name: value
+        for name, value in name_assignments.items()
         if isinstance(value, ast.Dict)
     }
     if "valid_mols" in assigned_names and "valid_df" not in assigned_names:
@@ -772,8 +748,7 @@ def _panel_api_issues(tree: ast.AST) -> list[str]:
             isinstance(node, ast.Assign)
             and isinstance(node.value, ast.Dict)
             and any(
-                isinstance(target, ast.Name)
-                and target.id in {"report", "report_data"}
+                isinstance(target, ast.Name) and target.id in {"report", "report_data"}
                 for target in node.targets
             )
         ):
@@ -788,14 +763,16 @@ def _panel_api_issues(tree: ast.AST) -> list[str]:
                     for child in ast.walk(node.value)
                     if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
                 }
-                undefined_report_names = sorted({
-                    child.id
-                    for child in ast.walk(node.value)
-                    if isinstance(child, ast.Name)
-                    and isinstance(child.ctx, ast.Load)
-                    and child.id not in report_bindings
-                    and child.id not in report_local_names
-                })
+                undefined_report_names = sorted(
+                    {
+                        child.id
+                        for child in ast.walk(node.value)
+                        if isinstance(child, ast.Name)
+                        and isinstance(child.ctx, ast.Load)
+                        and child.id not in report_bindings
+                        and child.id not in report_local_names
+                    }
+                )
                 if undefined_report_names:
                     issues.append(
                         "define every report input before constructing report; names used "
@@ -807,9 +784,7 @@ def _panel_api_issues(tree: ast.AST) -> list[str]:
                 if isinstance(key, ast.Constant) and isinstance(key.value, str)
             }
             seed_value = report_fields.get("seed")
-            if not (
-                isinstance(seed_value, ast.Constant) and seed_value.value == 2026
-            ):
+            if not (isinstance(seed_value, ast.Constant) and seed_value.value == 2026):
                 issues.append("report must record seed=2026 at the top level")
             parameters = report_fields.get("parameters")
             if isinstance(parameters, ast.Name):
@@ -819,11 +794,15 @@ def _panel_api_issues(tree: ast.AST) -> list[str]:
             descriptor_quantiles = report_fields.get("descriptor_quantiles")
             if isinstance(descriptor_quantiles, ast.Name):
                 descriptor_quantiles = dict_assignments.get(descriptor_quantiles.id)
-            descriptor_keys = {
-                key.value
-                for key in descriptor_quantiles.keys
-                if isinstance(key, ast.Constant) and isinstance(key.value, str)
-            } if isinstance(descriptor_quantiles, ast.Dict) else set()
+            descriptor_keys = (
+                {
+                    key.value
+                    for key in descriptor_quantiles.keys
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                }
+                if isinstance(descriptor_quantiles, ast.Dict)
+                else set()
+            )
             if not {"candidate", "panel"}.issubset(descriptor_keys):
                 issues.append(
                     "report descriptor_quantiles must contain separate candidate and "
@@ -966,497 +945,6 @@ def _panel_api_issues(tree: ast.AST) -> list[str]:
     return list(dict.fromkeys(issues))
 
 
-def _repair_missing_function_body_indent(source: str) -> str:
-    """Repair a generated function body shifted to column zero."""
-    lines = source.splitlines()
-    if not lines or not lines[0].startswith("def build_neighborhood_atlas("):
-        return source
-
-    # Locate the signature's final colon, including when arguments span several lines.
-    signature_end_line = None
-    nesting_depth = 0
-    try:
-        tokens = tokenize.generate_tokens(iter(source.splitlines(keepends=True)).__next__)
-        for token in tokens:
-            if token.type != tokenize.OP:
-                continue
-            if token.string in "([{":
-                nesting_depth += 1
-            elif token.string in ")]}":
-                nesting_depth -= 1
-            elif token.string == ":" and nesting_depth == 0:
-                signature_end_line = token.end[0]
-                if lines[signature_end_line - 1][token.end[1] :].strip():
-                    return source
-                break
-    except (IndentationError, tokenize.TokenError):
-        return source
-
-    if signature_end_line is None:
-        return source
-    first_body_line = next(
-        (line for line in lines[signature_end_line:] if line.strip()), ""
-    )
-    if not first_body_line or first_body_line[0].isspace():
-        return source
-    repaired_lines = lines[:signature_end_line] + [
-        f"    {line}" if line.strip() else line
-        for line in lines[signature_end_line:]
-    ]
-    repaired = "\n".join(repaired_lines) + "\n"
-    try:
-        ast.parse(repaired)
-    except SyntaxError:
-        return source
-    return repaired
-
-
-def _compact_neighborhood_source(source: str) -> str:
-    """Remove presentation padding while preserving executable Python."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return source
-    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
-    if len(functions) != 1:
-        return source
-
-    function = functions[0]
-    doc_node = (
-        function.body[0]
-        if function.body
-        and isinstance(function.body[0], ast.Expr)
-        and isinstance(function.body[0].value, ast.Constant)
-        and isinstance(function.body[0].value.value, str)
-        else None
-    )
-    doc_start = doc_node.lineno if doc_node else None
-    doc_end = doc_node.end_lineno if doc_node else None
-    doc_summary = ""
-    if doc_node:
-        first_paragraph = ast.get_docstring(function, clean=True).split("\n\n", 1)[0]
-        doc_summary = " ".join(first_paragraph.split())
-    protected_string_lines = {
-        number
-        for node in ast.walk(function)
-        if isinstance(node, ast.Constant)
-        and isinstance(node.value, str)
-        and node is not getattr(doc_node, "value", None)
-        and node.end_lineno
-        and node.end_lineno > node.lineno
-        for number in range(node.lineno, node.end_lineno + 1)
-    }
-
-    compacted = []
-    for number, line in enumerate(source.splitlines(), start=1):
-        if doc_start and doc_start <= number <= doc_end:
-            if number == doc_start:
-                indentation = line[: len(line) - len(line.lstrip())]
-                compacted.append(f"{indentation}{json.dumps(doc_summary, ensure_ascii=False)}")
-            continue
-        if number in protected_string_lines:
-            compacted.append(line.rstrip())
-            continue
-        if not line.strip():
-            continue
-        stripped = line.lstrip()
-        if stripped.startswith("#"):
-            decoration = stripped[1:].strip()
-            if decoration and set(decoration) <= {"-", "="}:
-                continue
-        compacted.append(line.rstrip())
-    return "\n".join(compacted) + "\n"
-
-
-def validate_neighborhood_function_source(source: str) -> str:
-    """Validate the single function generated for Module 2."""
-    source = _strip_code_fence(source)
-    source = _repair_missing_function_body_indent(source)
-    source = _compact_neighborhood_source(source)
-    try:
-        tree = ast.parse(source)
-    except SyntaxError as exc:
-        raise WorkshopAgentError(f"Generated function has invalid syntax: {exc}") from exc
-
-    issues = []
-    if len(source.splitlines()) > NEIGHBORHOOD_FUNCTION_LINE_CAP:
-        issues.append(
-            "the compacted function exceeds the "
-            f"{NEIGHBORHOOD_FUNCTION_LINE_CAP}-line safety cap"
-        )
-    if any(isinstance(node, (ast.Import, ast.ImportFrom)) for node in ast.walk(tree)):
-        issues.append("do not add imports; the notebook already provides pd and np")
-    top_level = [node for node in tree.body if not isinstance(node, ast.Expr)]
-    functions = [node for node in top_level if isinstance(node, ast.FunctionDef)]
-    if len(functions) != 1 or len(top_level) != 1:
-        issues.append("return exactly one top-level function")
-    else:
-        function = functions[0]
-        if function.name != "build_neighborhood_atlas" or function.decorator_list:
-            issues.append(
-                "the function must be undecorated and named build_neighborhood_atlas"
-            )
-        positional = [item.arg for item in function.args.args]
-        if positional[:2] != ["records", "anchor_terms"]:
-            issues.append("the first arguments must be records and anchor_terms")
-        if not ast.get_docstring(function):
-            issues.append("include a short function docstring")
-
-    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
-    called_names = {
-        node.func.id for node in calls if isinstance(node.func, ast.Name)
-    }
-    for required_helper in ("make_fingerprints", "tanimoto_matrix"):
-        if required_helper not in called_names:
-            issues.append(f"call the supplied {required_helper} helper")
-    for call in calls:
-        if isinstance(call.func, ast.Name) and call.func.id == "make_fingerprints":
-            unsupported = {
-                keyword.arg
-                for keyword in call.keywords
-                if keyword.arg not in {"radius", "fp_bits"}
-            }
-            if unsupported:
-                issues.append(
-                    "make_fingerprints only accepts molecules, radius, and fp_bits"
-                )
-                break
-
-    anchor_terms_as_string = any(
-        isinstance(node, ast.Attribute)
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "anchor_terms"
-        and node.attr in {"lower", "casefold", "strip"}
-        for node in ast.walk(tree)
-    )
-    if anchor_terms_as_string:
-        issues.append(
-            "anchor_terms is a sequence; iterate over each term instead of calling "
-            "a string method on the collection"
-        )
-    iterates_over_anchor_terms = any(
-        (
-            isinstance(node, ast.For)
-            and isinstance(node.iter, ast.Name)
-            and node.iter.id == "anchor_terms"
-        )
-        or (
-            isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp))
-            and any(
-                isinstance(generator.iter, ast.Name)
-                and generator.iter.id == "anchor_terms"
-                for generator in node.generators
-            )
-        )
-        for node in ast.walk(tree)
-    )
-    if not iterates_over_anchor_terms:
-        issues.append("iterate over anchor_terms to locate one query row per term")
-
-    assigned_names = {
-        target.id
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.Assign, ast.AnnAssign))
-        for target in (
-            node.targets if isinstance(node, ast.Assign) else [node.target]
-        )
-        if isinstance(target, ast.Name)
-    }
-    scaffold_names = {
-        "query_indices",
-        "molecules",
-        "query_molecules",
-        "library_fps",
-        "query_fps",
-        "similarities",
-        "rows",
-        "columns",
-    }
-    missing_scaffold_names = sorted(scaffold_names - assigned_names)
-    if missing_scaffold_names:
-        issues.append(
-            "follow the workshop scaffold; missing variables: "
-            + ", ".join(missing_scaffold_names)
-        )
-
-    literal_anchor_match = any(
-        isinstance(call.func, ast.Attribute)
-        and call.func.attr == "contains"
-        and call.args
-        and isinstance(call.args[0], ast.Name)
-        and call.args[0].id == "term"
-        and any(
-            keyword.arg == "case"
-            and isinstance(keyword.value, ast.Constant)
-            and keyword.value.value is False
-            for keyword in call.keywords
-        )
-        and any(
-            keyword.arg == "regex"
-            and isinstance(keyword.value, ast.Constant)
-            and keyword.value.value is False
-            for keyword in call.keywords
-        )
-        for call in calls
-    )
-    if not literal_anchor_match:
-        issues.append(
-            "locate anchors with .str.contains(term, case=False, regex=False); "
-            "exact name equality is not reliable for ReFRAME labels"
-        )
-
-    full_library_assignment = any(
-        isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "molecules"
-            for target in node.targets
-        )
-        and isinstance(node.value, ast.Call)
-        and isinstance(node.value.func, ast.Attribute)
-        and node.value.func.attr == "tolist"
-        and isinstance(node.value.func.value, ast.Subscript)
-        and isinstance(node.value.func.value.value, ast.Name)
-        and node.value.func.value.value.id == "records"
-        and isinstance(node.value.func.value.slice, ast.Constant)
-        and node.value.func.value.slice.value == "_mol"
-        for node in ast.walk(tree)
-    )
-    if not full_library_assignment:
-        issues.append(
-            "assign molecules = records['_mol'].tolist() so the fingerprint library "
-            "stays aligned with records.iloc"
-        )
-
-    nested_radius_loop = any(
-        isinstance(anchor_loop, ast.For)
-        and isinstance(anchor_loop.iter, ast.Name)
-        and anchor_loop.iter.id == "anchor_terms"
-        and any(
-            isinstance(descendant, ast.For)
-            and descendant is not anchor_loop
-            and isinstance(descendant.iter, ast.Name)
-            and descendant.iter.id == "radii"
-            for descendant in ast.walk(anchor_loop)
-        )
-        for anchor_loop in ast.walk(tree)
-    )
-    if nested_radius_loop:
-        issues.append(
-            "collect all query_indices first, then run the radius loop outside the "
-            "anchor_terms loop"
-        )
-
-    fingerprinted_inputs = {
-        call.args[0].id
-        for call in calls
-        if isinstance(call.func, ast.Name)
-        and call.func.id == "make_fingerprints"
-        and call.args
-        and isinstance(call.args[0], ast.Name)
-    }
-    if not {"molecules", "query_molecules"}.issubset(fingerprinted_inputs):
-        issues.append(
-            "call make_fingerprints separately for molecules and query_molecules"
-        )
-    expected_similarity_call = any(
-        isinstance(call.func, ast.Name)
-        and call.func.id == "tanimoto_matrix"
-        and len(call.args) >= 2
-        and isinstance(call.args[0], ast.Name)
-        and call.args[0].id == "query_fps"
-        and isinstance(call.args[1], ast.Name)
-        and call.args[1].id == "library_fps"
-        for call in calls
-    )
-    if not expected_similarity_call:
-        issues.append("call tanimoto_matrix(query_fps, library_fps)")
-
-    required_fields = {
-        "_mol",
-        "name",
-        "canonical_ikey",
-        "reframedb_url",
-        "radius",
-        "query",
-        "query_ikey",
-        "rank",
-        "neighbor",
-        "neighbor_ikey",
-        "tanimoto",
-        "profile",
-    }
-    string_constants = {
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
-    }
-    missing_fields = sorted(required_fields - string_constants)
-    if missing_fields:
-        issues.append(
-            "use the required record and output fields: " + ", ".join(missing_fields)
-        )
-    query_uses_collection = any(
-        isinstance(node, ast.Dict)
-        and any(
-            isinstance(key, ast.Constant)
-            and key.value == "query"
-            and isinstance(value, ast.Name)
-            and value.id == "anchor_terms"
-            for key, value in zip(node.keys, node.values)
-        )
-        for node in ast.walk(tree)
-    )
-    if query_uses_collection:
-        issues.append("write the current query name, not the anchor_terms collection")
-    stable_argsort = any(
-        isinstance(call.func, ast.Attribute)
-        and call.func.attr == "argsort"
-        and any(
-            keyword.arg == "kind"
-            and isinstance(keyword.value, ast.Constant)
-            and keyword.value.value == "stable"
-            for keyword in call.keywords
-        )
-        for call in calls
-    )
-    if not stable_argsort:
-        issues.append("use np.argsort(..., kind='stable') for deterministic ranking")
-    sorts_one_query_row = any(
-        isinstance(call.func, ast.Attribute)
-        and call.func.attr == "argsort"
-        and call.args
-        and isinstance(call.args[0], ast.UnaryOp)
-        and isinstance(call.args[0].op, ast.USub)
-        and isinstance(call.args[0].operand, ast.Subscript)
-        and isinstance(call.args[0].operand.value, ast.Name)
-        and call.args[0].operand.value.id == "similarities"
-        and isinstance(call.args[0].operand.slice, ast.Name)
-        and call.args[0].operand.slice.id == "query_position"
-        for call in calls
-    )
-    if not sorts_one_query_row:
-        issues.append(
-            "rank one query row with np.argsort(-similarities[query_position], "
-            "kind='stable')"
-        )
-
-    forbidden_internals = {
-        node.attr
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute)
-        and node.attr in {"fp_data", "ikey_list", "numpy"}
-    }
-    if forbidden_internals:
-        issues.append(
-            "do not access fingerprint internals or call .numpy(); the helpers return "
-            "backend-ready fingerprints and a host similarity matrix"
-        )
-    if called_names.intersection({"MorganFingerprintGenerator", "crossTanimotoSimilarity"}):
-        issues.append("use the supplied helpers instead of direct nvMolKit calls")
-    try:
-        _validate_safe_tree(tree)
-    except WorkshopAgentError as exc:
-        issues.append(str(exc))
-
-    if issues:
-        unique_issues = list(dict.fromkeys(issues))
-        details = "\n".join(f"- {issue}" for issue in unique_issues)
-        raise WorkshopAgentError(f"Generated function failed local checks:\n{details}")
-    return source
-
-
-def generate_neighborhood_function(
-    prompt: str,
-    api_key: str,
-    *,
-    client: Any = None,
-    max_repairs: int = 2,
-) -> GeneratedFunction:
-    """Generate one Module 2 function, requesting bounded repairs when needed."""
-    if max_repairs not in range(0, 4):
-        raise ValueError("max_repairs must be between 0 and 3.")
-
-    system_prompt = (
-        "You are a bounded coding partner for chemists. Select two implementation "
-        "policies that the local workshop agent will render into tested Python. "
-        "Return ordinary text in exactly this format:\n"
-        "MISSING_ANCHOR: raise or skip\n"
-        "INVALID_MATRIX: raise or skip\n"
-        "CHOICE_1: one brief design choice\n"
-        "CHOICE_2: one brief design choice\n"
-        "Explain the scientific or software consequence of each policy without "
-        "making biological claims. Do not return code, JSON, or Markdown fences."
-    )
-    request_prompt = prompt
-    last_error: WorkshopAgentError | None = None
-
-    for attempt in range(max_repairs + 1):
-        content = _neighborhood_text_request(
-            api_key=api_key,
-            client=client,
-            system_prompt=system_prompt,
-            user_prompt=request_prompt,
-            max_tokens=800,
-        )
-        try:
-            plan = _parse_neighborhood_text_response(content)
-            rendered = _render_neighborhood_function(plan)
-            validated = validate_neighborhood_function_source(rendered)
-            return GeneratedFunction(
-                function_source=validated,
-                design_choices=plan.design_choices,
-            )
-        except WorkshopAgentError as exc:
-            last_error = exc
-            if attempt == max_repairs:
-                break
-            request_prompt = (
-                f"{prompt}\n\n"
-                "Your previous response failed local validation. Return a corrected "
-                "complete response using MISSING_ANCHOR, INVALID_MATRIX, CHOICE_1, "
-                "and CHOICE_2 exactly as requested. Select only raise or skip for "
-                "each policy. Do not return code or JSON.\n\n"
-                f"Validation error:\n{exc}\n\n"
-                "Rejected response:\n"
-                f"{content}"
-            )
-
-    raise WorkshopAgentError(
-        f"Generated function remained invalid after {max_repairs + 1} attempts: "
-        f"{last_error}"
-    ) from last_error
-
-
-def review_neighborhood_function(
-    *,
-    prompt: str,
-    function_source: str,
-    result_summary: str,
-    api_key: str,
-    client: Any = None,
-) -> NeighborhoodReview:
-    """Ask the same embedded agent for a bounded skeptical review."""
-    user_prompt = (
-        f"Original contract:\n{prompt}\n\n"
-        f"Implementation:\n```python\n{function_source}\n```\n\n"
-        f"Observed result summary:\n{result_summary}\n\n"
-        "Review without changing or executing the code."
-    )
-    return _structured_request(
-        api_key=api_key,
-        client=client,
-        system_prompt=(
-            "You are a skeptical cheminformatics reviewer. Separate software "
-            "correctness, molecular representation, and biological inference. "
-            "Propose tests that could fail for concrete defects."
-        ),
-        user_prompt=user_prompt,
-        tool_name="submit_neighborhood_review",
-        response_model=NeighborhoodReview,
-        max_tokens=1400,
-    )
-
-
 def _quantile(values: list[float], fraction: float) -> float | None:
     clean = sorted(value for value in values if math.isfinite(value))
     if not clean:
@@ -1515,76 +1003,16 @@ _ALLOWED_IMPORT_ROOTS = {
 }
 
 
-# The controller owns this small, allowlisted preamble.  Generated analyses can
-# therefore focus on the scientific method without failing because an import was
-# accidentally omitted from an otherwise usable proposal.
-_PANEL_REQUIRED_IMPORTS = (
-    ("pathlib", "Path", "Path", "from pathlib import Path"),
-    ("json", None, "json", "import json"),
-    ("numpy", None, "np", "import numpy as np"),
-    ("pandas", None, "pd", "import pandas as pd"),
-    ("torch", None, "torch", "import torch"),
-    ("rdkit", "Chem", "Chem", "from rdkit import Chem"),
-    (
-        "nvmolkit.fingerprints",
-        "MorganFingerprintGenerator",
-        "MorganFingerprintGenerator",
-        "from nvmolkit.fingerprints import MorganFingerprintGenerator",
-    ),
-    (
-        "nvmolkit.clustering",
-        "fused_butina",
-        "fused_butina",
-        "from nvmolkit.clustering import fused_butina",
-    ),
-    (
-        "nvmolkit.similarity",
-        "crossTanimotoSimilarity",
-        "crossTanimotoSimilarity",
-        "from nvmolkit.similarity import crossTanimotoSimilarity",
-    ),
-)
-
-
-def _ensure_panel_imports(source: str) -> str:
-    """Prepend any missing imports from the controller's fixed safe preamble."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        # Preserve the original syntax error for the main validator's clearer receipt.
-        return source
-
-    imports: set[tuple[str, str | None, str]] = set()
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                bound_name = alias.asname or alias.name.split(".")[0]
-                imports.add((alias.name, None, bound_name))
-        elif isinstance(node, ast.ImportFrom) and not node.level:
-            for alias in node.names:
-                bound_name = alias.asname or alias.name
-                imports.add((node.module or "", alias.name, bound_name))
-
-    missing_lines = [
-        line
-        for module, imported_name, bound_name, line in _PANEL_REQUIRED_IMPORTS
-        if (module, imported_name, bound_name) not in imports
-    ]
-    if not missing_lines:
-        return source
-    return "\n".join(missing_lines) + "\n\n" + source.lstrip()
-
-
 def validate_panel_analysis_source(source: str) -> str:
     """Apply conservative static checks to the standalone Module 3 script."""
-    source = _strip_code_fence(source)
-    source = _ensure_panel_imports(source)
     if len(source.splitlines()) > 550:
         raise WorkshopAgentError("The generated analysis exceeds the 550-line cap.")
     try:
         tree = ast.parse(source)
     except SyntaxError as exc:
-        raise WorkshopAgentError(f"Generated analysis has invalid syntax: {exc}") from exc
+        raise WorkshopAgentError(
+            f"Generated analysis has invalid syntax: {exc}"
+        ) from exc
     local_issues = _panel_api_issues(tree)
     try:
         _validate_safe_tree(tree)
@@ -1592,9 +1020,7 @@ def validate_panel_analysis_source(source: str) -> str:
         local_issues.insert(0, str(exc))
     if local_issues:
         details = "\n".join(f"- {issue}" for issue in local_issues)
-        raise WorkshopAgentError(
-            f"Generated analysis failed local checks:\n{details}"
-        )
+        raise WorkshopAgentError(f"Generated analysis failed local checks:\n{details}")
 
     imported_roots: set[str] = set()
     for node in ast.walk(tree):
@@ -1602,7 +1028,9 @@ def validate_panel_analysis_source(source: str) -> str:
             imported_roots.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             if node.level:
-                raise WorkshopAgentError("Generated analysis may not use relative imports.")
+                raise WorkshopAgentError(
+                    "Generated analysis may not use relative imports."
+                )
             imported_roots.add((node.module or "").split(".")[0])
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             value = node.value.strip()
@@ -1620,7 +1048,9 @@ def validate_panel_analysis_source(source: str) -> str:
     required_api_names = {"MorganFingerprintGenerator"}
     names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
     if not required_api_names.issubset(names):
-        raise WorkshopAgentError("Generated analysis must use MorganFingerprintGenerator.")
+        raise WorkshopAgentError(
+            "Generated analysis must use MorganFingerprintGenerator."
+        )
     second_operations = {
         "crossTanimotoSimilarity",
         "fused_butina",
@@ -1632,7 +1062,8 @@ def validate_panel_analysis_source(source: str) -> str:
             "Generated analysis must use a second approved nvMolKit batch operation."
         )
     string_values = {
-        node.value for node in ast.walk(tree)
+        node.value
+        for node in ast.walk(tree)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
     required_files = {"reframe_candidates.csv", "panel.csv", "report.json"}
@@ -1696,8 +1127,13 @@ def validate_panel_artifacts(
         )
     candidate_keys = {row.get("canonical_ikey", "") for row in candidates}
     panel_keys = [row.get("canonical_ikey", "") for row in panel]
-    if len(set(panel_keys)) != expected_panel_size or not set(panel_keys) <= candidate_keys:
-        raise WorkshopAgentError("Panel connectivity keys are not unique input members.")
+    if (
+        len(set(panel_keys)) != expected_panel_size
+        or not set(panel_keys) <= candidate_keys
+    ):
+        raise WorkshopAgentError(
+            "Panel connectivity keys are not unique input members."
+        )
     if any(not row.get("reframedb_url", "").strip() for row in panel):
         raise WorkshopAgentError("Every selected compound must retain its ReFRAME URL.")
     try:
@@ -1730,7 +1166,9 @@ def validate_panel_artifacts(
             f"report.json is missing keys: {sorted(missing_report)}"
         )
     if report["candidate_count"] != len(candidates):
-        raise WorkshopAgentError("report.json candidate_count does not match the input.")
+        raise WorkshopAgentError(
+            "report.json candidate_count does not match the input."
+        )
     if report["panel_count"] != expected_panel_size:
         raise WorkshopAgentError("report.json panel_count does not match panel.csv.")
     unique_value = report["unique_ikeys"]
@@ -1742,7 +1180,9 @@ def validate_panel_artifacts(
     similarities = _similarity_values(report["pairwise_similarity"])
     if not similarities:
         raise WorkshopAgentError("report.json has no numeric similarity summaries.")
-    if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in similarities):
+    if any(
+        not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in similarities
+    ):
         raise WorkshopAgentError("Similarity summaries must be finite and in [0, 1].")
     if report["seed"] != 2026:
         raise WorkshopAgentError("report.json seed must equal the workshop seed 2026.")
@@ -1771,7 +1211,7 @@ def _render_panel_analysis(approved_strategy: int, expected_panel_size: int) -> 
         raise ValueError("expected_panel_size must be positive.")
 
     common_prefix = textwrap.dedent(
-        f'''\
+        f"""\
         from pathlib import Path
         import json
         import numpy as np
@@ -1854,12 +1294,12 @@ def _render_panel_analysis(approved_strategy: int, expected_panel_size: int) -> 
             )
         # Tanimoto is mathematically bounded; remove only harmless GPU roundoff.
         similarity_matrix = np.clip(similarity_matrix, 0.0, 1.0)
-        '''
+        """
     )
 
     if approved_strategy == 1:
         strategy_block = textwrap.dedent(
-            '''\
+            """\
             clusters, _, _ = fused_butina(
                 fingerprint_tensor,
                 cutoff=DISTANCE_CUTOFF,
@@ -1921,11 +1361,11 @@ def _render_panel_analysis(approved_strategy: int, expected_panel_size: int) -> 
                 for index in selected_indices
             ]
             strategy_name = "cluster_first_butina"
-            '''
+            """
         )
     else:
         strategy_block = textwrap.dedent(
-            '''\
+            """\
             preferred_mask = valid_df["_availability_rank"].to_numpy() <= 1
             if int(preferred_mask.sum()) < PANEL_SIZE:
                 preferred_mask = np.ones(len(valid_df), dtype=bool)
@@ -1981,11 +1421,11 @@ def _render_panel_analysis(approved_strategy: int, expected_panel_size: int) -> 
                 "Greedy max-min fingerprint diversity with availability preference"
             )
             strategy_name = "greedy_max_min_similarity"
-            '''
+            """
         )
 
     common_suffix = textwrap.dedent(
-        f'''\
+        f"""\
         if len(selected_indices) != PANEL_SIZE:
             raise ValueError("Selection did not produce the requested panel size")
         panel_df["selection_order"] = np.arange(1, PANEL_SIZE + 1)
@@ -2059,7 +1499,7 @@ def _render_panel_analysis(approved_strategy: int, expected_panel_size: int) -> 
             json.dumps(report, indent=2), encoding="utf-8"
         )
         print(f"Selected {{len(panel_df)}} compounds with {{strategy_name}}")
-        '''
+        """
     )
     return common_prefix + "\n" + strategy_block + "\n" + common_suffix
 
@@ -2182,7 +1622,9 @@ class PanelDesignAgent:
     ) -> PanelAgentRun:
         """Render, run, and independently validate one approved strategy."""
         if self.plan is None:
-            raise WorkshopAgentError("Request and review a plan before running the agent.")
+            raise WorkshopAgentError(
+                "Request and review a plan before running the agent."
+            )
         if approved_strategy not in (1, 2):
             raise ValueError("approved_strategy must be 1 or 2.")
         if max_revisions not in range(0, 4):
