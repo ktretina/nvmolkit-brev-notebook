@@ -21,6 +21,27 @@ MODULE3_NOTEBOOK_PATH = (
 )
 WORKFLOW_PATH = REPO_ROOT / "notebooks" / "module3_interactive_workflow.py"
 SNAPSHOT_PATH = REPO_ROOT / "notebooks" / "data" / "reframe_teaching_snapshot.csv"
+SPEC_PATH = (
+    REPO_ROOT
+    / "docs"
+    / "superpowers"
+    / "specs"
+    / "2026-08-18-live-browser-notebook-experience-design.md"
+)
+PLAN_PATH = (
+    REPO_ROOT
+    / "docs"
+    / "superpowers"
+    / "plans"
+    / "2026-08-18-live-browser-notebook-experience.md"
+)
+
+
+def _notebook_cell_source(path: Path, cell_id: str) -> str:
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    cell = next(cell for cell in stored["cells"] if cell["id"] == cell_id)
+    source = cell["source"]
+    return "".join(source) if isinstance(source, list) else source
 
 
 def _load_agent():
@@ -449,8 +470,13 @@ def test_module2_notebook_uses_plain_policy_explanations_and_consistent_flow():
     for required_text in (
         "only the bounded policy prompt",
         "does not send dataset rows, rendered code, or analysis results",
+        "Hosted mode asks Nemotron to choose the two bounded policy values for this run",
+        "Reference mode uses fixed local reference policy values with no hosted selection",
+        "In both modes, Python applies the matching allow-listed implementation",
+        "You evaluate the choices afterward, run the checks, and interpret the result",
         "## Step 3 — Validate and bind the locally rendered function",
-        "## Step 4 — Run the bound function and its acceptance tests",
+        "## Step 4 — Run the bound function and its normal-path invariant checks",
+        "Selected failure branches were not triggered",
         "## Step 6 — Review the local receipt and results",
     ):
         assert required_text in source
@@ -461,9 +487,14 @@ def test_module2_notebook_has_one_recoverable_bounded_attendee_flow():
     for required_text in (
         "hosted nemotron returns only two bounded policy choices plus explanations",
         "python renders, validates, and binds the function",
+        "hosted mode asks nemotron to choose the two bounded policy values for this run",
+        "reference mode uses fixed local reference policy values with no hosted selection",
+        "in both modes, python applies the matching allow-listed implementation",
+        "you evaluate the choices afterward, run the checks, and interpret the result",
         "set `nvmolkit_workshop_mode=reference`, restart, and rerun the notebook",
         "zero client calls",
-        "## step 4 — run the bound function and its acceptance tests",
+        "## step 4 — run the bound function and its normal-path invariant checks",
+        "selected failure branches were not triggered",
         "selected failure policies, representation sensitivity, and scientific interpretation",
     ):
         assert required_text in source
@@ -481,19 +512,68 @@ def test_module2_notebook_has_one_recoverable_bounded_attendee_flow():
 
 
 def test_module2_discussion_and_answer_key_pair_the_three_semantic_items():
-    source = NOTEBOOK_PATH.read_text(encoding="utf-8")
-    discussion = source[
-        source.index("## Checks and next step") : source.index(
-            "## Sources and scientific boundary"
-        )
-    ]
-    answer_key = source[source.index("## Answer key") :]
-    assert "selected failure policy" in discussion.lower()
+    discussion = _notebook_cell_source(NOTEBOOK_PATH, "cell-17376c167229")
+    answer_key = _notebook_cell_source(NOTEBOOK_PATH, "2db02500")
+    normalized_discussion = " ".join(discussion.split())
+    assert (
+        "Are both selected policies appropriate? If not, which values would you choose "
+        "and why?"
+    ) in normalized_discussion
     assert "radius-sensitive anchor" in discussion.lower()
     assert "unsupported scientific inference" in discussion.lower()
+    assert "`raise`/`raise` is appropriate for the fixed teaching run" in answer_key
+    assert "recorded run values remain the values actually used" in answer_key
+    assert "recorded Nemotron values" not in answer_key
     assert "selected `skip` would continue" in answer_key
     assert "lowest top-10 Jaccard overlap" in answer_key
     assert "binding, activity, ADMET, efficacy, or safety" in answer_key
+
+
+def test_module2_roles_distinguish_hosted_selection_from_local_reference_values():
+    goal = _notebook_cell_source(NOTEBOOK_PATH, "cell-65b035d14880")
+    receipt = _notebook_cell_source(NOTEBOOK_PATH, "embedded-agent-review")
+    answer_key = _notebook_cell_source(NOTEBOOK_PATH, "2db02500")
+    plan = PLAN_PATH.read_text(encoding="utf-8")
+    design = SPEC_PATH.read_text(encoding="utf-8")
+
+    for source in (goal, plan, design):
+        normalized_source = " ".join(source.split())
+        assert (
+            "Hosted mode asks Nemotron to choose the two bounded policy values for this run"
+            in normalized_source
+        )
+        assert (
+            "Reference mode uses fixed local reference policy values with no hosted "
+            "selection" in normalized_source
+        )
+    assert 'if implementation.label == "hosted_nemotron":' in receipt
+    assert 'elif implementation.label == "reference":' in receipt
+    assert "Hosted mode: Nemotron chose the two bounded policy values" in receipt
+    assert "fixed local reference policy values were used" in receipt
+    assert "no hosted selection occurred" in receipt
+    assert "hosted receipt" not in receipt.lower()
+    assert "policy receipt" in receipt.lower()
+    assert "Python applies" in receipt
+    assert "You evaluate" in receipt
+    assert "recorded run values remain the values actually used" in answer_key
+    assert "recorded Nemotron values" not in answer_key
+    assert "recorded run values remain the values actually used" in plan
+    assert "recorded Nemotron values" not in plan
+    assert "you select and assess failure policies" not in goal.lower()
+
+
+def test_module2_validation_copy_is_limited_to_normal_path_invariants():
+    notebook_source = NOTEBOOK_PATH.read_text(encoding="utf-8").lower()
+    check_cell = _notebook_cell_source(NOTEBOOK_PATH, "cell-b766b437bdb5")
+
+    assert "all acceptance tests" not in notebook_source
+    assert "normal-path invariant checks" in notebook_source
+    assert "selected failure branches were not triggered" in notebook_source
+    assert (
+        'attendee_columns = ["radius", "query", "rank", "neighbor", "tanimoto"]'
+        in check_cell
+    )
+    assert "display(attendee_atlas.head(12))" in check_cell
 
 
 def test_panel_metric_definitions_match_the_approved_contract():

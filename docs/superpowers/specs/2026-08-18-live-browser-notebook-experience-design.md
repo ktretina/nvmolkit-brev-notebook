@@ -61,10 +61,16 @@ Do not change:
 
 ### Human and agent roles
 
-State that Nemotron chooses the two bounded failure-policy values for this run
-and gives concise reasons. Python immediately renders, validates, and applies
-the matching allow-listed implementation. The attendee evaluates the choices
-afterward and decides whether both policies are scientifically appropriate.
+Hosted mode asks Nemotron to choose the two bounded policy values for this run
+and give concise reasons. Reference mode uses fixed local reference policy
+values with no hosted selection. In both modes, Python immediately renders,
+validates, and applies the matching allow-listed implementation. The attendee
+evaluates the choices afterward and decides whether both policies are
+scientifically appropriate.
+
+Call the visible result a policy receipt. Do not label the receipt itself as
+hosted because reference mode also displays it. Only the hosted branch may say
+that Nemotron selected the policy values.
 
 Do not say that the attendee selected the values unless the notebook contains
 an actual override control. This change does not add such a control.

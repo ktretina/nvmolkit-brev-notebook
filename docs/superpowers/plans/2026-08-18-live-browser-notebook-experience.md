@@ -34,9 +34,11 @@ Run one heavy command at a time.
 ### Task 1: Make Module 2 truthful and readable
 
 **Files:**
-- Modify: `notebooks/02_agent_assisted_reframe_neighborhoods.ipynb` cells `cell-65b035d14880`, `cell-89be8eb5140f`, `student-copy-generated-code`, `cell-a511e060a724`, `cell-b766b437bdb5`, `cell-5e6cb5fb12e0`, `embedded-agent-review`, `cell-17376c167229`, `2db02500`
+- Modify: `notebooks/02_agent_assisted_reframe_neighborhoods.ipynb` cells `cell-65b035d14880`, `cell-a341837a7935`, `cell-89be8eb5140f`, `student-copy-generated-code`, `cell-a511e060a724`, `cell-b766b437bdb5`, `cell-5e6cb5fb12e0`, `embedded-agent-review`, `cell-17376c167229`, `2db02500`
 - Modify: `tests/test_workshop_llm_agent.py`
 - Modify: `tests/test_workshop_notebook_execution.py`
+- Modify for review repair: `docs/superpowers/specs/2026-08-18-live-browser-notebook-experience-design.md`
+- Modify for review repair: `docs/superpowers/plans/2026-08-18-live-browser-notebook-experience.md`
 
 - [ ] **Step 1: Add failing Module 2 role, evidence, and table tests**
 
@@ -53,15 +55,19 @@ def _notebook_cell_source(path: Path, cell_id: str) -> str:
 Add these tests:
 
 ```python
-def test_module2_roles_assign_policy_choice_to_nemotron_and_review_to_attendee():
+def test_module2_roles_distinguish_hosted_selection_from_local_reference_values():
     goal = _notebook_cell_source(NOTEBOOK_PATH, "cell-65b035d14880")
     receipt = _notebook_cell_source(NOTEBOOK_PATH, "embedded-agent-review")
-    combined = f"{goal}\n{receipt}".lower()
 
-    assert "nemotron chooses" in combined
-    assert "python applies" in combined
-    assert "you evaluate" in combined
-    assert "you select and assess failure policies" not in combined
+    assert "Hosted mode asks Nemotron to choose" in goal
+    assert "Reference mode uses fixed local reference policy values" in goal
+    assert "no hosted selection" in goal
+    assert 'if implementation.label == "hosted_nemotron":' in receipt
+    assert 'elif implementation.label == "reference":' in receipt
+    assert "fixed local reference policy values were used" in receipt
+    assert "no hosted selection occurred" in receipt
+    assert "hosted receipt" not in receipt.lower()
+    assert "policy receipt" in receipt.lower()
 
 
 def test_module2_validation_copy_is_limited_to_normal_path_invariants():
@@ -98,7 +104,7 @@ Run:
 ```bash
 PYTHONDONTWRITEBYTECODE=1 MPLCONFIGDIR=/private/tmp/nvmolkit-live-m2-mpl IPYTHONDIR=/private/tmp/nvmolkit-live-m2-ipython JUPYTER_PLATFORM_DIRS=1 \
   /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 -m pytest -q -p no:cacheprovider \
-  tests/test_workshop_llm_agent.py::test_module2_roles_assign_policy_choice_to_nemotron_and_review_to_attendee \
+  tests/test_workshop_llm_agent.py::test_module2_roles_distinguish_hosted_selection_from_local_reference_values \
   tests/test_workshop_llm_agent.py::test_module2_validation_copy_is_limited_to_normal_path_invariants \
   tests/test_workshop_llm_agent.py::test_module2_discussion_and_answer_key_pair_the_three_semantic_items \
   tests/test_workshop_notebook_execution.py::test_module2_reference_executes_cleanly_without_key_or_hosted_client
@@ -110,13 +116,21 @@ branch limitation, and eight-column table.
 - [ ] **Step 3: Apply the minimal notebook repair**
 
 Preserve all cell IDs and clean notebook metadata. Use this exact role model in
-the Goal and visible receipt:
+the Goal:
 
 ```text
-Nemotron chooses the two bounded policy values for this run. Python applies the
-matching allow-listed implementation. You evaluate the choices afterward, run
-the checks, and interpret the result.
+Hosted mode asks Nemotron to choose the two bounded policy values for this run.
+Reference mode uses fixed local reference policy values with no hosted
+selection. In both modes, Python applies the matching allow-listed
+implementation. You evaluate the choices afterward, run the checks, and
+interpret the result.
 ```
+
+In the visible receipt, branch on exact implementation labels. Print the
+Nemotron selection only for `hosted_nemotron`. For `reference`, print that
+fixed local reference policy values were used and that no hosted selection
+occurred. Use neutral `policy receipt` wording for the shared source; do not
+call it a hosted receipt.
 
 Rename Step 4 to:
 
@@ -145,8 +159,8 @@ and why?
 ```
 
 State in the answer key that `raise`/`raise` is appropriate for the fixed
-teaching run, while the recorded Nemotron values remain the values actually
-used by that run.
+teaching run, while the recorded run values remain the values actually used by
+that run.
 
 - [ ] **Step 4: Run Module 2 GREEN and adjacent gates**
 
@@ -177,13 +191,16 @@ git diff --check
 git status --short
 ```
 
-Expected: checks pass and only the three Task 1 files are modified.
+Expected: checks pass and only the five Task 1 files are modified. Notebook
+changes are limited to the ten named cells.
 
 Commit:
 
 ```bash
 git add notebooks/02_agent_assisted_reframe_neighborhoods.ipynb \
-  tests/test_workshop_llm_agent.py tests/test_workshop_notebook_execution.py
+  tests/test_workshop_llm_agent.py tests/test_workshop_notebook_execution.py \
+  docs/superpowers/specs/2026-08-18-live-browser-notebook-experience-design.md \
+  docs/superpowers/plans/2026-08-18-live-browser-notebook-experience.md
 git commit -m "fix: clarify the neighborhood lesson"
 ```
 

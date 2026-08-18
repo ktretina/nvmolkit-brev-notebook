@@ -62,6 +62,21 @@ def test_module2_reference_executes_cleanly_without_key_or_hosted_client(
     executor = ExecutePreprocessor(timeout=300, kernel_name="python3")
     executor.preprocess(notebook, {"metadata": {"path": str(tmp_path)}})
 
+    check_cell = next(cell for cell in notebook.cells if cell.id == "cell-b766b437bdb5")
+    html_output = "\n".join(
+        output.data.get("text/html", "")
+        for output in check_cell.outputs
+        if output.output_type in {"display_data", "execute_result"}
+    )
+    table_head = re.search(r"<thead>(.*?)</thead>", html_output, flags=re.DOTALL)
+    assert table_head is not None
+    table_headers = [
+        re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", header)).strip()
+        for header in re.findall(
+            r"<th[^>]*>(.*?)</th>", table_head.group(1), flags=re.DOTALL
+        )
+    ]
+
     output_path = tmp_path / "module2-reference-executed.ipynb"
     nbformat.write(notebook, output_path)
     assert output_path.is_file()
@@ -72,8 +87,16 @@ def test_module2_reference_executes_cleanly_without_key_or_hosted_client(
         for output in cell.get("outputs", [])
         if output.output_type == "stream"
     )
+    assert table_headers == ["", "radius", "query", "rank", "neighbor", "tanimoto"]
+    assert "Normal-path invariant checks passed" in stream_text
+    assert "Selected failure branches were not triggered" in stream_text
     assert "NVMOLKIT_WORKSHOP_MODE=reference" in stream_text
     assert "Implementation label: reference" in stream_text
+    reference_text = stream_text.lower()
+    assert "nemotron chose" not in reference_text
+    assert "nemotron choose" not in reference_text
+    assert "fixed local reference policy values were used" in reference_text
+    assert "no hosted selection occurred" in reference_text
 
 
 def _module3_notebook():
