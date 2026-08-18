@@ -210,7 +210,7 @@ git commit -m "fix: clarify the neighborhood lesson"
 - Modify: `notebooks/module3_interactive_workflow.py`
 - Modify: `notebooks/03_full_agent_reframe_panel_design.ipynb` cell `m3-setup` only for the helper version lock
 - Modify: `tests/test_workshop_llm_agent.py`
-- Modify: `docs/superpowers/plans/2026-08-18-live-browser-notebook-experience.md` only for the approved review repair that keeps callback exception redaction inside the output context
+- Modify: `docs/superpowers/plans/2026-08-18-live-browser-notebook-experience.md` only for approved review repairs that keep callback exception redaction inside the output context and use one exact failed-analysis status
 
 - [ ] **Step 1: Add failing live-output and status tests**
 
@@ -259,6 +259,12 @@ Keep the existing callback-error redaction assertion as a separate case. Assert
 that the raw exception never reaches the output context, transcript, or card,
 while the redacted failure card appears and the successful run stays unchanged.
 
+Add focused cases for an agent that returns `PanelAgentRun(success=False)` and
+an agent whose `run` method raises. Both cases must show the exact status
+`Analysis did not validate` in the final card and transcript. The old
+`Agent workflow did not pass` and `Agent run stopped safely` titles must be
+absent. Neither case may call the completion callback or enter a success state.
+
 - [ ] **Step 2: Run the widget test and witness RED**
 
 Run:
@@ -277,7 +283,7 @@ audit still renders “Agent workflow complete.”
 Bump:
 
 ```python
-MODULE3_WORKFLOW_VERSION = "2026.08.18.2"
+MODULE3_WORKFLOW_VERSION = "2026.08.18.3"
 ```
 
 Update the exact version lock in notebook cell `m3-setup` to the same value.
@@ -329,7 +335,20 @@ self._line(status)
 self._append(self._html_card(status, body))
 ```
 
-Keep the failed-analysis card and callback error isolation unchanged.
+Use one exact failed-analysis status in both failure paths:
+
+```python
+FAILED_ANALYSIS_STATUS = "Analysis did not validate"
+
+# In the run exception path:
+self._error_card(FAILED_ANALYSIS_STATUS, error)
+
+# In the returned unsuccessful-run branch:
+self._line(FAILED_ANALYSIS_STATUS)
+self._append(self._html_card(FAILED_ANALYSIS_STATUS, body))
+```
+
+Keep callback error isolation and safe error redaction unchanged.
 
 - [ ] **Step 4: Run GREEN and the workflow-adjacent suite**
 

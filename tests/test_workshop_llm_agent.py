@@ -1283,6 +1283,97 @@ def test_module3_widget_redacts_callback_error_without_changing_success(
     assert "Completion display failed" in _widget_text(workflow.root)
 
 
+def test_module3_widget_labels_returned_failed_run_consistently(monkeypatch, tmp_path):
+    agent = _load_agent()
+    workflow_module = _load_workflow(agent)
+    plan = agent.PanelPlan.model_validate(_panel_plan_payload())
+    run = agent.PanelAgentRun(
+        success=False,
+        approved_strategy=2,
+        attempts=(),
+        analysis_path=tmp_path / "analysis.py",
+        panel_path=tmp_path / "panel.csv",
+        report_path=tmp_path / "report.json",
+        trace_path=tmp_path / "agent_trace.json",
+        audit=None,
+    )
+
+    class FakeAgent:
+        def request_plan(self):
+            return plan
+
+        def run(self, **kwargs):
+            return run
+
+    callback_calls = []
+    monkeypatch.setattr(workflow_module.widgets, "Output", _RecordingOutput)
+    monkeypatch.setattr(workflow_module, "ipython_display", lambda value: value)
+    workflow = workflow_module.launch_interactive_panel_design(
+        FakeAgent(),
+        expected_panel_size=24,
+        on_complete=callback_calls.append,
+    )
+
+    workflow._approve_and_run(workflow.approve_button)
+
+    visible_text = _widget_text(workflow.root)
+    assert "<h3>Analysis did not validate</h3>" in visible_text
+    assert "Analysis did not validate" in workflow.transcript_text
+    assert "Agent workflow did not pass" not in visible_text
+    assert "Agent workflow did not pass" not in workflow.transcript_text
+    assert "Agent run stopped safely" not in visible_text
+    assert "Agent run stopped safely" not in workflow.transcript_text
+    assert "Analysis validated;" not in visible_text
+    assert "Analysis validated;" not in workflow.transcript_text
+    assert workflow.status == "failed"
+    assert workflow.agent_run is run
+    assert workflow.result_output.enter_count == 0
+    assert callback_calls == []
+
+
+def test_module3_widget_labels_raised_run_failure_consistently(monkeypatch):
+    agent = _load_agent()
+    workflow_module = _load_workflow(agent)
+    plan = agent.PanelPlan.model_validate(_panel_plan_payload())
+    secret = "nvapi-" + "run-secret" * 2
+
+    class FakeAgent:
+        def request_plan(self):
+            return plan
+
+        def run(self, **kwargs):
+            raise RuntimeError(f"bounded run failed {secret}")
+
+    callback_calls = []
+    monkeypatch.setattr(workflow_module.widgets, "Output", _RecordingOutput)
+    monkeypatch.setattr(workflow_module, "ipython_display", lambda value: value)
+    workflow = workflow_module.launch_interactive_panel_design(
+        FakeAgent(),
+        expected_panel_size=24,
+        on_complete=callback_calls.append,
+    )
+
+    workflow._approve_and_run(workflow.approve_button)
+
+    visible_text = _widget_text(workflow.root)
+    assert "<h3>Analysis did not validate</h3>" in visible_text
+    assert "Analysis did not validate" in workflow.transcript_text
+    assert "Agent workflow did not pass" not in visible_text
+    assert "Agent workflow did not pass" not in workflow.transcript_text
+    assert "Agent run stopped safely" not in visible_text
+    assert "Agent run stopped safely" not in workflow.transcript_text
+    assert "Analysis validated;" not in visible_text
+    assert "Analysis validated;" not in workflow.transcript_text
+    assert secret not in visible_text
+    assert secret not in workflow.transcript_text
+    assert "bounded run failed nvapi-[hidden]" in visible_text
+    assert "bounded run failed nvapi-[hidden]" in workflow.transcript_text
+    assert workflow.status == "failed"
+    assert workflow.agent_run is None
+    assert workflow.result_output.enter_count == 0
+    assert callback_calls == []
+
+
 def test_module3_trace_records_reference_mode(monkeypatch, tmp_path):
     agent = _load_agent()
     _write_candidate_workspace(tmp_path)

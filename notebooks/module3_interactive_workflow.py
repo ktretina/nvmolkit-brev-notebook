@@ -12,7 +12,8 @@ from IPython.display import display as ipython_display
 from workshop_llm_agent import PanelAgentRun, PanelDesignAgent, PanelPlan
 
 
-MODULE3_WORKFLOW_VERSION = "2026.08.18.2"
+MODULE3_WORKFLOW_VERSION = "2026.08.18.3"
+FAILED_ANALYSIS_STATUS = "Analysis did not validate"
 
 
 def _safe_text(value: Any, limit: int = 6000) -> str:
@@ -218,7 +219,7 @@ class InteractivePanelDesignWorkflow:
                             )
         except Exception as error:
             self.status = "failed"
-            self._error_card("Agent run stopped safely", error)
+            self._error_card(FAILED_ANALYSIS_STATUS, error)
         finally:
             self._busy = False
 
@@ -341,9 +342,10 @@ class InteractivePanelDesignWorkflow:
             self._line(status)
             self._append(self._html_card(status, body))
         else:
+            self._line(FAILED_ANALYSIS_STATUS)
             self._append(
                 self._html_card(
-                    "Agent workflow did not pass",
+                    FAILED_ANALYSIS_STATUS,
                     f"<p>All bounded attempts were used. Inspect <code>{escape(str(run.trace_path))}</code>. "
                     "No panel is available until a validated run succeeds.</p>",
                 )
