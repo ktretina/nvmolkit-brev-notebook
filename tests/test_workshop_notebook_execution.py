@@ -17,6 +17,22 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK_DIR = REPO_ROOT / "notebooks"
 MODULE2_PATH = NOTEBOOK_DIR / "02_agent_assisted_reframe_neighborhoods.ipynb"
 MODULE3_PATH = NOTEBOOK_DIR / "03_full_agent_reframe_panel_design.ipynb"
+WORKSHOP_AGENT_PATH = NOTEBOOK_DIR / "workshop_llm_agent.py"
+
+
+def test_workshop_agent_version_matches_both_notebook_locks():
+    expected_version = "2026.08.19.1"
+    module2_source = "\n".join(
+        cell.source for cell in nbformat.read(MODULE2_PATH, as_version=4).cells
+    )
+    module3_source = "\n".join(
+        cell.source for cell in nbformat.read(MODULE3_PATH, as_version=4).cells
+    )
+    agent_source = WORKSHOP_AGENT_PATH.read_text(encoding="utf-8")
+
+    assert f'WORKSHOP_AGENT_VERSION = "{expected_version}"' in agent_source
+    assert f'EXPECTED_WORKSHOP_AGENT_VERSION = "{expected_version}"' in module2_source
+    assert f'EXPECTED_WORKSHOP_AGENT_VERSION = "{expected_version}"' in module3_source
 
 
 def test_module2_reference_executes_cleanly_without_key_or_hosted_client(

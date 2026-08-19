@@ -10,6 +10,7 @@ import ast
 import csv
 import getpass
 import hashlib
+import inspect
 import io
 import json
 import math
@@ -29,11 +30,18 @@ from typing import Any, Callable, Literal
 from openai import AuthenticationError, OpenAI, PermissionDeniedError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+try:
+    from nvmolkit_compat import normalize_fused_butina_result
+except ModuleNotFoundError as error:
+    if error.name != "nvmolkit_compat":
+        raise
+    from notebooks.nvmolkit_compat import normalize_fused_butina_result
+
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 DEFAULT_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
 NEMOTRON_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
-WORKSHOP_AGENT_VERSION = "2026.08.18.4"
+WORKSHOP_AGENT_VERSION = "2026.08.19.1"
 WORKSHOP_MODE_ENV = "NVMOLKIT_WORKSHOP_MODE"
 _NVIDIA_API_KEY_PATH = Path.home() / ".config" / "nvmolkit" / "NVIDIA_API_KEY"
 _MAX_API_KEY_FILE_BYTES = 4096
@@ -1254,7 +1262,10 @@ def _render_panel_analysis(approved_strategy: int, expected_panel_size: int) -> 
         if approved_strategy == 1
         else "descriptor_seeded_max_min"
     )
-    return textwrap.dedent(
+    normalizer_source = textwrap.dedent(
+        inspect.getsource(normalize_fused_butina_result)
+    )
+    source = textwrap.dedent(
         f"""\
         from pathlib import Path
         import json
@@ -1264,6 +1275,9 @@ def _render_panel_analysis(approved_strategy: int, expected_panel_size: int) -> 
         from rdkit import Chem, DataStructs
         from rdkit.Chem import rdFingerprintGenerator
         from rdkit.ML.Cluster import Butina
+
+
+        __NVMOLKIT_FUSED_RESULT_NORMALIZER__
 
 
         SEED = 2026
@@ -1428,21 +1442,30 @@ def _render_panel_analysis(approved_strategy: int, expected_panel_size: int) -> 
         centroid_indices = list(range(CANDIDATE_COUNT))
         if {approved_strategy} == 1:
             if nvmolkit_ready:
-                clusters, _, _ = fused_butina(
+                raw_result = fused_butina(
                     fingerprint_tensor,
                     cutoff=DISTANCE_CUTOFF,
                     return_centroids=True,
                 )
+                cluster_labels, clusters, centroid_indices = (
+                    normalize_fused_butina_result(
+                        raw_result, molecule_count=CANDIDATE_COUNT
+                    )
+                )
+                centroid_indices = [int(index) for index in centroid_indices]
+                for members in clusters:
+                    member_indices = [int(index) for index in members]
+                    cluster_sizes[member_indices] = len(member_indices)
             else:
                 clusters = rdkit_clusters(rdkit_fingerprints)
-            centroid_indices = []
-            for cluster_id, members in enumerate(clusters):
-                member_indices = [int(index) for index in members]
-                if not member_indices:
-                    raise ValueError("Cluster output contains an empty cluster")
-                cluster_labels[member_indices] = cluster_id
-                cluster_sizes[member_indices] = len(member_indices)
-                centroid_indices.append(member_indices[0])
+                centroid_indices = []
+                for cluster_id, members in enumerate(clusters):
+                    member_indices = [int(index) for index in members]
+                    if not member_indices:
+                        raise ValueError("Cluster output contains an empty cluster")
+                    cluster_labels[member_indices] = cluster_id
+                    cluster_sizes[member_indices] = len(member_indices)
+                    centroid_indices.append(member_indices[0])
             if (cluster_labels < 0).any():
                 raise ValueError("Every candidate must receive a cluster label")
 
@@ -1607,6 +1630,11 @@ def _render_panel_analysis(approved_strategy: int, expected_panel_size: int) -> 
             f"with {{STRATEGY}} using {{backend}}"
         )
         """
+    )
+    return source.replace(
+        "__NVMOLKIT_FUSED_RESULT_NORMALIZER__",
+        normalizer_source.rstrip(),
+        1,
     )
 
 

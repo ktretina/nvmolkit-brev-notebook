@@ -1,11 +1,15 @@
+from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
+import inspect
+import io
 import json
 import os
 from pathlib import Path
 import shlex
 import sys
+import textwrap
 import traceback
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import ast
 
 import ipywidgets as widgets
@@ -117,6 +121,140 @@ def _write_candidate_workspace(path, *, count=96):
     frame["TPSA"] = [Descriptors.TPSA(molecule) for molecule in molecules]
     frame.to_csv(path / "reframe_candidates.csv", index=False)
     return frame
+
+
+def _install_fake_panel_nvmolkit(monkeypatch, *, result_shape):
+    import numpy as np
+    from rdkit import DataStructs
+    from rdkit.Chem import rdFingerprintGenerator
+    from rdkit.ML.Cluster import Butina
+
+    state = {"calls": [], "centroids": [], "first_members": []}
+
+    class FakeAsyncResult:
+        def __init__(self, value):
+            self.value = value
+
+        def numpy(self):
+            return np.asarray(self.value)
+
+    class FakeFingerprintBatch:
+        def __init__(self, fingerprints):
+            self.fingerprints = fingerprints
+
+        def torch(self):
+            return self
+
+    class FakeMorganFingerprintGenerator:
+        def __init__(self, *, radius, fpSize):
+            self.generator = rdFingerprintGenerator.GetMorganGenerator(
+                radius=radius, fpSize=fpSize
+            )
+
+        def GetFingerprints(self, molecules, *, num_threads):
+            assert num_threads == 0
+            return FakeFingerprintBatch(
+                list(self.generator.GetFingerprints(molecules, numThreads=0))
+            )
+
+    def cross_tanimoto_similarity(left, right):
+        return FakeAsyncResult(
+            [
+                DataStructs.BulkTanimotoSimilarity(query, right.fingerprints)
+                for query in left.fingerprints
+            ]
+        )
+
+    def fused_butina(fingerprint_tensor, *, cutoff, return_centroids):
+        state["calls"].append((cutoff, return_centroids))
+        distances = []
+        for row_index in range(1, len(fingerprint_tensor.fingerprints)):
+            distances.extend(
+                DataStructs.BulkTanimotoSimilarity(
+                    fingerprint_tensor.fingerprints[row_index],
+                    fingerprint_tensor.fingerprints[:row_index],
+                    returnDistance=True,
+                )
+            )
+        clusters = tuple(
+            tuple(int(member) for member in cluster)
+            for cluster in Butina.ClusterData(
+                distances,
+                len(fingerprint_tensor.fingerprints),
+                cutoff,
+                isDistData=True,
+                reordering=True,
+            )
+        )
+        centroids = np.asarray([cluster[-1] for cluster in clusters], dtype=int)
+        state["centroids"] = centroids.tolist()
+        state["first_members"] = [cluster[0] for cluster in clusters]
+        if result_shape == "v05":
+            cumulative_sizes = np.concatenate(
+                (
+                    np.zeros(1, dtype=int),
+                    np.cumsum(
+                        np.asarray([len(cluster) for cluster in clusters], dtype=int)
+                    ),
+                )
+            )
+            return (
+                tuple(FakeAsyncResult(cluster) for cluster in clusters),
+                FakeAsyncResult(cumulative_sizes),
+                FakeAsyncResult(centroids),
+            )
+        labels = np.full(len(fingerprint_tensor.fingerprints), -1, dtype=int)
+        for cluster_id, cluster in enumerate(clusters):
+            labels[list(cluster)] = len(clusters) - cluster_id - 1
+        reversed_centroids = centroids[::-1]
+        if result_shape == "v06":
+            return FakeAsyncResult(labels), FakeAsyncResult(reversed_centroids)
+        if result_shape == "malformed":
+            return FakeAsyncResult(labels[:-1]), FakeAsyncResult(reversed_centroids)
+        raise AssertionError(f"unexpected fake result shape: {result_shape}")
+
+    fake_torch = ModuleType("torch")
+    fake_torch.Tensor = type("FakeTensor", (), {})
+    fake_torch.cuda = SimpleNamespace(is_available=lambda: True)
+    fake_nvmolkit = ModuleType("nvmolkit")
+    fake_nvmolkit.__path__ = []
+    fake_clustering = ModuleType("nvmolkit.clustering")
+    fake_clustering.fused_butina = fused_butina
+    fake_fingerprints = ModuleType("nvmolkit.fingerprints")
+    fake_fingerprints.MorganFingerprintGenerator = FakeMorganFingerprintGenerator
+    fake_similarity = ModuleType("nvmolkit.similarity")
+    fake_similarity.crossTanimotoSimilarity = cross_tanimoto_similarity
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "nvmolkit", fake_nvmolkit)
+    monkeypatch.setitem(sys.modules, "nvmolkit.clustering", fake_clustering)
+    monkeypatch.setitem(sys.modules, "nvmolkit.fingerprints", fake_fingerprints)
+    monkeypatch.setitem(sys.modules, "nvmolkit.similarity", fake_similarity)
+    return state
+
+
+def _execute_panel_source_in_process(arguments, **kwargs):
+    assert arguments[1:] == ["-I", "-"]
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    previous_cwd = Path.cwd()
+    return_code = 0
+    try:
+        os.chdir(kwargs["cwd"])
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exec(
+                compile(kwargs["input"], "<isolated-panel-analysis>", "exec"),
+                {"__name__": "__main__"},
+            )
+    except Exception:
+        return_code = 1
+        traceback.print_exc(file=stderr)
+    finally:
+        os.chdir(previous_cwd)
+    return SimpleNamespace(
+        returncode=return_code,
+        stdout=stdout.getvalue(),
+        stderr=stderr.getvalue(),
+    )
 
 
 def _panel_plan_payload():
@@ -805,6 +943,165 @@ def test_panel_source_is_exactly_controller_rendered(approved_strategy):
             approved_strategy=approved_strategy,
             expected_panel_size=24,
         )
+
+
+def test_panel_source_embeds_and_uses_the_exact_fused_result_normalizer():
+    agent = _load_agent()
+    source = agent._render_panel_analysis(1, 24)
+    normalizer_source = textwrap.dedent(
+        inspect.getsource(agent.normalize_fused_butina_result)
+    )
+    tree = ast.parse(source)
+
+    assert source.count(normalizer_source) == 1
+    compile(source, "<rendered-panel-analysis>", "exec")
+    assert "from nvmolkit_compat import" not in source
+    assert "from notebooks.nvmolkit_compat import" not in source
+    fused_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "fused_butina"
+    ]
+    assert len(fused_calls) == 1
+    fused_keywords = {keyword.arg: keyword.value for keyword in fused_calls[0].keywords}
+    assert isinstance(fused_keywords["cutoff"], ast.Name)
+    assert fused_keywords["cutoff"].id == "DISTANCE_CUTOFF"
+    assert ast.literal_eval(fused_keywords["return_centroids"]) is True
+    assignments = {
+        tuple(element.id for element in node.targets[0].elts): node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Tuple)
+        and all(isinstance(element, ast.Name) for element in node.targets[0].elts)
+    }
+    normalized_call = assignments[("cluster_labels", "clusters", "centroid_indices")]
+    assert isinstance(normalized_call, ast.Call)
+    assert isinstance(normalized_call.func, ast.Name)
+    assert normalized_call.func.id == "normalize_fused_butina_result"
+    assert isinstance(normalized_call.args[0], ast.Name)
+    assert normalized_call.args[0].id == "raw_result"
+    assert len(normalized_call.keywords) == 1
+    assert normalized_call.keywords[0].arg == "molecule_count"
+    assert isinstance(normalized_call.keywords[0].value, ast.Name)
+    assert normalized_call.keywords[0].value.id == "CANDIDATE_COUNT"
+    fused_assignment = source.index("raw_result = fused_butina(")
+    fused_branch_start = source.rindex("if nvmolkit_ready:", 0, fused_assignment)
+    fused_branch_end = source.index("else:", fused_assignment)
+    fused_branch = source[fused_branch_start:fused_branch_end]
+    assert (
+        "centroid_indices = [int(index) for index in centroid_indices]" in fused_branch
+    )
+    assert "member_indices[0]" not in fused_branch
+    assert "centroid_indices.append" not in fused_branch
+
+
+def test_panel_v05_and_v06_results_keep_the_same_validated_partition(
+    monkeypatch, tmp_path
+):
+    import pandas as pd
+
+    agent = _load_agent()
+    results = {}
+    for result_shape in ("v05", "v06"):
+        workdir = tmp_path / result_shape
+        workdir.mkdir()
+        _write_candidate_workspace(workdir)
+        state = _install_fake_panel_nvmolkit(monkeypatch, result_shape=result_shape)
+        panel_agent = agent.PanelDesignAgent(
+            workdir=workdir,
+            mission="bounded mission",
+            mode="reference",
+        )
+        panel_agent.request_plan()
+        monkeypatch.setattr(agent.subprocess, "run", _execute_panel_source_in_process)
+
+        run = panel_agent.run(
+            approved_strategy=1,
+            expected_panel_size=24,
+            timeout_seconds=120,
+        )
+
+        assert run.success, run.attempts[0].stderr_tail
+        assert state["calls"] == [(0.55, True)]
+        assert any(
+            centroid != first_member
+            for centroid, first_member in zip(
+                state["centroids"], state["first_members"], strict=True
+            )
+        )
+        panel = pd.read_csv(run.panel_path)
+        report = json.loads(run.report_path.read_text(encoding="utf-8"))
+        candidates = pd.read_csv(workdir / "reframe_candidates.csv")
+        index_by_key = {
+            key: index for index, key in enumerate(candidates["canonical_ikey"])
+        }
+        selected_indices = [
+            index_by_key[key] for key in panel["canonical_ikey"].tolist()
+        ]
+        descriptor_extrema = {
+            int(index)
+            for column in ("MolWt", "cLogP", "TPSA")
+            for index in (candidates[column].idxmin(), candidates[column].idxmax())
+        }
+        selected_after_seeding = set(selected_indices) - descriptor_extrema
+        assert len(panel) == 24
+        assert panel["canonical_ikey"].nunique() == 24
+        assert panel["selection_order"].tolist() == list(range(1, 25))
+        assert report["acceptance"]["passed"] is True
+        assert selected_after_seeding <= set(state["centroids"])
+        results[result_shape] = (panel, report)
+
+    old_panel, old_report = results["v05"]
+    new_panel, new_report = results["v06"]
+    assert old_panel["canonical_ikey"].tolist() == new_panel["canonical_ikey"].tolist()
+    old_labels = old_panel["method_cluster"].tolist()
+    new_labels = new_panel["method_cluster"].tolist()
+    assert old_labels != new_labels
+    assert all(
+        (old_labels[left] == old_labels[right])
+        == (new_labels[left] == new_labels[right])
+        for left in range(len(old_labels))
+        for right in range(left + 1, len(old_labels))
+    )
+    assert old_report["cluster_coverage"] == new_report["cluster_coverage"]
+
+
+def test_panel_malformed_fused_result_fails_before_result_artifacts(
+    monkeypatch, tmp_path
+):
+    agent = _load_agent()
+    _write_candidate_workspace(tmp_path)
+    (tmp_path / "panel.csv").write_text("stale panel", encoding="utf-8")
+    (tmp_path / "report.json").write_text("stale report", encoding="utf-8")
+    (tmp_path / "agent_trace.json").write_text(
+        json.dumps({"success": True}), encoding="utf-8"
+    )
+    state = _install_fake_panel_nvmolkit(monkeypatch, result_shape="malformed")
+    panel_agent = agent.PanelDesignAgent(
+        workdir=tmp_path,
+        mission="bounded mission",
+        mode="reference",
+    )
+    panel_agent.request_plan()
+    monkeypatch.setattr(agent.subprocess, "run", _execute_panel_source_in_process)
+
+    run = panel_agent.run(
+        approved_strategy=1,
+        expected_panel_size=24,
+        timeout_seconds=120,
+    )
+
+    trace = json.loads(run.trace_path.read_text(encoding="utf-8"))
+    assert state["calls"] == [(0.55, True)]
+    assert run.success is False
+    assert "Malformed fused Butina result." in run.attempts[0].stderr_tail
+    assert not run.panel_path.exists()
+    assert not run.report_path.exists()
+    assert trace["success"] is False
+    assert trace["attempts"][0]["passed"] is False
 
 
 def test_panel_child_process_does_not_receive_hosted_key(monkeypatch, tmp_path):
