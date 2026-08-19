@@ -1253,12 +1253,13 @@ def test_module3_widget_redacts_callback_error_without_changing_success(
         def run(self, **kwargs):
             return run
 
-    secret = "nvapi-" + "callback-secret" * 2
+    secret = "nvapi-abc.def/ghi+jkl="
+    named_secret = "named.secret/value+tail="
     callback_calls = []
 
     def failing_callback(result):
         callback_calls.append(result)
-        raise RuntimeError(f"renderer rejected {secret}")
+        raise RuntimeError(f"renderer rejected {secret}; NVIDIA_API_KEY={named_secret}")
 
     monkeypatch.setattr(workflow_module.widgets, "Output", _RecordingOutput)
     monkeypatch.setattr(workflow_module, "ipython_display", lambda value: value)
@@ -1277,10 +1278,42 @@ def test_module3_widget_redacts_callback_error_without_changing_success(
     assert workflow.result_output.rendered_errors == []
     assert secret not in workflow.transcript_text
     assert secret not in _widget_text(workflow.root)
-    assert "renderer rejected nvapi-[hidden]" in workflow.transcript_text
-    assert "renderer rejected nvapi-[hidden]" in _widget_text(workflow.root)
+    assert ".def/ghi+jkl=" not in workflow.transcript_text
+    assert ".def/ghi+jkl=" not in _widget_text(workflow.root)
+    assert named_secret not in workflow.transcript_text
+    assert named_secret not in _widget_text(workflow.root)
+    expected = "renderer rejected [REDACTED]; NVIDIA_API_KEY=[REDACTED]"
+    assert expected in workflow.transcript_text
+    assert expected in _widget_text(workflow.root)
     assert "Completion display failed" in workflow.transcript_text
     assert "Completion display failed" in _widget_text(workflow.root)
+
+
+def test_module3_widget_redacts_every_failure_card_message(monkeypatch):
+    agent = _load_agent()
+    workflow_module = _load_workflow(agent)
+    secret = "nvapi-abc.def/ghi+jkl="
+    named_secret = "named.secret/value+tail="
+    raw_message = f"provider exposed {secret} NVIDIA_API_KEY={named_secret}"
+
+    monkeypatch.setattr(workflow_module.widgets, "Output", _RecordingOutput)
+    workflow = workflow_module.InteractivePanelDesignWorkflow(
+        object(), expected_panel_size=24
+    )
+    workflow._error_card("Plan request failed", RuntimeError(raw_message))
+    workflow._progress(
+        "attempt_failed",
+        {"attempt": 1, "message": raw_message, "will_revise": False},
+    )
+    workflow._progress("audit_failed", {"message": raw_message})
+
+    visible_text = _widget_text(workflow.root)
+    for raw_secret in (secret, ".def/ghi+jkl=", named_secret):
+        assert raw_secret not in visible_text
+        assert raw_secret not in workflow.transcript_text
+    expected = "provider exposed [REDACTED] NVIDIA_API_KEY=[REDACTED]"
+    assert expected in visible_text
+    assert expected in workflow.transcript_text
 
 
 def test_module3_widget_labels_returned_failed_run_consistently(monkeypatch, tmp_path):
@@ -1335,14 +1368,17 @@ def test_module3_widget_labels_raised_run_failure_consistently(monkeypatch):
     agent = _load_agent()
     workflow_module = _load_workflow(agent)
     plan = agent.PanelPlan.model_validate(_panel_plan_payload())
-    secret = "nvapi-" + "run-secret" * 2
+    secret = "nvapi-abc.def/ghi+jkl="
+    named_secret = "named.secret/value+tail="
 
     class FakeAgent:
         def request_plan(self):
             return plan
 
         def run(self, **kwargs):
-            raise RuntimeError(f"bounded run failed {secret}")
+            raise RuntimeError(
+                f"bounded run failed {secret}; NVIDIA_API_KEY={named_secret}"
+            )
 
     callback_calls = []
     monkeypatch.setattr(workflow_module.widgets, "Output", _RecordingOutput)
@@ -1366,8 +1402,13 @@ def test_module3_widget_labels_raised_run_failure_consistently(monkeypatch):
     assert "Analysis validated;" not in workflow.transcript_text
     assert secret not in visible_text
     assert secret not in workflow.transcript_text
-    assert "bounded run failed nvapi-[hidden]" in visible_text
-    assert "bounded run failed nvapi-[hidden]" in workflow.transcript_text
+    assert ".def/ghi+jkl=" not in visible_text
+    assert ".def/ghi+jkl=" not in workflow.transcript_text
+    assert named_secret not in visible_text
+    assert named_secret not in workflow.transcript_text
+    expected = "bounded run failed [REDACTED]; NVIDIA_API_KEY=[REDACTED]"
+    assert expected in visible_text
+    assert expected in workflow.transcript_text
     assert workflow.status == "failed"
     assert workflow.agent_run is None
     assert workflow.result_output.enter_count == 0

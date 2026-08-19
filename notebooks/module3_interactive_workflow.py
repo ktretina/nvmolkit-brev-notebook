@@ -3,22 +3,26 @@
 from __future__ import annotations
 
 from html import escape
-import re
 from typing import Any, Callable
 
 import ipywidgets as widgets
 from IPython.display import display as ipython_display
 
-from workshop_llm_agent import PanelAgentRun, PanelDesignAgent, PanelPlan
+from workshop_llm_agent import (
+    PanelAgentRun,
+    PanelDesignAgent,
+    PanelPlan,
+    _redact_sensitive_text,
+)
 
 
-MODULE3_WORKFLOW_VERSION = "2026.08.18.3"
+MODULE3_WORKFLOW_VERSION = "2026.08.18.4"
 FAILED_ANALYSIS_STATUS = "Analysis did not validate"
 
 
 def _safe_text(value: Any, limit: int = 6000) -> str:
     """Keep notebook messages readable and avoid displaying a hosted API key."""
-    text = re.sub(r"nvapi-[A-Za-z0-9_-]+", "nvapi-[hidden]", str(value))
+    text = _redact_sensitive_text(value)
     return text[-limit:]
 
 

@@ -283,7 +283,7 @@ audit still renders “Agent workflow complete.”
 Bump:
 
 ```python
-MODULE3_WORKFLOW_VERSION = "2026.08.18.3"
+MODULE3_WORKFLOW_VERSION = "2026.08.18.4"
 ```
 
 Update the exact version lock in notebook cell `m3-setup` to the same value.
@@ -348,7 +348,9 @@ self._line(FAILED_ANALYSIS_STATUS)
 self._append(self._html_card(FAILED_ANALYSIS_STATUS, body))
 ```
 
-Keep callback error isolation and safe error redaction unchanged.
+Keep callback error isolation. Reuse the agent module's exact
+`_redact_sensitive_text` helper for every widget error path so punctuation-bearing
+`nvapi-` keys and named `NVIDIA_API_KEY` values cannot reach a card or transcript.
 
 - [ ] **Step 4: Run GREEN and the workflow-adjacent suite**
 
