@@ -51,7 +51,13 @@ CASES = (
         ClusterArgs(cutoff=0.5, decision_basis=SECRET_BASIS),
         "discover_fused_butina_clusters(cutoff=0.5)",
         "nvMolKit invocation executed by Python",
-        "clusters = fused_butina(fingerprints.torch(), cutoff=0.5)[0]",
+        (
+            "cluster_ids, centroids = fused_butina(fingerprints.torch(), "
+            "cutoff=0.5, return_centroids=True)\n"
+            "# Repository-owned compatibility normalization\n"
+            "_, clusters, _ = normalize_fused_butina_result("
+            "(cluster_ids, centroids), molecule_count=molecule_count)"
+        ),
     ),
     (
         "embed_representative_conformers",
@@ -192,7 +198,11 @@ def test_cluster_receipt_formats_both_allowed_boundaries(cutoff):
         f"discover_fused_butina_clusters(cutoff={cutoff!r})"
     )
     assert receipt.scientific_invocation == (
-        f"clusters = fused_butina(fingerprints.torch(), cutoff={cutoff!r})[0]"
+        "cluster_ids, centroids = fused_butina(fingerprints.torch(), "
+        f"cutoff={cutoff!r}, return_centroids=True)\n"
+        "# Repository-owned compatibility normalization\n"
+        "_, clusters, _ = normalize_fused_butina_result("
+        "(cluster_ids, centroids), molecule_count=molecule_count)"
     )
     assert receipt == command_receipt("discover_fused_butina_clusters", arguments)
 
@@ -466,7 +476,14 @@ def test_cluster_receipt_tracks_the_real_fused_butina_call_site():
         chemistry_workflow.discover_fused_butina_clusters, "_fused_butina"
     )
     displayed = _one_receipt_call(receipt, "fused_butina")
+    displayed_normalization = _one_receipt_call(
+        receipt, "normalize_fused_butina_result"
+    )
     public = _one_source_call(chemistry_workflow._fused_butina, "fused_butina")
+    actual_normalization = _one_source_call(
+        chemistry_workflow.discover_fused_butina_clusters,
+        "normalize_fused_butina_result",
+    )
     cutoff_assignment = _assigned_expression(
         chemistry_workflow.discover_fused_butina_clusters, "cutoff"
     )
@@ -479,14 +496,33 @@ def test_cluster_receipt_tracks_the_real_fused_butina_call_site():
         "state.fingerprints.torch()"
     ]
     assert ast.unparse(cutoff_assignment) == "float(cluster_cutoff)"
-    assert _keyword_sources(actual) == {"cutoff": "cutoff"}
+    assert _keyword_sources(actual) == {
+        "cutoff": "cutoff",
+        "return_centroids": "True",
+    }
     assert _call_name(public) == _call_name(displayed)
     assert [ast.unparse(value) for value in public.args] == ["fingerprints"]
-    assert _keyword_sources(public) == {"cutoff": "cutoff"}
-    assert [ast.unparse(value) for value in displayed.args] == [
-        "fingerprints.torch()"
+    assert _keyword_sources(public) == {
+        "cutoff": "cutoff",
+        "return_centroids": "return_centroids",
+    }
+    assert [ast.unparse(value) for value in displayed.args] == ["fingerprints.torch()"]
+    assert _literal_keywords(displayed) == {
+        "cutoff": arguments.cutoff,
+        "return_centroids": True,
+    }
+    assert [ast.unparse(value) for value in actual_normalization.args] == [
+        "cluster_result"
     ]
-    assert _literal_keywords(displayed) == {"cutoff": arguments.cutoff}
+    assert _keyword_sources(actual_normalization) == {
+        "molecule_count": "molecule_count"
+    }
+    assert [ast.unparse(value) for value in displayed_normalization.args] == [
+        "(cluster_ids, centroids)"
+    ]
+    assert _keyword_sources(displayed_normalization) == {
+        "molecule_count": "molecule_count"
+    }
 
 
 def test_embedding_receipt_tracks_the_real_embed_call_site():

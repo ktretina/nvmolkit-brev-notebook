@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 from rdkit import Chem
 
+from notebooks.nvmolkit_compat import normalize_fused_butina_result
+
 
 class WorkflowPhase(StrEnum):
     NEW = "new"
@@ -170,10 +172,14 @@ def _cross_tanimoto_similarity(fingerprints):
     return crossTanimotoSimilarity(fingerprints)
 
 
-def _fused_butina(fingerprints, *, cutoff: float):
+def _fused_butina(fingerprints, *, cutoff: float, return_centroids: bool):
     from nvmolkit.clustering import fused_butina
 
-    return fused_butina(fingerprints, cutoff=cutoff)
+    return fused_butina(
+        fingerprints,
+        cutoff=cutoff,
+        return_centroids=return_centroids,
+    )
 
 
 def _embed_molecules(molecules, parameters, *, confsPerMolecule: int, maxIterations: int):
@@ -515,13 +521,20 @@ def discover_fused_butina_clusters(
         raise ValueError("cluster cutoff must be 0.40 through 0.60 inclusive")
 
     cutoff = float(cluster_cutoff)
-    cluster_result = _fused_butina(state.fingerprints.torch(), cutoff=cutoff)
+    molecule_count = len(state.molecules)
+    cluster_result = _fused_butina(
+        state.fingerprints.torch(),
+        cutoff=cutoff,
+        return_centroids=True,
+    )
     _synchronize_cuda()
-    clusters_raw = cluster_result[0]
+    _, clusters_raw, _ = normalize_fused_butina_result(
+        cluster_result,
+        molecule_count=molecule_count,
+    )
     clusters = [
         [int(molecule_index) for molecule_index in cluster] for cluster in clusters_raw
     ]
-    molecule_count = len(state.molecules)
     assigned_indices = [index for cluster in clusters for index in cluster]
     if len(assigned_indices) != molecule_count or sorted(assigned_indices) != list(
         range(molecule_count)

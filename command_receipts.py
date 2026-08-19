@@ -67,13 +67,14 @@ def command_receipt(stage: str, arguments: object) -> CommandReceipt:
         _require_exact_model(arguments, ClusterArgs)
         cutoff = repr(arguments.cutoff)
         return CommandReceipt(
-            approved_tool_call=(
-                f"discover_fused_butina_clusters(cutoff={cutoff})"
-            ),
+            approved_tool_call=(f"discover_fused_butina_clusters(cutoff={cutoff})"),
             scientific_label=_NVMOLKIT_LABEL,
             scientific_invocation=(
-                "clusters = fused_butina(fingerprints.torch(), "
-                f"cutoff={cutoff})[0]"
+                "cluster_ids, centroids = fused_butina(fingerprints.torch(), "
+                f"cutoff={cutoff}, return_centroids=True)\n"
+                "# Repository-owned compatibility normalization\n"
+                "_, clusters, _ = normalize_fused_butina_result("
+                "(cluster_ids, centroids), molecule_count=molecule_count)"
             ),
         )
 

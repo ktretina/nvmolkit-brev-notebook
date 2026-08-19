@@ -387,6 +387,14 @@ class _FakeGpuResult:
         return self.tensor
 
 
+class _FakeAsyncResult:
+    def __init__(self, values):
+        self.values = np.asarray(values)
+
+    def numpy(self):
+        return self.values.copy()
+
+
 @pytest.fixture
 def inspected_state():
     return WorkflowState(
@@ -435,9 +443,9 @@ def fake_gpu(monkeypatch):
         calls["similarity"].append(fingerprints)
         return similarity_result
 
-    def cluster(fingerprints, *, cutoff):
-        calls["cluster"].append((fingerprints, cutoff))
-        return [[0, 2], [1]], [2, 1]
+    def cluster(fingerprints, *, cutoff, return_centroids):
+        calls["cluster"].append((fingerprints, cutoff, return_centroids))
+        return ([(0, 2), (1,)], [0, 2, 3], [0, 1])
 
     def sync():
         calls["sync"] += 1
@@ -549,7 +557,7 @@ def test_similarity_chain_records_gpu_calls_summaries_figures_and_eligibility(
     assert [patch.get_height() for patch in cluster_axes[0].patches] == [2, 1]
     assert inspected_state.clusters == [[0, 2], [1]]
     assert inspected_state.cluster_cutoff == 0.47
-    assert calls["cluster"] == [(fingerprint_result.tensor, 0.47)]
+    assert calls["cluster"] == [(fingerprint_result.tensor, 0.47, True)]
     assert calls["sync"] == 3
     assert inspected_state.phase is WorkflowPhase.CLUSTERED
     assert all(
@@ -680,21 +688,21 @@ def test_cluster_cutoff_inclusive_boundaries_execute_and_are_forwarded_unchanged
 
     result = discover_fused_butina_clusters(inspected_state, cluster_cutoff=cutoff)
 
-    assert calls["cluster"] == [(fingerprint_result.tensor, cutoff)]
+    assert calls["cluster"] == [(fingerprint_result.tensor, cutoff, True)]
     assert result.summary["cluster_cutoff"] == cutoff
     assert inspected_state.phase is WorkflowPhase.CLUSTERED
 
 
 @pytest.mark.parametrize(
-    "clusters",
+    "raw_result",
     [
-        [[0], [1]],
-        [[0, 1], [1, 2]],
-        [[0, 1], [2, 3]],
+        ([0, 1], [0, 1]),
+        ([0, 1, 0], [1, 1]),
     ],
+    ids=["incomplete-labels", "centroid-outside-cluster"],
 )
-def test_cluster_rejects_incomplete_duplicate_or_out_of_range_assignment_atomically(
-    inspected_state, fake_gpu, monkeypatch, clusters
+def test_cluster_rejects_malformed_v06_result_atomically(
+    inspected_state, fake_gpu, monkeypatch, raw_result
 ):
     _, fingerprint_result, similarity_result = fake_gpu
     inspected_state.phase = WorkflowPhase.COMPARED
@@ -703,15 +711,77 @@ def test_cluster_rejects_incomplete_duplicate_or_out_of_range_assignment_atomica
     monkeypatch.setattr(
         chemistry_workflow,
         "_fused_butina",
-        lambda fingerprints, *, cutoff: (
-            clusters,
-            [len(cluster) for cluster in clusters],
-        ),
+        lambda fingerprints, *, cutoff, return_centroids: raw_result,
     )
     before = _state_snapshot(inspected_state)
-    with pytest.raises(RuntimeError, match="assigned exactly once"):
+    with pytest.raises(ValueError, match=r"^Malformed fused Butina result\.$"):
         discover_fused_butina_clusters(inspected_state, cluster_cutoff=0.5)
     assert _state_snapshot(inspected_state) == before
+
+
+@pytest.mark.parametrize(
+    "raw_result",
+    [
+        ([(0, 2), (1,)], [0, 2, 3], [0, 1]),
+        (_FakeAsyncResult([0, 1, 0]), _FakeAsyncResult([0, 1])),
+    ],
+    ids=["nvMolKit-0.5", "nvMolKit-0.6-async"],
+)
+def test_cluster_normalizes_supported_result_shapes_to_the_same_exact_assignment(
+    inspected_state, fake_gpu, monkeypatch, raw_result
+):
+    calls, fingerprint_result, similarity_result = fake_gpu
+    inspected_state.phase = WorkflowPhase.COMPARED
+    inspected_state.fingerprints = fingerprint_result
+    inspected_state.similarity = similarity_result
+
+    def cluster(fingerprints, *, cutoff, return_centroids):
+        calls["cluster"].append((fingerprints, cutoff, return_centroids))
+        return raw_result
+
+    monkeypatch.setattr(chemistry_workflow, "_fused_butina", cluster)
+
+    result = discover_fused_butina_clusters(
+        inspected_state,
+        cluster_cutoff=0.5,
+    )
+
+    expected_summary = {
+        "entry_point": "fused_butina",
+        "cluster_cutoff": 0.5,
+        "molecule_count": 3,
+        "cluster_count": 2,
+        "singleton_count": 1,
+        "singleton_fraction": pytest.approx(1 / 3),
+        "largest_cluster_sizes": [2, 1],
+        "assignment_count": 3,
+        "representative_eligibility": {
+            "eligible_cluster_count": 2,
+            "eligible_singleton_count": 1,
+            "maximum_representative_count": 2,
+            "candidates_by_cluster": [
+                {
+                    "cluster_id": 0,
+                    "candidate_ids": ["mol-0"],
+                    "source_rows": [2],
+                    "is_singleton": False,
+                },
+                {
+                    "cluster_id": 1,
+                    "candidate_ids": ["mol-1"],
+                    "source_rows": [5],
+                    "is_singleton": True,
+                },
+            ],
+        },
+    }
+    assert inspected_state.clusters == [[0, 2], [1]]
+    assert result.summary == expected_summary
+    assert inspected_state.summaries["discover_fused_butina_clusters"] == (
+        expected_summary
+    )
+    assert calls["cluster"] == [(fingerprint_result.tensor, 0.5, True)]
+    assert inspected_state.phase is WorkflowPhase.CLUSTERED
 
 
 @pytest.mark.parametrize(
