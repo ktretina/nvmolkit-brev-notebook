@@ -51,7 +51,7 @@ class FakeAsyncResult:
 
 def test_normalizes_v05_member_lists_and_centroids():
     labels, clusters, centroids = normalize_fused_butina_result(
-        ([(0, 2), (1,)], [2, 3], [0, 1]), molecule_count=3
+        ([(0, 2), (1,)], [0, 2, 3], [0, 1]), molecule_count=3
     )
     assert labels.tolist() == [0, 1, 0]
     assert clusters == ((0, 2), (1,))
@@ -226,7 +226,7 @@ Complete fresh specification and quality reviews before Task 3.
 - [ ] **Step 1: Write failing old/new-shape and receipt tests**
 
 Extend the companion clustering fixture to run twice: once with
-`([(0, 2), (1,)], [2, 3], [0, 1])`, and once with fake asynchronous
+`([(0, 2), (1,)], [0, 2, 3], [0, 1])`, and once with fake asynchronous
 `([0, 1, 0], [0, 1])`. Both must produce `[[0, 2], [1]]`, the same summary,
 and exact assignment. Add failures showing malformed labels or centroids leave
 the workflow state unchanged.
