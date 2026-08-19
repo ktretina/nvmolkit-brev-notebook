@@ -483,7 +483,8 @@ As a final review repair, securely read and bind `reframe_candidates.csv` to
 `candidate_pool[input_columns].to_csv(index=False)`, bind `analysis.py` to the
 exact controller-rendered source for the retained approved strategy, and bind
 `report.json`'s strategy name to that same approved strategy before returning
-any receipt or gallery data.
+any receipt or gallery data. Securely snapshot `panel.csv` immediately before
+and after validation, reject any change, and parse only the bound byte snapshot.
 
 ```python
 def _expected_run_paths():
@@ -568,8 +569,9 @@ def build_validated_panel_receipt(run, *, recommended_strategy):
     }
 ```
 
-The existing immediate renderer calls this helper, prints the compact receipt,
-and draws the current figures. It may update `panel` for immediate display, but
+The existing immediate renderer performs one canonical validation, derives the
+compact receipt and display data from that one result, prints the receipt, and
+draws the current figures. It may update `panel` for immediate display, but
 Steps 5 and 6 must revalidate instead of trusting that global.
 
 - [ ] **Step 4: Make Steps 5 and 6 authoritative, replay-safe displays**

@@ -640,6 +640,45 @@ def test_module3_receipt_uses_report_snapshot_from_same_validation(
     )
 
 
+def test_module3_receipt_rejects_panel_changed_after_validation(
+    module3_reference_run, tmp_path, monkeypatch
+):
+    workdir = tmp_path / "module3_agent_workspace"
+    run = _clone_module3_run(module3_reference_run, workdir)
+    namespace = _module3_receipt_namespace(module3_reference_run, workdir=workdir)
+    agent_module = namespace["_workshop_llm_agent"]
+    original_snapshot_validator = agent_module._validate_panel_artifacts_snapshot
+    panel_path = workdir / "panel.csv"
+
+    def validate_then_replace_panel(*args, **kwargs):
+        receipt, report_snapshot = original_snapshot_validator(*args, **kwargs)
+        with panel_path.open(newline="", encoding="utf-8") as handle:
+            panel_rows = list(csv.DictReader(handle))
+        panel_rows[0]["name"] = "Unvalidated replacement chemistry"
+        with panel_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=panel_rows[0])
+            writer.writeheader()
+            writer.writerows(panel_rows)
+        return receipt, report_snapshot
+
+    monkeypatch.setattr(
+        agent_module,
+        "_validate_panel_artifacts_snapshot",
+        validate_then_replace_panel,
+    )
+    visible_output = []
+    namespace.update(
+        agent_run=run,
+        reference_plan=module3_reference_run["plan"],
+        print=lambda *args, **kwargs: visible_output.append((args, kwargs)),
+        display=lambda *args, **kwargs: visible_output.append((args, kwargs)),
+    )
+
+    with pytest.raises(ValueError, match="changed during validation"):
+        _execute_module3_cell("m3-state", namespace)
+    assert visible_output == []
+
+
 def test_module3_receipt_rejects_report_strategy_that_disagrees_with_run(
     module3_reference_run, tmp_path
 ):
@@ -660,6 +699,34 @@ def test_module3_receipt_rejects_report_strategy_that_disagrees_with_run(
         namespace["_require_canonical_run"](
             run, module3_reference_run["plan"].recommended_strategy
         )
+
+
+def test_module3_immediate_renderer_validates_canonical_run_once(
+    module3_reference_run, monkeypatch
+):
+    namespace = _module3_receipt_namespace(module3_reference_run)
+    original_require = namespace["_require_canonical_run"]
+    validation_calls = []
+
+    def counted_require(run, recommended_strategy):
+        validation_calls.append((run, recommended_strategy))
+        return original_require(run, recommended_strategy)
+
+    namespace.update(
+        _require_canonical_run=counted_require,
+        reference_plan=module3_reference_run["plan"],
+        display=lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(namespace["plt"], "show", lambda: None)
+
+    namespace["render_validated_panel_run"](module3_reference_run["run"])
+
+    assert validation_calls == [
+        (
+            module3_reference_run["run"],
+            module3_reference_run["plan"].recommended_strategy,
+        )
+    ]
 
 
 def test_module3_receipt_revalidates_report_before_using_stale_panel(
