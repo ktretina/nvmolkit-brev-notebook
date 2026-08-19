@@ -679,6 +679,78 @@ def test_module3_receipt_rejects_panel_changed_after_validation(
     assert visible_output == []
 
 
+def test_module3_receipt_rejects_candidate_changed_during_validation(
+    module3_reference_run, tmp_path, monkeypatch
+):
+    workdir = tmp_path / "module3_agent_workspace"
+    run = _clone_module3_run(module3_reference_run, workdir)
+    namespace = _module3_receipt_namespace(module3_reference_run, workdir=workdir)
+    agent_module = namespace["_workshop_llm_agent"]
+    original_snapshot_validator = agent_module._validate_panel_artifacts_snapshot
+    candidate_path = workdir / "reframe_candidates.csv"
+
+    def validate_then_replace_candidate(*args, **kwargs):
+        receipt, report_snapshot = original_snapshot_validator(*args, **kwargs)
+        with candidate_path.open(newline="", encoding="utf-8") as handle:
+            candidate_rows = list(csv.DictReader(handle))
+        candidate_rows[0]["name"] = "Unvalidated replacement candidate"
+        with candidate_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=candidate_rows[0])
+            writer.writeheader()
+            writer.writerows(candidate_rows)
+        return receipt, report_snapshot
+
+    monkeypatch.setattr(
+        agent_module,
+        "_validate_panel_artifacts_snapshot",
+        validate_then_replace_candidate,
+    )
+    visible_output = []
+    namespace.update(
+        agent_run=run,
+        reference_plan=module3_reference_run["plan"],
+        print=lambda *args, **kwargs: visible_output.append((args, kwargs)),
+        display=lambda *args, **kwargs: visible_output.append((args, kwargs)),
+    )
+
+    with pytest.raises(ValueError, match="reframe_candidates.csv changed"):
+        _execute_module3_cell("m3-state", namespace)
+    assert visible_output == []
+
+
+def test_module3_receipt_rejects_analysis_changed_during_validation(
+    module3_reference_run, tmp_path, monkeypatch
+):
+    workdir = tmp_path / "module3_agent_workspace"
+    run = _clone_module3_run(module3_reference_run, workdir)
+    namespace = _module3_receipt_namespace(module3_reference_run, workdir=workdir)
+    agent_module = namespace["_workshop_llm_agent"]
+    original_snapshot_validator = agent_module._validate_panel_artifacts_snapshot
+    analysis_path = workdir / "analysis.py"
+
+    def validate_then_replace_analysis(*args, **kwargs):
+        receipt, report_snapshot = original_snapshot_validator(*args, **kwargs)
+        analysis_path.write_text("print('unvalidated source')\n", encoding="utf-8")
+        return receipt, report_snapshot
+
+    monkeypatch.setattr(
+        agent_module,
+        "_validate_panel_artifacts_snapshot",
+        validate_then_replace_analysis,
+    )
+    visible_output = []
+    namespace.update(
+        agent_run=run,
+        reference_plan=module3_reference_run["plan"],
+        print=lambda *args, **kwargs: visible_output.append((args, kwargs)),
+        display=lambda *args, **kwargs: visible_output.append((args, kwargs)),
+    )
+
+    with pytest.raises(ValueError, match="analysis.py changed"):
+        _execute_module3_cell("m3-state", namespace)
+    assert visible_output == []
+
+
 def test_module3_receipt_rejects_report_strategy_that_disagrees_with_run(
     module3_reference_run, tmp_path
 ):

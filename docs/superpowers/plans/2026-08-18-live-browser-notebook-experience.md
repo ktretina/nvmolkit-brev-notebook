@@ -483,8 +483,9 @@ As a final review repair, securely read and bind `reframe_candidates.csv` to
 `candidate_pool[input_columns].to_csv(index=False)`, bind `analysis.py` to the
 exact controller-rendered source for the retained approved strategy, and bind
 `report.json`'s strategy name to that same approved strategy before returning
-any receipt or gallery data. Securely snapshot `panel.csv` immediately before
-and after validation, reject any change, and parse only the bound byte snapshot.
+any receipt or gallery data. Securely snapshot `reframe_candidates.csv`,
+`analysis.py`, and `panel.csv` immediately before and after validation and
+reject any change. Parse only the bound panel byte snapshot for display.
 
 ```python
 def _expected_run_paths():
