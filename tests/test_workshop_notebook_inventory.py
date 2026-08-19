@@ -162,12 +162,9 @@ def test_module1_advanced_10k_path_is_gpu_only_and_reports_provenance():
     assert "torch.cuda.synchronize" in source
     assert 'advanced_reframe.attrs["source"]' in source
     assert "len(advanced_reframe)" in source
-    estimate_print = source.index("10k float32 square matrix estimate")
-    memory_guard = source.index(
-        "require_memory_within_limit(advanced_square_bytes, limit_mib=512)"
-    )
-    live_load = source.index('source="live"')
-    assert estimate_print < memory_guard < live_load
+    assert "square_matrix_bytes" not in source
+    assert "require_memory_within_limit" not in source
+    assert "nvMolKit fused clustering seconds" in source
 
 
 def test_module1_report_contract_is_present():
