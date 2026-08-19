@@ -1,7 +1,7 @@
-import os
 import json
 import itertools
 import inspect
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,6 +22,10 @@ def test_gpu_source_gate_covers_decision_ladder_and_persistent_conclusion():
         'objective_evidence.key == "O01"',
         "request_synthesis",
         "evidence_controlled_conclusion",
+        'nvmolkit.__version__ == "0.6.0"',
+        "normalize_fused_butina_result",
+        "direct_labels",
+        "direct_centroids",
     ):
         assert required in source
 
@@ -45,9 +49,7 @@ def test_cpu_acceptance_contract_covers_certified_objective_terminal_evidence():
     menu = build_action_menu(context, baseline, 0)
     maxima = accepted_maxima(menu)
     attempt = evaluate_selected_swap(context, menu, maxima[0], 1)
-    run = terminal_objective_run(
-        context, (attempt,), TerminationReason.TARGET_ACHIEVED
-    )
+    run = terminal_objective_run(context, (attempt,), TerminationReason.TARGET_ACHIEVED)
     payload = json.loads(build_objective_evidence(run).payload_json)
 
     assert menu.state_id.startswith("state-")
@@ -66,6 +68,7 @@ def test_cpu_acceptance_contract_covers_certified_objective_terminal_evidence():
 def test_nvmolkit_gpu_workflow():
     import nvmolkit
     import torch
+    from nvmolkit.clustering import fused_butina
 
     from chemistry_workflow import (
         WorkflowPhase,
@@ -78,7 +81,11 @@ def test_nvmolkit_gpu_workflow():
         measure_tanimoto_similarity,
         optimize_conformers_mmff94,
     )
-    from demo_agent import BoundedWorkflowController, EvidenceControlledConclusion, STAGES
+    from demo_agent import (
+        BoundedWorkflowController,
+        EvidenceControlledConclusion,
+        STAGES,
+    )
     from objective_challenge import (
         accepted_maxima,
         build_action_menu,
@@ -88,14 +95,15 @@ def test_nvmolkit_gpu_workflow():
         measure_panel,
         target_is_achieved,
     )
+    from notebooks.nvmolkit_compat import normalize_fused_butina_result
 
     assert torch.cuda.is_available(), "A CUDA-capable NVIDIA GPU is required."
     assert "L4" in torch.cuda.get_device_name(0), (
         f"GPU acceptance requires an NVIDIA L4; found {torch.cuda.get_device_name(0)}"
     )
     assert torch.cuda.get_device_capability(0) >= (7, 0)
-    assert nvmolkit.__version__ == "0.5.0", (
-        f"GPU acceptance requires nvMolKit 0.5.0; found {nvmolkit.__version__}"
+    assert nvmolkit.__version__ == "0.6.0", (
+        f"GPU acceptance requires nvMolKit 0.6.0; found {nvmolkit.__version__}"
     )
 
     data_path = Path(__file__).resolve().parents[1] / "data" / "sample_molecules.csv"
@@ -228,9 +236,7 @@ def test_nvmolkit_gpu_workflow():
     assert menu.state_id.startswith("state-")
     assert accepted_maxima(menu)
     assert all(action.limiting_pairs for action in menu.actions)
-    assert is_strict_improvement(
-        context.benchmark_score, context.baseline_score
-    )
+    assert is_strict_improvement(context.benchmark_score, context.baseline_score)
     candidate_ids = tuple(candidate.molecule_id for candidate in context.candidates)
     all_panels = tuple(itertools.combinations(candidate_ids, 4))
     assert len(all_panels) == 70
@@ -252,9 +258,7 @@ def test_nvmolkit_gpu_workflow():
                     build_action_menu(context, second, 1)
                 )
                 assert any(
-                    target_is_achieved(
-                        suggestion.predicted_score, context.target_score
-                    )
+                    target_is_achieved(suggestion.predicted_score, context.target_score)
                     for suggestion in next_suggestions
                 )
     assert len(below_target) == 35
@@ -266,14 +270,16 @@ def test_nvmolkit_gpu_workflow():
         assert current_menu is not None
         selected_swap = accepted_maxima(current_menu)[0]
         completions.expected_names.append("select_next_panel_swap")
-        completions.arguments.append({
-            "state_id": current_menu.state_id,
-            "swap_id": selected_swap.swap_id,
-            "observed_limiting_pairs": [
-                list(pair) for pair in current_menu.source.limiting_pairs
-            ],
-            "decision_rule": "maximize_predicted_minimum_distance",
-        })
+        completions.arguments.append(
+            {
+                "state_id": current_menu.state_id,
+                "swap_id": selected_swap.swap_id,
+                "observed_limiting_pairs": [
+                    list(pair) for pair in current_menu.source.limiting_pairs
+                ],
+                "decision_rule": "maximize_predicted_minimum_distance",
+            }
+        )
         proposal = controller.request_objective_attempt()
         attempt = controller.execute_objective_attempt(proposal)
         accepted_panels.append(tuple(sorted(attempt.selected_ids)))
@@ -304,7 +310,9 @@ def test_nvmolkit_gpu_workflow():
     assert controller.session.turn_count == 7 + len(accepted_panels)
     assert len(completions.calls) == 7 + len(accepted_panels)
     assistant_messages = [
-        message for message in controller.session.messages if message["role"] == "assistant"
+        message
+        for message in controller.session.messages
+        if message["role"] == "assistant"
     ]
     tool_messages = [
         message for message in controller.session.messages if message["role"] == "tool"
@@ -352,11 +360,45 @@ def test_nvmolkit_gpu_workflow():
     assert len(set(cluster_by_index)) == len(state.clusters)
     assert len({candidate.cluster_id for candidate in context.candidates}) == 8
 
+    torch.cuda.synchronize()
+    direct_result = fused_butina(
+        fingerprints,
+        cutoff=stage_arguments["discover_fused_butina_clusters"]["cutoff"],
+        return_centroids=True,
+    )
+    torch.cuda.synchronize()
+    direct_labels, direct_clusters, direct_centroids = normalize_fused_butina_result(
+        direct_result, molecule_count=256
+    )
+    direct_label_values = [int(label) for label in direct_labels]
+    direct_assigned_indices = [
+        molecule_index for cluster in direct_clusters for molecule_index in cluster
+    ]
+    assert len(direct_label_values) == 256
+    assert len(direct_assigned_indices) == 256
+    assert sorted(direct_assigned_indices) == list(range(256))
+    assert sorted(set(direct_label_values)) == list(range(len(direct_clusters)))
+    assert all(
+        int(direct_centroids[cluster_id]) in cluster
+        for cluster_id, cluster in enumerate(direct_clusters)
+    )
+    assert all(
+        (direct_label_values[left] == direct_label_values[right])
+        == (cluster_by_index[left] == cluster_by_index[right])
+        for left in range(256)
+        for right in range(left + 1, 256)
+    )
+
     report = scientific.report
 
     assert state.phase is WorkflowPhase.OPTIMIZED
     assert [record.key for record in report.evidence] == [
-        "E01", "E02", "E03", "E04", "E05", "E06"
+        "E01",
+        "E02",
+        "E03",
+        "E04",
+        "E05",
+        "E06",
     ]
     assert [record.provenance for record in report.evidence[1:]] == [
         "MorganFingerprintGenerator",
@@ -365,7 +407,9 @@ def test_nvmolkit_gpu_workflow():
         "EmbedMolecules",
         "MMFFOptimizeMoleculesConfs",
     ]
-    evidence = {record.key: json.loads(record.payload_json) for record in report.evidence}
+    evidence = {
+        record.key: json.loads(record.payload_json) for record in report.evidence
+    }
     assert evidence["E01"]["valid_count"] == 256
     assert evidence["E02"]["packed_shape"] == [256, 32]
     assert evidence["E03"]["matrix_shape"] == [256, 256]
@@ -381,11 +425,19 @@ def test_nvmolkit_gpu_workflow():
     assert mol_indices.is_cuda
     assert conf_indices.is_cuda
     attempted = evidence["E06"]["attempted_conformer_count"]
-    assert len(energies) == len(converged) == len(mol_indices) == len(conf_indices) == attempted
+    assert (
+        len(energies)
+        == len(converged)
+        == len(mol_indices)
+        == len(conf_indices)
+        == attempted
+    )
     assert torch.isfinite(energies).all().item()
 
     result_pairs = list(zip(mol_indices.tolist(), conf_indices.tolist()))
-    assert all(0 <= mol_index < len(state.conformer_molecules) for mol_index, _ in result_pairs)
+    assert all(
+        0 <= mol_index < len(state.conformer_molecules) for mol_index, _ in result_pairs
+    )
     assert all(
         0 <= conf_index < state.conformer_molecules[mol_index].GetNumConformers()
         for mol_index, conf_index in result_pairs
