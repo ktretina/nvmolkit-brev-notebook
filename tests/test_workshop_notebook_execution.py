@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import re
@@ -310,7 +311,9 @@ def test_module3_receipt_replays_canonical_evidence_without_new_calls(
         run, recommended_strategy=recommended_strategy
     )
     namespace["_require_canonical_run"](run, recommended_strategy)
-    namespace["_require_canonical_run"](run, recommended_strategy)
+    _, loaded_report, _, _ = namespace["_require_canonical_run"](
+        run, recommended_strategy
+    )
 
     assert first == second
     assert first["mode"] == "reference"
@@ -319,12 +322,18 @@ def test_module3_receipt_replays_canonical_evidence_without_new_calls(
     assert first["approved_strategy"] == run.approved_strategy
     assert first["analysis_status"] == "validated"
     assert first["audit_status"] == "reference audit complete"
+    assert loaded_report["parameters"]["strategy"] == "descriptor_seeded_max_min"
     assert "hosted" not in first["audit_status"]
     assert replay_calls == {"plan": 0, "run": 0, "audit": 0}
     assert module3_reference_run["counts"] == {"plan": 1, "run": 1, "audit": 1}
 
 
-def test_module3_pending_receipt_and_gallery_cells_are_safe_without_calls(capsys):
+@pytest.mark.parametrize(
+    "workflow_status", ("planning", "awaiting_approval", "executing")
+)
+def test_module3_pending_receipt_and_gallery_cells_are_safe_without_calls(
+    workflow_status, capsys
+):
     calls = []
 
     def forbidden(*args, **kwargs):
@@ -334,10 +343,13 @@ def test_module3_pending_receipt_and_gallery_cells_are_safe_without_calls(capsys
     namespace = {
         "agent_run": None,
         "panel": object(),
-        "PANEL_AGENT_MODE": "reference",
-        "WORKSHOP_MODE": "reference",
-        "reference_plan": SimpleNamespace(recommended_strategy=2),
-        "module3_workflow": None,
+        "PANEL_AGENT_MODE": "hosted",
+        "WORKSHOP_MODE": "hosted",
+        "module3_workflow": SimpleNamespace(
+            status=workflow_status,
+            agent_run=None,
+            plan=None,
+        ),
         "build_validated_panel_receipt": forbidden,
         "_require_canonical_run": forbidden,
     }
@@ -347,6 +359,66 @@ def test_module3_pending_receipt_and_gallery_cells_are_safe_without_calls(capsys
     output = capsys.readouterr().out
     waiting = "Waiting for sponsor approval. No validated result is available yet."
     assert output.count(waiting) == 2
+    assert calls == []
+
+
+def test_module3_plan_failed_prompts_retry_without_calls(capsys):
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("plan failure reached validation or execution")
+
+    namespace = {
+        "agent_run": None,
+        "PANEL_AGENT_MODE": "hosted",
+        "WORKSHOP_MODE": "hosted",
+        "module3_workflow": SimpleNamespace(
+            status="plan_failed",
+            agent_run=None,
+            plan=None,
+        ),
+        "build_validated_panel_receipt": forbidden,
+        "_require_canonical_run": forbidden,
+        "display": forbidden,
+        "Draw": SimpleNamespace(MolsToGridImage=forbidden),
+    }
+
+    _execute_module3_cell("m3-state", namespace)
+    _execute_module3_cell("m3-gallery", namespace)
+
+    output = capsys.readouterr().out
+    retry = "Plan request failed. Use Retry Plan before approval."
+    assert output.count(retry) == 2
+    assert "Waiting for sponsor approval" not in output
+    assert calls == []
+
+
+def test_module3_reference_without_run_prompts_step4_without_calls(capsys):
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("missing reference run reached validation or execution")
+
+    namespace = {
+        "agent_run": None,
+        "PANEL_AGENT_MODE": "reference",
+        "WORKSHOP_MODE": "reference",
+        "module3_workflow": None,
+        "build_validated_panel_receipt": forbidden,
+        "_require_canonical_run": forbidden,
+        "display": forbidden,
+        "Draw": SimpleNamespace(MolsToGridImage=forbidden),
+    }
+
+    _execute_module3_cell("m3-state", namespace)
+    _execute_module3_cell("m3-gallery", namespace)
+
+    output = capsys.readouterr().out
+    missing = "Reference analysis has not run. Rerun Step 4."
+    assert output.count(missing) == 2
+    assert "Waiting for sponsor approval" not in output
     assert calls == []
 
 
@@ -443,6 +515,8 @@ def test_module3_failed_hosted_workflow_without_run_is_not_reported_as_pending(
         "trace success false",
         "wrong trace recommendation",
         "run and trace audit disagreement",
+        "analysis source tamper",
+        "candidate input tamper",
     ),
 )
 def test_module3_receipt_rejects_inconsistent_retained_evidence(
@@ -486,6 +560,31 @@ def test_module3_receipt_rejects_inconsistent_retained_evidence(
         trace["audit"] = None
         trace["audit_error"] = ""
         trace_path.write_text(json.dumps(trace), encoding="utf-8")
+    elif mutation == "analysis source tamper":
+        (workdir / "analysis.py").write_text(
+            "print('tampered source')\n", encoding="utf-8"
+        )
+    elif mutation == "candidate input tamper":
+        candidate_path = workdir / "reframe_candidates.csv"
+        panel_path = workdir / "panel.csv"
+        with candidate_path.open(newline="", encoding="utf-8") as handle:
+            candidate_rows = list(csv.DictReader(handle))
+        with panel_path.open(newline="", encoding="utf-8") as handle:
+            panel_rows = list(csv.DictReader(handle))
+        selected_key = panel_rows[0]["canonical_ikey"]
+        tampered_name = "Tampered selected compound"
+        next(row for row in candidate_rows if row["canonical_ikey"] == selected_key)[
+            "name"
+        ] = tampered_name
+        panel_rows[0]["name"] = tampered_name
+        with candidate_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=candidate_rows[0])
+            writer.writeheader()
+            writer.writerows(candidate_rows)
+        with panel_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=panel_rows[0])
+            writer.writeheader()
+            writer.writerows(panel_rows)
 
     visible_output = []
     namespace.update(
@@ -506,6 +605,61 @@ def test_module3_receipt_rejects_inconsistent_retained_evidence(
     with pytest.raises(ValueError):
         _execute_module3_cell("m3-gallery", namespace)
     assert visible_output == []
+
+
+def test_module3_receipt_uses_report_snapshot_from_same_validation(
+    module3_reference_run, tmp_path, monkeypatch
+):
+    workdir = tmp_path / "module3_agent_workspace"
+    run = _clone_module3_run(module3_reference_run, workdir)
+    namespace = _module3_receipt_namespace(module3_reference_run, workdir=workdir)
+    agent_module = namespace["_workshop_llm_agent"]
+    original_snapshot_validator = agent_module._validate_panel_artifacts_snapshot
+    report_path = workdir / "report.json"
+    expected_backend = json.loads(report_path.read_text(encoding="utf-8"))["backend"]
+
+    def validate_then_tamper(*args, **kwargs):
+        receipt, report_snapshot = original_snapshot_validator(*args, **kwargs)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["backend"] = "tampered-after-validation"
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        return receipt, report_snapshot
+
+    monkeypatch.setattr(
+        agent_module, "_validate_panel_artifacts_snapshot", validate_then_tamper
+    )
+
+    receipt = namespace["build_validated_panel_receipt"](
+        run,
+        recommended_strategy=module3_reference_run["plan"].recommended_strategy,
+    )
+
+    assert receipt["backend"] == expected_backend
+    assert json.loads(report_path.read_text(encoding="utf-8"))["backend"] == (
+        "tampered-after-validation"
+    )
+
+
+def test_module3_receipt_rejects_report_strategy_that_disagrees_with_run(
+    module3_reference_run, tmp_path
+):
+    workdir = tmp_path / "module3_agent_workspace"
+    run = _clone_module3_run(module3_reference_run, workdir)
+    namespace = _module3_receipt_namespace(module3_reference_run, workdir=workdir)
+    original_loader = namespace["load_validated_panel_artifacts"]
+
+    def load_with_wrong_strategy(run_to_load):
+        panel, report, trace, receipt = original_loader(run_to_load)
+        changed_report = json.loads(json.dumps(report))
+        changed_report["parameters"]["strategy"] = "cluster_aware_max_min"
+        return panel, changed_report, trace, receipt
+
+    namespace["load_validated_panel_artifacts"] = load_with_wrong_strategy
+
+    with pytest.raises(ValueError, match="reported strategy"):
+        namespace["_require_canonical_run"](
+            run, module3_reference_run["plan"].recommended_strategy
+        )
 
 
 def test_module3_receipt_revalidates_report_before_using_stale_panel(

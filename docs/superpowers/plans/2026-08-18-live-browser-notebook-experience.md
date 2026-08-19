@@ -475,8 +475,15 @@ missing replay instruction, old metric wording, and four-column grid.
 Import `DEFAULT_MODEL` from `workshop_llm_agent` in `m3-setup`.
 
 Make `agent_run` the one canonical run object. Require its paths to be the fixed
-regular, non-symlink workspace files. Continue to call
-`validate_panel_artifacts()` for the panel and report. Add these functions:
+regular, non-symlink workspace files. Use
+`_validate_panel_artifacts_snapshot()` so receipt fields come from the exact
+report snapshot that passed independent validation. Add these functions:
+
+As a final review repair, securely read and bind `reframe_candidates.csv` to
+`candidate_pool[input_columns].to_csv(index=False)`, bind `analysis.py` to the
+exact controller-rendered source for the retained approved strategy, and bind
+`report.json`'s strategy name to that same approved strategy before returning
+any receipt or gallery data.
 
 ```python
 def _expected_run_paths():
@@ -583,15 +590,13 @@ and draws from the returned panel. Change:
 molsPerRow=3
 ```
 
-Both cells must retain an explicit pending guard before those calls:
-
-```python
-if agent_run is None:
-    print("Waiting for sponsor approval. No validated result is available yet.")
-```
-
-Only the `else` branch may enter the complete canonical receipt or gallery code
-specified above. The pending branch returns without validation or execution.
+Both cells must retain an explicit workflow-state guard before those calls.
+Only the validated-run branch may enter the complete canonical receipt or
+gallery code specified above. Reserve the sponsor-pending message for hosted
+`planning`, `awaiting_approval`, or `executing` states. A `plan_failed` state
+directs the attendee to **Retry Plan**; reference mode without a run directs the
+attendee to rerun Step 4. These states must remain validation- and
+execution-free.
 
 Use these instructions before Step 4:
 
