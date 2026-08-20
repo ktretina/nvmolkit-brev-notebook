@@ -153,46 +153,106 @@ contained such a statement, so neither file was changed.
 
 ## L4 GPU evidence
 
-**Status:** NOT RUN.
+**Status:** PASS for the fresh L4 runtime and complete GPU-enabled test suite.
 
-No fresh L4 environment running nvMolKit 0.6.0 was created or used. The
-GPU-only test remains intentionally skipped until it runs on a fresh,
-task-owned Brev L4. Local deterministic tests do not establish CUDA runtime
-compatibility, numerical execution, performance, or device-memory behavior.
+The user created a fresh deployment from Launchable
+`env-3HJtJW3qHg4Dw1I3xt75BfpBmZW`. Qualification used only the resulting
+task-owned instance:
 
-A read-only check of the user-provided existing instance found an old checkout:
-the origin was the intended GitHub repository, the branch was `main`, and HEAD
-was `25781fdbd50ffa894b6f94da8fd2284fa518b9c7`. That instance had Python
-3.12.14 and nvMolKit 0.5.0, not nvMolKit 0.6.0. Its worktree was not clean.
-Therefore, it was neither patched nor reused as upgrade evidence.
+```text
+name: nvmolkit---nemotron-notebook-436a34
+instance ID: 28zcii3yz
+machine: g6.xlarge
+GPU: one NVIDIA L4
+```
+
+The preflight verified a clean checkout at published commit
+`fa8fefb49e7e288c3ff7823f1005244db1732667`, the expected public origin,
+setup-script SHA-256
+`daf428d54e3bdb3ad289ff069f5e5aff143edffed2a5497f8d687ffa77ec3153`,
+Python 3.12.14, nvMolKit 0.6.0, one L4 with CUDA capability 8.9, and a healthy
+Jupyter Server 2.20.0 API. The protected key was checked only for regular-file,
+owner, mode-0600, and bounded-size properties. Its value was not printed or
+recorded.
+
+The full suite then ran serially with `RUN_GPU_TESTS=1`, the ambient
+`NVIDIA_API_KEY` variable strictly absent, and the pytest child launched with
+that variable removed. Result: exit 0; exactly `938 passed`, with zero skips,
+failures, or errors. A separate JUnit receipt verifier confirmed all eight
+required GPU, reference-kernel, inventory, replay, and provenance gates.
+
+Evidence hashes:
+
+```text
+pytest log: 412bae3b6ef1f9726b5b02a6897ac07907af9bd5de2705305f2f555ea6e0170f
+JUnit XML:  06d218bf050d4fd2864d0ba635441a2fdaade51e285ec49d1f241828b48be96f
+```
+
+An optional text scan in the first wrapper used a malformed grep expression
+and was discarded. It is not part of this PASS decision. The independent
+JUnit verifier, exact test counts, required-gate statuses, clean-tree checks,
+and process-environment controls are the accepted evidence.
+
+This gate establishes fresh L4/CUDA execution with nvMolKit 0.6.0. It does not
+establish throughput, latency, cost, or device-memory performance.
 
 ## Hosted-model evidence
 
-**Status:** NOT RUN.
+**Status:** PASS for the hosted-kernel smoke; browser-human acceptance was not
+part of this gate.
 
-No hosted-model request was made. Local reference-mode, mock-client, protocol,
-and replay tests do not establish hosted endpoint availability, latency, or
-response behavior.
+A reviewed, temporary-only harness executed in-memory copies of Modules 2 and
+3 with the exact managed Python 3.12 kernel, one L4, nvMolKit 0.6.0, and model
+`nvidia/nemotron-3-nano-30b-a3b`. Provider retries were disabled. It completed
+in 23.644 seconds and made exactly three hosted requests:
+
+- Module 2 made one `submit_neighborhood_policy` request, returned mode
+  `hosted_nemotron`, and produced a 60-row GPU-backed atlas.
+- Module 3 made one `submit_panel_plan` request and one
+  `submit_panel_audit` request. The sponsor path approved strategy 2 after the
+  model recommended strategy 1. Exactly one isolated `nvmolkit-gpu` analysis
+  ran, selected 24 of 96 candidates, passed independent artifact validation,
+  and completed the audit.
+- Replaying the Module 3 receipt and gallery produced zero new hosted requests
+  and zero new analysis executions. Both the original and replayed gallery
+  cells emitted SVG output.
+
+The harness saved no executed source notebooks, left the published checkout
+clean, and passed its exact-key and `nvapi-` output/artifact scans. Receipt
+hashes:
+
+```text
+Module 2 in-memory notebook: eaf48f91e689ca989a776d37c561a0cd77ebe62092b9783471aa74bf1b0a0ff6
+Module 3 in-memory notebook: c294e84f987022a6df8d137482a64f199b2e764e6c772316146579dd1c62f41f
+Module 3 validated report:   b44db12ade7a95863c6bbb0f7808c3b0634c5b40b1084266489c3720c6e97159
+```
+
+The recorded elapsed time is one diagnostic observation, not a performance
+benchmark. This result establishes one successful hosted-kernel workflow. It
+does not establish endpoint reliability, a latency distribution, JupyterLab
+frontend rendering, or the complete human attendee experience.
 
 ## Browser evidence
 
 **Status:** NOT RUN.
 
-No JupyterLab browser session or Secure Link was opened. Local notebook schema,
-clean-state, compile, and execution tests do not establish browser rendering,
-widget interaction, or the live attendee flow.
+No human JupyterLab session or Secure Link flow was exercised. The
+hosted-kernel smoke verified widget-driven workflow state and SVG MIME output,
+but it did not verify browser rendering, manual widget interaction, autosave
+behavior, or the live attendee flow.
 
 ## GitHub PR closeout
 
 **Status:** COMPLETE.
 
-GitHub `main` was verified at
-`c8a24115f6a75efe4dc8fb9bcaec3e88b8fe7f25`. Runtime source and notebook
+The published source used by the fresh deployment was verified at
+`fa8fefb49e7e288c3ff7823f1005244db1732667`. Runtime source and notebook
 qualification remains attributed to tested source
 `0cc05cc7506a89df2fd64c2cfab3055829d59adb`. Commit `c8a2411` is a
 qualification/report-only documentation commit relative to that tested source:
 it added this report and corrected two factual examples in the implementation
-plan; it did not change runtime source or notebooks.
+plan. Commit `fa8fefb` added publication and Brev preflight evidence. Neither
+commit changed runtime source or notebooks.
 
 - [PR #1](https://github.com/ktretina/nvmolkit-brev-notebook/pull/1)
   received an
@@ -209,7 +269,9 @@ accepted history.
 
 ## Brev Launchable definition
 
-**Status:** PREFLIGHT PASS; DEFINITION UPDATE NOT DONE.
+**Status:** PREFLIGHT PASS; fresh deployment runtime passed through the
+hosted-kernel smoke; browser-human acceptance was not run; the saved definition
+was not directly inspected or edited.
 
 The installed Brev CLI was version 0.6.332. The active organization was
 `agents-in-ls`, ID `org-3FVWXFV8irpOznkgYhF29j6Osqx`.
@@ -234,38 +296,37 @@ NVIDIA's
 documents Launchable creation and editing in the Brev Console. The
 [CLI instance-management documentation](https://docs.nvidia.com/brev/cli/instance-management)
 covers instance deployment and management. No supported CLI definition-editing
-surface was identified, and no Launchable definition edit was made.
+surface was identified, and no Launchable definition edit was made through the
+CLI in this qualification run.
 
-The old instance credential file was checked only for metadata. Its mode was
-600, owner UID was 1000, and size was 70 bytes. Its contents and value were not
-read, copied, or recorded.
+The user completed that supported deployment action. The resulting fresh
+instance built the published source at `fa8fefb`, passed the setup, L4,
+GPU-suite, and hosted-kernel gates recorded above, and remained clean. No old
+instance was patched or used as nvMolKit 0.6.0 evidence.
 
-**Next required action:** make a fresh deployment from the
-[supported Launchable deployment page](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3HJtJW3qHg4Dw1I3xt75BfpBmZW),
-with the user entering their `NVIDIA_API_KEY` there. This is blocked on that
-user action. The old, dirty nvMolKit 0.5.0 instance must not be patched or used
-as nvMolKit 0.6.0 evidence.
-
-Until a fresh deployment completes, L4 GPU, hosted-model, and browser evidence
-for nvMolKit 0.6.0 remain `NOT RUN`. This record does not claim that the
-Launchable definition or live attendee experience is updated or ready.
+This runtime evidence proves what the Launchable produced for this deployment.
+It does not directly inspect every saved Console field or prove the
+organization-only Secure Link and JupyterLab browser experience. Those remain
+separate Console/browser checks.
 
 ## Residual risks and rollback
 
-- L4 GPU, hosted-model, and browser gates for nvMolKit 0.6.0 are still
-  `NOT RUN`. They must remain separate from local evidence, GitHub publication,
-  CLI deployment preflight, and inspection of the old nvMolKit 0.5.0 instance.
-- The Brev CLI dry run did not inspect or edit the saved Launchable definition.
-  A fresh deployment is required, and it is blocked on the user entering their
-  key through the supported deployment page.
+- Browser-human acceptance is still `NOT RUN`. The L4 suite and hosted-kernel
+  smoke do not prove JupyterLab widget rendering, a human click path, or the
+  organization-only Secure Link.
+- The fresh deployment proves the resulting runtime, but the Brev CLI did not
+  directly inspect every saved Launchable Console field.
+- The task-owned instance was still running at the end of qualification and may
+  continue to incur charges until the user stops it.
 - Three changed Python files retain whole-file Ruff formatting debt that was
   already present at the comparison base. The changed hunks are range-format
   clean; removing the unrelated debt is outside this upgrade.
-- Commit `c8a24115f6a75efe4dc8fb9bcaec3e88b8fe7f25` and this report update are
+- Commits `c8a24115f6a75efe4dc8fb9bcaec3e88b8fe7f25`,
+  `fa8fefb49e7e288c3ff7823f1005244db1732667`, and this report update are
   documentation changes made after tested source
   `0cc05cc7506a89df2fd64c2cfab3055829d59adb`. They do not change runtime code or
   notebooks.
-- Before publication, use non-destructive Git reverts to return to the accepted
-  comparison base if a final review finds a release-blocking issue. After any
-  live Launchable update, restore the last accepted source only through the
-  supported Brev surface and repeat every affected external gate.
+- Use non-destructive Git reverts to return to the accepted comparison base if
+  a later review finds a release-blocking issue. After any live Launchable
+  update, restore the last accepted source only through the supported Brev
+  surface and repeat every affected external gate.
