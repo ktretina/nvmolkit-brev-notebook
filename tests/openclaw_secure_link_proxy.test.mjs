@@ -16,8 +16,12 @@ import {
 const PROXY_PATH = fileURLToPath(
   new URL("../launchable/openclaw_secure_link_proxy.mjs", import.meta.url),
 );
-const SECURE_LINK_HOST =
+const CURRENT_SECURE_LINK_HOST =
+  "open-chemistry-agent-80fyx449k.brevlab.com";
+const LEGACY_SECURE_LINK_HOST =
   "open-chemistry-agent-4z4yqg7de.apps.run.brev.nvidia.com";
+const SECURE_LINK_HOSTS = [CURRENT_SECURE_LINK_HOST, LEGACY_SECURE_LINK_HOST];
+const SECURE_LINK_HOST = LEGACY_SECURE_LINK_HOST;
 const SECURE_LINK_ORIGIN = `https://${SECURE_LINK_HOST}`;
 const BACKEND_ORIGIN = "http://127.0.0.1:18789";
 
@@ -314,32 +318,44 @@ test("bootstraps once, proxies HTTP, and tunnels WebSocket data", async (t) => {
     testHeader: "static-header",
   });
 
-  const socket = net.connect({ host: "127.0.0.1", port: proxyPort });
-  await once(socket, "connect");
-  const key = Buffer.from("0123456789abcdef").toString("base64");
-  const handshake = readHandshake(socket);
-  socket.write(
-    "GET /socket?keep=1 HTTP/1.1\r\n" +
-      `Host: ${SECURE_LINK_HOST}\r\n` +
-      `Origin: ${SECURE_LINK_ORIGIN}\r\n` +
-      "Upgrade: websocket\r\n" +
-      "Connection: Upgrade\r\n" +
-      `Sec-WebSocket-Key: ${key}\r\n` +
-      "Sec-WebSocket-Version: 13\r\n" +
-      "X-ACS-Test: websocket-header\r\n\r\n",
-  );
-  const handshakeResult = await handshake;
-  assert.match(handshakeResult.headers, /^HTTP\/1\.1 101 Switching Protocols/m);
-  const reply = readTextFrame(socket, handshakeResult.remainder);
-  socket.write(encodeMaskedTextFrame("through-proxy"));
-  assert.equal(await reply, "backend-reply");
-  socket.destroy();
+  for (const secureLinkHost of SECURE_LINK_HOSTS) {
+    const socket = net.connect({ host: "127.0.0.1", port: proxyPort });
+    await once(socket, "connect");
+    const key = crypto.randomBytes(16).toString("base64");
+    const handshake = readHandshake(socket);
+    socket.write(
+      "GET /socket?keep=1 HTTP/1.1\r\n" +
+        `Host: ${secureLinkHost}\r\n` +
+        `Origin: https://${secureLinkHost}\r\n` +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        `Sec-WebSocket-Key: ${key}\r\n` +
+        "Sec-WebSocket-Version: 13\r\n" +
+        "X-ACS-Test: websocket-header\r\n\r\n",
+    );
+    const handshakeResult = await handshake;
+    assert.match(handshakeResult.headers, /^HTTP\/1\.1 101 Switching Protocols/m);
+    const reply = readTextFrame(socket, handshakeResult.remainder);
+    socket.write(encodeMaskedTextFrame("through-proxy"));
+    assert.equal(await reply, "backend-reply");
+    socket.destroy();
+  }
 
-  assert.equal(upgrades.length, 1);
-  assert.equal(upgrades[0].url, "/socket?keep=1");
-  assert.equal(upgrades[0].headers.host, SECURE_LINK_HOST);
-  assert.equal(upgrades[0].headers.origin, BACKEND_ORIGIN);
-  assert.equal(upgrades[0].headers["x-acs-test"], "websocket-header");
+  assert.equal(upgrades.length, SECURE_LINK_HOSTS.length);
+  assert.deepEqual(
+    upgrades.map(({ url, headers }) => ({
+      url,
+      host: headers.host,
+      origin: headers.origin,
+      testHeader: headers["x-acs-test"],
+    })),
+    SECURE_LINK_HOSTS.map((host) => ({
+      url: "/socket?keep=1",
+      host,
+      origin: BACKEND_ORIGIN,
+      testHeader: "websocket-header",
+    })),
+  );
 });
 
 

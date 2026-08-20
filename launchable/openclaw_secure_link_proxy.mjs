@@ -13,7 +13,7 @@ export const PROXY_DEFAULTS = Object.freeze({
   backendPort: 18789,
 });
 const SECURE_LINK_HOST_PATTERN =
-  /^open-chemistry-agent-[a-z0-9]+\.apps\.run\.brev\.nvidia\.com$/;
+  /^open-chemistry-agent-[a-z0-9]+(?:\.brevlab\.com|\.apps\.run\.brev\.nvidia\.com)$/;
 const PRIVATE_DASHBOARD_ORIGIN = "http://127.0.0.1:18789";
 
 
