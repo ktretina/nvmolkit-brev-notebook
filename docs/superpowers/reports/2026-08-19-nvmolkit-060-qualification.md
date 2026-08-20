@@ -155,10 +155,16 @@ contained such a statement, so neither file was changed.
 
 **Status:** NOT RUN.
 
-No L4 environment was created or used during this local gate. The GPU-only
-test remains intentionally skipped until it runs on the task-owned Brev L4.
-Local deterministic tests do not establish CUDA runtime compatibility,
-numerical execution, performance, or device-memory behavior.
+No fresh L4 environment running nvMolKit 0.6.0 was created or used. The
+GPU-only test remains intentionally skipped until it runs on a fresh,
+task-owned Brev L4. Local deterministic tests do not establish CUDA runtime
+compatibility, numerical execution, performance, or device-memory behavior.
+
+A read-only check of the user-provided existing instance found an old checkout:
+the origin was the intended GitHub repository, the branch was `main`, and HEAD
+was `25781fdbd50ffa894b6f94da8fd2284fa518b9c7`. That instance had Python
+3.12.14 and nvMolKit 0.5.0, not nvMolKit 0.6.0. Its worktree was not clean.
+Therefore, it was neither patched nor reused as upgrade evidence.
 
 ## Hosted-model evidence
 
@@ -178,31 +184,87 @@ widget interaction, or the live attendee flow.
 
 ## GitHub PR closeout
 
-**Status:** NOT RUN.
+**Status:** COMPLETE.
 
-No branch was pushed, no pull request was commented on, and no pull request was
-closed during this task.
+GitHub `main` was verified at
+`c8a24115f6a75efe4dc8fb9bcaec3e88b8fe7f25`. Runtime source and notebook
+qualification remains attributed to tested source
+`0cc05cc7506a89df2fd64c2cfab3055829d59adb`. Commit `c8a2411` is a
+qualification/report-only documentation commit relative to that tested source:
+it added this report and corrected two factual examples in the implementation
+plan; it did not change runtime source or notebooks.
+
+- [PR #1](https://github.com/ktretina/nvmolkit-brev-notebook/pull/1)
+  received an
+  [evidence-linked supersession comment](https://github.com/ktretina/nvmolkit-brev-notebook/pull/1#issuecomment-5349527453)
+  and was verified `CLOSED`.
+- [PR #2](https://github.com/ktretina/nvmolkit-brev-notebook/pull/2)
+  received an
+  [evidence-linked supersession comment](https://github.com/ktretina/nvmolkit-brev-notebook/pull/2#issuecomment-5349529207)
+  and was verified `CLOSED`.
+
+The accepted implementation was integrated directly; neither superseded pull
+request was merged. Kevin Boyd's contribution credit is retained in the
+accepted history.
 
 ## Brev Launchable definition
 
-**Status:** NOT RUN.
+**Status:** PREFLIGHT PASS; DEFINITION UPDATE NOT DONE.
 
-No Brev command, Console operation, definition inspection, definition edit, or
-deployment was performed during this task. The saved Launchable source, setup
-body, fields, access policy, and current environment state are not qualified by
-this local record.
+The installed Brev CLI was version 0.6.332. The active organization was
+`agents-in-ls`, ID `org-3FVWXFV8irpOznkgYhF29j6Osqx`.
+
+An exact CLI dry run for Launchable
+`env-3HJtJW3qHg4Dw1I3xt75BfpBmZW` reported:
+
+- name `nvMolKit + Nemotron Notebook`;
+- instance type `g6.xlarge`;
+- 75 GiB storage;
+- VM mode; and
+- exactly one required parameter, `NVIDIA_API_KEY`.
+
+A second dry run supplied a clearly dummy, non-secret value for that parameter.
+It succeeded and created no instance. These dry runs establish only that the
+installed CLI could resolve and preview deployment of the named Launchable.
+They do not establish the saved repository source, setup body, branch, notebook
+order, access policy, or live runtime behavior.
+
+NVIDIA's
+[Launchables documentation](https://docs.nvidia.com/brev/concepts/launchables)
+documents Launchable creation and editing in the Brev Console. The
+[CLI instance-management documentation](https://docs.nvidia.com/brev/cli/instance-management)
+covers instance deployment and management. No supported CLI definition-editing
+surface was identified, and no Launchable definition edit was made.
+
+The old instance credential file was checked only for metadata. Its mode was
+600, owner UID was 1000, and size was 70 bytes. Its contents and value were not
+read, copied, or recorded.
+
+**Next required action:** make a fresh deployment from the
+[supported Launchable deployment page](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3HJtJW3qHg4Dw1I3xt75BfpBmZW),
+with the user entering their `NVIDIA_API_KEY` there. This is blocked on that
+user action. The old, dirty nvMolKit 0.5.0 instance must not be patched or used
+as nvMolKit 0.6.0 evidence.
+
+Until a fresh deployment completes, L4 GPU, hosted-model, and browser evidence
+for nvMolKit 0.6.0 remain `NOT RUN`. This record does not claim that the
+Launchable definition or live attendee experience is updated or ready.
 
 ## Residual risks and rollback
 
-- L4 GPU, hosted-model, browser, GitHub closeout, and Brev Launchable gates are
-  still `NOT RUN`. They must remain separate from this deterministic local
-  evidence.
+- L4 GPU, hosted-model, and browser gates for nvMolKit 0.6.0 are still
+  `NOT RUN`. They must remain separate from local evidence, GitHub publication,
+  CLI deployment preflight, and inspection of the old nvMolKit 0.5.0 instance.
+- The Brev CLI dry run did not inspect or edit the saved Launchable definition.
+  A fresh deployment is required, and it is blocked on the user entering their
+  key through the supported deployment page.
 - Three changed Python files retain whole-file Ruff formatting debt that was
   already present at the comparison base. The changed hunks are range-format
   clean; removing the unrelated debt is outside this upgrade.
-- The report and the two factual plan-example corrections are documentation
-  changes made after tested source `0cc05cc7506a89df2fd64c2cfab3055829d59adb`.
-  They do not change runtime code or notebooks.
+- Commit `c8a24115f6a75efe4dc8fb9bcaec3e88b8fe7f25` and this report update are
+  documentation changes made after tested source
+  `0cc05cc7506a89df2fd64c2cfab3055829d59adb`. They do not change runtime code or
+  notebooks.
 - Before publication, use non-destructive Git reverts to return to the accepted
   comparison base if a final review finds a release-blocking issue. After any
   live Launchable update, restore the last accepted source only through the
