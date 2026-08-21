@@ -89,7 +89,12 @@ printf 'ENV_CLEAN\n' >>"${INVOCATION_LOG}"
 [[ "${1:-}" == "-s" ]] && printf 'Linux\n' || printf 'x86_64\n'
 """, encoding="utf-8")
     (fake_bin / "uname").chmod(0o755)
-    env = os.environ | {
+    base_env = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in {"NVIDIA_INFERENCE_API_KEY", "NVIDIA_API_KEY"}
+    }
+    env = base_env | {
         "HOME": str(fake_home),
         "INVOCATION_LOG": str(log),
         "PATH": f"{fake_bin}:/usr/bin:/bin",
@@ -156,6 +161,27 @@ def test_setup_accepts_legacy_variable_name_only_for_sk_key(tmp_path):
     key_file = fake_home / ".config" / "nvmolkit" / "NVIDIA_INFERENCE_API_KEY"
     assert key_file.read_text(encoding="utf-8") == legacy_key
     assert legacy_key not in result.stdout + result.stderr
+
+
+def test_setup_harness_does_not_inherit_ambient_credentials(monkeypatch, tmp_path):
+    ambient_primary = "sk-ambient-primary-test-sentinel"
+    ambient_legacy = "sk-ambient-legacy-test-sentinel"
+    explicit_legacy = "sk-explicit-legacy-test-sentinel"
+    monkeypatch.setenv("NVIDIA_INFERENCE_API_KEY", ambient_primary)
+    monkeypatch.setenv("NVIDIA_API_KEY", ambient_legacy)
+
+    result, fake_home, _ = _run_setup(
+        tmp_path,
+        {"NVIDIA_API_KEY": explicit_legacy},
+    )
+
+    assert result.returncode == 0, result.stderr
+    key_file = fake_home / ".config" / "nvmolkit" / "NVIDIA_INFERENCE_API_KEY"
+    assert key_file.read_text(encoding="utf-8") == explicit_legacy
+    combined_output = result.stdout + result.stderr
+    assert ambient_primary not in combined_output
+    assert ambient_legacy not in combined_output
+    assert explicit_legacy not in combined_output
 
 
 def test_setup_rejects_invalid_primary_without_falling_back(tmp_path):
