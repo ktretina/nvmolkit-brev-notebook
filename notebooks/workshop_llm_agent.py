@@ -38,12 +38,14 @@ except ModuleNotFoundError as error:
     from notebooks.nvmolkit_compat import normalize_fused_butina_result
 
 
-NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-DEFAULT_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
+NVIDIA_BASE_URL = "https://inference-api.nvidia.com/v1"
+DEFAULT_MODEL = "nvidia/nvidia/nemotron-3-nano-30b-a3b"
 NEMOTRON_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
-WORKSHOP_AGENT_VERSION = "2026.08.19.1"
+WORKSHOP_AGENT_VERSION = "2026.08.21.1"
 WORKSHOP_MODE_ENV = "NVMOLKIT_WORKSHOP_MODE"
-_NVIDIA_API_KEY_PATH = Path.home() / ".config" / "nvmolkit" / "NVIDIA_API_KEY"
+_NVIDIA_INFERENCE_API_KEY_PATH = (
+    Path.home() / ".config" / "nvmolkit" / "NVIDIA_INFERENCE_API_KEY"
+)
 _MAX_API_KEY_FILE_BYTES = 4096
 _MAX_CANDIDATE_FILE_BYTES = 1024 * 1024
 _PANEL_REPORT_LIMITATIONS = (
@@ -51,8 +53,16 @@ _PANEL_REPORT_LIMITATIONS = (
     "The first 24 rows are a deterministic teaching baseline, not an optimum.",
     "Structural diversity does not establish biological activity or safety.",
 )
-_KEY_SHAPED_PATTERN = re.compile(r"nvapi-[A-Za-z0-9._~+/=-]+")
-_NAMED_KEY_PATTERN = re.compile(r"(?i)(NVIDIA_API_KEY\s*[:=]\s*)[^\s,;]+")
+_KEY_SHAPED_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:sk|nvapi)-[A-Za-z0-9._~+/=-]+"
+)
+_NAMED_KEY_PATTERN = re.compile(
+    r"(?i)([\"']?(?:NVIDIA_INFERENCE_API_KEY|NVIDIA_API_KEY)[\"']?"
+    r"\s*[:=]\s*[\"']?)[^\s,;}\]\"']+"
+)
+_WORKSHOP_API_KEY_ENVIRONMENT_NAMES = frozenset(
+    {"NVIDIA_INFERENCE_API_KEY", "NVIDIA_API_KEY"}
+)
 _PANEL_CHILD_ENVIRONMENT_ALLOWLIST = frozenset(
     {
         "CUDA_DEVICE_ORDER",
@@ -72,8 +82,10 @@ _PANEL_CHILD_ENVIRONMENT_ALLOWLIST = frozenset(
     }
 )
 AUTH_GUIDANCE = (
-    "NVIDIA_API_KEY must be a hosted NVIDIA Developer API key beginning with "
-    "nvapi-. Generate it from the Nemotron model page on build.nvidia.com."
+    "Provide an NVIDIA Inference Hub key beginning with sk- as "
+    "NVIDIA_INFERENCE_API_KEY. NVIDIA_API_KEY is accepted only as a legacy "
+    "variable name for the same sk- key; an nvapi- Build key cannot use this "
+    "workshop endpoint."
 )
 
 
@@ -180,16 +192,19 @@ def _load_protected_workshop_api_key() -> str | None:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
         raise ValueError(
-            "The stored NVIDIA_API_KEY cannot be opened securely on this platform."
+            "The stored NVIDIA_INFERENCE_API_KEY cannot be opened securely on "
+            "this platform."
         )
     try:
-        descriptor = os.open(_NVIDIA_API_KEY_PATH, os.O_RDONLY | nofollow)
+        descriptor = os.open(
+            _NVIDIA_INFERENCE_API_KEY_PATH, os.O_RDONLY | nofollow
+        )
     except FileNotFoundError:
         return None
     except OSError:
         raise ValueError(
-            "The stored NVIDIA_API_KEY could not be opened securely. Redeploy "
-            "the Brev Launchable."
+            "The stored NVIDIA_INFERENCE_API_KEY could not be opened securely. "
+            "Redeploy the Brev Launchable."
         ) from None
 
     try:
@@ -197,40 +212,52 @@ def _load_protected_workshop_api_key() -> str | None:
             file_status = os.fstat(descriptor)
         except OSError:
             raise ValueError(
-                "The stored NVIDIA_API_KEY could not be inspected securely. "
-                "Redeploy the Brev Launchable."
+                "The stored NVIDIA_INFERENCE_API_KEY could not be inspected "
+                "securely. Redeploy the Brev Launchable."
             ) from None
         if not stat.S_ISREG(file_status.st_mode):
-            raise ValueError("The stored NVIDIA_API_KEY must be a regular file.")
+            raise ValueError(
+                "The stored NVIDIA_INFERENCE_API_KEY must be a regular file."
+            )
         if file_status.st_uid != os.getuid():
-            raise ValueError("The stored NVIDIA_API_KEY must be owned by this user.")
+            raise ValueError(
+                "The stored NVIDIA_INFERENCE_API_KEY must be owned by this user."
+            )
         if stat.S_IMODE(file_status.st_mode) != 0o600:
-            raise ValueError("The stored NVIDIA_API_KEY must have mode 0600.")
+            raise ValueError(
+                "The stored NVIDIA_INFERENCE_API_KEY must have mode 0600."
+            )
         if file_status.st_size > _MAX_API_KEY_FILE_BYTES:
-            raise ValueError("The stored NVIDIA_API_KEY is unexpectedly large.")
+            raise ValueError(
+                "The stored NVIDIA_INFERENCE_API_KEY is unexpectedly large."
+            )
         try:
             with os.fdopen(descriptor, "rb") as key_file:
                 descriptor = -1
                 key_bytes = key_file.read(_MAX_API_KEY_FILE_BYTES + 1)
         except OSError:
             raise ValueError(
-                "The stored NVIDIA_API_KEY could not be read securely. Redeploy "
-                "the Brev Launchable."
+                "The stored NVIDIA_INFERENCE_API_KEY could not be read securely. "
+                "Redeploy the Brev Launchable."
             ) from None
     finally:
         if descriptor >= 0:
             os.close(descriptor)
 
     if len(key_bytes) > _MAX_API_KEY_FILE_BYTES:
-        raise ValueError("The stored NVIDIA_API_KEY is unexpectedly large.")
+        raise ValueError(
+            "The stored NVIDIA_INFERENCE_API_KEY is unexpectedly large."
+        )
     try:
         candidate = key_bytes.decode("utf-8").strip()
     except UnicodeDecodeError:
-        raise ValueError("The stored NVIDIA_API_KEY is not valid text.") from None
+        raise ValueError(
+            "The stored NVIDIA_INFERENCE_API_KEY is not valid text."
+        ) from None
     if not candidate:
         raise ValueError(
-            "The saved Launchable setup script did not store NVIDIA_API_KEY. "
-            "Redeploy the Brev Launchable."
+            "The saved Launchable setup script did not store "
+            "NVIDIA_INFERENCE_API_KEY. Redeploy the Brev Launchable."
         )
     return candidate
 
@@ -239,16 +266,21 @@ def get_workshop_api_key(api_key: str | None = None, *, prompt: bool = True) -> 
     """Return an explicit, environment, or securely stored hosted key."""
     if api_key is not None:
         candidate = api_key.strip()
+    elif "NVIDIA_INFERENCE_API_KEY" in os.environ:
+        candidate = os.environ["NVIDIA_INFERENCE_API_KEY"].strip()
+    elif "NVIDIA_API_KEY" in os.environ:
+        candidate = os.environ["NVIDIA_API_KEY"].strip()
     else:
-        candidate = os.environ.get("NVIDIA_API_KEY", "").strip()
-        if not candidate:
-            saved_key = _load_protected_workshop_api_key()
-            candidate = saved_key or ""
-    if not candidate and prompt:
-        candidate = getpass.getpass(
-            "Hosted NVIDIA Developer API key (nvapi-; input hidden): "
-        ).strip()
-    if not candidate or not candidate.startswith("nvapi-"):
+        saved_key = _load_protected_workshop_api_key()
+        if saved_key is not None:
+            candidate = saved_key
+        elif prompt:
+            candidate = getpass.getpass(
+                "NVIDIA Inference Hub API key (sk-; input hidden): "
+            ).strip()
+        else:
+            candidate = ""
+    if not candidate or not candidate.startswith("sk-"):
         raise ValueError(AUTH_GUIDANCE)
     return candidate
 
@@ -295,6 +327,7 @@ def _structured_request(
             ],
             tools=[_tool_definition(tool_name, response_model)],
             tool_choice={"type": "function", "function": {"name": tool_name}},
+            parallel_tool_calls=False,
             extra_body=NEMOTRON_EXTRA_BODY,
             temperature=0.0,
             max_tokens=max_tokens,
@@ -1777,7 +1810,7 @@ def _panel_child_environment() -> dict[str, str]:
     return {
         name: os.environ[name]
         for name in _PANEL_CHILD_ENVIRONMENT_ALLOWLIST
-        if name in os.environ
+        if name in os.environ and name not in _WORKSHOP_API_KEY_ENVIRONMENT_NAMES
     }
 
 

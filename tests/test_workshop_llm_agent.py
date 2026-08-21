@@ -325,14 +325,28 @@ def _client_for(payload):
     return SimpleNamespace(chat=SimpleNamespace(completions=completions)), completions
 
 
+def _clear_workshop_key_environment(monkeypatch):
+    monkeypatch.delenv("NVIDIA_INFERENCE_API_KEY", raising=False)
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+
+
+def test_workshop_uses_verified_inference_hub_endpoint_and_model():
+    agent = _load_agent()
+
+    assert agent.NVIDIA_BASE_URL == "https://inference-api.nvidia.com/v1"
+    assert agent.DEFAULT_MODEL == "nvidia/nvidia/nemotron-3-nano-30b-a3b"
+
+
 def test_workshop_key_loads_protected_launch_file_without_prompt(monkeypatch, tmp_path):
     agent = _load_agent()
-    saved_key = "nvapi-" + "saved" * 5
-    key_path = tmp_path / "NVIDIA_API_KEY"
+    saved_key = "sk-" + "saved" * 5
+    key_path = tmp_path / "NVIDIA_INFERENCE_API_KEY"
     key_path.write_text(saved_key, encoding="utf-8")
     key_path.chmod(0o600)
-    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
-    monkeypatch.setattr(agent, "_NVIDIA_API_KEY_PATH", key_path, raising=False)
+    _clear_workshop_key_environment(monkeypatch)
+    monkeypatch.setattr(
+        agent, "_NVIDIA_INFERENCE_API_KEY_PATH", key_path, raising=False
+    )
     monkeypatch.setattr(
         agent.getpass,
         "getpass",
@@ -344,14 +358,58 @@ def test_workshop_key_loads_protected_launch_file_without_prompt(monkeypatch, tm
 
 def test_workshop_key_precedence_does_not_inspect_protected_file(monkeypatch, tmp_path):
     agent = _load_agent()
-    unsafe_path = tmp_path / "NVIDIA_API_KEY"
-    unsafe_path.write_text("nvapi-unsafe-file", encoding="utf-8")
+    unsafe_path = tmp_path / "NVIDIA_INFERENCE_API_KEY"
+    unsafe_path.write_text("sk-unsafe-file", encoding="utf-8")
     unsafe_path.chmod(0o644)
-    monkeypatch.setattr(agent, "_NVIDIA_API_KEY_PATH", unsafe_path, raising=False)
-    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-environment-key")
+    monkeypatch.setattr(
+        agent, "_NVIDIA_INFERENCE_API_KEY_PATH", unsafe_path, raising=False
+    )
+    monkeypatch.setenv("NVIDIA_API_KEY", "sk-legacy-environment-key")
+    monkeypatch.setenv("NVIDIA_INFERENCE_API_KEY", "sk-primary-environment-key")
 
-    assert agent.get_workshop_api_key("nvapi-explicit-key") == "nvapi-explicit-key"
-    assert agent.get_workshop_api_key() == "nvapi-environment-key"
+    assert agent.get_workshop_api_key("sk-explicit-key") == "sk-explicit-key"
+    assert agent.get_workshop_api_key() == "sk-primary-environment-key"
+
+
+def test_workshop_key_uses_legacy_variable_name_for_inference_hub_key(
+    monkeypatch, tmp_path
+):
+    agent = _load_agent()
+    _clear_workshop_key_environment(monkeypatch)
+    monkeypatch.setenv("NVIDIA_API_KEY", "sk-legacy-environment-key")
+    monkeypatch.setattr(
+        agent,
+        "_NVIDIA_INFERENCE_API_KEY_PATH",
+        tmp_path / "missing" / "NVIDIA_INFERENCE_API_KEY",
+        raising=False,
+    )
+
+    assert agent.get_workshop_api_key(prompt=False) == "sk-legacy-environment-key"
+
+
+def test_invalid_primary_key_fails_closed_without_using_legacy_or_saved_key(
+    monkeypatch, tmp_path
+):
+    agent = _load_agent()
+    key_path = tmp_path / "NVIDIA_INFERENCE_API_KEY"
+    key_path.write_text("sk-saved-key", encoding="utf-8")
+    key_path.chmod(0o600)
+    monkeypatch.setattr(
+        agent, "_NVIDIA_INFERENCE_API_KEY_PATH", key_path, raising=False
+    )
+    monkeypatch.setenv("NVIDIA_INFERENCE_API_KEY", "nvapi-build-key")
+    monkeypatch.setenv("NVIDIA_API_KEY", "sk-legacy-key")
+    monkeypatch.setattr(
+        agent.getpass,
+        "getpass",
+        lambda prompt: pytest.fail("an invalid primary key must fail closed"),
+    )
+
+    with pytest.raises(ValueError, match="Inference Hub") as captured:
+        agent.get_workshop_api_key()
+
+    assert "sk-" in str(captured.value)
+    assert "nvapi-" in str(captured.value)
 
 
 @pytest.mark.parametrize("unsafe_kind", ["mode", "symlink", "oversize"])
@@ -359,11 +417,11 @@ def test_workshop_key_rejects_unsafe_protected_file_without_prompt(
     monkeypatch, tmp_path, unsafe_kind
 ):
     agent = _load_agent()
-    secret = "nvapi-" + "do-not-leak" * 400
+    secret = "sk-" + "do-not-leak" * 400
     target = tmp_path / "target"
     target.write_text(secret, encoding="utf-8")
     target.chmod(0o600)
-    key_path = tmp_path / "NVIDIA_API_KEY"
+    key_path = tmp_path / "NVIDIA_INFERENCE_API_KEY"
     if unsafe_kind == "mode":
         key_path.write_text(secret, encoding="utf-8")
         key_path.chmod(0o644)
@@ -372,8 +430,10 @@ def test_workshop_key_rejects_unsafe_protected_file_without_prompt(
     else:
         key_path.write_text(secret, encoding="utf-8")
         key_path.chmod(0o600)
-    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
-    monkeypatch.setattr(agent, "_NVIDIA_API_KEY_PATH", key_path, raising=False)
+    _clear_workshop_key_environment(monkeypatch)
+    monkeypatch.setattr(
+        agent, "_NVIDIA_INFERENCE_API_KEY_PATH", key_path, raising=False
+    )
     monkeypatch.setattr(
         agent.getpass,
         "getpass",
@@ -396,13 +456,13 @@ def test_workshop_key_prompts_only_when_protected_file_is_missing(
     monkeypatch, tmp_path
 ):
     agent = _load_agent()
-    prompted_key = "nvapi-local-fallback"
+    prompted_key = "sk-local-fallback"
     prompts = []
-    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    _clear_workshop_key_environment(monkeypatch)
     monkeypatch.setattr(
         agent,
-        "_NVIDIA_API_KEY_PATH",
-        tmp_path / "missing" / "NVIDIA_API_KEY",
+        "_NVIDIA_INFERENCE_API_KEY_PATH",
+        tmp_path / "missing" / "NVIDIA_INFERENCE_API_KEY",
         raising=False,
     )
     monkeypatch.setattr(
@@ -413,9 +473,40 @@ def test_workshop_key_prompts_only_when_protected_file_is_missing(
 
     assert agent.get_workshop_api_key(prompt=True) == prompted_key
     assert len(prompts) == 1
-    with pytest.raises(ValueError, match="NVIDIA_API_KEY"):
+    with pytest.raises(ValueError, match="NVIDIA_INFERENCE_API_KEY"):
         agent.get_workshop_api_key(prompt=False)
     assert len(prompts) == 1
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["explicit", "primary_environment", "legacy_environment", "saved_file"],
+)
+def test_workshop_key_rejects_build_keys_with_actionable_guidance(
+    monkeypatch, tmp_path, source
+):
+    agent = _load_agent()
+    _clear_workshop_key_environment(monkeypatch)
+    key_path = tmp_path / "NVIDIA_INFERENCE_API_KEY"
+    monkeypatch.setattr(
+        agent, "_NVIDIA_INFERENCE_API_KEY_PATH", key_path, raising=False
+    )
+    explicit_key = None
+    if source == "explicit":
+        explicit_key = "nvapi-explicit-build-key"
+    elif source == "primary_environment":
+        monkeypatch.setenv("NVIDIA_INFERENCE_API_KEY", "nvapi-primary-build-key")
+    elif source == "legacy_environment":
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-legacy-build-key")
+    else:
+        key_path.write_text("nvapi-saved-build-key", encoding="utf-8")
+        key_path.chmod(0o600)
+
+    with pytest.raises(ValueError, match="Inference Hub") as captured:
+        agent.get_workshop_api_key(explicit_key, prompt=False)
+
+    assert "sk-" in str(captured.value)
+    assert "nvapi-" in str(captured.value)
 
 
 def test_workshop_mode_defaults_to_interactive_and_accepts_only_two_modes(monkeypatch):
@@ -475,7 +566,8 @@ def test_interactive_mode_uses_exact_policy_schema_and_python_owned_renderer(
     assert key_requests
     assert len(completions.calls) == 1
     call = completions.calls[0]
-    assert call["model"] == "nvidia/nemotron-3-nano-30b-a3b"
+    assert call["model"] == "nvidia/nvidia/nemotron-3-nano-30b-a3b"
+    assert call["parallel_tool_calls"] is False
     assert set(call["tools"][0]["function"]["parameters"]["properties"]) == {
         "MISSING_ANCHOR",
         "INVALID_MATRIX",
@@ -503,6 +595,42 @@ def test_interactive_mode_redacts_key_shaped_provider_failures(monkeypatch):
         )
 
     assert key not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    ("raw", "secret"),
+    [
+        ("provider returned sk-abc.def/ghi+jkl=", "sk-abc.def/ghi+jkl="),
+        ("provider returned nvapi-abc.def/ghi+jkl=", "nvapi-abc.def/ghi+jkl="),
+        (
+            'request={"NVIDIA_INFERENCE_API_KEY": "sk-json-secret"}',
+            "sk-json-secret",
+        ),
+        ("request={'NVIDIA_API_KEY': 'sk-dict-secret'}", "sk-dict-secret"),
+        ("NVIDIA_INFERENCE_API_KEY=opaque-secret", "opaque-secret"),
+    ],
+)
+def test_sensitive_text_redacts_both_key_names_and_key_shapes(raw, secret):
+    agent = _load_agent()
+
+    redacted = agent._redact_sensitive_text(raw)
+
+    assert secret not in redacted
+    assert "[REDACTED]" in redacted
+
+
+@pytest.mark.parametrize(
+    "safe_text",
+    [
+        "task-id remains visible",
+        "mask-id remains visible",
+        "risk-id remains visible",
+    ],
+)
+def test_sensitive_text_does_not_redact_sk_substrings_in_ordinary_words(safe_text):
+    agent = _load_agent()
+
+    assert agent._redact_sensitive_text(safe_text) == safe_text
 
 
 @pytest.mark.parametrize("malformed", [False, True])
@@ -871,7 +999,7 @@ def test_hosted_panel_agent_calls_only_strict_plan_and_audit_schemas(tmp_path):
         workdir=tmp_path,
         mission="bounded mission",
         mode="hosted",
-        api_key="nvapi-" + "x" * 24,
+        api_key="sk-" + "x" * 24,
         client=client,
     )
     panel_agent.request_plan()
@@ -898,6 +1026,7 @@ def test_hosted_panel_agent_calls_only_strict_plan_and_audit_schemas(tmp_path):
     for call in calls:
         function = call["tools"][0]["function"]
         assert function["strict"] is True
+        assert call["parallel_tool_calls"] is False
         assert function["parameters"]["additionalProperties"] is False
 
 
@@ -1119,7 +1248,10 @@ def test_panel_child_process_does_not_receive_hosted_key(monkeypatch, tmp_path):
         child_environments.append(kwargs["env"])
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
-    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-" + "secret" * 5)
+    monkeypatch.setenv("NVIDIA_API_KEY", "sk-" + "legacy-secret" * 3)
+    monkeypatch.setenv(
+        "NVIDIA_INFERENCE_API_KEY", "sk-" + "primary-secret" * 3
+    )
     monkeypatch.setattr(agent.subprocess, "run", fake_run)
     monkeypatch.setattr(
         agent,
@@ -1142,6 +1274,7 @@ def test_panel_child_process_does_not_receive_hosted_key(monkeypatch, tmp_path):
     assert run.success
     assert len(child_environments) == 1
     assert "NVIDIA_API_KEY" not in child_environments[0]
+    assert "NVIDIA_INFERENCE_API_KEY" not in child_environments[0]
 
 
 def test_panel_executes_validated_source_after_callback_mutation_and_redacts_output(
@@ -1371,7 +1504,7 @@ def test_panel_audit_uses_validated_report_snapshot_before_progress_callback(
         workdir=tmp_path,
         mission="bounded mission",
         mode="hosted",
-        api_key="nvapi-" + "x" * 24,
+        api_key="sk-" + "x" * 24,
         client=client,
     )
     panel_agent.request_plan()
