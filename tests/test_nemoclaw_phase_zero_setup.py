@@ -364,6 +364,50 @@ def test_workspace_note_exposes_only_the_bounded_workshop_commands_and_artifacts
     assert "not evidence of biological activity" in source
 
 
+def test_workspace_note_stops_completed_lessons_and_copies_canonical_answers():
+    source = WORKSPACE_TOOLS.read_text()
+    assert "Each lesson command has a one-call budget." in source
+    assert "top-level `status: complete`" in source
+    assert "stop tool use and answer from that first result" in source
+    assert "Never run that lesson again in the same prompt." in source
+    assert "An empty assistant response does not permit another tool call." in source
+    assert "Copy the decoded `answer_markdown` string exactly" in source
+    assert "returns both conformer stages; run it only once" in source
+    assert "exact returned `state_id` and `swap_id`" in source
+    assert "Keep both values single-quoted" in source
+    assert "Run at most three objective-step commands" in source
+
+
+def test_workspace_note_preserves_scientific_boundaries():
+    source = WORKSPACE_TOOLS.read_text()
+    assert "deterministic 256-record ChEMBL convenience sample" in source
+    assert "non-representative chemical space" in source
+    assert "radius-2, 1024-bit hashed fingerprint" in source
+    assert "real GPU execution with no acceleration or speedup claim" in source
+    assert "cutoff `0.40` is Tanimoto distance" in source
+    assert "similarity `1.0` does not prove molecular identity" in source
+    assert (
+        "nvMolKit computes fingerprints and Tanimoto similarities on GPU; "
+        "RDKit runs Butina clustering on CPU." in source
+    )
+    assert "`D_min` is the minimum pairwise Tanimoto distance" in source
+    assert "`D_min = min(1 - Tanimoto similarity)`" in source
+    assert "higher `D_min` means greater separation" in source
+    assert "weakest-link diversity score within eight fixed candidates" in source
+    assert "Never call `D_min` a similarity score." in source
+    assert (
+        "deterministic selected molecules are not centroids, medoids, or "
+        "globally optimal representatives" in source
+    )
+    assert (
+        "Do not report intermediate, predicted, target, or per-step scores" in source
+    )
+    assert (
+        "structural-descriptor objective does not demonstrate unrestricted "
+        "autonomous design or biological performance" in source
+    )
+
+
 def test_artifact_server_is_retry_safe_and_serves_only_outputs():
     completed = subprocess.run(
         ["bash", "-n", str(ARTIFACT_SERVER)],

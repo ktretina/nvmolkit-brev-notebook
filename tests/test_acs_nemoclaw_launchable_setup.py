@@ -10,6 +10,59 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "launchable" / "acs_nemoclaw_launchable_setup.sh"
+CONFIG_ARGV = (
+    (
+        "acs-chemistry-agent",
+        "exec",
+        "--workdir",
+        "/sandbox/.openclaw/workspace",
+        "--",
+        "openclaw",
+        "config",
+        "set",
+        "models.providers.inference.timeoutSeconds",
+        "300",
+        "--strict-json",
+    ),
+    (
+        "acs-chemistry-agent",
+        "exec",
+        "--workdir",
+        "/sandbox/.openclaw/workspace",
+        "--",
+        "openclaw",
+        "config",
+        "set",
+        "tools.loopDetection.enabled",
+        "true",
+        "--strict-json",
+    ),
+    ("acs-chemistry-agent", "gateway", "restart", "--quiet"),
+    (
+        "acs-chemistry-agent",
+        "exec",
+        "--workdir",
+        "/sandbox/.openclaw/workspace",
+        "--",
+        "openclaw",
+        "config",
+        "get",
+        "models.providers.inference.timeoutSeconds",
+        "--json",
+    ),
+    (
+        "acs-chemistry-agent",
+        "exec",
+        "--workdir",
+        "/sandbox/.openclaw/workspace",
+        "--",
+        "openclaw",
+        "config",
+        "get",
+        "tools.loopDetection.enabled",
+        "--json",
+    ),
+)
 
 
 def _source() -> str:
@@ -57,6 +110,102 @@ def _run_preflight(
     )
 
 
+def _fake_nemoclaw(tmp_path: Path) -> Path:
+    executable = tmp_path / "fake-nemoclaw"
+    executable.write_text(
+        r"""#!/usr/bin/env bash
+set -Eeuo pipefail
+call_number=0
+if [[ -f "${ACS_FAKE_COUNTER}" ]]; then
+  call_number="$(<"${ACS_FAKE_COUNTER}")"
+fi
+call_number=$((call_number + 1))
+printf '%s\n' "${call_number}" > "${ACS_FAKE_COUNTER}"
+{
+  printf '%s' "$1"
+  shift
+  for argument in "$@"; do
+    printf '\t%s' "${argument}"
+  done
+  printf '\n'
+} >> "${ACS_FAKE_LOG}"
+printf '%s\n' "${ACS_SECRET_CANARY}" >&2
+printf '%s\n' "${ACS_RAW_CANARY}" >&2
+if [[ "${ACS_FAIL_CALL}" == "${call_number}" ]]; then
+  exit 17
+fi
+arguments=" $* "
+if [[ "${arguments}" == *" openclaw config get models.providers.inference.timeoutSeconds --json "* ]]; then
+  printf '%s\n' "${ACS_PROVIDER_JSON}"
+elif [[ "${arguments}" == *" openclaw config get tools.loopDetection.enabled --json "* ]]; then
+  printf '%s\n' "${ACS_LOOP_JSON}"
+else
+  printf '%s\n' "${ACS_RAW_CANARY}"
+fi
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    return executable
+
+
+def _run_runtime_config(
+    tmp_path: Path,
+    *,
+    fail_call: int = 0,
+    provider_json: str = "300",
+    loop_json: str = "true",
+) -> tuple[subprocess.CompletedProcess[str], tuple[tuple[str, ...], ...], Path]:
+    fake_nemoclaw = _fake_nemoclaw(tmp_path)
+    call_log = tmp_path / "nemoclaw-argv.log"
+    counter = tmp_path / "nemoclaw-counter"
+    ready_marker = tmp_path / "ready"
+    harness = tmp_path / "configure-runtime.sh"
+    harness.write_text(
+        r"""#!/usr/bin/env bash
+set -Eeuo pipefail
+source "${ACS_SETUP_SCRIPT}"
+configure_openclaw_runtime \
+  "${ACS_FAKE_NEMOCLAW}" \
+  "acs-chemistry-agent" \
+  "/sandbox/.openclaw/workspace"
+printf 'ready\n' > "${ACS_READY_MARKER}"
+""",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "ACS_FAIL_CALL": str(fail_call),
+            "ACS_FAKE_COUNTER": str(counter),
+            "ACS_FAKE_LOG": str(call_log),
+            "ACS_FAKE_NEMOCLAW": str(fake_nemoclaw),
+            "ACS_LOOP_JSON": loop_json,
+            "ACS_PROVIDER_JSON": provider_json,
+            "ACS_RAW_CANARY": "raw-config-output-canary",
+            "ACS_READY_MARKER": str(ready_marker),
+            "ACS_SECRET_CANARY": "nvapi-config-secret-canary",
+            "ACS_SETUP_SCRIPT": str(SCRIPT),
+            "HOME": str(tmp_path / "home"),
+        }
+    )
+    completed = subprocess.run(
+        ["bash", str(harness)],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    calls = ()
+    if call_log.exists():
+        calls = tuple(
+            tuple(line.split("\t"))
+            for line in call_log.read_text(encoding="utf-8").splitlines()
+        )
+    return completed, calls, ready_marker
+
+
 def test_setup_script_has_the_complete_secret_safe_contract() -> None:
     source = _source()
     completed = subprocess.run(
@@ -92,7 +241,9 @@ def test_setup_prepends_local_bin_before_first_nemoclaw_config_command() -> None
         'die "NemoClaw or OpenShell is missing."'
     )
     path_export = 'export PATH="${HOME}/.local/bin:${PATH}"'
-    first_config_command = '"${nemoclaw}" "${sandbox_name}" config set'
+    first_config_command = (
+        'configure_openclaw_runtime "${nemoclaw}" "${sandbox_name}" "${workspace}"'
+    )
 
     assert source.count(path_export) == 1
     assert source.index(nemoclaw_path) < source.index(executable_check)
@@ -101,38 +252,140 @@ def test_setup_prepends_local_bin_before_first_nemoclaw_config_command() -> None
     assert source.index(path_export) < source.index(first_config_command)
 
 
-def test_setup_applies_verified_host_provider_timeout_before_runtime_checks() -> None:
+def test_setup_applies_verified_openclaw_config_before_runtime_checks() -> None:
     source = _source()
     executable_check = (
         '[[ -x "${nemoclaw}" && -x "${openshell}" ]] || '
         'die "NemoClaw or OpenShell is missing."'
     )
-    config_set = (
-        '"${nemoclaw}" "${sandbox_name}" config set \\\n'
-        "  --key models.providers.inference.timeoutSeconds \\\n"
-        "  --value 300 \\\n"
-        "  --config-accept-new-path \\\n"
-        "  --restart"
+    tools_install = (
+        '"${nemoclaw}" "${sandbox_name}" exec -- mv -- \\\n'
+        '  "${workspace}/acs_workspace_tools.md" "${workspace}/TOOLS.md"'
     )
-    config_get = (
-        'provider_timeout="$("${nemoclaw}" "${sandbox_name}" config get \\\n'
-        "  --key models.providers.inference.timeoutSeconds \\\n"
-        '  --format json 2>/dev/null)"'
+    config_call = (
+        'configure_openclaw_runtime "${nemoclaw}" "${sandbox_name}" "${workspace}"'
     )
-    timeout_check = '[[ "${provider_timeout}" == "300" ]] ||'
     listener_check = 'ss -H -ltn "sport = :18789"'
-    assert config_set in source
-    assert config_get in source
-    assert timeout_check in source
-    assert source.index(executable_check) < source.index(config_set)
-    assert source.index(config_set) < source.index(config_get)
-    assert source.index(config_get) < source.index(timeout_check)
-    assert source.index(timeout_check) < source.index(listener_check)
+
+    assert tools_install in source
+    assert config_call in source
+    positions = tuple(
+        source.index(fragment)
+        for fragment in (
+            executable_check,
+            tools_install,
+            config_call,
+            listener_check,
+        )
+    )
+    assert positions == tuple(sorted(positions))
+    assert source.count(config_call) == 1
+    assert '"${nemoclaw}" "${sandbox_name}" config set' not in source
+    assert '"${nemoclaw}" "${sandbox_name}" config get' not in source
+    assert "--config-accept-new-path" not in source
+    assert "--format json" not in source
     assert "agent --session-id" not in source
     assert "HIGHLIGHT_THRESHOLD" not in source
     assert source.count("threshold-080") == 1
     assert "shields down" not in source
-    assert "openclaw config set" not in source
+
+
+def test_setup_reads_config_without_printing_values_or_secrets() -> None:
+    source = _source()
+    config_start = source.index("configure_openclaw_runtime() {")
+    config_end = source.index("\n}\n\nif [[", config_start)
+    block = source[config_start:config_end]
+
+    assert "NVIDIA_INFERENCE_API_KEY" not in block
+    assert "printf" not in block
+    assert "echo" not in block
+    assert block.count(">/dev/null 2>&1") == 3
+    assert block.count("--json 2>/dev/null") == 2
+    assert "|| true" not in block
+
+
+def test_runtime_config_executes_exact_order_and_suppresses_cli_output(
+    tmp_path: Path,
+) -> None:
+    completed, calls, ready_marker = _run_runtime_config(tmp_path)
+
+    assert completed.returncode == 0, completed.stderr
+    assert calls == CONFIG_ARGV
+    assert ready_marker.read_text(encoding="utf-8") == "ready\n"
+    combined = completed.stdout + completed.stderr
+    assert "Phase: Configure OpenClaw runtime" in completed.stdout
+    assert "raw-config-output-canary" not in combined
+    assert "nvapi-config-secret-canary" not in combined
+
+
+@pytest.mark.parametrize(
+    ("fail_call", "expected_error"),
+    (
+        (1, "could not set the inference provider timeout."),
+        (2, "could not enable OpenClaw tool-loop detection."),
+        (3, "could not restart the OpenClaw gateway."),
+        (4, "could not read back the inference provider timeout."),
+        (5, "could not read back OpenClaw tool-loop detection."),
+    ),
+)
+def test_runtime_config_nonzero_gate_stops_before_ready(
+    tmp_path: Path,
+    fail_call: int,
+    expected_error: str,
+) -> None:
+    completed, calls, ready_marker = _run_runtime_config(
+        tmp_path,
+        fail_call=fail_call,
+    )
+
+    assert completed.returncode != 0
+    assert calls == CONFIG_ARGV[:fail_call]
+    assert not ready_marker.exists()
+    assert expected_error in completed.stderr
+    combined = completed.stdout + completed.stderr
+    assert "raw-config-output-canary" not in combined
+    assert "nvapi-config-secret-canary" not in combined
+
+
+def test_runtime_config_failed_restart_rejects_stale_valid_values(
+    tmp_path: Path,
+) -> None:
+    completed, calls, ready_marker = _run_runtime_config(
+        tmp_path,
+        fail_call=3,
+        provider_json="300",
+        loop_json="true",
+    )
+
+    assert completed.returncode != 0
+    assert calls == CONFIG_ARGV[:3]
+    assert not ready_marker.exists()
+    assert "could not restart the OpenClaw gateway." in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("provider_json", "loop_json"),
+    (
+        ('"300"', "true"),
+        ("300.0", "true"),
+        ("300", '"true"'),
+        ("300", "false"),
+    ),
+)
+def test_runtime_config_accepts_only_exact_json_number_and_boolean(
+    tmp_path: Path,
+    provider_json: str,
+    loop_json: str,
+) -> None:
+    completed, calls, ready_marker = _run_runtime_config(
+        tmp_path,
+        provider_json=provider_json,
+        loop_json=loop_json,
+    )
+
+    assert completed.returncode != 0
+    assert calls in (CONFIG_ARGV[:4], CONFIG_ARGV)
+    assert not ready_marker.exists()
 
 
 def test_setup_script_orchestrates_only_the_lean_workshop_assets() -> None:
@@ -167,6 +420,11 @@ def test_setup_script_orchestrates_only_the_lean_workshop_assets() -> None:
     assert "agent --session-id" not in source
     assert source.count("acs_chemistry_task.py") == 1
     assert source.count("acs_task_prompt.txt") == 1
+
+
+def test_retired_task_prompt_is_absent_but_remote_cleanup_is_retained() -> None:
+    assert not (ROOT / "launchable" / "acs_task_prompt.txt").exists()
+    assert _source().count("acs_task_prompt.txt") == 1
 
 
 def test_setup_uploads_files_to_existing_parent_directories() -> None:
@@ -526,6 +784,7 @@ def test_setup_has_short_progress_without_raw_tool_output() -> None:
     for label in (
         "Validate hardware",
         "Install OpenClaw runtime",
+        "Configure OpenClaw runtime",
         "Verify private dashboard",
         "Install chemistry tools",
         "Prepare workshop files",
@@ -533,7 +792,8 @@ def test_setup_has_short_progress_without_raw_tool_output() -> None:
     ):
         assert f'phase "{label}"' in source
     assert "set -x" not in source
-    assert "--json" not in source
+    assert source.count("--json 2>/dev/null") == 2
+    assert "--json" not in source.replace("--json 2>/dev/null", "")
     assert source.count(">/dev/null 2>&1") >= 12
 
 

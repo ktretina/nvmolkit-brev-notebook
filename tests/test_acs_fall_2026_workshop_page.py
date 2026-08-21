@@ -567,10 +567,10 @@ def test_deployment_checks_are_evergreen_without_a_live_readiness_claim() -> Non
 
 def test_marked_prompt_blocks_are_byte_locked() -> None:
     expected_hashes = {
-        "01-data-and-representation": "ccea479eb0762db9adb25f7fcc3e4a60758400f55646714ec8489ad2d474e482",
-        "02-relationships-and-groups": "048c34ac064ee30dce7df1be1ec37a9e6ebc002d552cf21bef67401325e40ee4",
-        "03-sampled-3d-geometry": "357706bafd1eb73e852bc72da419c37dd0f1a5f6d234edf12e24df104ad2e724",
-        "04-objective": "00b83de39a40a93344749b1a379537285f7b502fb38050cb7824cac774727f75",
+        "01-data-and-representation": "39ca26c1b494dbe01bcbaabf27d72d755b444915e9ff26c874e629f09610bf22",
+        "02-relationships-and-groups": "5d556991910812a24bb09b23cd250fd4a7157986948082fb8cc05cb3d52c1f5e",
+        "03-sampled-3d-geometry": "6779b1bfbe141a72c795d5e648ad33a5e7ddd55a8bc953b0c1ae116f757be34a",
+        "04-objective": "ec93fcfa236b6000980178626b322aeb0786a52a53a0132338784221c24550ea",
     }
 
     blocks = _prompt_blocks(_source())
@@ -582,10 +582,10 @@ def test_marked_prompt_blocks_are_byte_locked() -> None:
 
 def test_full_marked_prompt_blocks_are_byte_locked() -> None:
     expected_hashes = {
-        "01-data-and-representation": "02298b2f7c453da733db946da8eb87f9271abab8bb63ef7ddd731f7d326bd1ee",
-        "02-relationships-and-groups": "d131d2009b1fc3df43d4d5694b6db35724734b1f1d75e4976884662b7728d949",
-        "03-sampled-3d-geometry": "c4e9be7701a2812eb4cbba657638befcc201a4399ebaadc1edf9cfb4d293c822",
-        "04-objective": "660aeb1bfe8a50b4aab9f79f638a0e9a80176dc3d20d32e4f94e4e9ff5d4e75f",
+        "01-data-and-representation": "5f4d12063bfba5be83abf2b8b3fa06d3d9b234d927e0ff4335d1049bad735f6d",
+        "02-relationships-and-groups": "7de44e0efcd1c3f9023c4a4ee3c8a4fa0b4758872cad1c0cfa5fee3685baae19",
+        "03-sampled-3d-geometry": "f7e14b338b3c3b104c56d89baa2e8db0e20378a8a53d0f345524cdffa6035d4e",
+        "04-objective": "8356ebf74d0034cbff6a361f5060d2008c2664f633f072290a9944fbf93cd726",
     }
 
     blocks = _full_marked_prompt_blocks(_source())
@@ -644,10 +644,95 @@ def test_exactly_four_self_contained_prompts_use_only_the_fixed_runner() -> None
         assert "Do not repair or retry" in block
         heading_positions = [block.index(heading) for heading in RESPONSE_HEADINGS]
         assert heading_positions == sorted(heading_positions)
-        assert "at most three measured facts" in block
         assert "Download Results" in block
         assert "`workshop/results.zip`" in block
         assert block.rstrip().endswith(MEDIA_LINES[prompt_id])
+
+    for prompt_id in PROMPT_IDS[:3]:
+        assert "Use at most three measured-result bullets." in blocks[prompt_id]
+    assert (
+        "Use at most three measured facts: baseline `D_min`, final `D_min`, "
+        "and their change." in blocks["04-objective"]
+    )
+
+
+def test_prompt_blocks_lead_with_scientific_objectives_before_execution() -> None:
+    for block in _prompt_blocks(_source()).values():
+        positions = (
+            block.index("Question:"),
+            block.index("Scientific objective:"),
+            block.index("Execution contract:"),
+            block.index("Answer contract:"),
+        )
+        assert positions == tuple(sorted(positions))
+
+
+def test_lesson_prompts_stop_after_the_first_complete_result() -> None:
+    clauses = (
+        "This command has a one-call budget.",
+        "The budget is consumed when the command is submitted.",
+        "top-level `status: complete`",
+        "stop all tool use",
+        "first completed result as authoritative",
+        "Do not emit an empty response or run the command again.",
+        "return its decoded `answer_markdown` string exactly",
+    )
+    for prompt_id, command in LESSON_COMMANDS.items():
+        block = _prompt_blocks(_source())[prompt_id]
+        assert block.count(command) == 1
+        for clause in clauses:
+            assert clause in block
+        assert block.index(command) < block.index("top-level `status: complete`")
+        assert block.index("top-level `status: complete`") < block.index(
+            "Answer contract:"
+        )
+
+
+def test_prompt_science_boundaries_match_the_runner_contract() -> None:
+    blocks = _prompt_blocks(_source())
+    first = blocks["01-data-and-representation"]
+    second = blocks["02-relationships-and-groups"]
+    third = blocks["03-sampled-3d-geometry"]
+    objective = blocks["04-objective"]
+
+    assert "Do not use the words `accelerated` or `acceleration`" in first
+    assert "cutoff `0.40` is Tanimoto distance, not Tanimoto similarity" in second
+    assert "similarity `1.0` does not prove molecular identity" in second
+    assert (
+        "nvMolKit computed fingerprints and Tanimoto similarities on GPU; "
+        "RDKit performed Butina clustering on CPU." in second
+    )
+    assert "returns both conformer stages" in third
+    assert "Do not run it once per stage." in third
+    assert "`D_min` is the minimum pairwise Tanimoto distance" in objective
+    assert "`D_min = min(1 - Tanimoto similarity)`" in objective
+    assert "Do not call `D_min` a similarity score." in objective
+    assert "higher `D_min` means greater separation" in objective
+    assert (
+        "Do not report intermediate, predicted, target, or per-step scores "
+        "anywhere in the answer." in objective
+    )
+
+
+def test_relationships_question_attributes_gpu_similarity_before_distance() -> None:
+    block = _prompt_blocks(_source())["02-relationships-and-groups"]
+    question = (
+        "Question: Which molecules are similar, and how does Butina group them "
+        "from distances derived from GPU-computed Tanimoto similarities?"
+    )
+
+    assert block.startswith(question)
+    assert "GPU-computed Tanimoto distances" not in block
+
+
+def test_prompt_answer_limits_match_canonical_bullet_contract() -> None:
+    blocks = _prompt_blocks(_source())
+    for prompt_id in PROMPT_IDS[:3]:
+        assert "Use at most three measured-result bullets." in blocks[prompt_id]
+    assert (
+        "Use at most three measured facts: baseline `D_min`, final `D_min`, "
+        "and their change." in blocks["04-objective"]
+    )
 
 
 def test_objective_prompt_uses_the_actual_menu_contract() -> None:

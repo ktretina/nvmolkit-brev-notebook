@@ -129,6 +129,10 @@ If an LLM request times out, start a new session and retry the whole prompt once
 ~~~text
 Question: What is in the fixed molecule library, and how is it represented for comparison?
 
+Scientific objective:
+Characterize the fixed molecular sample and create the structural fingerprints used by the later comparisons. Separate input validation on CPU from fingerprint generation on GPU, without making a performance claim.
+
+Execution contract:
 Work only in `/sandbox/.openclaw/workspace`.
 Do not read or edit files.
 Do not install software or use the network.
@@ -137,26 +141,28 @@ Do not run an alternate command.
 Run only this exact command, once:
 env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages python3 /sandbox/.openclaw/workspace/acs_workshop_runner.py run-lesson data-and-representation
 
+This command has a one-call budget. The budget is consumed when the command is submitted.
 If the command fails, report the error and stop. Do not repair or retry.
-Use only the returned results. Answer with these six headings in this order:
-Question
-What ran
-Measured result
-Meaning
-Scientific limit
-Image and download location
+If the first returned result has top-level `status: complete`, stop all tool use. Treat that first completed result as authoritative and return its decoded `answer_markdown` string exactly. Do not emit an empty response or run the command again.
 
-Use at most three measured facts. State that the data are a deterministic 256-record ChEMBL convenience sample, not representative chemical space. State that Morgan/Tanimoto conclusions depend on the radius-2, 1024-bit hashed fingerprint. Report real GPU execution, not acceleration or speedup. Say that the current bundle is in **Download Results** at `workshop/results.zip`.
+Answer contract:
+The returned answer has these six headings in order: Question, What ran, Measured result, Meaning, Scientific limit, and Image and download location. Add no text before or after the decoded `answer_markdown` string. Use at most three measured-result bullets.
 
-End with this exact line:
+The scientific limits must identify the deterministic 256-record ChEMBL convenience sample as non-representative chemical space and bind conclusions to the radius-2, 1024-bit hashed fingerprint. Report real GPU execution via nvMolKit, with no CPU timing comparison or speedup claim. Do not use the words `accelerated` or `acceleration` anywhere in the answer. The download location is **Download Results** at `workshop/results.zip`.
+
+The answer must end with this exact line:
 MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/01-inspection/library_preview.png
 ~~~
 <!-- ACS_PROMPT:01-data-and-representation:END -->
 
 <!-- ACS_PROMPT:02-relationships-and-groups:BEGIN -->
 ~~~text
-Question: Which molecules are similar, and how does Butina group them from the GPU-computed Tanimoto distances?
+Question: Which molecules are similar, and how does Butina group them from distances derived from GPU-computed Tanimoto similarities?
 
+Scientific objective:
+Find the strongest fingerprint-space relationships in the fixed sample, then group molecules with a fixed Butina distance rule. Keep similarity, distance, and CPU/GPU responsibilities distinct.
+
+Execution contract:
 Work only in `/sandbox/.openclaw/workspace`.
 Do not read or edit files.
 Do not install software or use the network.
@@ -165,18 +171,16 @@ Do not run an alternate command.
 Run only this exact command, once:
 env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages python3 /sandbox/.openclaw/workspace/acs_workshop_runner.py run-lesson relationships-and-groups
 
+This command has a one-call budget. The budget is consumed when the command is submitted.
 If the command fails, report the error and stop. Do not repair or retry.
-Use only the returned results. Answer with these six headings in this order:
-Question
-What ran
-Measured result
-Meaning
-Scientific limit
-Image and download location
+If the first returned result has top-level `status: complete`, stop all tool use. Treat that first completed result as authoritative and return its decoded `answer_markdown` string exactly. Do not emit an empty response or run the command again.
 
-Use at most three measured facts. State that cutoff `0.40` is Tanimoto distance. State that the result depends on the radius-2, 1024-bit hashed fingerprint and that similarity `1.0` does not prove molecular identity. Report real GPU fingerprint and similarity execution followed by CPU RDKit clustering; do not claim acceleration or speedup. Say that the current bundle is in **Download Results** at `workshop/results.zip`.
+Answer contract:
+The returned answer has these six headings in order: Question, What ran, Measured result, Meaning, Scientific limit, and Image and download location. Add no text before or after the decoded `answer_markdown` string. Use at most three measured-result bullets.
 
-End with this exact line:
+The cutoff `0.40` is Tanimoto distance, not Tanimoto similarity. The result depends on the radius-2, 1024-bit hashed fingerprint, and similarity `1.0` does not prove molecular identity. nvMolKit computed fingerprints and Tanimoto similarities on GPU; RDKit performed Butina clustering on CPU. This execution placement is not evidence of speedup. The download location is **Download Results** at `workshop/results.zip`.
+
+The answer must end with this exact line:
 MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/04-clusters/cluster_sizes.png
 ~~~
 <!-- ACS_PROMPT:02-relationships-and-groups:END -->
@@ -185,6 +189,10 @@ MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/04-clusters/cluster_sizes.pn
 ~~~text
 Question: What sampled 3D geometries were generated and optimized?
 
+Scientific objective:
+Generate a bounded set of 3D conformers for deterministic representatives and evaluate which sampled conformers converge under MMFF94. Keep sampled computational geometries separate from experimental structures.
+
+Execution contract:
 Work only in `/sandbox/.openclaw/workspace`.
 Do not read or edit files.
 Do not install software or use the network.
@@ -193,18 +201,17 @@ Do not run an alternate command.
 Run only this exact command, once:
 env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages python3 /sandbox/.openclaw/workspace/acs_workshop_runner.py run-lesson sampled-3d-geometry
 
+This single command returns both conformer stages. Do not run it once per stage.
+This command has a one-call budget. The budget is consumed when the command is submitted.
 If the command fails, report the error and stop. Do not repair or retry.
-Use only the returned results. Answer with these six headings in this order:
-Question
-What ran
-Measured result
-Meaning
-Scientific limit
-Image and download location
+If the first returned result has top-level `status: complete`, stop all tool use. Treat that first completed result as authoritative and return its decoded `answer_markdown` string exactly. Do not emit an empty response or run the command again.
 
-Use at most three measured facts. State that the deterministic selected molecules are not centroids, medoids, or globally optimal representatives. State that sampled conformers are not experimental structures and MMFF94 energies compare sampled conformers within one molecule only. Report real GPU execution, not acceleration or speedup. Say that the current bundle is in **Download Results** at `workshop/results.zip`.
+Answer contract:
+The returned answer has these six headings in order: Question, What ran, Measured result, Meaning, Scientific limit, and Image and download location. Add no text before or after the decoded `answer_markdown` string. Use at most three measured-result bullets.
 
-End with this exact line:
+The deterministic selected molecules are not centroids, medoids, or globally optimal representatives. Sampled conformers are not experimental structures. MMFF94 energies compare sampled conformers within one molecule only. Report real GPU execution without an acceleration or speedup claim. The download location is **Download Results** at `workshop/results.zip`.
+
+The answer must end with this exact line:
 MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/06-mmff94/optimized_structures.png
 ~~~
 <!-- ACS_PROMPT:03-sampled-3d-geometry:END -->
@@ -213,11 +220,14 @@ MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/06-mmff94/optimized_structur
 ~~~text
 Question: Can a bounded agent improve the weakest-link diversity of a four-molecule panel?
 
+Scientific objective:
+Improve the least-separated molecular pair in a fixed four-molecule panel by choosing only state-bound swaps with the best predicted minimum distance. This is a bounded structural-diversity exercise, not open-ended molecular design.
+
+Execution contract:
 Work only in `/sandbox/.openclaw/workspace`.
 Do not read or edit files.
 Do not install software or use the network.
 Do not run an alternate command.
-
 Run only the exact commands below.
 
 Run `objective-start` exactly once with this command:
@@ -227,20 +237,14 @@ If `terminal` is `true`, run zero objective-step commands. If the result is pend
 
 env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages python3 /sandbox/.openclaw/workspace/acs_workshop_runner.py objective-step --state-id 'STATE_ID_FROM_MENU' --swap-id 'SWAP_ID_FROM_MENU'
 
-After each result, stop immediately when `terminal` is `true`. Otherwise, repeat with the new displayed menu. Run at most three objective-step commands in total.
+After each result, stop immediately when `terminal` is `true`. Otherwise, repeat with the new displayed menu. Run at most three objective-step commands in total. If a command fails, report the error and stop. Do not repair or retry.
 
-If a command fails, report the error and stop. Do not repair or retry.
-Use only the returned results. Answer with these six headings in this order:
-Question
-What ran
-Measured result
-Meaning
-Scientific limit
-Image and download location
+Answer contract:
+When the first terminal result arrives, stop all tool use and return its decoded `answer_markdown` string exactly. Add no text before or after it. The returned answer has these six headings in order: Question, What ran, Measured result, Meaning, Scientific limit, and Image and download location.
 
-Use at most three measured facts: baseline `D_min`, final `D_min`, and their change. Put the baseline panel, limiting pair, accepted swap or swaps, and final panel under **What ran**. State that `D_min` is the weakest-link diversity score within eight fixed candidates. It is a structural-descriptor objective and does not demonstrate unrestricted autonomous design or biological performance. Report real GPU execution, not acceleration or speedup. Say that the full bundle is in **Download Results** at `workshop/results.zip`.
+`D_min` is the minimum pairwise Tanimoto distance. In this exercise, `D_min = min(1 - Tanimoto similarity)`: higher `D_min` means greater separation for the least-separated pair. It is the weakest-link diversity score within eight fixed candidates. Do not call `D_min` a similarity score. Use at most three measured facts: baseline `D_min`, final `D_min`, and their change. Do not report intermediate, predicted, target, or per-step scores anywhere in the answer. Put the baseline panel, limiting pair, accepted swap or swaps, and final panel under **What ran**. This structural-descriptor objective does not demonstrate unrestricted autonomous design or biological performance. The download location is **Download Results** at `workshop/results.zip`.
 
-End with this exact line:
+The answer must end with this exact line:
 MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/07-objective/final_panel.png
 ~~~
 <!-- ACS_PROMPT:04-objective:END -->

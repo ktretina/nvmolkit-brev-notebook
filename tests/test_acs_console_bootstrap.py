@@ -272,10 +272,75 @@ def test_console_bootstrap_fails_closed_when_git_status_fails(tmp_path: Path) ->
 def test_authoring_sheet_uses_the_bootstrap_as_the_only_setup_source() -> None:
     source = AUTHORING_SHEET.read_text(encoding="utf-8")
 
+    new_definition = "## Create a new definition"
+    existing_definition = "## Update the existing saved definition"
+    assert new_definition in source
+    assert existing_definition in source
+    assert source.index(new_definition) < source.index(existing_definition)
+    assert "The fields below apply only to a new definition." in source
+    assert "Do not select **Create Launchable** for this update." in source
     assert "I don’t have any code files" in source
     assert "launchable/acs_console_bootstrap.sh.in" in source
     assert "Paste the bootstrap" in source
     assert "Do not paste `launchable/acs_nemoclaw_launchable_setup.sh`" in source
-    assert "one time-bounded agent turn" in source
-    assert "final state" in source
-    assert "does not prove the historical number of edits or commands" in source
+    assert "four fixed prompts" in source
+    assert "canonical `answer_markdown`" in source
+    assert "source push alone does not update" in source
+    in_place = (
+        "Validate the updated source in place on the task-owned existing instance "
+        "before publication."
+    )
+    source_boundary = (
+        "This in-place pass validates the source and runtime, not the saved "
+        "Launchable bootstrap."
+    )
+    publish_source = (
+        "After that in-place pass succeeds, publish the reviewed source commit."
+    )
+    assert in_place in source
+    assert source_boundary in source
+    assert publish_source in source
+    assert "Commit and push the generated bootstrap second." in source
+    generated_bootstrap = (
+        "Paste the exact generated `launchable/acs_console_bootstrap.sh` into the "
+        "existing saved Launchable `env-3Hlp4pHBlTTlfDxfH41KkGhTeCV`."
+    )
+    assert generated_bootstrap in source
+    assert "Keep access set to **Only my organization** during this update." in source
+    fresh_deployment = "Create a future fresh deployment from the saved definition."
+    broader_access = (
+        "Only after this fresh-deployment pass may access change to "
+        "**Anyone with the link**."
+    )
+    assert fresh_deployment in source
+    assert "automatic OpenClaw sign-in" in source
+    assert "all four prompts" in source
+    assert "all four images" in source
+    assert "Download Results" in source
+    assert broader_access in source
+    sequence = tuple(
+        source.index(item)
+        for item in (
+            in_place,
+            source_boundary,
+            publish_source,
+            "Commit and push the generated bootstrap second.",
+            generated_bootstrap,
+            fresh_deployment,
+            broader_access,
+        )
+    )
+    assert sequence == tuple(sorted(sequence))
+    assert "source and bootstrap commits pass live acceptance" not in source
+    assert "`NVIDIA_INFERENCE_API_KEY`" in source
+    assert "Never put the API key in source" in source
+    assert "Launchable default" in source
+    assert "Enter it only in the private required Console parameter" in source
+    assert "16,384 bytes" in source
+    assert "| `Open Chemistry Agent` | `18788` |" in source
+    assert "| `Download Results` | `8765` |" in source
+    assert "Do not add a Secure Link for port `18789`." in source
+    assert "Do not expose raw TCP or UDP ports." in source
+    assert "one time-bounded agent turn" not in source
+    assert "edit a bounded chemistry task" not in source
+    assert "acs_task_prompt.txt" not in source

@@ -52,6 +52,49 @@ phase() {
   printf 'Phase: %s\n' "$1"
 }
 
+configure_openclaw_runtime() {
+  local nemoclaw_path="$1"
+  local target_sandbox="$2"
+  local target_workspace="$3"
+  local provider_timeout=""
+  local loop_detection=""
+
+  phase "Configure OpenClaw runtime"
+  if ! "${nemoclaw_path}" "${target_sandbox}" exec \
+    --workdir "${target_workspace}" -- openclaw config set \
+    models.providers.inference.timeoutSeconds 300 --strict-json \
+    >/dev/null 2>&1; then
+    die "could not set the inference provider timeout."
+  fi
+  if ! "${nemoclaw_path}" "${target_sandbox}" exec \
+    --workdir "${target_workspace}" -- openclaw config set \
+    tools.loopDetection.enabled true --strict-json >/dev/null 2>&1; then
+    die "could not enable OpenClaw tool-loop detection."
+  fi
+  if ! "${nemoclaw_path}" "${target_sandbox}" gateway restart --quiet \
+    >/dev/null 2>&1; then
+    die "could not restart the OpenClaw gateway."
+  fi
+  if ! provider_timeout="$("${nemoclaw_path}" "${target_sandbox}" exec \
+    --workdir "${target_workspace}" -- openclaw config get \
+    models.providers.inference.timeoutSeconds --json 2>/dev/null)"; then
+    die "could not read back the inference provider timeout."
+  fi
+  [[ "${provider_timeout}" == "300" ]] ||
+    die "the inference provider timeout was not set to 300 seconds."
+  if ! loop_detection="$("${nemoclaw_path}" "${target_sandbox}" exec \
+    --workdir "${target_workspace}" -- openclaw config get \
+    tools.loopDetection.enabled --json 2>/dev/null)"; then
+    die "could not read back OpenClaw tool-loop detection."
+  fi
+  [[ "${loop_detection}" == "true" ]] ||
+    die "OpenClaw tool-loop detection was not enabled."
+}
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+
 cleanup() {
   local exit_code=$?
   set +e
@@ -319,38 +362,6 @@ stop_tracked_artifact_forward
 [[ -z "$(ss -H -ltn "sport = :8765")" ]] ||
   die "port 8765 is already owned by an untracked process."
 
-"${nemoclaw}" "${sandbox_name}" config set \
-  --key models.providers.inference.timeoutSeconds \
-  --value 300 \
-  --config-accept-new-path \
-  --restart >/dev/null 2>&1
-provider_timeout="$("${nemoclaw}" "${sandbox_name}" config get \
-  --key models.providers.inference.timeoutSeconds \
-  --format json 2>/dev/null)"
-[[ "${provider_timeout}" == "300" ]] ||
-  die "the inference provider timeout was not set to 300 seconds."
-readonly provider_timeout
-
-phase "Verify private dashboard"
-dashboard_listeners="$(ss -H -ltn "sport = :18789")"
-[[ -n "${dashboard_listeners}" ]] || die "the private OpenClaw dashboard is not listening."
-ACS_DASHBOARD_LISTENERS="${dashboard_listeners}" python3 -c '
-import ipaddress
-import os
-
-for line in os.environ["ACS_DASHBOARD_LISTENERS"].splitlines():
-    fields = line.split()
-    if len(fields) < 4:
-        raise SystemExit("invalid dashboard listener record")
-    endpoint = fields[3]
-    if endpoint.startswith("["):
-        host = endpoint[1 : endpoint.rfind("]")]
-    else:
-        host = endpoint.rsplit(":", 1)[0]
-    if not ipaddress.ip_address(host).is_loopback:
-        raise SystemExit("the raw OpenClaw dashboard is not loopback-only")
-' >/dev/null 2>&1
-
 host_sha256() {
   sha256sum -- "$1" | awk '{ print $1 }'
 }
@@ -417,6 +428,29 @@ phase "Prepare workshop files"
   "${workspace}" >/dev/null 2>&1
 "${nemoclaw}" "${sandbox_name}" exec -- mv -- \
   "${workspace}/acs_workspace_tools.md" "${workspace}/TOOLS.md" >/dev/null 2>&1
+
+configure_openclaw_runtime "${nemoclaw}" "${sandbox_name}" "${workspace}"
+
+phase "Verify private dashboard"
+dashboard_listeners="$(ss -H -ltn "sport = :18789")"
+[[ -n "${dashboard_listeners}" ]] || die "the private OpenClaw dashboard is not listening."
+ACS_DASHBOARD_LISTENERS="${dashboard_listeners}" python3 -c '
+import ipaddress
+import os
+
+for line in os.environ["ACS_DASHBOARD_LISTENERS"].splitlines():
+    fields = line.split()
+    if len(fields) < 4:
+        raise SystemExit("invalid dashboard listener record")
+    endpoint = fields[3]
+    if endpoint.startswith("["):
+        host = endpoint[1 : endpoint.rfind("]")]
+    else:
+        host = endpoint.rsplit(":", 1)[0]
+    if not ipaddress.ip_address(host).is_loopback:
+        raise SystemExit("the raw OpenClaw dashboard is not loopback-only")
+' >/dev/null 2>&1
+
 "${openshell}" sandbox upload "${sandbox_name}" "${artifact_server}" \
   "${workspace}" >/dev/null 2>&1
 
