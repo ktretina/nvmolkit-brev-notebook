@@ -41,6 +41,7 @@ def test_setup_uses_brev_managed_python_and_leaves_jupyter_to_brev():
     setup = (REPO_ROOT / "launchable" / "setup.sh").read_text(encoding="utf-8")
     requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
     assert setup.splitlines()[0] == "#!/bin/bash"
+    assert setup.splitlines()[1:3] == ["set +x +v", "set -euo pipefail"]
     assert setup.count(SETUP_KEY_SENTINEL) == 1
     assert "required in Brev Setup values" not in setup
     assert not re.search(
@@ -79,7 +80,7 @@ def test_setup_uses_brev_managed_python_and_leaves_jupyter_to_brev():
     assert "jupyterlab==" not in requirements
 
 
-def _run_setup(tmp_path, rendered_key=None, setup_values=None):
+def _run_setup(tmp_path, rendered_key=None, setup_values=None, bash_flags=None):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     (fake_home / "nvmolkit-brev-notebook").symlink_to(REPO_ROOT, target_is_directory=True)
@@ -127,7 +128,7 @@ printf 'ENV_CLEAN\n' >>"${INVOCATION_LOG}"
     execution_dir = tmp_path / "execution"
     execution_dir.mkdir()
     result = subprocess.run(
-        ["bash", str(copied_setup)],
+        ["bash", *(bash_flags or ()), str(copied_setup)],
         cwd=execution_dir,
         env=env,
         capture_output=True,
@@ -187,6 +188,38 @@ def test_rendered_setup_ignores_ambient_keys_and_runs_managed_runtime(tmp_path):
     assert invocations.index("MODULE ensurepip --upgrade ") < invocations.index("MODULE pip install --upgrade")
     assert invocations.index("MODULE pip install --upgrade") < invocations.index("MODULE pip install -r")
     assert invocations.index("MODULE pip install -r") < invocations.index("SMOKE") < invocations.index("HEALTH")
+
+
+def test_rendered_setup_treats_shell_syntax_as_literal_key_data(tmp_path):
+    marker = tmp_path / "credential-injection-marker"
+    rendered_key = (
+        "sk-injection-test'; "
+        f'printf injected >"{marker}"; '
+        "launch_api_key='sk-after-injection"
+    )
+
+    result, fake_home, _ = _run_setup(tmp_path, rendered_key=rendered_key)
+
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+    key_file = fake_home / ".config" / "nvmolkit" / "NVIDIA_INFERENCE_API_KEY"
+    assert key_file.read_text(encoding="utf-8") == rendered_key
+    assert rendered_key not in result.stdout + result.stderr
+
+
+def test_rendered_setup_disables_trace_and_verbose_before_reading_key(tmp_path):
+    rendered_key = "sk-trace-verbose-sentinel-must-not-leak"
+
+    result, fake_home, _ = _run_setup(
+        tmp_path,
+        rendered_key=rendered_key,
+        bash_flags=("-xv",),
+    )
+
+    assert result.returncode == 0, result.stderr
+    key_file = fake_home / ".config" / "nvmolkit" / "NVIDIA_INFERENCE_API_KEY"
+    assert key_file.read_text(encoding="utf-8") == rendered_key
+    assert rendered_key not in result.stdout + result.stderr
 
 
 def test_rendered_setup_rejects_nvapi_key_before_installation(tmp_path):
