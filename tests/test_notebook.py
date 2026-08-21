@@ -1,14 +1,30 @@
 import http.server
+import importlib.util
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SETUP_KEY_SENTINEL = "__NVIDIA_INFERENCE_API_KEY__"
+RENDER_SETUP_PATH = REPO_ROOT / "launchable" / "render_setup.py"
+
+
+def _load_render_setup():
+    assert RENDER_SETUP_PATH.is_file(), "launchable/render_setup.py is required"
+    spec = importlib.util.spec_from_file_location(
+        "nvmolkit_render_setup", RENDER_SETUP_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_readme_preserves_launch_and_separate_acceptance_gates():
@@ -43,6 +59,8 @@ def test_setup_uses_brev_managed_python_and_leaves_jupyter_to_brev():
     assert setup.splitlines()[0] == "#!/bin/bash"
     assert setup.splitlines()[1:3] == ["set +x +v", "set -euo pipefail"]
     assert setup.count(SETUP_KEY_SENTINEL) == 1
+    assert f"launch_api_key={SETUP_KEY_SENTINEL}" in setup
+    assert "NVMOLKIT_EMBEDDED_CREDENTIAL_EOF" not in setup
     assert "required in Brev Setup values" not in setup
     assert not re.search(
         r'launch_api_key=.*\$\{NVIDIA_(?:INFERENCE_)?API_KEY', setup
@@ -78,6 +96,113 @@ def test_setup_uses_brev_managed_python_and_leaves_jupyter_to_brev():
     )
     assert all(forbidden not in setup for forbidden in ("jupyter lab", "nohup", "PID_FILE", "kill ", "-m venv"))
     assert "jupyterlab==" not in requirements
+
+
+def test_renderer_shell_quotes_accepted_single_line_key():
+    renderer = _load_render_setup()
+    key = "sk-quote-test'; $(printf unsafe) # spaces"
+    template = f"launch_api_key={SETUP_KEY_SENTINEL}\n"
+
+    rendered = renderer.render_setup(template, key)
+
+    assert rendered == f"launch_api_key={shlex.quote(key)}\n"
+    assert SETUP_KEY_SENTINEL not in rendered
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "launch_api_key=missing\n",
+        f"{SETUP_KEY_SENTINEL}\n{SETUP_KEY_SENTINEL}\n",
+    ],
+)
+def test_renderer_requires_exactly_one_sentinel(template):
+    renderer = _load_render_setup()
+
+    with pytest.raises(ValueError, match="exactly one"):
+        renderer.render_setup(template, "sk-test-key")
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "nvapi-invalid-prefix",
+        "sk-",
+        "sk-carriage\rreturn",
+        "sk-line\nfeed",
+        "sk-nul\x00byte",
+    ],
+)
+def test_renderer_rejects_invalid_or_multiline_keys(key):
+    renderer = _load_render_setup()
+    template = f"launch_api_key={SETUP_KEY_SENTINEL}\n"
+
+    with pytest.raises(ValueError):
+        renderer.render_setup(template, key)
+
+
+def test_renderer_cli_writes_private_file_without_key_output(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    renderer = _load_render_setup()
+    key = "sk-cli-private-sentinel-must-not-leak"
+    output_path = tmp_path / "private-rendered-setup.sh"
+    monkeypatch.setattr(renderer.getpass, "getpass", lambda _prompt: key)
+
+    assert renderer.main([str(output_path)]) == 0
+
+    captured = capsys.readouterr()
+    assert key not in captured.out + captured.err
+    assert str(output_path.resolve()) in captured.out
+    assert output_path.stat().st_mode & 0o777 == 0o600
+    template = (REPO_ROOT / "launchable" / "setup.sh").read_text(
+        encoding="utf-8"
+    )
+    assert output_path.read_text(encoding="utf-8") == renderer.render_setup(
+        template,
+        key,
+    )
+
+
+def test_renderer_cli_refuses_existing_output_before_prompt(
+    monkeypatch,
+    tmp_path,
+):
+    renderer = _load_render_setup()
+    output_path = tmp_path / "existing-rendered-setup.sh"
+    output_path.write_text("preserve me", encoding="utf-8")
+    monkeypatch.setattr(
+        renderer.getpass,
+        "getpass",
+        lambda _prompt: pytest.fail("existing output must be rejected before prompt"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        renderer.main([str(output_path)])
+
+    assert exc_info.value.code == 2
+    assert output_path.read_text(encoding="utf-8") == "preserve me"
+
+
+def test_renderer_cli_refuses_output_inside_repository_before_prompt(
+    monkeypatch,
+):
+    renderer = _load_render_setup()
+    output_path = REPO_ROOT / "forbidden-rendered-setup-test.sh"
+    assert not output_path.exists()
+    monkeypatch.setattr(
+        renderer.getpass,
+        "getpass",
+        lambda _prompt: pytest.fail("repository output must be rejected before prompt"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        renderer.main([str(output_path)])
+
+    assert exc_info.value.code == 2
+    assert not output_path.exists()
 
 
 def _run_setup(tmp_path, rendered_key=None, setup_values=None, bash_flags=None):
@@ -122,8 +247,7 @@ printf 'ENV_CLEAN\n' >>"${INVOCATION_LOG}"
     copied_setup = tmp_path / "brev-generated-setup.sh"
     setup = (REPO_ROOT / "launchable" / "setup.sh").read_text(encoding="utf-8")
     if rendered_key is not None:
-        assert setup.count(SETUP_KEY_SENTINEL) == 1
-        setup = setup.replace(SETUP_KEY_SENTINEL, rendered_key)
+        setup = _load_render_setup().render_setup(setup, rendered_key)
     copied_setup.write_text(setup, encoding="utf-8")
     execution_dir = tmp_path / "execution"
     execution_dir.mkdir()
@@ -222,19 +346,38 @@ def test_rendered_setup_disables_trace_and_verbose_before_reading_key(tmp_path):
     assert rendered_key not in result.stdout + result.stderr
 
 
-def test_rendered_setup_rejects_nvapi_key_before_installation(tmp_path):
-    invalid_key = "nvapi-rendered-sentinel-must-not-leak"
-    result, fake_home, log = _run_setup(
-        tmp_path,
-        rendered_key=invalid_key,
+def test_renderer_rejects_multiline_delimiter_breakout_before_script_exists(
+    tmp_path,
+):
+    marker = tmp_path / "multiline-injection-marker"
+    rendered_key = (
+        "sk-multiline-test\n"
+        "NVMOLKIT_EMBEDDED_CREDENTIAL_EOF\n"
+        f'printf injected >"{marker}"\n'
+        "exit 0"
     )
 
-    assert result.returncode != 0
-    assert "Inference Hub key beginning with sk-" in result.stderr
-    assert invalid_key not in result.stdout + result.stderr
-    assert not log.exists()
+    with pytest.raises(ValueError, match="one line"):
+        _run_setup(tmp_path, rendered_key=rendered_key)
+
+    assert not marker.exists()
+    assert not (tmp_path / "brev-generated-setup.sh").exists()
+
+
+def test_renderer_rejects_invalid_prefix_before_script_exists(tmp_path):
+    invalid_key = "nvapi-rendered-sentinel-must-not-leak"
+
+    with pytest.raises(ValueError, match="beginning with sk-"):
+        _run_setup(tmp_path, rendered_key=invalid_key)
+
+    assert not (tmp_path / "brev-generated-setup.sh").exists()
+    assert not (tmp_path / "invocations.log").exists()
     assert not (
-        fake_home / ".config" / "nvmolkit" / "NVIDIA_INFERENCE_API_KEY"
+        tmp_path
+        / "home"
+        / ".config"
+        / "nvmolkit"
+        / "NVIDIA_INFERENCE_API_KEY"
     ).exists()
 
 

@@ -2,9 +2,7 @@
 set +x +v
 set -euo pipefail
 
-IFS= read -r launch_api_key <<'NVMOLKIT_EMBEDDED_CREDENTIAL_EOF'
-__NVIDIA_INFERENCE_API_KEY__
-NVMOLKIT_EMBEDDED_CREDENTIAL_EOF
+launch_api_key=__NVIDIA_INFERENCE_API_KEY__
 unset NVIDIA_INFERENCE_API_KEY NVIDIA_API_KEY
 
 if [[ "${launch_api_key}" == __NVIDIA_* ]]; then
