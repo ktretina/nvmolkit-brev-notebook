@@ -1,6 +1,6 @@
 # nvMolKit + Nemotron Notebook
 
-This standalone three-notebook workshop demonstrates how agentic AI can support a bounded chemistry workflow. It starts with direct [nvMolKit](https://github.com/NVIDIA-BioNeMo/nvMolKit) calls, then uses hosted Nemotron for constrained policy selection, planning, and audit. Python owns validation and executable chemistry code. The hosted model does not receive molecule rows, matrices, rendered code, or output artifacts.
+This standalone three-notebook workshop demonstrates how agentic AI can support a bounded chemistry workflow. It starts with direct [nvMolKit](https://github.com/NVIDIA-BioNeMo/nvMolKit) calls, then uses hosted Nemotron for constrained policy selection, planning, and audit. Python owns validation and executable chemistry code. Nemotron receives an aggregate input profile for planning and an independently validated aggregate report snapshot for audit, but no raw molecule rows, similarity matrices, rendered code, credentials, or local visualization artifacts.
 
 ## Three-notebook workshop path
 

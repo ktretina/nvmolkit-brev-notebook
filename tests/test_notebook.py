@@ -27,6 +27,10 @@ def test_readme_preserves_launch_and_separate_acceptance_gates():
     assert "strict plan" in lowered
     assert "strict audit" in lowered
     assert "minimum tanimoto distance" in lowered
+    assert "aggregate input profile" in lowered
+    assert "independently validated aggregate report snapshot" in lowered
+    assert "no raw molecule rows" in lowered
+    assert "credentials" in lowered and "local visualization artifacts" in lowered
     assert "pytest -q" in readme
     assert "RUN_GPU_TESTS=1 .venv/bin/python -m pytest -q" in readme
     assert "not yet live-qualified" in lowered
