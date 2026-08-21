@@ -205,6 +205,194 @@ def test_renderer_cli_refuses_output_inside_repository_before_prompt(
     assert not output_path.exists()
 
 
+def test_renderer_cli_refuses_dangling_output_symlink(monkeypatch, tmp_path):
+    renderer = _load_render_setup()
+    output_path = tmp_path / "dangling-rendered-setup.sh"
+    symlink_target = tmp_path / "missing-symlink-target.sh"
+    output_path.symlink_to(symlink_target)
+    prompt_count = 0
+
+    def read_key(_prompt):
+        nonlocal prompt_count
+        prompt_count += 1
+        return "sk-dangling-symlink-test"
+
+    monkeypatch.setattr(renderer.getpass, "getpass", read_key)
+    exit_code = None
+    try:
+        renderer.main([str(output_path)])
+    except SystemExit as error:
+        exit_code = error.code
+
+    assert not symlink_target.exists()
+    assert exit_code == 2
+    assert prompt_count == 0
+    assert os.path.lexists(output_path)
+
+
+def test_renderer_cli_refuses_symlink_parent(monkeypatch, tmp_path):
+    renderer = _load_render_setup()
+    real_parent = tmp_path / "real-parent"
+    symlink_parent = tmp_path / "symlink-parent"
+    real_parent.mkdir()
+    symlink_parent.symlink_to(real_parent, target_is_directory=True)
+    output_path = symlink_parent / "private-rendered-setup.sh"
+    prompt_count = 0
+
+    def read_key(_prompt):
+        nonlocal prompt_count
+        prompt_count += 1
+        return "sk-symlink-parent-test"
+
+    monkeypatch.setattr(renderer.getpass, "getpass", read_key)
+    exit_code = None
+    try:
+        renderer.main([str(output_path)])
+    except SystemExit as error:
+        exit_code = error.code
+
+    assert not (real_parent / output_path.name).exists()
+    assert exit_code == 2
+    assert prompt_count == 0
+
+
+@pytest.mark.parametrize("parent_kind", ["missing", "file"])
+def test_renderer_cli_requires_existing_directory_parent_before_prompt(
+    monkeypatch,
+    tmp_path,
+    parent_kind,
+):
+    renderer = _load_render_setup()
+    output_parent = tmp_path / f"{parent_kind}-parent"
+    if parent_kind == "file":
+        output_parent.write_text("not a directory", encoding="utf-8")
+    output_path = output_parent / "private-rendered-setup.sh"
+    prompt_count = 0
+
+    def read_key(_prompt):
+        nonlocal prompt_count
+        prompt_count += 1
+        return "sk-invalid-parent-test"
+
+    monkeypatch.setattr(renderer.getpass, "getpass", read_key)
+
+    with pytest.raises(SystemExit) as exc_info:
+        renderer.main([str(output_path)])
+
+    assert exc_info.value.code == 2
+    assert prompt_count == 0
+    assert not os.path.lexists(output_path)
+
+
+def test_renderer_cli_refuses_repository_symlink_alias_before_prompt(
+    monkeypatch,
+    tmp_path,
+):
+    renderer = _load_render_setup()
+    repository_alias = tmp_path / "repository-alias"
+    repository_alias.symlink_to(REPO_ROOT, target_is_directory=True)
+    output_path = (
+        repository_alias / "launchable" / "forbidden-alias-rendered-setup.sh"
+    )
+    assert not os.path.lexists(output_path)
+    monkeypatch.setattr(
+        renderer.getpass,
+        "getpass",
+        lambda _prompt: pytest.fail("repository alias must fail before prompt"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        renderer.main([str(output_path)])
+
+    assert exc_info.value.code == 2
+    assert not os.path.lexists(output_path)
+
+
+def test_renderer_cli_refuses_case_alias_of_repository_when_supported(
+    monkeypatch,
+):
+    renderer = _load_render_setup()
+    repository_text = os.fspath(REPO_ROOT)
+    repository_alias = None
+    for index, character in enumerate(repository_text):
+        alternate = character.swapcase()
+        if alternate == character:
+            continue
+        candidate = Path(
+            repository_text[:index] + alternate + repository_text[index + 1 :]
+        )
+        try:
+            is_alias = os.path.samefile(candidate, REPO_ROOT)
+        except OSError:
+            continue
+        if candidate != REPO_ROOT and is_alias:
+            repository_alias = candidate
+            break
+    if repository_alias is None:
+        pytest.skip("filesystem does not expose an alternate-case repository alias")
+
+    output_path = repository_alias / "forbidden-case-rendered-setup.sh"
+    assert not os.path.lexists(output_path)
+    monkeypatch.setattr(
+        renderer.getpass,
+        "getpass",
+        lambda _prompt: pytest.fail("case alias must fail before prompt"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        renderer.main([str(output_path)])
+
+    assert exc_info.value.code == 2
+    assert not os.path.lexists(output_path)
+
+
+def test_renderer_cli_rejects_parent_swap_without_redirecting_output(
+    monkeypatch,
+    tmp_path,
+):
+    renderer = _load_render_setup()
+    output_parent = tmp_path / "verified-parent"
+    displaced_parent = tmp_path / "displaced-parent"
+    replacement_parent = tmp_path / "replacement-parent"
+    output_parent.mkdir()
+    replacement_parent.mkdir()
+    (replacement_parent / "replacement-marker").write_text(
+        "replacement",
+        encoding="utf-8",
+    )
+    output_path = output_parent / "private-rendered-setup.sh"
+    real_open = renderer.os.open
+    swapped = False
+
+    def swap_parent_then_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            output_parent.rename(displaced_parent)
+            replacement_parent.rename(output_parent)
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(renderer.os, "open", swap_parent_then_open)
+    monkeypatch.setattr(
+        renderer.getpass,
+        "getpass",
+        lambda _prompt: "sk-parent-swap-test",
+    )
+    exit_code = None
+    try:
+        renderer.main([str(output_path)])
+    except SystemExit as error:
+        exit_code = error.code
+
+    assert swapped
+    assert (output_parent / "replacement-marker").exists()
+    assert not (output_parent / output_path.name).exists()
+    assert not (displaced_parent / output_path.name).exists()
+    assert exit_code == 2
+
+
 def _run_setup(tmp_path, rendered_key=None, setup_values=None, bash_flags=None):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
