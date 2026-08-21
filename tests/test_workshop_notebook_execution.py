@@ -21,7 +21,7 @@ WORKSHOP_AGENT_PATH = NOTEBOOK_DIR / "workshop_llm_agent.py"
 
 
 def test_workshop_agent_version_matches_both_notebook_locks():
-    expected_version = "2026.08.19.1"
+    expected_version = "2026.08.21.1"
     module2_source = "\n".join(
         cell.source for cell in nbformat.read(MODULE2_PATH, as_version=4).cells
     )
@@ -80,6 +80,7 @@ def test_module2_reference_executes_cleanly_without_key_or_hosted_client(
     monkeypatch.setenv("MPLCONFIGDIR", str(matplotlib_dir))
     monkeypatch.setenv("IPYTHONDIR", str(ipython_dir))
     monkeypatch.setenv("NVMOLKIT_WORKSHOP_MODE", "reference")
+    monkeypatch.delenv("NVIDIA_INFERENCE_API_KEY", raising=False)
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
 
     executor = ExecutePreprocessor(timeout=300, kernel_name="python3")
@@ -947,6 +948,7 @@ def test_module3_reference_executes_cleanly_without_key_client_or_network(
     monkeypatch.setenv(
         "REFRAME_CSV", "https://hostile.invalid/reframe.csv?token=do-not-disclose"
     )
+    monkeypatch.delenv("NVIDIA_INFERENCE_API_KEY", raising=False)
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
 
     executor = ExecutePreprocessor(timeout=300, kernel_name="python3")

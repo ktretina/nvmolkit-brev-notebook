@@ -15,12 +15,11 @@ MODULE1_NOTEBOOK_PATH = NOTEBOOK_DIR / "01_direct_nvmolkit_reframe.ipynb"
 REQUIREMENTS_PATH = REPO_ROOT / "requirements.txt"
 README_PATH = REPO_ROOT / "README.md"
 LAUNCHABLE_FIELDS_PATH = REPO_ROOT / "launchable" / "fields.md"
-FIXED_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
+FIXED_MODEL = "nvidia/nvidia/nemotron-3-nano-30b-a3b"
 ORDERED_NOTEBOOK_NAMES = (
     "01_direct_nvmolkit_reframe.ipynb",
     "02_agent_assisted_reframe_neighborhoods.ipynb",
     "03_full_agent_reframe_panel_design.ipynb",
-    "nvmolkit_nemotron_demo.ipynb",
 )
 PRIMARY_NOTEBOOK_NAMES = {
     *ORDERED_NOTEBOOK_NAMES,
@@ -80,14 +79,15 @@ def test_primary_notebook_inventory_is_exact():
     } == PRIMARY_NOTEBOOK_NAMES
 
 
-def test_release_docs_publish_the_four_notebook_path_and_launch_contract():
+def test_release_docs_publish_the_three_notebook_path_and_launch_contract():
     readme = README_PATH.read_text(encoding="utf-8")
     fields = LAUNCHABLE_FIELDS_PATH.read_text(encoding="utf-8")
-    readme_opening = readme.split("## Four-notebook workshop path", 1)[0]
+    readme_opening = readme.split("## Three-notebook workshop path", 1)[0]
 
-    assert "four-notebook workshop" in readme_opening.lower()
-    assert "direct nvMolKit" in readme_opening
-    assert "companion demo" in readme_opening.lower()
+    assert "three-notebook workshop" in readme_opening.lower()
+    assert "direct" in readme_opening and "nvMolKit" in readme_opening
+    assert "companion demo" not in readme.lower()
+    assert "nvmolkit_nemotron_demo.ipynb" not in readme
 
     for document in (readme, fields):
         notebook_positions = [document.index(name) for name in ORDERED_NOTEBOOK_NAMES]
@@ -97,10 +97,24 @@ def test_release_docs_publish_the_four_notebook_path_and_launch_contract():
         assert "hosted mode" in document.lower()
         assert "reference mode" in document.lower()
         assert FIXED_MODEL in document
-        assert "NVIDIA_API_KEY" in document
+        assert "NVIDIA_INFERENCE_API_KEY" in document
+        assert "https://inference-api.nvidia.com/v1" in document
         assert "8888" in document
         assert "75 GiB" in document
         assert "Only my organization" in document
+
+
+def test_module2_explains_the_organizer_supplied_inference_hub_key():
+    module2 = nbformat.read(
+        NOTEBOOK_DIR / "02_agent_assisted_reframe_neighborhoods.ipynb", as_version=4
+    )
+    markdown = "\n".join(
+        cell.source for cell in module2.cells if cell.cell_type == "markdown"
+    )
+    assert "organizer-supplied" in markdown
+    assert "Inference Hub" in markdown
+    assert "`sk-`" in markdown
+    assert "`nvapi-`" not in markdown
 
 
 def test_primary_notebooks_are_clean_python_312_notebooks():
