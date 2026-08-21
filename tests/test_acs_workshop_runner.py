@@ -4,10 +4,12 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
 import zipfile
+from dataclasses import asdict
 from pathlib import Path
 from types import ModuleType
 
@@ -22,6 +24,7 @@ from rdkit.Geometry import Point3D
 import acs_workshop_runner as runner
 import chemistry_workflow
 from objective_fixtures import (
+    controlled_context,
     controlled_context_with_three_misses,
     controlled_context_with_ranked_swaps,
     controlled_context_with_tied_paths,
@@ -202,6 +205,71 @@ FIXED_GPU = runner.GpuIdentity(
     torch_version="2.7.1+cu128",
     nvmolkit_version="0.5.0",
 )
+
+EXPECTED_EXECUTION = {
+    "inspect_library": {
+        "placement": "CPU",
+        "software": "RDKit",
+        "operation": "library parsing and validation",
+        "upstream": None,
+        "gpu": None,
+    },
+    "generate_morgan_fingerprints": {
+        "placement": "GPU",
+        "software": "nvMolKit",
+        "operation": "Morgan fingerprint generation",
+        "upstream": None,
+        "gpu": asdict(FIXED_GPU),
+    },
+    "measure_tanimoto_similarity": {
+        "placement": "GPU",
+        "software": "nvMolKit",
+        "operation": "Tanimoto similarity calculation",
+        "upstream": None,
+        "gpu": asdict(FIXED_GPU),
+    },
+    "discover_fused_butina_clusters": {
+        "placement": "CPU",
+        "software": "RDKit",
+        "operation": "Butina clustering",
+        "upstream": {
+            "stage": "measure_tanimoto_similarity",
+            "placement": "GPU",
+            "software": "nvMolKit",
+            "operation": "Tanimoto similarity calculation",
+        },
+        "gpu": asdict(FIXED_GPU),
+    },
+    "embed_representative_conformers": {
+        "placement": "GPU",
+        "software": "nvMolKit",
+        "operation": "ETKDGv3 conformer embedding",
+        "upstream": None,
+        "gpu": asdict(FIXED_GPU),
+    },
+    "optimize_conformers_mmff94": {
+        "placement": "GPU",
+        "software": "nvMolKit",
+        "operation": "MMFF94 conformer optimization",
+        "upstream": None,
+        "gpu": asdict(FIXED_GPU),
+    },
+}
+
+EXPECTED_LESSON_MEDIA = {
+    "data-and-representation": (
+        "MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/"
+        "01-inspection/library_preview.png"
+    ),
+    "relationships-and-groups": (
+        "MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/"
+        "04-clusters/cluster_sizes.png"
+    ),
+    "sampled-3d-geometry": (
+        "MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/"
+        "06-mmff94/optimized_structures.png"
+    ),
+}
 
 
 def write_manifest(root: Path) -> runner.WorkshopPaths:
@@ -926,6 +994,7 @@ def test_run_lesson_executes_one_terminal_prefix_and_returns_closed_compact_item
         "completed_stages",
         "results_zip_path",
         "artifact_relative_zip_path",
+        "answer_markdown",
     }
     assert result["lesson"] == "relationships-and-groups"
     assert [item["stage"] for item in result["completed_stages"]] == [
@@ -936,11 +1005,27 @@ def test_run_lesson_executes_one_terminal_prefix_and_returns_closed_compact_item
         assert set(item) == {
             "stage",
             "result",
+            "execution",
             "image_paths",
             "summary_path",
             "readme_path",
             "artifact_directory",
         }
+        assert item["execution"] == EXPECTED_EXECUTION[item["stage"]]
+        assert set(item["execution"]) == {
+            "placement",
+            "software",
+            "operation",
+            "upstream",
+            "gpu",
+        }
+        if item["execution"]["upstream"] is not None:
+            assert set(item["execution"]["upstream"]) == {
+                "stage",
+                "placement",
+                "software",
+                "operation",
+            }
         assert item["result"] == EXPECTED_STAGE_RESULTS[item["stage"]]
         assert "facts" not in item
         assert "records" not in item
@@ -948,6 +1033,245 @@ def test_run_lesson_executes_one_terminal_prefix_and_returns_closed_compact_item
     assert not (workshop_paths.output_root / "01-inspection").exists()
     assert (workshop_paths.output_root / "03-similarity").is_dir()
     assert (workshop_paths.output_root / "04-clusters").is_dir()
+
+
+@pytest.mark.parametrize(
+    ("lesson", "terminal_stage"),
+    tuple(runner.LESSON_TERMINAL_STAGES.items()),
+)
+def test_lesson_compact_items_report_all_closed_execution_boundaries(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    lesson: str,
+    terminal_stage: str,
+) -> None:
+    execution = (
+        _objective_execution(workflow_executions)
+        if lesson == "sampled-3d-geometry"
+        else workflow_executions[terminal_stage]
+    )
+    result = runner.run_lesson(
+        lesson,
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+
+    observed = {
+        item["stage"]: item["execution"] for item in result["completed_stages"]
+    }
+    assert observed == {
+        stage_name: EXPECTED_EXECUTION[stage_name]
+        for stage_name in runner.LESSON_STAGES[lesson]
+    }
+
+
+def test_execution_payload_rejects_an_unknown_stage() -> None:
+    with pytest.raises(ValueError, match=r"^Unsupported workshop stage\.$"):
+        runner._execution_payload("not_a_stage", {"gpu": None})
+
+
+@pytest.mark.parametrize(
+    ("stage_name", "summary", "expected_error"),
+    (
+        pytest.param(
+            "generate_morgan_fingerprints",
+            {},
+            "Workshop stage GPU identity is invalid.",
+            id="missing-fingerprint-gpu",
+        ),
+        pytest.param(
+            "measure_tanimoto_similarity",
+            {"gpu": None},
+            "Workshop stage GPU identity is invalid.",
+            id="missing-similarity-gpu",
+        ),
+        pytest.param(
+            "embed_representative_conformers",
+            {"gpu": None},
+            "Workshop stage GPU identity is invalid.",
+            id="missing-embedding-gpu",
+        ),
+        pytest.param(
+            "optimize_conformers_mmff94",
+            {"gpu": None},
+            "Workshop stage GPU identity is invalid.",
+            id="missing-mmff94-gpu",
+        ),
+        pytest.param(
+            "discover_fused_butina_clusters",
+            {"gpu": None},
+            "Workshop stage GPU provenance is invalid.",
+            id="missing-butina-upstream-gpu",
+        ),
+        pytest.param(
+            "inspect_library",
+            {"gpu": asdict(FIXED_GPU)},
+            "Workshop stage GPU identity is invalid.",
+            id="unexpected-inspection-gpu",
+        ),
+        pytest.param(
+            "generate_morgan_fingerprints",
+            {"gpu": {**asdict(FIXED_GPU), "extra": "forged"}},
+            "Workshop stage GPU identity is invalid.",
+            id="extra-gpu-field",
+        ),
+        pytest.param(
+            "generate_morgan_fingerprints",
+            {"gpu": {**asdict(FIXED_GPU), "device": 0}},
+            "Workshop stage GPU identity is invalid.",
+            id="non-string-gpu-field",
+        ),
+    ),
+)
+def test_execution_payload_rejects_invalid_gpu_identity_exactly(
+    stage_name: str,
+    summary: dict[str, object],
+    expected_error: str,
+) -> None:
+    with pytest.raises(RuntimeError, match=rf"^{re.escape(expected_error)}$"):
+        runner._execution_payload(stage_name, summary)
+
+
+def test_run_stage_rejects_non_string_gpu_identity_before_publication(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    valid = workflow_executions["generate_morgan_fingerprints"]
+    invalid = runner.WorkflowExecution(
+        state=valid.state,
+        stage_results=valid.stage_results,
+        gpu=runner.GpuIdentity(
+            name=FIXED_GPU.name,
+            device=0,  # type: ignore[arg-type]
+            torch_version=FIXED_GPU.torch_version,
+            nvmolkit_version=FIXED_GPU.nvmolkit_version,
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError, match=r"^Workshop stage GPU identity is invalid\.$"
+    ):
+        runner.run_stage(
+            "generate_morgan_fingerprints",
+            paths=workshop_paths,
+            workflow_executor=lambda _stage: invalid,
+        )
+
+    assert not (workshop_paths.output_root / "02-fingerprints").exists()
+
+
+@pytest.mark.parametrize(
+    ("lesson", "terminal_stage"),
+    tuple(runner.LESSON_TERMINAL_STAGES.items()),
+)
+def test_lesson_answers_have_exact_closed_markdown_contract(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    lesson: str,
+    terminal_stage: str,
+) -> None:
+    execution = (
+        _objective_execution(workflow_executions)
+        if lesson == "sampled-3d-geometry"
+        else workflow_executions[terminal_stage]
+    )
+    result = runner.run_lesson(
+        lesson,
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    assert set(result) == {
+        "schema_version",
+        "status",
+        "lesson",
+        "completed_stages",
+        "results_zip_path",
+        "artifact_relative_zip_path",
+        "answer_markdown",
+    }
+    answer = result["answer_markdown"]
+    assert [line for line in answer.splitlines() if line.startswith("## ")] == [
+        "## Question",
+        "## What ran",
+        "## Measured result",
+        "## Meaning",
+        "## Scientific limit",
+        "## Image and download location",
+    ]
+    assert answer.count("\n- ") in {1, 2, 3}
+    assert "**Download Results**" in answer
+    assert "`workshop/results.zip`" in answer
+    assert answer.endswith(EXPECTED_LESSON_MEDIA[lesson])
+    assert not re.search(r"\b(?:accelerat\w*|speedup|faster)\b", answer, re.I)
+
+
+def test_lesson_answers_ground_cpu_gpu_work_without_performance_claims(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    result = runner.run_lesson(
+        "relationships-and-groups",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: workflow_executions[
+            "discover_fused_butina_clusters"
+        ],
+    )
+    answer = result["answer_markdown"]
+    expected_what_ran = (
+        "nvMolKit generated Morgan fingerprints and computed Tanimoto "
+        "similarities on GPU NVIDIA L4 (cuda:0). RDKit ran Butina clustering "
+        "on CPU using those GPU-computed similarities."
+    )
+    assert answer == (
+        "## Question\nWhich molecules are similar, and how does Butina group "
+        "them from distances derived from GPU-computed Tanimoto "
+        "similarities?\n\n"
+        f"## What ran\n{expected_what_ran}\n\n"
+        "## Measured result\n"
+        f"- {EXPECTED_STAGE_RESULTS['measure_tanimoto_similarity']}\n"
+        f"- {EXPECTED_STAGE_RESULTS['discover_fused_butina_clusters']}\n\n"
+        "## Meaning\nThe similarity stage compares the fixed fingerprints; "
+        "Butina then groups molecules whose Tanimoto distances satisfy the "
+        "fixed rule.\n\n"
+        "## Scientific limit\nThe cutoff 0.40 is Tanimoto distance, not "
+        "similarity. Results depend on the radius-2, 1024-bit hashed "
+        "fingerprint, and similarity 1.0 does not prove molecular identity or "
+        "biological behavior.\n\n"
+        "## Image and download location\nThe current bundle is in **Download "
+        "Results** at `workshop/results.zip`.\n\n"
+        "MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/"
+        "04-clusters/cluster_sizes.png"
+    )
+    assert "cutoff 0.40 is Tanimoto distance, not similarity" in answer
+    assert "similarity 1.0 does not prove molecular identity" in answer
+    assert not re.search(r"\b(?:accelerat\w*|speedup|faster)\b", answer, re.I)
+
+
+def test_lesson_answers_keep_prompt_specific_scientific_limits(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    first = runner.run_lesson(
+        "data-and-representation",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: workflow_executions[
+            "generate_morgan_fingerprints"
+        ],
+    )["answer_markdown"]
+    assert "deterministic 256-record ChEMBL convenience sample" in first
+    assert "radius-2, 1024-bit hashed fingerprint" in first
+    assert "RDKit ran library parsing and validation on CPU" in first
+    assert "nvMolKit ran Morgan fingerprint generation on GPU NVIDIA L4" in first
+
+    geometry = runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: _objective_execution(workflow_executions),
+    )["answer_markdown"]
+    assert "One command returned both stages" in geometry
+    assert "not centroids, medoids, or globally optimal representatives" in geometry
+    assert "Sampled conformers are not experimental structures" in geometry
+    assert "MMFF94 energies compare sampled conformers within one molecule only" in geometry
 
 
 def test_run_lessons_build_complete_archive_and_objective_state_in_order(
@@ -1282,7 +1606,12 @@ def test_run_lesson_rejects_nonempty_tampered_public_artifacts_without_replacing
         target.write_text(f"tampered {mutation}\n", encoding="utf-8")
     tampered_bytes = target.read_bytes()
 
-    with pytest.raises(RuntimeError, match=r"^Workshop stage artifacts are invalid\.$"):
+    expected_error = (
+        "Workshop objective state is invalid."
+        if lesson == "sampled-3d-geometry"
+        else "Workshop stage artifacts are invalid."
+    )
+    with pytest.raises(RuntimeError, match=rf"^{re.escape(expected_error)}$"):
         runner.run_lesson(lesson, paths=workshop_paths, workflow_executor=execute)
     assert target.read_bytes() == tampered_bytes
     assert archive_path.read_bytes() == previous_archive
@@ -2031,6 +2360,471 @@ def _objective_execution(
     return execution
 
 
+def _prompt_3_snapshot(paths: runner.WorkshopPaths) -> dict[str, tuple[bytes, int]]:
+    targets = [
+        paths.context_path,
+        paths.history_path,
+        paths.output_root / "results.zip",
+    ]
+    for directory_name in ("05-conformers", "06-mmff94", "07-objective"):
+        directory = paths.output_root / directory_name
+        if directory.is_dir():
+            targets.extend(sorted(directory.iterdir()))
+    return {
+        str(path.relative_to(paths.root)): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in targets
+    }
+
+
+def _initialize_pending_geometry(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    execution = _objective_execution(workflow_executions)
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+
+
+def _unexpected_geometry_executor(_stage_name: str) -> runner.WorkflowExecution:
+    raise AssertionError("validated replay must not execute chemistry")
+
+
+def _initialize_terminal_geometry(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> dict[str, object]:
+    _initialize_pending_geometry(workshop_paths, workflow_executions)
+    pending = runner.objective_start(paths=workshop_paths)
+    selected = max(pending["actions"], key=lambda action: action["predicted_score"])
+    return runner.objective_step(
+        pending["state_id"], selected["swap_id"], paths=workshop_paths
+    )
+
+
+def _replace_terminal_image_and_rebuild_zip(
+    workshop_paths: runner.WorkshopPaths,
+) -> None:
+    image_path = workshop_paths.output_root / "07-objective/final_panel.png"
+    changed = Image.new("RGB", (1, 1), (17, 31, 47))
+    changed.save(image_path, format="PNG", compress_level=1)
+    changed.close()
+
+    archive_path = workshop_paths.output_root / "results.zip"
+    _, present_stages, stage_members, objective_members = (
+        runner._validated_results_archive(archive_path)
+    )
+    assert objective_members is not None
+    rebuilt_objective = {
+        name: (
+            image_path.read_bytes()
+            if name == "07-objective/final_panel.png"
+            else contents
+        )
+        for name, contents in objective_members.items()
+    }
+    archive_path.write_bytes(
+        runner._results_archive_bytes(
+            present_stages,
+            stage_members,
+            rebuilt_objective,
+        )
+    )
+
+
+def _forge_terminal_public_from_private_run(
+    workshop_paths: runner.WorkshopPaths,
+) -> None:
+    _, _, _, _, run, _ = runner._load_objective_state(workshop_paths)
+    assert run is not None
+    objective_directory = workshop_paths.output_root / "07-objective"
+    if not objective_directory.exists():
+        objective_directory.mkdir(mode=0o700)
+        runner._write_objective_directory(objective_directory, run, workshop_paths)
+    forged_image = Image.new("RGB", (1, 1), (101, 113, 127))
+    forged_image.save(objective_directory / "final_panel.png", format="PNG")
+    forged_image.close()
+
+    archive_path = workshop_paths.output_root / "results.zip"
+    _, present_stages, stage_members, _ = runner._validated_results_archive(
+        archive_path
+    )
+    objective_members = {
+        f"07-objective/{name}": (objective_directory / name).read_bytes()
+        for name in runner._OBJECTIVE_FILES
+    }
+    archive_path.write_bytes(
+        runner._results_archive_bytes(
+            present_stages,
+            stage_members,
+            objective_members,
+        )
+    )
+
+
+@pytest.mark.parametrize("boundary", ("outputs", "output_root", "stage"))
+def test_third_lesson_replay_rejects_symlinked_output_ancestry_before_executor(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    boundary: str,
+) -> None:
+    _initialize_pending_geometry(workshop_paths, workflow_executions)
+    state_before = (
+        workshop_paths.context_path.read_bytes(),
+        workshop_paths.history_path.read_bytes(),
+    )
+    if boundary == "outputs":
+        target = workshop_paths.root / "outputs"
+        backing = workshop_paths.root / "outputs-real"
+    elif boundary == "output_root":
+        target = workshop_paths.output_root
+        backing = workshop_paths.root / "outputs/workshop-real"
+    else:
+        target = workshop_paths.output_root / "05-conformers"
+        backing = workshop_paths.output_root / "05-conformers-real"
+    os.replace(target, backing)
+    os.symlink(backing.name, target)
+
+    with pytest.raises(
+        RuntimeError, match=r"^Workshop objective state is invalid\.$"
+    ):
+        runner.run_lesson(
+            "sampled-3d-geometry",
+            paths=workshop_paths,
+            workflow_executor=_unexpected_geometry_executor,
+        )
+
+    assert (
+        workshop_paths.context_path.read_bytes(),
+        workshop_paths.history_path.read_bytes(),
+    ) == state_before
+
+
+def test_third_lesson_first_call_rejects_nonprivate_state_root_before_executor(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    execution = _objective_execution(workflow_executions)
+    calls: list[str] = []
+    workshop_paths.state_root.chmod(0o755)
+
+    def executor(stage_name: str) -> runner.WorkflowExecution:
+        calls.append(stage_name)
+        return execution
+
+    with pytest.raises(
+        RuntimeError, match=r"^Workshop objective state is invalid\.$"
+    ):
+        runner.run_lesson(
+            "sampled-3d-geometry",
+            paths=workshop_paths,
+            workflow_executor=executor,
+        )
+
+    assert calls == []
+    assert not workshop_paths.output_root.exists()
+    assert not workshop_paths.context_path.exists()
+    assert not workshop_paths.history_path.exists()
+
+
+@pytest.mark.parametrize("mutation", ("missing", "symlink"))
+def test_third_lesson_replay_normalizes_invalid_zip_before_executor(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    mutation: str,
+) -> None:
+    _initialize_pending_geometry(workshop_paths, workflow_executions)
+    state_before = (
+        workshop_paths.context_path.read_bytes(),
+        workshop_paths.history_path.read_bytes(),
+    )
+    archive = workshop_paths.output_root / "results.zip"
+    if mutation == "missing":
+        archive.unlink()
+    else:
+        backing = workshop_paths.output_root / "results-real.zip"
+        os.replace(archive, backing)
+        os.symlink(backing.name, archive)
+
+    with pytest.raises(
+        RuntimeError, match=r"^Workshop objective state is invalid\.$"
+    ):
+        runner.run_lesson(
+            "sampled-3d-geometry",
+            paths=workshop_paths,
+            workflow_executor=_unexpected_geometry_executor,
+        )
+
+    assert (
+        workshop_paths.context_path.read_bytes(),
+        workshop_paths.history_path.read_bytes(),
+    ) == state_before
+
+
+@pytest.mark.parametrize(
+    "mutation", ("directory_symlink", "file_missing", "file_symlink")
+)
+def test_third_lesson_terminal_replay_normalizes_invalid_objective_path(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    mutation: str,
+) -> None:
+    _initialize_terminal_geometry(workshop_paths, workflow_executions)
+    state_before = (
+        workshop_paths.context_path.read_bytes(),
+        workshop_paths.history_path.read_bytes(),
+    )
+    archive_before = (workshop_paths.output_root / "results.zip").read_bytes()
+    objective_directory = workshop_paths.output_root / "07-objective"
+    if mutation == "directory_symlink":
+        backing = workshop_paths.output_root / "07-objective-real"
+        os.replace(objective_directory, backing)
+        os.symlink(backing.name, objective_directory)
+    else:
+        objective_file = objective_directory / "objective_summary.json"
+        if mutation == "file_missing":
+            objective_file.unlink()
+        else:
+            backing = workshop_paths.output_root / "objective-summary-real.json"
+            os.replace(objective_file, backing)
+            os.symlink(f"../{backing.name}", objective_file)
+
+    with pytest.raises(
+        RuntimeError, match=r"^Workshop objective state is invalid\.$"
+    ):
+        runner.run_lesson(
+            "sampled-3d-geometry",
+            paths=workshop_paths,
+            workflow_executor=_unexpected_geometry_executor,
+        )
+
+    assert (
+        workshop_paths.context_path.read_bytes(),
+        workshop_paths.history_path.read_bytes(),
+    ) == state_before
+    assert (workshop_paths.output_root / "results.zip").read_bytes() == archive_before
+
+
+def test_third_lesson_first_call_executes_once_and_pending_replay_is_stable(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    execution = _objective_execution(workflow_executions)
+    calls: list[str] = []
+
+    def first_executor(stage_name: str) -> runner.WorkflowExecution:
+        calls.append(stage_name)
+        return execution
+
+    first = runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=first_executor,
+    )
+    before = _prompt_3_snapshot(workshop_paths)
+
+    replay = runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=_unexpected_geometry_executor,
+    )
+
+    assert calls == ["optimize_conformers_mmff94"]
+    assert replay == first
+    assert replay["answer_markdown"] == first["answer_markdown"]
+    assert "replayed" not in replay
+    assert _prompt_3_snapshot(workshop_paths) == before
+
+
+def test_third_lesson_replay_rejects_half_present_private_state_before_executor(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    _initialize_pending_geometry(workshop_paths, workflow_executions)
+    history_before = workshop_paths.history_path.read_bytes()
+    archive_before = (workshop_paths.output_root / "results.zip").read_bytes()
+    workshop_paths.context_path.unlink()
+
+    with pytest.raises(RuntimeError, match="objective state"):
+        runner.run_lesson(
+            "sampled-3d-geometry",
+            paths=workshop_paths,
+            workflow_executor=_unexpected_geometry_executor,
+        )
+
+    assert workshop_paths.history_path.read_bytes() == history_before
+    assert (workshop_paths.output_root / "results.zip").read_bytes() == archive_before
+
+
+def test_third_lesson_replay_rejects_tampered_bound_zip_before_executor(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    _initialize_pending_geometry(workshop_paths, workflow_executions)
+    state_before = (
+        workshop_paths.context_path.read_bytes(),
+        workshop_paths.history_path.read_bytes(),
+    )
+    archive = workshop_paths.output_root / "results.zip"
+    archive.write_bytes(archive.read_bytes() + b"tamper")
+    archive_before = archive.read_bytes()
+
+    with pytest.raises(RuntimeError, match="objective state"):
+        runner.run_lesson(
+            "sampled-3d-geometry",
+            paths=workshop_paths,
+            workflow_executor=_unexpected_geometry_executor,
+        )
+
+    assert (
+        workshop_paths.context_path.read_bytes(),
+        workshop_paths.history_path.read_bytes(),
+    ) == state_before
+    assert archive.read_bytes() == archive_before
+
+
+def test_third_lesson_replay_rejects_valid_but_unbound_stage_file_before_executor(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    _initialize_pending_geometry(workshop_paths, workflow_executions)
+    state_before = (
+        workshop_paths.context_path.read_bytes(),
+        workshop_paths.history_path.read_bytes(),
+    )
+    archive_before = (workshop_paths.output_root / "results.zip").read_bytes()
+    image_path = workshop_paths.output_root / "05-conformers/embedding_counts.png"
+    with Image.open(image_path) as source:
+        changed = source.convert("RGBA")
+    changed.save(image_path, format="PNG", compress_level=1)
+    changed.close()
+    image_before = image_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="objective state"):
+        runner.run_lesson(
+            "sampled-3d-geometry",
+            paths=workshop_paths,
+            workflow_executor=_unexpected_geometry_executor,
+        )
+
+    assert (
+        workshop_paths.context_path.read_bytes(),
+        workshop_paths.history_path.read_bytes(),
+    ) == state_before
+    assert (workshop_paths.output_root / "results.zip").read_bytes() == archive_before
+    assert image_path.read_bytes() == image_before
+
+
+def test_third_lesson_replay_normalizes_noncanonical_stage_summary(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    _initialize_pending_geometry(workshop_paths, workflow_executions)
+    summary_path = workshop_paths.output_root / "05-conformers/summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["facts"]["noncanonical"] = float("nan")
+    summary_path.write_text(
+        json.dumps(summary, sort_keys=True, indent=2, allow_nan=True) + "\n",
+        encoding="utf-8",
+    )
+
+    archive_path = workshop_paths.output_root / "results.zip"
+    _, present_stages, stage_members, objective_members = (
+        runner._validated_results_archive(archive_path)
+    )
+    assert objective_members is None
+    stage_members["05-conformers/summary.json"] = summary_path.read_bytes()
+    rebuilt = runner._results_archive_bytes(present_stages, stage_members)
+    archive_path.write_bytes(rebuilt)
+
+    context = json.loads(workshop_paths.context_path.read_text(encoding="utf-8"))
+    context["stage_results_zip_sha256"] = hashlib.sha256(rebuilt).hexdigest()
+    runner._atomic_private_json(workshop_paths.context_path, context)
+    history = json.loads(workshop_paths.history_path.read_text(encoding="utf-8"))
+    history["context_sha256"] = hashlib.sha256(
+        workshop_paths.context_path.read_bytes()
+    ).hexdigest()
+    runner._atomic_private_json(workshop_paths.history_path, history)
+    before = _prompt_3_snapshot(workshop_paths)
+
+    with pytest.raises(
+        RuntimeError, match=r"^Workshop objective state is invalid\.$"
+    ):
+        runner.run_lesson(
+            "sampled-3d-geometry",
+            paths=workshop_paths,
+            workflow_executor=_unexpected_geometry_executor,
+        )
+
+    assert _prompt_3_snapshot(workshop_paths) == before
+
+
+def test_third_lesson_terminal_replay_skips_executor_and_is_byte_stable(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution = _objective_execution(
+        workflow_executions, controlled_context_with_tied_paths(True)
+    )
+    first = runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    objective = runner.objective_start(paths=workshop_paths)
+    while not objective["terminal"]:
+        maximum = max(action["predicted_score"] for action in objective["actions"])
+        selected = next(
+            action
+            for action in objective["actions"]
+            if action["predicted_score"] == maximum
+        )
+        objective = runner.objective_step(
+            objective["state_id"], selected["swap_id"], paths=workshop_paths
+        )
+    before = _prompt_3_snapshot(workshop_paths)
+    monkeypatch.setattr(runner, "_objective_render_state", pytest.fail)
+    monkeypatch.setattr(runner, "objective_figures", pytest.fail)
+
+    replay = runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=_unexpected_geometry_executor,
+    )
+
+    assert objective["terminal"] is True
+    assert replay == first
+    assert replay["answer_markdown"] == first["answer_markdown"]
+    assert "replayed" not in replay
+    assert _prompt_3_snapshot(workshop_paths) == before
+
+
+def test_third_lesson_terminal_replay_rejects_rebuilt_public_forgery(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _initialize_terminal_geometry(workshop_paths, workflow_executions)
+    _replace_terminal_image_and_rebuild_zip(workshop_paths)
+    before = _prompt_3_snapshot(workshop_paths)
+    monkeypatch.setattr(runner, "_objective_render_state", pytest.fail)
+    monkeypatch.setattr(runner, "objective_figures", pytest.fail)
+
+    with pytest.raises(
+        RuntimeError, match=r"^Workshop objective state is invalid\.$"
+    ):
+        runner.run_lesson(
+            "sampled-3d-geometry",
+            paths=workshop_paths,
+            workflow_executor=_unexpected_geometry_executor,
+        )
+
+    assert _prompt_3_snapshot(workshop_paths) == before
+
+
 def test_third_lesson_initializes_private_objective_and_start_is_pending(
     workshop_paths: runner.WorkshopPaths,
     workflow_executions: dict[str, runner.WorkflowExecution],
@@ -2068,6 +2862,22 @@ def test_third_lesson_initializes_private_objective_and_start_is_pending(
     assert np.asarray(context["distance_matrix"]).shape == (8, 8)
     reconstructed = runner._context_from_payload(context)
     assert runner.certify_argmax_reachability(reconstructed)
+    history = json.loads(workshop_paths.history_path.read_text(encoding="utf-8"))
+    assert set(history) == {
+        "schema_version",
+        "dataset_sha256",
+        "context_sha256",
+        "current",
+        "menu",
+        "accepted_attempt_count",
+        "terminal",
+        "termination_reason",
+        "attempts",
+        "last_request",
+        "last_result",
+        "terminal_results_zip_sha256",
+    }
+    assert history["terminal_results_zip_sha256"] is None
 
     monkeypatch.setattr(runner, "execute_workflow_prefix", pytest.fail)
     pending = runner.objective_start(paths=workshop_paths)
@@ -2091,8 +2901,305 @@ def test_third_lesson_initializes_private_objective_and_start_is_pending(
     assert pending["status"] == "pending"
     assert pending["attempt_count"] == 0
     assert 1 <= len(pending["actions"]) <= 3
+    assert "answer_markdown" not in pending
     with zipfile.ZipFile(workshop_paths.output_root / "results.zip") as archive:
         assert all(".acs-workshop-state" not in name for name in archive.namelist())
+
+
+def test_terminal_objective_answer_is_canonical_and_score_bounded(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    execution = _objective_execution(workflow_executions)
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    pending = runner.objective_start(paths=workshop_paths)
+    selected = max(pending["actions"], key=lambda action: action["predicted_score"])
+    terminal = runner.objective_step(
+        pending["state_id"], selected["swap_id"], paths=workshop_paths
+    )
+
+    assert set(terminal) == {
+        "schema_version",
+        "status",
+        "terminal",
+        "attempt_count",
+        "attempt_limit",
+        "baseline",
+        "target_score",
+        "final",
+        "attempts",
+        "achieved",
+        "termination_reason",
+        "image_paths",
+        "artifact_directory",
+        "results_zip_path",
+        "artifact_relative_zip_path",
+        "answer_markdown",
+    }
+    answer = terminal["answer_markdown"]
+    assert [line for line in answer.splitlines() if line.startswith("## ")] == [
+        "## Question",
+        "## What ran",
+        "## Measured result",
+        "## Meaning",
+        "## Scientific limit",
+        "## Image and download location",
+    ]
+    baseline = terminal["baseline"]["score"]
+    final = terminal["final"]["score"]
+    measured = answer.split("## Measured result\n", 1)[1].split(
+        "\n\n## Meaning", 1
+    )[0]
+    assert measured.splitlines() == [
+        f"- Baseline `D_min`: {baseline:.3f}.",
+        f"- Final `D_min`: {final:.3f}.",
+        f"- Change in `D_min`: {final - baseline:+.3f}.",
+    ]
+    assert "minimum pairwise Tanimoto distance" in answer
+    assert "min(1 - Tanimoto similarity)" in answer
+    assert "weakest-link diversity score within eight fixed candidates" in answer
+    assert "similarity score" not in answer
+    assert "target" not in answer.lower()
+    assert "predicted" not in answer.lower()
+    assert not re.search(r"\b(?:accelerat\w*|speedup|faster)\b", answer, re.I)
+    assert "became more separated in this fingerprint space" in answer
+    assert answer.endswith(
+        "MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/"
+        "07-objective/final_panel.png"
+    )
+
+    what_ran = answer.split("## What ran\n", 1)[1].split(
+        "\n\n## Measured result", 1
+    )[0]
+    for molecule_id in terminal["baseline"]["selected_ids"]:
+        assert json.dumps(molecule_id) in what_ran
+    for molecule_id in terminal["baseline"]["limiting_pairs"][0]:
+        assert json.dumps(molecule_id) in what_ran
+    for attempt in terminal["attempts"]:
+        assert json.dumps(attempt["selected_swap"]["swap_id"]) in what_ran
+    for molecule_id in terminal["final"]["selected_ids"]:
+        assert json.dumps(molecule_id) in what_ran
+    assert not re.search(r"\b0\.\d+\b", what_ran)
+
+    stored = json.loads(workshop_paths.history_path.read_text(encoding="utf-8"))
+    assert stored["last_result"] == terminal
+    assert stored["last_result"]["answer_markdown"] == answer
+
+
+def test_zero_attempt_terminal_run_lesson_binds_and_replays_immediately(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_optimal = controlled_context(distances={}, default_distance=0.5)
+    execution = _objective_execution(workflow_executions, baseline_optimal)
+    first = runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+
+    stored = json.loads(workshop_paths.history_path.read_text(encoding="utf-8"))
+    assert stored["terminal"] is True
+    assert stored["accepted_attempt_count"] == 0
+    assert stored["last_request"] is None
+    assert type(stored["last_result"]) is dict
+    assert stored["last_result"]["answer_markdown"]
+    expected_digest = hashlib.sha256(
+        (workshop_paths.output_root / "results.zip").read_bytes()
+    ).hexdigest()
+    assert stored["terminal_results_zip_sha256"] == expected_digest
+    before = _prompt_3_snapshot(workshop_paths)
+    monkeypatch.setattr(runner, "_objective_render_state", pytest.fail)
+    monkeypatch.setattr(runner, "objective_figures", pytest.fail)
+
+    replay = runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=_unexpected_geometry_executor,
+    )
+
+    assert replay == first
+    assert _prompt_3_snapshot(workshop_paths) == before
+    assert stat.S_IMODE(os.lstat(workshop_paths.history_path).st_mode) == 0o600
+
+
+def test_zero_attempt_public_commit_interruption_recovers_via_objective_start(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_optimal = controlled_context(distances={}, default_distance=0.5)
+    execution = _objective_execution(workflow_executions, baseline_optimal)
+    real_replace = runner.os.replace
+    real_render_state = runner._objective_render_state
+    real_figures = runner.objective_figures
+    interrupted = False
+
+    def interrupt_public_commit(source, destination):
+        nonlocal interrupted
+        if (
+            not interrupted
+            and Path(destination) == workshop_paths.output_root / "07-objective"
+        ):
+            interrupted = True
+            raise OSError("simulated public commit interruption")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(runner.os, "replace", interrupt_public_commit)
+    with pytest.raises(OSError, match="public commit interruption"):
+        runner.run_lesson(
+            "sampled-3d-geometry",
+            paths=workshop_paths,
+            workflow_executor=lambda _stage: execution,
+        )
+    journaled = json.loads(workshop_paths.history_path.read_text(encoding="utf-8"))
+    assert journaled["terminal"] is True
+    assert journaled["accepted_attempt_count"] == 0
+    assert re.fullmatch(
+        r"[0-9a-f]{64}", journaled["terminal_results_zip_sha256"]
+    )
+    assert not (workshop_paths.output_root / "07-objective").exists()
+    before = _prompt_3_snapshot(workshop_paths)
+    monkeypatch.setattr(runner, "_objective_render_state", pytest.fail)
+    monkeypatch.setattr(runner, "objective_figures", pytest.fail)
+
+    with pytest.raises(
+        RuntimeError, match=r"^Workshop objective state is invalid\.$"
+    ):
+        runner.run_lesson(
+            "sampled-3d-geometry",
+            paths=workshop_paths,
+            workflow_executor=_unexpected_geometry_executor,
+        )
+    assert _prompt_3_snapshot(workshop_paths) == before
+
+    monkeypatch.setattr(runner, "_objective_render_state", real_render_state)
+    monkeypatch.setattr(runner, "objective_figures", real_figures)
+    recovered = runner.objective_start(paths=workshop_paths)
+    stored = json.loads(workshop_paths.history_path.read_text(encoding="utf-8"))
+    assert recovered == journaled["last_result"]
+    assert stored["terminal_results_zip_sha256"] == journaled[
+        "terminal_results_zip_sha256"
+    ]
+    assert stored["terminal_results_zip_sha256"] == hashlib.sha256(
+        (workshop_paths.output_root / "results.zip").read_bytes()
+    ).hexdigest()
+
+
+def test_zero_attempt_untrusted_state_rejects_stage_mutation_without_write(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_optimal = controlled_context(distances={}, default_distance=0.5)
+    execution = _objective_execution(workflow_executions, baseline_optimal)
+    real_atomic = runner._atomic_private_json
+    history_writes = 0
+
+    def interrupt_digest(path: Path, payload: dict[str, object]) -> None:
+        nonlocal history_writes
+        if path == workshop_paths.history_path:
+            history_writes += 1
+            if history_writes == 2:
+                raise OSError("simulated digest interruption")
+        real_atomic(path, payload)
+
+    monkeypatch.setattr(runner, "_atomic_private_json", interrupt_digest)
+    with pytest.raises(OSError, match="digest interruption"):
+        runner.run_lesson(
+            "sampled-3d-geometry",
+            paths=workshop_paths,
+            workflow_executor=lambda _stage: execution,
+        )
+    image_path = workshop_paths.output_root / "05-conformers/embedding_counts.png"
+    changed = Image.new("RGB", (1, 1), (61, 73, 89))
+    changed.save(image_path, format="PNG")
+    changed.close()
+    before = _prompt_3_snapshot(workshop_paths)
+    monkeypatch.setattr(runner, "_objective_render_state", pytest.fail)
+    monkeypatch.setattr(runner, "objective_figures", pytest.fail)
+
+    with pytest.raises(
+        RuntimeError, match=r"^Workshop objective state is invalid\.$"
+    ):
+        runner.run_lesson(
+            "sampled-3d-geometry",
+            paths=workshop_paths,
+            workflow_executor=_unexpected_geometry_executor,
+        )
+
+    assert _prompt_3_snapshot(workshop_paths) == before
+
+
+def test_prompt_3_never_binds_forged_public_bytes_without_private_digest(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_optimal = controlled_context(distances={}, default_distance=0.5)
+    execution = _objective_execution(workflow_executions, baseline_optimal)
+    real_atomic = runner._atomic_private_json
+    history_writes = 0
+
+    def interrupt_digest_journal(path: Path, payload: dict[str, object]) -> None:
+        nonlocal history_writes
+        if path == workshop_paths.history_path:
+            history_writes += 1
+            if history_writes == 2:
+                raise OSError("simulated trusted digest interruption")
+        real_atomic(path, payload)
+
+    monkeypatch.setattr(runner, "_atomic_private_json", interrupt_digest_journal)
+    with pytest.raises(OSError, match="trusted digest interruption"):
+        runner.run_lesson(
+            "sampled-3d-geometry",
+            paths=workshop_paths,
+            workflow_executor=lambda _stage: execution,
+        )
+    journaled = json.loads(workshop_paths.history_path.read_text(encoding="utf-8"))
+    assert journaled["terminal"] is True
+    assert journaled["terminal_results_zip_sha256"] is None
+    _forge_terminal_public_from_private_run(workshop_paths)
+    before = _prompt_3_snapshot(workshop_paths)
+    monkeypatch.setattr(runner, "_objective_render_state", pytest.fail)
+    monkeypatch.setattr(runner, "objective_figures", pytest.fail)
+
+    with pytest.raises(
+        RuntimeError, match=r"^Workshop objective state is invalid\.$"
+    ):
+        runner.run_lesson(
+            "sampled-3d-geometry",
+            paths=workshop_paths,
+            workflow_executor=_unexpected_geometry_executor,
+        )
+
+    assert _prompt_3_snapshot(workshop_paths) == before
+    stored = json.loads(workshop_paths.history_path.read_text(encoding="utf-8"))
+    assert stored["terminal_results_zip_sha256"] is None
+
+
+def test_baseline_optimal_objective_answer_uses_zero_change_meaning(
+    workshop_paths: runner.WorkshopPaths,
+) -> None:
+    context = controlled_context(distances={}, default_distance=0.5)
+    run = runner.baseline_terminal_run(context)
+    terminal = runner._terminal_envelope(workshop_paths, run)
+    answer = terminal["answer_markdown"]
+    meaning = answer.split("## Meaning\n", 1)[1].split(
+        "\n\n## Scientific limit", 1
+    )[0]
+
+    assert "Change in `D_min`: +0.000." in answer
+    assert "became more separated" not in meaning
+    assert meaning == (
+        "`D_min` did not increase; the weakest-link separation remained "
+        "unchanged in this fingerprint space."
+    )
 
 
 def test_objective_step_accepts_maximum_publishes_and_retries_exactly(
@@ -2111,6 +3218,10 @@ def test_objective_step_accepts_maximum_publishes_and_retries_exactly(
         pending["state_id"], selected["swap_id"], paths=workshop_paths
     )
     history_bytes = workshop_paths.history_path.read_bytes()
+    stored = json.loads(history_bytes)
+    assert stored["terminal_results_zip_sha256"] == hashlib.sha256(
+        (workshop_paths.output_root / "results.zip").read_bytes()
+    ).hexdigest()
     assert terminal["status"] == "complete"
     assert terminal["attempt_count"] == 1
     assert terminal["termination_reason"] == "target_achieved"
@@ -2155,6 +3266,32 @@ def test_objective_step_accepts_maximum_publishes_and_retries_exactly(
         workflow_executor=lambda _stage: execution,
     )
     assert workshop_paths.history_path.read_bytes() == terminal_state_bytes
+
+
+@pytest.mark.parametrize("entrypoint", ("start", "duplicate_step"))
+def test_duplicate_terminal_commands_verify_private_zip_digest(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    entrypoint: str,
+) -> None:
+    _initialize_terminal_geometry(workshop_paths, workflow_executions)
+    stored = json.loads(workshop_paths.history_path.read_text(encoding="utf-8"))
+    _replace_terminal_image_and_rebuild_zip(workshop_paths)
+    before = _prompt_3_snapshot(workshop_paths)
+
+    with pytest.raises(
+        RuntimeError, match=r"^Workshop objective state is invalid\.$"
+    ):
+        if entrypoint == "start":
+            runner.objective_start(paths=workshop_paths)
+        else:
+            runner.objective_step(
+                stored["last_request"]["state_id"],
+                stored["last_request"]["swap_id"],
+                paths=workshop_paths,
+            )
+
+    assert _prompt_3_snapshot(workshop_paths) == before
 
 
 def test_objective_step_rejects_nonmaximum_without_mutation(
@@ -2258,7 +3395,7 @@ def test_tied_maxima_are_accepted_and_attempt_limit_is_exact(
     assert run.termination_reason.value == "attempt_limit_reached"
 
 
-def test_terminal_publication_interruption_recovers_without_another_attempt(
+def test_terminal_public_commit_interruption_recovers_exact_duplicate(
     workshop_paths: runner.WorkshopPaths,
     workflow_executions: dict[str, runner.WorkflowExecution],
     monkeypatch: pytest.MonkeyPatch,
@@ -2271,27 +3408,88 @@ def test_terminal_publication_interruption_recovers_without_another_attempt(
     )
     pending = runner.objective_start(paths=workshop_paths)
     selected = max(pending["actions"], key=lambda action: action["predicted_score"])
-    real_publish = runner._publish_objective
-    calls = 0
+    real_replace = runner.os.replace
+    interrupted = False
 
-    def interrupt(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise OSError("simulated interruption")
-        return real_publish(*args, **kwargs)
+    def interrupt_public_commit(source, destination):
+        nonlocal interrupted
+        if (
+            not interrupted
+            and Path(destination) == workshop_paths.output_root / "07-objective"
+        ):
+            interrupted = True
+            raise OSError("simulated public commit interruption")
+        real_replace(source, destination)
 
-    monkeypatch.setattr(runner, "_publish_objective", interrupt)
-    with pytest.raises(OSError, match="simulated interruption"):
+    monkeypatch.setattr(runner.os, "replace", interrupt_public_commit)
+    with pytest.raises(OSError, match="public commit interruption"):
         runner.objective_step(
             pending["state_id"], selected["swap_id"], paths=workshop_paths
         )
+    journaled = json.loads(
+        workshop_paths.history_path.read_text(encoding="utf-8")
+    )
+    assert journaled["terminal"] is True
+    assert journaled["accepted_attempt_count"] == 1
+    assert journaled["last_request"] == {
+        "state_id": pending["state_id"],
+        "swap_id": selected["swap_id"],
+    }
+    assert re.fullmatch(
+        r"[0-9a-f]{64}", journaled["terminal_results_zip_sha256"]
+    )
+    assert not (workshop_paths.output_root / "07-objective").exists()
+
+    recovered = runner.objective_step(
+        pending["state_id"], selected["swap_id"], paths=workshop_paths
+    )
     stored = json.loads(workshop_paths.history_path.read_text(encoding="utf-8"))
-    assert stored["accepted_attempt_count"] == 1
-    recovered = runner.objective_start(paths=workshop_paths)
-    assert recovered["status"] == "complete"
-    assert recovered["attempt_count"] == 1
-    assert calls == 2
+    assert recovered == journaled["last_result"]
+    assert stored["terminal_results_zip_sha256"] == journaled[
+        "terminal_results_zip_sha256"
+    ]
+    assert journaled["terminal_results_zip_sha256"] == hashlib.sha256(
+        (workshop_paths.output_root / "results.zip").read_bytes()
+    ).hexdigest()
+
+
+def test_terminal_journal_interruption_does_not_publish_or_mutate(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution = _objective_execution(workflow_executions)
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    pending = runner.objective_start(paths=workshop_paths)
+    selected = max(pending["actions"], key=lambda action: action["predicted_score"])
+    history_before = workshop_paths.history_path.read_bytes()
+    archive_before = (workshop_paths.output_root / "results.zip").read_bytes()
+    real_figures = runner.objective_figures
+    render_calls = 0
+
+    def record_render(*args, **kwargs):
+        nonlocal render_calls
+        render_calls += 1
+        return real_figures(*args, **kwargs)
+
+    def interrupt_journal(_path: Path, _payload: dict[str, object]) -> None:
+        raise OSError("simulated journal interruption")
+
+    monkeypatch.setattr(runner, "objective_figures", record_render)
+    monkeypatch.setattr(runner, "_atomic_private_json", interrupt_journal)
+    with pytest.raises(OSError, match="journal interruption"):
+        runner.objective_step(
+            pending["state_id"], selected["swap_id"], paths=workshop_paths
+        )
+
+    assert render_calls == 1
+    assert workshop_paths.history_path.read_bytes() == history_before
+    assert (workshop_paths.output_root / "results.zip").read_bytes() == archive_before
+    assert not (workshop_paths.output_root / "07-objective").exists()
 
 
 def test_private_json_is_indented_and_rejects_forged_cached_result(
@@ -2547,6 +3745,31 @@ def test_pending_duplicate_retry_rejects_tampered_bound_archive_without_mutation
         )
     assert workshop_paths.history_path.read_bytes() == history_before
     assert archive_path.read_bytes() == archive_before
+
+
+def test_results_archive_raw_size_limit_fails_before_file_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    assert runner._RESULTS_ARCHIVE_MAX_RAW_BYTES == 40 * 1024 * 1024
+    oversized = tmp_path / "oversized-results.zip"
+    with oversized.open("wb") as destination:
+        destination.truncate(runner._RESULTS_ARCHIVE_MAX_RAW_BYTES + 1)
+    monkeypatch.setattr(
+        runner,
+        "_read_regular_file",
+        lambda _path: pytest.fail("oversized archive was read"),
+    )
+    monkeypatch.setattr(
+        runner.zipfile,
+        "ZipFile",
+        lambda *_args, **_kwargs: pytest.fail("oversized archive was opened"),
+    )
+
+    with pytest.raises(
+        RuntimeError, match=r"^Workshop objective state is invalid\.$"
+    ):
+        runner._validated_results_archive(oversized)
 
 
 @pytest.mark.parametrize("limit_kind", ("member", "aggregate"))

@@ -214,6 +214,118 @@ class StageSpec:
     image_names: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ExecutionSpec:
+    placement: str
+    software: str
+    operation: str
+    upstream_stage: str | None = None
+
+
+@dataclass(frozen=True)
+class LessonAnswerSpec:
+    question: str
+    meaning: str
+    scientific_limit: str
+    media_line: str
+
+
+@dataclass(frozen=True)
+class _PreparedObjectivePublication:
+    output_root: Path
+    directory: Path
+    archive_path: Path
+    archive_bytes: bytes
+    digest: str
+
+
+EXECUTION_SPECS: Final = {
+    "inspect_library": ExecutionSpec(
+        "CPU", "RDKit", "library parsing and validation"
+    ),
+    "generate_morgan_fingerprints": ExecutionSpec(
+        "GPU", "nvMolKit", "Morgan fingerprint generation"
+    ),
+    "measure_tanimoto_similarity": ExecutionSpec(
+        "GPU", "nvMolKit", "Tanimoto similarity calculation"
+    ),
+    "discover_fused_butina_clusters": ExecutionSpec(
+        "CPU",
+        "RDKit",
+        "Butina clustering",
+        upstream_stage="measure_tanimoto_similarity",
+    ),
+    "embed_representative_conformers": ExecutionSpec(
+        "GPU", "nvMolKit", "ETKDGv3 conformer embedding"
+    ),
+    "optimize_conformers_mmff94": ExecutionSpec(
+        "GPU", "nvMolKit", "MMFF94 conformer optimization"
+    ),
+}
+_GPU_IDENTITY_KEYS: Final = {
+    "name",
+    "device",
+    "torch_version",
+    "nvmolkit_version",
+}
+LESSON_ANSWER_SPECS: Final = {
+    "data-and-representation": LessonAnswerSpec(
+        question=(
+            "What is in the fixed molecule library, and how is it represented "
+            "for comparison?"
+        ),
+        meaning=(
+            "The validated molecules were converted into fixed-length structural "
+            "descriptors that support comparisons within this exercise."
+        ),
+        scientific_limit=(
+            "This is a deterministic 256-record ChEMBL convenience sample, not "
+            "representative chemical space. Morgan and Tanimoto conclusions depend "
+            "on the radius-2, 1024-bit hashed fingerprint."
+        ),
+        media_line=(
+            "MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/"
+            "01-inspection/library_preview.png"
+        ),
+    ),
+    "relationships-and-groups": LessonAnswerSpec(
+        question=(
+            "Which molecules are similar, and how does Butina group them from "
+            "distances derived from GPU-computed Tanimoto similarities?"
+        ),
+        meaning=(
+            "The similarity stage compares the fixed fingerprints; Butina then "
+            "groups molecules whose Tanimoto distances satisfy the fixed rule."
+        ),
+        scientific_limit=(
+            "The cutoff 0.40 is Tanimoto distance, not similarity. Results depend "
+            "on the radius-2, 1024-bit hashed fingerprint, and similarity 1.0 does "
+            "not prove molecular identity or biological behavior."
+        ),
+        media_line=(
+            "MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/"
+            "04-clusters/cluster_sizes.png"
+        ),
+    ),
+    "sampled-3d-geometry": LessonAnswerSpec(
+        question="What sampled 3D geometries were generated and optimized?",
+        meaning=(
+            "The fixed representatives received deterministic ETKDGv3 conformer "
+            "samples followed by within-molecule MMFF94 optimization."
+        ),
+        scientific_limit=(
+            "The selected molecules are not centroids, medoids, or globally optimal "
+            "representatives. Sampled conformers are not experimental structures, "
+            "and MMFF94 energies compare sampled conformers within one molecule only."
+        ),
+        media_line=(
+            "MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/"
+            "06-mmff94/optimized_structures.png"
+        ),
+    ),
+}
+
+
 STAGE_SPECS: Final = {
     "inspect_library": StageSpec(
         directory=STAGE_DIRECTORIES["inspect_library"],
@@ -1172,6 +1284,10 @@ def _stage_publication(
         if type(execution.gpu) is not GpuIdentity:
             raise RuntimeError("Workshop stage GPU identity is invalid.")
         gpu_payload = asdict(execution.gpu)
+        if set(gpu_payload) != _GPU_IDENTITY_KEYS or any(
+            type(value) is not str or not value for value in gpu_payload.values()
+        ):
+            raise RuntimeError("Workshop stage GPU identity is invalid.")
 
     summary_payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -1482,6 +1598,52 @@ def _prefix_execution_for_stage(
     )
 
 
+def _execution_payload(
+    stage_name: str,
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        spec = EXECUTION_SPECS[stage_name]
+    except KeyError as error:
+        raise ValueError("Unsupported workshop stage.") from error
+    raw_gpu = summary.get("gpu")
+    if raw_gpu is None:
+        gpu = None
+    elif (
+        type(raw_gpu) is not dict
+        or set(raw_gpu) != _GPU_IDENTITY_KEYS
+        or any(type(value) is not str or not value for value in raw_gpu.values())
+    ):
+        raise RuntimeError("Workshop stage GPU identity is invalid.")
+    else:
+        gpu = dict(raw_gpu)
+
+    if spec.placement == "GPU" and gpu is None:
+        raise RuntimeError("Workshop stage GPU identity is invalid.")
+    if spec.placement == "CPU" and spec.upstream_stage is None and gpu is not None:
+        raise RuntimeError("Workshop stage GPU identity is invalid.")
+
+    upstream = None
+    if spec.upstream_stage is not None:
+        source = EXECUTION_SPECS[spec.upstream_stage]
+        if source.placement != "GPU" or gpu is None:
+            raise RuntimeError("Workshop stage GPU provenance is invalid.")
+        upstream = {
+            "stage": spec.upstream_stage,
+            "placement": source.placement,
+            "software": source.software,
+            "operation": source.operation,
+        }
+
+    return {
+        "placement": spec.placement,
+        "software": spec.software,
+        "operation": spec.operation,
+        "upstream": upstream,
+        "gpu": gpu,
+    }
+
+
 def _compact_stage_item(
     stage_name: str,
     summary: dict[str, Any],
@@ -1491,6 +1653,7 @@ def _compact_stage_item(
     return {
         "stage": stage_name,
         "result": _stage_result_text(stage_name, _fact_dict(summary, "facts")),
+        "execution": _execution_payload(stage_name, summary),
         "image_paths": [
             str((stage_directory / image_name).resolve())
             for image_name in stage_spec.image_names
@@ -1498,6 +1661,95 @@ def _compact_stage_item(
         "summary_path": str((stage_directory / "summary.json").resolve()),
         "readme_path": str((stage_directory / "README.md").resolve()),
         "artifact_directory": str(stage_directory.resolve()),
+    }
+
+
+def _answer_markdown(
+    *,
+    question: str,
+    what_ran: str,
+    measured_results: Sequence[str],
+    meaning: str,
+    scientific_limit: str,
+    media_line: str,
+) -> str:
+    if not 1 <= len(measured_results) <= 3:
+        raise RuntimeError("Workshop answer facts are invalid.")
+    measured = "\n".join(f"- {item}" for item in measured_results)
+    return (
+        f"## Question\n{question}\n\n"
+        f"## What ran\n{what_ran}\n\n"
+        f"## Measured result\n{measured}\n\n"
+        f"## Meaning\n{meaning}\n\n"
+        f"## Scientific limit\n{scientific_limit}\n\n"
+        "## Image and download location\n"
+        "The current bundle is in **Download Results** at "
+        "`workshop/results.zip`.\n\n"
+        f"{media_line}"
+    )
+
+
+def _execution_sentence(item: dict[str, Any]) -> str:
+    execution = _fact_dict(item, "execution")
+    gpu = execution["gpu"]
+    upstream = execution["upstream"]
+    if execution["placement"] == "GPU":
+        return (
+            f'{execution["software"]} ran {execution["operation"]} on GPU '
+            f'{gpu["name"]} ({gpu["device"]}).'
+        )
+    if upstream is None:
+        return f'{execution["software"]} ran {execution["operation"]} on CPU.'
+    return (
+        f'{execution["software"]} ran {execution["operation"]} on CPU using '
+        f'{upstream["software"]} {upstream["operation"]} results computed on '
+        f'GPU {gpu["name"]} ({gpu["device"]}).'
+    )
+
+
+def _lesson_answer_markdown(
+    lesson: str,
+    completed_stages: Sequence[dict[str, Any]],
+) -> str:
+    if tuple(item.get("stage") for item in completed_stages) != LESSON_STAGES[lesson]:
+        raise RuntimeError("Workshop lesson result is invalid.")
+    spec = LESSON_ANSWER_SPECS[lesson]
+    what_ran = " ".join(_execution_sentence(item) for item in completed_stages)
+    if lesson == "relationships-and-groups":
+        gpu = _fact_dict(_fact_dict(completed_stages[0], "execution"), "gpu")
+        what_ran = (
+            "nvMolKit generated Morgan fingerprints and computed Tanimoto "
+            f"similarities on GPU {gpu['name']} ({gpu['device']}). RDKit ran "
+            "Butina clustering on CPU using those GPU-computed similarities."
+        )
+    elif lesson == "sampled-3d-geometry":
+        what_ran = f"One command returned both stages. {what_ran}"
+    return _answer_markdown(
+        question=spec.question,
+        what_ran=what_ran,
+        measured_results=tuple(
+            _fact_string(item.get("result")) for item in completed_stages
+        ),
+        meaning=spec.meaning,
+        scientific_limit=spec.scientific_limit,
+        media_line=spec.media_line,
+    )
+
+
+def _lesson_envelope(
+    lesson: str,
+    completed_stages: Sequence[dict[str, Any]],
+    archive_path: Path,
+) -> dict[str, Any]:
+    stages = list(completed_stages)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "complete",
+        "lesson": lesson,
+        "completed_stages": stages,
+        "results_zip_path": str(archive_path.resolve()),
+        "artifact_relative_zip_path": "workshop/results.zip",
+        "answer_markdown": _lesson_answer_markdown(lesson, stages),
     }
 
 
@@ -1525,6 +1777,7 @@ _OBJECTIVE_STATE_KEYS: Final = {
     "attempts",
     "last_request",
     "last_result",
+    "terminal_results_zip_sha256",
 }
 _OBJECTIVE_FILES: Final = (
     "README.md",
@@ -1539,20 +1792,45 @@ _OBJECTIVE_FILES: Final = (
 # archive cannot turn a retry into an unbounded memory allocation.
 _RESULTS_ARCHIVE_MAX_MEMBER_BYTES: Final = 8 * 1024 * 1024
 _RESULTS_ARCHIVE_MAX_EXPANDED_BYTES: Final = 32 * 1024 * 1024
+_RESULTS_ARCHIVE_MAX_RAW_BYTES: Final = 40 * 1024 * 1024
 
 
 def _objective_error() -> RuntimeError:
     return RuntimeError("Workshop objective state is invalid.")
 
 
-def _validated_private_root(paths: WorkshopPaths) -> Path:
+def _validated_objective_directory_below_root(
+    paths: WorkshopPaths,
+    directory: Path,
+    *,
+    required_mode: int | None = None,
+) -> Path:
     try:
-        mode = os.lstat(paths.state_root).st_mode
-    except OSError as error:
+        fixed_root = _fixed_root(paths)
+        lexical_root = Path(os.path.abspath(os.fspath(paths.root)))
+        lexical_directory = Path(os.path.abspath(os.fspath(directory)))
+        relative = lexical_directory.relative_to(lexical_root)
+        if not relative.parts:
+            raise ValueError
+        current = fixed_root
+        mode = 0
+        for component in relative.parts:
+            current = current / component
+            mode = os.lstat(current).st_mode
+            if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode):
+                raise ValueError
+        current.resolve(strict=True).relative_to(fixed_root)
+        if required_mode is not None and stat.S_IMODE(mode) != required_mode:
+            raise ValueError
+    except (OSError, RuntimeError, ValueError) as error:
         raise _objective_error() from error
-    if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode) or stat.S_IMODE(mode) != 0o700:
-        raise _objective_error()
-    return paths.state_root
+    return current
+
+
+def _validated_private_root(paths: WorkshopPaths) -> Path:
+    return _validated_objective_directory_below_root(
+        paths, paths.state_root, required_mode=0o700
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -1853,6 +2131,7 @@ def _state_payload(
     *,
     last_request: dict[str, str] | None = None,
     last_result: dict[str, Any] | None = None,
+    terminal_results_zip_sha256: str | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1866,6 +2145,7 @@ def _state_payload(
         "attempts": [_attempt_payload(attempt) for attempt in attempts],
         "last_request": last_request,
         "last_result": last_result,
+        "terminal_results_zip_sha256": terminal_results_zip_sha256,
     }
 
 
@@ -1897,6 +2177,18 @@ def _load_objective_state(
             or type(state_payload["terminal"]) is not bool
         ):
             raise ValueError
+        terminal_results_zip_sha256 = state_payload[
+            "terminal_results_zip_sha256"
+        ]
+        if terminal_results_zip_sha256 is not None and (
+            type(terminal_results_zip_sha256) is not str
+            or len(terminal_results_zip_sha256) != 64
+            or any(
+                character not in _LOWER_HEXADECIMAL
+                for character in terminal_results_zip_sha256
+            )
+        ):
+            raise ValueError
         attempts = tuple(
             ObjectiveAttempt(
                 attempt_number=item["attempt_number"],
@@ -1926,27 +2218,39 @@ def _load_objective_state(
             attempts,
             last_request=state_payload["last_request"],
             last_result=state_payload["last_result"],
+            terminal_results_zip_sha256=terminal_results_zip_sha256,
         )
         if not _exact_json_equal(expected, state_payload):
             raise ValueError
         last_request = state_payload["last_request"]
         last_result = state_payload["last_result"]
-        if (last_request is None) != (last_result is None):
+        if run is None and terminal_results_zip_sha256 is not None:
             raise ValueError
-        if last_request is not None and (
-            type(last_request) is not dict
-            or set(last_request) != {"state_id", "swap_id"}
-            or any(type(value) is not str for value in last_request.values())
-            or type(last_result) is not dict
-            or not attempts
-            or last_request
-            != {
-                "state_id": attempts[-1].state_id,
-                "swap_id": attempts[-1].selected_swap.swap_id,
-            }
-        ):
-            raise ValueError
-        if last_request is not None:
+        if last_request is None:
+            if run is None:
+                if last_result is not None:
+                    raise ValueError
+            elif (
+                attempts
+                or type(last_result) is not dict
+                or not _exact_json_equal(last_result, _terminal_envelope(paths, run))
+            ):
+                raise ValueError
+        else:
+            if (
+                type(last_request) is not dict
+                or set(last_request) != {"state_id", "swap_id"}
+                or any(type(value) is not str for value in last_request.values())
+                or type(last_result) is not dict
+                or not attempts
+                or (run is not None and terminal_results_zip_sha256 is None)
+                or last_request
+                != {
+                    "state_id": attempts[-1].state_id,
+                    "swap_id": attempts[-1].selected_swap.swap_id,
+                }
+            ):
+                raise ValueError
             expected_result = (
                 _terminal_envelope(paths, run)
                 if run is not None
@@ -1974,7 +2278,15 @@ def _initialize_objective_state(
             _private_json_bytes(expected_context)
         ).hexdigest()
         current, menu, run = _derive_objective(context, ())
-        initial = _state_payload(context_sha256, current, menu, run, ())
+        last_result = None if run is None else _terminal_envelope(paths, run)
+        initial = _state_payload(
+            context_sha256,
+            current,
+            menu,
+            run,
+            (),
+            last_result=last_result,
+        )
         _atomic_private_json(paths.context_path, expected_context)
         _atomic_private_json(paths.history_path, initial)
         return
@@ -2022,10 +2334,72 @@ def _terminal_attempt_payload(attempt: ObjectiveAttempt) -> dict[str, Any]:
     }
 
 
+def _quoted_ids(values: Sequence[str]) -> str:
+    if not values or any(type(value) is not str or not value for value in values):
+        raise RuntimeError("Workshop objective result is invalid.")
+    return ", ".join(json.dumps(value) for value in values)
+
+
+def _objective_answer_markdown(
+    run: ObjectiveRun,
+    final: PanelMeasurement,
+) -> str:
+    baseline = run.baseline
+    if type(baseline) is not PanelMeasurement:
+        raise RuntimeError("Workshop objective result is invalid.")
+    swaps = tuple(
+        attempt.selected_swap.swap_id
+        for attempt in run.attempts
+        if attempt.selected_swap is not None
+    )
+    swap_text = _quoted_ids(swaps) if swaps else "none"
+    limiting_pair = _quoted_ids(baseline.limiting_pairs[0])
+    meaning = (
+        "A larger `D_min` means the least separated pair in the selected "
+        "panel became more separated in this fingerprint space."
+        if final.score > baseline.score
+        else (
+            "`D_min` did not increase; the weakest-link separation remained "
+            "unchanged in this fingerprint space."
+        )
+    )
+    return _answer_markdown(
+        question=(
+            "Can a bounded agent improve the weakest-link diversity of a "
+            "four-molecule panel?"
+        ),
+        what_ran=(
+            f"Baseline panel: {_quoted_ids(baseline.selected_ids)}. "
+            f"Baseline limiting pair: {limiting_pair}. Accepted swaps: "
+            f"{swap_text}. Final panel: {_quoted_ids(final.selected_ids)}. "
+            "Python validated each displayed maximum-score action against the "
+            "fixed Tanimoto distance matrix derived from nvMolKit GPU-computed "
+            "Morgan fingerprints and similarities."
+        ),
+        measured_results=(
+            f"Baseline `D_min`: {baseline.score:.3f}.",
+            f"Final `D_min`: {final.score:.3f}.",
+            f"Change in `D_min`: {final.score - baseline.score:+.3f}.",
+        ),
+        meaning=meaning,
+        scientific_limit=(
+            "`D_min` is the minimum pairwise Tanimoto distance, "
+            "`min(1 - Tanimoto similarity)`, and the weakest-link diversity "
+            "score within eight fixed candidates. This structural-descriptor "
+            "objective does not demonstrate unrestricted autonomous design or "
+            "biological performance."
+        ),
+        media_line=(
+            "MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/"
+            "07-objective/final_panel.png"
+        ),
+    )
+
+
 def _terminal_envelope(paths: WorkshopPaths, run: ObjectiveRun) -> dict[str, Any]:
     objective_directory = paths.output_root / "07-objective"
     final = measure_panel(run.context, run.final_ids)
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
         "status": "complete",
         "terminal": True,
@@ -2049,6 +2423,8 @@ def _terminal_envelope(paths: WorkshopPaths, run: ObjectiveRun) -> dict[str, Any
         "results_zip_path": str((paths.output_root / "results.zip").resolve()),
         "artifact_relative_zip_path": "workshop/results.zip",
     }
+    result["answer_markdown"] = _objective_answer_markdown(run, final)
+    return result
 
 
 def _bundle_readme(present_stages: set[str]) -> str:
@@ -2276,30 +2652,6 @@ def _objective_directories_match(first: Path, second: Path) -> None:
             raise _objective_error()
 
 
-def _publish_objective_directory(paths: WorkshopPaths, run: ObjectiveRun) -> Path:
-    output_root = _safe_output_root(paths)
-    fixed = output_root / "07-objective"
-    temporary = Path(tempfile.mkdtemp(prefix=".acs-objective-", dir=output_root))
-    try:
-        _write_objective_directory(temporary, run, paths)
-        _validate_objective_directory(temporary, run)
-        try:
-            os.lstat(fixed)
-        except FileNotFoundError:
-            os.replace(temporary, fixed)
-            temporary = Path()
-        else:
-            _validate_objective_directory(fixed, run)
-            _objective_directories_match(temporary, fixed)
-    finally:
-        if (
-            temporary.name.startswith(".acs-objective-")
-            and temporary.parent == output_root
-        ):
-            shutil.rmtree(temporary, ignore_errors=True)
-    return fixed
-
-
 def _results_archive_bytes(
     present_stages: set[str],
     stage_members: dict[str, bytes],
@@ -2336,7 +2688,17 @@ def _results_archive_bytes(
 def _validated_results_archive(
     archive_path: Path,
 ) -> tuple[bytes, set[str], dict[str, bytes], dict[str, bytes] | None]:
-    raw = _read_regular_file(archive_path)
+    try:
+        archive_stat = os.lstat(archive_path)
+        if (
+            not stat.S_ISREG(archive_stat.st_mode)
+            or stat.S_ISLNK(archive_stat.st_mode)
+            or archive_stat.st_size > _RESULTS_ARCHIVE_MAX_RAW_BYTES
+        ):
+            raise ValueError
+        raw = _read_regular_file(archive_path)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise _objective_error() from error
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             infos = archive.infolist()
@@ -2425,29 +2787,44 @@ def _validated_results_archive(
     return raw, present_stages, stage_members, objective_members
 
 
-def _publish_objective(paths: WorkshopPaths, run: ObjectiveRun) -> Path:
-    objective_directory = _publish_objective_directory(paths, run)
-    output_root = _safe_output_root(paths)
-    archive_path = output_root / "results.zip"
-    context_payload, _ = _read_private_json(paths.context_path)
-    binding = context_payload["stage_results_zip_sha256"]
-    raw, present_stages, stage_members, current_objective = _validated_results_archive(
-        archive_path
-    )
-    canonical_stage = _results_archive_bytes(present_stages, stage_members)
-    if hashlib.sha256(canonical_stage).hexdigest() != binding:
-        raise _objective_error()
-    objective_members = {
-        f"07-objective/{name}": _read_regular_file(objective_directory / name)
-        for name in _OBJECTIVE_FILES
+def _bound_stage_item(
+    stage_name: str,
+    output_root: Path,
+    stage_members: dict[str, bytes],
+) -> dict[str, Any]:
+    directory = output_root / STAGE_DIRECTORIES[stage_name]
+    try:
+        _validate_stage_directory(stage_name, directory)
+        actual = _stage_directory_snapshot(stage_name, directory)
+    except (RuntimeError, ValueError) as error:
+        raise _objective_error() from error
+    prefix = f"{STAGE_DIRECTORIES[stage_name]}/"
+    expected = {
+        name.removeprefix(prefix): contents
+        for name, contents in stage_members.items()
+        if name.startswith(prefix)
     }
-    expected = _results_archive_bytes(present_stages, stage_members, objective_members)
-    if current_objective is not None:
-        if current_objective != objective_members or raw != expected:
-            raise _objective_error()
-        return archive_path
-    if hashlib.sha256(raw).hexdigest() != binding:
+    if actual != expected:
         raise _objective_error()
+    try:
+        summary = json.loads(actual["summary.json"].decode("utf-8"))
+        if (
+            type(summary) is not dict
+            or _formatted_json(summary).encode("utf-8") != actual["summary.json"]
+        ):
+            raise ValueError
+        return _compact_stage_item(
+            stage_name, summary, directory, STAGE_SPECS[stage_name]
+        )
+    except (KeyError, UnicodeError, RuntimeError, ValueError) as error:
+        raise _objective_error() from error
+
+
+def _atomic_results_archive(
+    output_root: Path,
+    archive_path: Path,
+    contents: bytes,
+) -> None:
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".acs-objective-results-", suffix=".zip", dir=output_root
     )
@@ -2455,7 +2832,7 @@ def _publish_objective(paths: WorkshopPaths, run: ObjectiveRun) -> Path:
     try:
         with os.fdopen(descriptor, "wb") as destination:
             descriptor = -1
-            destination.write(expected)
+            destination.write(contents)
         os.replace(temporary, archive_path)
         temporary = Path()
     finally:
@@ -2469,7 +2846,228 @@ def _publish_objective(paths: WorkshopPaths, run: ObjectiveRun) -> Path:
                 temporary.unlink()
             except OSError:
                 pass
-    return archive_path
+
+
+def _objective_archive_members(directory: Path) -> dict[str, bytes]:
+    try:
+        return {
+            f"07-objective/{name}": _read_regular_file(directory / name)
+            for name in _OBJECTIVE_FILES
+        }
+    except (OSError, RuntimeError, ValueError) as error:
+        raise _objective_error() from error
+
+
+def _discard_prepared_objective(
+    output_root: Path,
+    directory: Path,
+) -> None:
+    if (
+        directory.name.startswith(".acs-objective-prepared-")
+        and directory.parent == output_root
+    ):
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _prepare_objective_publication(
+    paths: WorkshopPaths,
+    run: ObjectiveRun,
+) -> _PreparedObjectivePublication:
+    output_root = _safe_output_root(paths)
+    directory = Path(
+        tempfile.mkdtemp(prefix=".acs-objective-prepared-", dir=output_root)
+    )
+    archive_path = output_root / "results.zip"
+    try:
+        validated = _validated_objective_directory_below_root(paths, directory)
+        mode = os.lstat(validated).st_mode
+        if (
+            validated != directory
+            or directory.parent != output_root
+            or not directory.name.startswith(".acs-objective-prepared-")
+            or stat.S_IMODE(mode) != 0o700
+        ):
+            raise _objective_error()
+        _write_objective_directory(directory, run, paths)
+        _validate_objective_directory(directory, run)
+        _, present_stages, stage_members, _ = _validated_results_archive(
+            archive_path
+        )
+        context_payload, _ = _read_private_json(paths.context_path)
+        canonical_stage = _results_archive_bytes(present_stages, stage_members)
+        if (
+            hashlib.sha256(canonical_stage).hexdigest()
+            != context_payload["stage_results_zip_sha256"]
+        ):
+            raise _objective_error()
+        archive_bytes = _results_archive_bytes(
+            present_stages,
+            stage_members,
+            _objective_archive_members(directory),
+        )
+        return _PreparedObjectivePublication(
+            output_root=output_root,
+            directory=directory,
+            archive_path=archive_path,
+            archive_bytes=archive_bytes,
+            digest=hashlib.sha256(archive_bytes).hexdigest(),
+        )
+    except Exception:
+        _discard_prepared_objective(output_root, directory)
+        raise
+
+
+def _commit_prepared_objective(
+    paths: WorkshopPaths,
+    run: ObjectiveRun,
+    prepared: _PreparedObjectivePublication,
+) -> Path:
+    output_root = _safe_output_root(paths)
+    if output_root != prepared.output_root:
+        raise _objective_error()
+    prepared_directory = _validated_objective_directory_below_root(
+        paths, prepared.directory
+    )
+    if (
+        prepared_directory != prepared.directory
+        or prepared_directory.parent != output_root
+        or not prepared_directory.name.startswith(".acs-objective-prepared-")
+        or hashlib.sha256(prepared.archive_bytes).hexdigest() != prepared.digest
+    ):
+        raise _objective_error()
+    _validate_objective_directory(prepared_directory, run)
+
+    fixed = output_root / "07-objective"
+    try:
+        os.lstat(fixed)
+    except FileNotFoundError:
+        os.replace(prepared_directory, fixed)
+    else:
+        _validate_objective_directory(fixed, run)
+        _objective_directories_match(prepared_directory, fixed)
+
+    fixed_members = _objective_archive_members(fixed)
+    raw, present_stages, stage_members, current_objective = (
+        _validated_results_archive(prepared.archive_path)
+    )
+    context_payload, _ = _read_private_json(paths.context_path)
+    canonical_stage = _results_archive_bytes(present_stages, stage_members)
+    binding = context_payload["stage_results_zip_sha256"]
+    expected = _results_archive_bytes(
+        present_stages,
+        stage_members,
+        fixed_members,
+    )
+    if (
+        hashlib.sha256(canonical_stage).hexdigest() != binding
+        or expected != prepared.archive_bytes
+    ):
+        raise _objective_error()
+    if current_objective is None:
+        if raw != canonical_stage:
+            raise _objective_error()
+        _atomic_results_archive(output_root, prepared.archive_path, expected)
+    elif current_objective != fixed_members or raw != expected:
+        raise _objective_error()
+
+    final_raw, _, _, final_objective = _validated_results_archive(
+        prepared.archive_path
+    )
+    if (
+        final_objective != fixed_members
+        or final_raw != expected
+        or hashlib.sha256(final_raw).hexdigest() != prepared.digest
+    ):
+        raise _objective_error()
+    return prepared.archive_path
+
+
+def _journal_prepared_terminal(
+    paths: WorkshopPaths,
+    state_payload: dict[str, Any],
+    prepared: _PreparedObjectivePublication,
+) -> dict[str, Any]:
+    stored_digest = state_payload["terminal_results_zip_sha256"]
+    if stored_digest is not None:
+        if stored_digest != prepared.digest:
+            raise _objective_error()
+        return state_payload
+    updated_state = dict(state_payload)
+    updated_state["terminal_results_zip_sha256"] = prepared.digest
+    _atomic_private_json(paths.history_path, updated_state)
+    return updated_state
+
+
+def _complete_terminal_publication(
+    paths: WorkshopPaths,
+    run: ObjectiveRun,
+    state_payload: dict[str, Any],
+) -> Path:
+    prepared = _prepare_objective_publication(paths, run)
+    try:
+        _journal_prepared_terminal(paths, state_payload, prepared)
+        return _commit_prepared_objective(paths, run, prepared)
+    finally:
+        _discard_prepared_objective(prepared.output_root, prepared.directory)
+
+
+def _validated_sampled_geometry_replay(
+    paths: WorkshopPaths,
+) -> dict[str, Any] | None:
+    _validated_private_root(paths)
+    context_exists = paths.context_path.exists() or paths.context_path.is_symlink()
+    history_exists = paths.history_path.exists() or paths.history_path.is_symlink()
+    if not context_exists and not history_exists:
+        return None
+    if context_exists != history_exists:
+        raise _objective_error()
+
+    output_root = _validated_objective_directory_below_root(paths, paths.output_root)
+    _, _, _, _, run, state_payload = _load_objective_state(paths)
+    archive_path = output_root / "results.zip"
+    try:
+        raw, present_stages, stage_members, objective_members = (
+            _validated_results_archive(archive_path)
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise _objective_error() from error
+    context_payload, _ = _read_private_json(paths.context_path)
+    canonical_stage = _results_archive_bytes(present_stages, stage_members)
+    binding = context_payload["stage_results_zip_sha256"]
+    if hashlib.sha256(canonical_stage).hexdigest() != binding:
+        raise _objective_error()
+    if run is None:
+        if objective_members is not None or raw != canonical_stage:
+            raise _objective_error()
+    else:
+        objective_directory = output_root / "07-objective"
+        try:
+            _validate_objective_directory(objective_directory, run)
+            expected_objective = {
+                f"07-objective/{name}": _read_regular_file(
+                    objective_directory / name
+                )
+                for name in _OBJECTIVE_FILES
+            }
+        except (OSError, RuntimeError, ValueError) as error:
+            raise _objective_error() from error
+        expected_terminal = _results_archive_bytes(
+            present_stages, stage_members, expected_objective
+        )
+        terminal_digest = state_payload["terminal_results_zip_sha256"]
+        if objective_members != expected_objective or raw != expected_terminal:
+            raise _objective_error()
+        if (
+            terminal_digest is None
+            or hashlib.sha256(raw).hexdigest() != terminal_digest
+        ):
+            raise _objective_error()
+
+    completed_stages = [
+        _bound_stage_item(stage_name, output_root, stage_members)
+        for stage_name in LESSON_STAGES["sampled-3d-geometry"]
+    ]
+    return _lesson_envelope("sampled-3d-geometry", completed_stages, archive_path)
 
 
 def _validate_bound_stage_archive(paths: WorkshopPaths) -> None:
@@ -2484,7 +3082,6 @@ def _validate_bound_stage_archive(paths: WorkshopPaths) -> None:
 def objective_start(*, paths: WorkshopPaths = DEFAULT_PATHS) -> dict[str, Any]:
     verify_manifest(paths)
     context, attempts, current, menu, run, state_payload = _load_objective_state(paths)
-    del attempts
     if run is None:
         if menu is None:
             raise _objective_error()
@@ -2494,7 +3091,7 @@ def objective_start(*, paths: WorkshopPaths = DEFAULT_PATHS) -> dict[str, Any]:
     last_result = state_payload["last_result"]
     if last_result is not None and last_result != result:
         raise _objective_error()
-    _publish_objective(paths, run)
+    _complete_terminal_publication(paths, run, state_payload)
     return result
 
 
@@ -2512,7 +3109,7 @@ def objective_step(
         if run is None:
             _validate_bound_stage_archive(paths)
         else:
-            _publish_objective(paths, run)
+            _complete_terminal_publication(paths, run, state_payload)
         return result
     if run is not None or menu is None:
         raise ValueError("Objective selection does not match the exact menu revision.")
@@ -2537,18 +3134,35 @@ def objective_step(
         if next_run is None and next_menu is not None
         else _terminal_envelope(paths, next_run)
     )
-    updated_state = _state_payload(
-        state_payload["context_sha256"],
-        next_current,
-        next_menu,
-        next_run,
-        updated_attempts,
-        last_request=request,
-        last_result=result,
-    )
-    _atomic_private_json(paths.history_path, updated_state)
-    if next_run is not None:
-        _publish_objective(paths, next_run)
+    if next_run is None:
+        updated_state = _state_payload(
+            state_payload["context_sha256"],
+            next_current,
+            next_menu,
+            next_run,
+            updated_attempts,
+            last_request=request,
+            last_result=result,
+        )
+        _atomic_private_json(paths.history_path, updated_state)
+        return result
+
+    prepared = _prepare_objective_publication(paths, next_run)
+    try:
+        updated_state = _state_payload(
+            state_payload["context_sha256"],
+            next_current,
+            next_menu,
+            next_run,
+            updated_attempts,
+            last_request=request,
+            last_result=result,
+            terminal_results_zip_sha256=prepared.digest,
+        )
+        _atomic_private_json(paths.history_path, updated_state)
+        _commit_prepared_objective(paths, next_run, prepared)
+    finally:
+        _discard_prepared_objective(prepared.output_root, prepared.directory)
     return result
 
 
@@ -2564,6 +3178,10 @@ def run_lesson(
         lesson_stages = LESSON_STAGES[lesson]
     except KeyError as error:
         raise ValueError("Invalid workshop arguments.") from error
+    if lesson == "sampled-3d-geometry":
+        replay = _validated_sampled_geometry_replay(paths)
+        if replay is not None:
+            return replay
     if workflow_executor is None:
         execution = execute_workflow_prefix(terminal_stage, paths=paths)
     else:
@@ -2590,7 +3208,7 @@ def run_lesson(
         )
         try:
             _initialize_objective_state(paths, execution, temporary_archive)
-            _, _, _, _, objective_run, _ = _load_objective_state(paths)
+            _, _, _, _, objective_run, objective_state = _load_objective_state(paths)
             archive_path = output_root / "results.zip"
             os.replace(temporary_archive, archive_path)
             temporary_archive = Path()
@@ -2604,21 +3222,14 @@ def run_lesson(
                 except OSError:
                     pass
         if objective_run is not None:
-            _publish_objective(paths, objective_run)
+            _complete_terminal_publication(paths, objective_run, objective_state)
     else:
         archive_path = _rebuild_results_zip(
             paths,
             execution,
             validated_stage_digests=validated_stage_digests,
         )
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "status": "complete",
-        "lesson": lesson,
-        "completed_stages": completed_stages,
-        "results_zip_path": str(archive_path.resolve()),
-        "artifact_relative_zip_path": "workshop/results.zip",
-    }
+    return _lesson_envelope(lesson, completed_stages, archive_path)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
