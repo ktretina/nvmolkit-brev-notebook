@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SETUP_KEY_SENTINEL = "__NVIDIA_INFERENCE_API_KEY__"
 
 
 def test_readme_preserves_launch_and_separate_acceptance_gates():
@@ -40,6 +41,11 @@ def test_setup_uses_brev_managed_python_and_leaves_jupyter_to_brev():
     setup = (REPO_ROOT / "launchable" / "setup.sh").read_text(encoding="utf-8")
     requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
     assert setup.splitlines()[0] == "#!/bin/bash"
+    assert setup.count(SETUP_KEY_SENTINEL) == 1
+    assert "required in Brev Setup values" not in setup
+    assert not re.search(
+        r'launch_api_key=.*\$\{NVIDIA_(?:INFERENCE_)?API_KEY', setup
+    )
     assert '${HOME}/.venv/bin/python3' in setup
     assert "command -v python3.12" not in setup
     assert '"${PYTHON}" -m pip --version' in setup
@@ -51,20 +57,29 @@ def test_setup_uses_brev_managed_python_and_leaves_jupyter_to_brev():
     assert '${HOME}/.jupyter/lab/user-settings/@jupyter-widgets/jupyterlab-manager' in setup
     assert '"saveState": true' in setup
     assert 'chmod 600 "${api_key_temp}"' in setup
+    assert 'printf \'%s\' "${launch_api_key}" >"${api_key_temp}"' in setup
+    assert 'mv -f -- "${api_key_temp}" "${api_key_path}"' in setup
     assert "NEMOTRON_MODEL" not in setup
     assert "JUPYTER_PORT" not in setup
     assert len(setup.encode("utf-8")) <= 16_384
     source_cleanup = setup.index("unset NVIDIA_INFERENCE_API_KEY NVIDIA_API_KEY")
+    assert source_cleanup < setup.index('if [[ -f "${PWD}/requirements.txt"')
     assert source_cleanup < setup.index('install -d -m 700 "${api_key_directory}"')
-    assert setup.index("unset launch_api_key") < setup.index(
-        'widget_settings_directory="${HOME}/.jupyter'
+    key_persistence = setup.index(
+        'mv -f -- "${api_key_temp}" "${api_key_path}"'
     )
-    assert "export launch_api_key" not in setup
+    widget_settings = setup.index('widget_settings_directory="${HOME}/.jupyter')
+    assert key_persistence < setup.index("unset launch_api_key", key_persistence)
+    assert setup.index("unset launch_api_key", key_persistence) < widget_settings
+    assert not re.search(
+        r"(?m)^\s*export\s+(?:launch_api_key|NVIDIA_(?:INFERENCE_)?API_KEY)",
+        setup,
+    )
     assert all(forbidden not in setup for forbidden in ("jupyter lab", "nohup", "PID_FILE", "kill ", "-m venv"))
     assert "jupyterlab==" not in requirements
 
 
-def _run_setup(tmp_path, setup_values):
+def _run_setup(tmp_path, rendered_key=None, setup_values=None):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     (fake_home / "nvmolkit-brev-notebook").symlink_to(REPO_ROOT, target_is_directory=True)
@@ -102,9 +117,13 @@ printf 'ENV_CLEAN\n' >>"${INVOCATION_LOG}"
         "HOME": str(fake_home),
         "INVOCATION_LOG": str(log),
         "PATH": f"{fake_bin}:/usr/bin:/bin",
-    } | setup_values
+    } | (setup_values or {})
     copied_setup = tmp_path / "brev-generated-setup.sh"
-    copied_setup.write_bytes((REPO_ROOT / "launchable" / "setup.sh").read_bytes())
+    setup = (REPO_ROOT / "launchable" / "setup.sh").read_text(encoding="utf-8")
+    if rendered_key is not None:
+        assert setup.count(SETUP_KEY_SENTINEL) == 1
+        setup = setup.replace(SETUP_KEY_SENTINEL, rendered_key)
+    copied_setup.write_text(setup, encoding="utf-8")
     execution_dir = tmp_path / "execution"
     execution_dir.mkdir()
     result = subprocess.run(
@@ -117,20 +136,34 @@ printf 'ENV_CLEAN\n' >>"${INVOCATION_LOG}"
     return result, fake_home, log
 
 
-def test_setup_prefers_inference_key_and_runs_only_managed_runtime(tmp_path):
-    primary_key = "sk-primary-setup-sentinel-must-not-leak"
-    legacy_key = "sk-legacy-setup-sentinel-must-not-leak"
+def test_unrendered_setup_fails_before_installation(tmp_path):
+    result, fake_home, log = _run_setup(tmp_path)
+
+    assert result.returncode != 0
+    assert "private Brev Console copy" in result.stderr
+    assert SETUP_KEY_SENTINEL not in result.stdout + result.stderr
+    assert not log.exists()
+    assert not (
+        fake_home / ".config" / "nvmolkit" / "NVIDIA_INFERENCE_API_KEY"
+    ).exists()
+
+
+def test_rendered_setup_ignores_ambient_keys_and_runs_managed_runtime(tmp_path):
+    rendered_key = "sk-rendered-setup-sentinel-must-not-leak"
+    ambient_primary = "sk-ambient-primary-sentinel-must-not-leak"
+    ambient_legacy = "sk-ambient-legacy-sentinel-must-not-leak"
     result, fake_home, log = _run_setup(
         tmp_path,
-        {
-            "NVIDIA_INFERENCE_API_KEY": primary_key,
-            "NVIDIA_API_KEY": legacy_key,
+        rendered_key=rendered_key,
+        setup_values={
+            "NVIDIA_INFERENCE_API_KEY": ambient_primary,
+            "NVIDIA_API_KEY": ambient_legacy,
         },
     )
     assert result.returncode == 0, result.stderr
     key_directory = fake_home / ".config" / "nvmolkit"
     key_file = key_directory / "NVIDIA_INFERENCE_API_KEY"
-    assert key_file.read_text(encoding="utf-8") == primary_key
+    assert key_file.read_text(encoding="utf-8") == rendered_key
     assert key_directory.stat().st_mode & 0o777 == 0o700
     assert key_file.stat().st_mode & 0o777 == 0o600
     widget_settings = (
@@ -145,8 +178,9 @@ def test_setup_prefers_inference_key_and_runs_only_managed_runtime(tmp_path):
     assert json.loads(widget_settings.read_text(encoding="utf-8")) == {
         "saveState": True
     }
-    assert primary_key not in result.stdout + result.stderr
-    assert legacy_key not in result.stdout + result.stderr
+    combined_output = result.stdout + result.stderr
+    for fake_secret in (rendered_key, ambient_primary, ambient_legacy):
+        assert fake_secret not in combined_output
     invocations = log.read_text(encoding="utf-8").splitlines()
     assert invocations.count("ENV_CLEAN") == 2
     assert any("sys.implementation.name" in line for line in invocations)
@@ -155,84 +189,17 @@ def test_setup_prefers_inference_key_and_runs_only_managed_runtime(tmp_path):
     assert invocations.index("MODULE pip install -r") < invocations.index("SMOKE") < invocations.index("HEALTH")
 
 
-def test_setup_accepts_legacy_variable_name_only_for_sk_key(tmp_path):
-    legacy_key = "sk-legacy-name-sentinel-must-not-leak"
-    result, fake_home, _ = _run_setup(
+def test_rendered_setup_rejects_nvapi_key_before_installation(tmp_path):
+    invalid_key = "nvapi-rendered-sentinel-must-not-leak"
+    result, fake_home, log = _run_setup(
         tmp_path,
-        {"NVIDIA_API_KEY": legacy_key},
-    )
-    assert result.returncode == 0, result.stderr
-    key_file = fake_home / ".config" / "nvmolkit" / "NVIDIA_INFERENCE_API_KEY"
-    assert key_file.read_text(encoding="utf-8") == legacy_key
-    assert legacy_key not in result.stdout + result.stderr
-
-
-def test_setup_harness_does_not_inherit_ambient_credentials(monkeypatch, tmp_path):
-    ambient_primary = "sk-ambient-primary-test-sentinel"
-    ambient_legacy = "sk-ambient-legacy-test-sentinel"
-    explicit_legacy = "sk-explicit-legacy-test-sentinel"
-    monkeypatch.setenv("NVIDIA_INFERENCE_API_KEY", ambient_primary)
-    monkeypatch.setenv("NVIDIA_API_KEY", ambient_legacy)
-
-    result, fake_home, _ = _run_setup(
-        tmp_path,
-        {"NVIDIA_API_KEY": explicit_legacy},
+        rendered_key=invalid_key,
     )
 
-    assert result.returncode == 0, result.stderr
-    key_file = fake_home / ".config" / "nvmolkit" / "NVIDIA_INFERENCE_API_KEY"
-    assert key_file.read_text(encoding="utf-8") == explicit_legacy
-    combined_output = result.stdout + result.stderr
-    assert ambient_primary not in combined_output
-    assert ambient_legacy not in combined_output
-    assert explicit_legacy not in combined_output
-
-
-def test_setup_rejects_invalid_primary_without_falling_back(tmp_path):
-    invalid_primary = "nvapi-primary-must-not-leak"
-    valid_legacy = "sk-legacy-must-not-be-used"
-    result, fake_home, _ = _run_setup(
-        tmp_path,
-        {
-            "NVIDIA_INFERENCE_API_KEY": invalid_primary,
-            "NVIDIA_API_KEY": valid_legacy,
-        },
-    )
     assert result.returncode != 0
     assert "Inference Hub key beginning with sk-" in result.stderr
-    assert invalid_primary not in result.stdout + result.stderr
-    assert valid_legacy not in result.stdout + result.stderr
-    assert not (
-        fake_home / ".config" / "nvmolkit" / "NVIDIA_INFERENCE_API_KEY"
-    ).exists()
-
-
-def test_setup_rejects_empty_primary_without_falling_back(tmp_path):
-    valid_legacy = "sk-legacy-must-not-be-used"
-    result, fake_home, _ = _run_setup(
-        tmp_path,
-        {
-            "NVIDIA_INFERENCE_API_KEY": "",
-            "NVIDIA_API_KEY": valid_legacy,
-        },
-    )
-    assert result.returncode != 0
-    assert "Inference Hub key beginning with sk-" in result.stderr
-    assert valid_legacy not in result.stdout + result.stderr
-    assert not (
-        fake_home / ".config" / "nvmolkit" / "NVIDIA_INFERENCE_API_KEY"
-    ).exists()
-
-
-def test_setup_rejects_legacy_build_key(tmp_path):
-    legacy_build_key = "nvapi-legacy-build-key-must-not-leak"
-    result, fake_home, _ = _run_setup(
-        tmp_path,
-        {"NVIDIA_API_KEY": legacy_build_key},
-    )
-    assert result.returncode != 0
-    assert "Inference Hub key beginning with sk-" in result.stderr
-    assert legacy_build_key not in result.stdout + result.stderr
+    assert invalid_key not in result.stdout + result.stderr
+    assert not log.exists()
     assert not (
         fake_home / ".config" / "nvmolkit" / "NVIDIA_INFERENCE_API_KEY"
     ).exists()
