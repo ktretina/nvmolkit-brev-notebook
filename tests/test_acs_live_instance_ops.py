@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -1001,6 +1002,64 @@ def test_process_kill_during_backup_is_reconciled_by_exact_retry(
         "presence": "present",
         "value": True,
     }
+
+
+def test_patch_holds_nonblocking_host_lock_for_full_process_lifetime(
+    tmp_path: Path,
+    fake_environment: tuple[dict[str, str], Path, Path, Path],
+) -> None:
+    environment, _, _, _ = fake_environment
+    bundle = _seed_bundle(tmp_path)
+    started = tmp_path / "backup-started"
+    release = tmp_path / "backup-release"
+    environment.update(
+        {
+            "ACS_FAKE_BACKUP_STARTED": str(started),
+            "ACS_FAKE_BACKUP_RELEASE": str(release),
+        }
+    )
+    state_dir = tmp_path / "state"
+    process = subprocess.Popen(
+        [
+            "bash",
+            str(PATCH_SCRIPT),
+            "--mode",
+            "apply",
+            "--bundle-dir",
+            str(bundle),
+            "--state-dir",
+            str(state_dir),
+            "--sandbox",
+            SANDBOX,
+        ],
+        cwd=ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 5
+    while not started.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert started.exists()
+
+    lock_path = (
+        Path("/tmp").resolve()
+        / f"acs-prompt-reliability-20260821-host-{environment['ACS_FAKE_UID']}"
+        / "operation.lock"
+    )
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+    with lock_path.open("rb") as lock_stream:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    release.touch()
+    stdout, stderr = process.communicate(timeout=20)
+    assert process.returncode == 0, (stdout, stderr)
+    for name in ("ACS_FAKE_BACKUP_STARTED", "ACS_FAKE_BACKUP_RELEASE"):
+        environment.pop(name)
+    rolled_back = _run_patch("rollback", bundle, state_dir, environment)
+    assert rolled_back.returncode == 0, (rolled_back.stdout, rolled_back.stderr)
 
 
 def test_host_global_active_operation_rejects_cross_state_apply_and_wrong_order(

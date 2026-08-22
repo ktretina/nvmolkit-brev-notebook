@@ -3,6 +3,8 @@ set -Eeuo pipefail
 umask 077
 exec 2>/dev/null
 
+original_arguments=("$@")
+readonly original_arguments
 readonly expected_sandbox="acs-chemistry-agent"
 readonly workspace="/sandbox/.openclaw/workspace"
 readonly sandbox_state_root="/sandbox/.acs-prompt-reliability-20260821"
@@ -90,6 +92,8 @@ readonly nemoclaw openshell python host_uid host_tmp
 read -r -d '' host_helper <<'PY' || true
 import base64
 import binascii
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -231,6 +235,74 @@ def prepare_directory(path):
         metadata = os.lstat(path)
     if not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o700 or metadata.st_uid != os.getuid():
         raise ValueError
+
+
+def emit_lock_failure():
+    os.write(1, encoded({
+        "code": "preflight_failed",
+        "main_session_touched": False,
+        "rollback": False,
+        "schema_version": 1,
+        "status": "fail",
+    }))
+
+
+def validate_lock_descriptor(global_state, descriptor):
+    path = global_state / "operation.lock"
+    safe_components(path)
+    path_metadata = os.lstat(path)
+    opened = os.fstat(descriptor)
+    identity = (path_metadata.st_dev, path_metadata.st_ino)
+    if (
+        identity != (opened.st_dev, opened.st_ino)
+        or not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or opened.st_uid != os.getuid()
+        or stat.S_IMODE(opened.st_mode) != 0o600
+    ):
+        raise ValueError
+
+
+def lock_exec(global_state, script_raw, arguments):
+    prepare_directory(global_state)
+    script = Path(script_raw)
+    safe_components(script)
+    script_metadata = os.lstat(script)
+    if (
+        not script.is_absolute()
+        or not stat.S_ISREG(script_metadata.st_mode)
+        or script_metadata.st_nlink != 1
+        or script_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(script_metadata.st_mode) & 0o022
+    ):
+        raise ValueError
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(global_state / "operation.lock", flags, 0o600)
+    try:
+        validate_lock_descriptor(global_state, descriptor)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+            emit_lock_failure()
+            raise SystemExit(70) from error
+        os.set_inheritable(descriptor, True)
+        environment = os.environ.copy()
+        environment["ACS_LIVE_PATCH_LOCK_FD"] = str(descriptor)
+        os.execve("/bin/bash", ("bash", str(script), *arguments), environment)
+    finally:
+        os.close(descriptor)
+
+
+def require_lock(global_state, descriptor_raw):
+    if re.fullmatch(r"[0-9]+", descriptor_raw) is None:
+        raise ValueError
+    descriptor = int(descriptor_raw)
+    if descriptor < 3:
+        raise ValueError
+    validate_lock_descriptor(global_state, descriptor)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 def validate_bundle(path):
@@ -546,6 +618,25 @@ def clear_prepared(state, global_state, sandbox, operation):
     (state / operation).rmdir()
 
 
+def reconcile_prepared(state, global_state, sandbox):
+    prepare_directory(state)
+    prepare_directory(global_state)
+    current = state / "current.json"
+    try:
+        os.lstat(current)
+    except FileNotFoundError:
+        return
+    _path, payload = operation_payload(state)
+    if payload["phase"] != "prepared" or payload["rolled_back"] is not False:
+        return
+    operation = payload["operation_id"]
+    reservation = expected_reservation(state, sandbox, operation)
+    active = load_active(global_state)
+    if active is not None and active != reservation:
+        raise ValueError
+    clear_prepared(state, global_state, sandbox, operation)
+
+
 def complete_rollback(state, global_state, sandbox, operation):
     path, payload = operation_payload(state, operation)
     if payload["phase"] != "backup_ready":
@@ -589,6 +680,10 @@ if action == "prepare":
     prepare_directory(Path(sys.argv[2]))
 elif action == "prepare-global":
     prepare_directory(Path(sys.argv[2]))
+elif action == "lock-exec":
+    lock_exec(Path(sys.argv[2]), sys.argv[3], sys.argv[4:])
+elif action == "require-lock":
+    require_lock(Path(sys.argv[2]), sys.argv[3])
 elif action == "free":
     require_free(Path(sys.argv[2]))
 elif action == "bundle":
@@ -605,6 +700,8 @@ elif action == "complete":
     complete_rollback(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], sys.argv[5])
 elif action == "clear-prepared":
     clear_prepared(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], sys.argv[5])
+elif action == "reconcile-prepared":
+    reconcile_prepared(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4])
 elif action == "parse-loop":
     parse_loop(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], sys.argv[5])
 else:
@@ -1248,6 +1345,15 @@ if ! "${python}" -c "${host_helper}" prepare "${state_dir}" >/dev/null || ! \
   emit_preflight_failure
   exit 70
 fi
+if [[ -z "${ACS_LIVE_PATCH_LOCK_FD-}" ]]; then
+  exec "${python}" -c "${host_helper}" lock-exec \
+    "${host_global_state}" "$0" "${original_arguments[@]}"
+fi
+if ! "${python}" -c "${host_helper}" require-lock \
+  "${host_global_state}" "${ACS_LIVE_PATCH_LOCK_FD}" >/dev/null; then
+  emit_preflight_failure
+  exit 70
+fi
 
 query_loop_state() {
   local stderr_file="$1"
@@ -1389,7 +1495,9 @@ handle_failure() {
 }
 
 if [[ "${mode}" == "apply" ]]; then
-  if ! "${python}" -c "${host_helper}" free \
+  if ! "${python}" -c "${host_helper}" reconcile-prepared \
+    "${state_dir}" "${host_global_state}" "${sandbox}" >/dev/null || ! \
+    "${python}" -c "${host_helper}" free \
     "${host_global_state}" >/dev/null; then
     emit_preflight_failure
     exit 70

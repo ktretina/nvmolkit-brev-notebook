@@ -430,3 +430,19 @@ The host lock coordinates reviewed patch processes. It does not stop an
 actively hostile same-UID process from writing the workspace while a patch is
 running. Record that limitation as a residual risk unless the platform exposes
 a supported quiesce boundary.
+
+The final review also records these non-Critical residual risks without
+expanding the frozen scope:
+
+- the trusted patch has a closed 16 KiB receipt contract, but its temporary
+  stdout and stderr files are not write-time bounded before validation;
+- a true `SIGKILL` after controller claim can leave a permanent fail-closed
+  `in_progress` record that requires operator inspection and a new invocation;
+- descendants retain the host lock until the operation process tree exits, so
+  a leaked descendant can wedge later operations instead of permitting unsafe
+  overlap;
+- the controller has no runtime timeout;
+- same-UID replacement of reviewed pathnames, inodes, or the lock file remains
+  outside the cooperative trust boundary; and
+- the controller is staged and hash-verified separately because the existing
+  closed patch bundle manifest contains exactly six files.
