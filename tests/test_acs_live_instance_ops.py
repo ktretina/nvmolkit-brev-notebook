@@ -1271,7 +1271,7 @@ def test_rollback_restores_from_host_backup_after_sandbox_backup_is_deleted(
     state_dir = tmp_path / "state"
     assert _run_patch("apply", bundle, state_dir, environment).returncode == 0
     operation = next(
-        (sandbox_root / "tmp/acs-prompt-reliability-20260821").iterdir()
+        (sandbox_root / "sandbox/.acs-prompt-reliability-20260821").iterdir()
     )
     (operation / "backup-package.json").unlink()
 
@@ -1573,7 +1573,7 @@ def test_forged_sandbox_backup_and_manifest_cannot_replace_host_trusted_backup(
     state_dir = tmp_path / "state"
     assert _run_patch("apply", bundle, state_dir, environment).returncode == 0
     operation = next(
-        (sandbox_root / "tmp/acs-prompt-reliability-20260821").iterdir()
+        (sandbox_root / "sandbox/.acs-prompt-reliability-20260821").iterdir()
     )
     forged = b"same-uid sandbox forgery\n"
     package_path = operation / "backup-package.json"
