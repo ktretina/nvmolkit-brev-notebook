@@ -159,8 +159,8 @@ def mapped(value: str) -> str:
         "/sandbox/.openclaw/workspace", str(root / "sandbox/.openclaw/workspace")
     )
     return value.replace(
-        "/tmp/acs-prompt-reliability-20260821",
-        str(root / "tmp/acs-prompt-reliability-20260821"),
+        "/sandbox/.acs-prompt-reliability-20260821",
+        str(root / "sandbox/.acs-prompt-reliability-20260821"),
     )
 
 
@@ -347,8 +347,8 @@ def mapped(value: str) -> Path:
         "/sandbox/.openclaw/workspace", str(root / "sandbox/.openclaw/workspace")
     )
     value = value.replace(
-        "/tmp/acs-prompt-reliability-20260821",
-        str(root / "tmp/acs-prompt-reliability-20260821"),
+        "/sandbox/.acs-prompt-reliability-20260821",
+        str(root / "sandbox/.acs-prompt-reliability-20260821"),
     )
     return Path(value)
 
@@ -764,7 +764,7 @@ def test_patch_apply_and_idempotent_rollback_restore_exact_prior_state(
             assert stat.S_IMODE((Path(current) / directory).stat().st_mode) == 0o700
         for filename in files:
             assert stat.S_IMODE((Path(current) / filename).stat().st_mode) == 0o600
-    remote_state = sandbox_root / "tmp/acs-prompt-reliability-20260821"
+    remote_state = sandbox_root / "sandbox/.acs-prompt-reliability-20260821"
     assert stat.S_IMODE(remote_state.stat().st_mode) == 0o700
     for current, directories, files in os.walk(remote_state):
         for directory in directories:
@@ -824,6 +824,41 @@ def test_patch_accepts_standard_sticky_sandbox_tmp_parent(
     assert stat.S_IMODE(sandbox_tmp.stat().st_mode) == 0o1777
     rolled_back = _run_patch("rollback", bundle, state_dir, environment)
     assert rolled_back.returncode == 0, (rolled_back.stdout, rolled_back.stderr)
+
+
+def test_trusted_backup_transfer_uses_private_sandbox_path(
+    tmp_path: Path,
+    fake_environment: tuple[dict[str, str], Path, Path, Path],
+) -> None:
+    environment, command_log, _, sandbox_root = fake_environment
+    sandbox_tmp = sandbox_root / "tmp"
+    sandbox_tmp.mkdir()
+    sandbox_tmp.chmod(0o1777)
+    bundle = _seed_bundle(tmp_path)
+    state_dir = tmp_path / "state"
+
+    applied = _run_patch("apply", bundle, state_dir, environment)
+    assert applied.returncode == 0, (applied.stdout, applied.stderr)
+    rolled_back = _run_patch("rollback", bundle, state_dir, environment)
+    assert rolled_back.returncode == 0, (rolled_back.stdout, rolled_back.stderr)
+
+    calls = _read_commands(command_log)
+    downloads = [
+        call for call in calls if call[:3] == ("openshell", "sandbox", "download")
+    ]
+    uploads = [
+        call for call in calls if call[:3] == ("openshell", "sandbox", "upload")
+    ]
+    expected_root = "/sandbox/.acs-prompt-reliability-20260821/"
+    assert len(downloads) == 1
+    assert downloads[0][4].startswith(expected_root)
+    assert len(uploads) == 3
+    assert all(call[5].startswith(expected_root) for call in uploads)
+    assert all(
+        "/tmp/acs-prompt-reliability-20260821" not in argument
+        for call in calls
+        for argument in call
+    )
 
 
 def test_apply_stops_before_sandbox_mutation_when_absence_cannot_be_unset(

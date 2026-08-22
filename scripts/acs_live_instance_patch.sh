@@ -5,7 +5,7 @@ exec 2>/dev/null
 
 readonly expected_sandbox="acs-chemistry-agent"
 readonly workspace="/sandbox/.openclaw/workspace"
-readonly sandbox_state_root="/tmp/acs-prompt-reliability-20260821"
+readonly sandbox_state_root="/sandbox/.acs-prompt-reliability-20260821"
 readonly loop_key="tools.loopDetection.enabled"
 readonly missing_loop_diagnostic="Config path not found: tools.loopDetection.enabled. Run openclaw config validate to inspect config shape."
 
@@ -625,7 +625,7 @@ import uuid
 from pathlib import Path
 
 WORKSPACE = Path("/sandbox/.openclaw/workspace")
-BASE = Path("/tmp/acs-prompt-reliability-20260821")
+BASE = Path("/sandbox/.acs-prompt-reliability-20260821")
 OPERATION = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 MAX_FILE_BYTES = 64 * 1024 * 1024
