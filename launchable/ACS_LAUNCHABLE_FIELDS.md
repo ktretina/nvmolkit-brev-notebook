@@ -31,19 +31,22 @@ The fields below apply only to a new definition.
 - **Bootstrap template:** `launchable/acs_console_bootstrap.sh.in`
 - Replace `@REVIEWED_PUBLIC_COMMIT_SHA@` in the template with the exact 40-character public source commit SHA.
 - Generate `launchable/acs_console_bootstrap.sh` from the template. The generated file must be no larger than 16,384 bytes.
-- Paste the bootstrap into the Console setup-script field.
+- Do not paste the public bootstrap into the Console. It contains no credential and fails closed until it is privately rendered.
 - Do not paste `launchable/acs_nemoclaw_launchable_setup.sh` directly. Brev does not guarantee that a pasted Console script is stored beside an attached source checkout.
 
-The bootstrap keeps the launch parameter out of clone and checkout child processes. It checks out the exact public commit in a private directory and then executes the unified setup from that checkout.
+The bootstrap keeps the saved workshop credential out of clone and checkout child processes. It checks out the exact public commit in a private directory and then executes the unified setup from that checkout.
 
-## Launch parameter
+## Organizer-only private setup
 
-- **Name:** `NVIDIA_INFERENCE_API_KEY`
-- **Type:** Text
-- **Required:** Yes
-- **Default:** None
+The OpenClaw Launchable has no Launch parameters or Setup values.
 
-Never put the API key in source, the setup script, a Launchable default, chat, screenshots, logs, or workshop files. Enter it only in the private required Console parameter at deployment time.
+1. Run `python3 launchable/render_acs_console_bootstrap.py /private/tmp/acs-openclaw-workshop-setup.sh` from the reviewed checkout.
+2. Enter the workshop-only `nvapi-` key only at the hidden prompt.
+3. Validate the output owner, regular-file type, mode `0600`, reviewed source pin, Bash syntax, and byte size without printing its contents. It must be no larger than 16,384 bytes.
+4. Save only the private rendered body in the new definition's setup-script field. Add no Launch parameters or Setup values.
+5. After the save is confirmed, delete `/private/tmp/acs-openclaw-workshop-setup.sh` and verify that it is absent.
+
+Never store the key in source, a Launchable default, documentation, logs, chat, screenshots, or workshop files. Monitor its use during the workshop and revoke it after the workshop.
 
 ## Network
 
@@ -75,8 +78,11 @@ Use this section for the existing saved Launchable `env-3Hlp4pHBlTTlfDxfH41KkGhT
 1. Validate the updated source in place on the task-owned existing instance before publication. This in-place pass validates the source and runtime, not the saved Launchable bootstrap. A source push alone does not update the saved Launchable definition.
 2. After that in-place pass succeeds, publish the reviewed source commit. Generate `launchable/acs_console_bootstrap.sh` with that public source commit pinned.
 3. Commit and push the generated bootstrap second.
-4. Keep access set to **Only my organization** during this update. Paste the exact generated `launchable/acs_console_bootstrap.sh` into the existing saved Launchable `env-3Hlp4pHBlTTlfDxfH41KkGhTeCV`.
-5. Create a future fresh deployment from the saved definition. Verify automatic OpenClaw sign-in, completion of all four prompts, display of all four images, and the **Download Results** service.
-6. Only after this fresh-deployment pass may access change to **Anyone with the link**.
+4. The OpenClaw Launchable has no Launch parameters or Setup values. Run `python3 launchable/render_acs_console_bootstrap.py /private/tmp/acs-openclaw-workshop-setup.sh` from the reviewed checkout.
+5. Enter the workshop-only `nvapi-` key only at the hidden prompt. Validate the output owner, regular-file type, mode `0600`, reviewed source pin, Bash syntax, and byte size without printing its contents. It must be no larger than 16,384 bytes.
+6. Keep access set to **Only my organization** during this update. Save only the private rendered body in the setup-script field of the existing saved Launchable `env-3Hlp4pHBlTTlfDxfH41KkGhTeCV`. Remove every Launch parameter and Setup value, then save once.
+7. After the save is confirmed, delete `/private/tmp/acs-openclaw-workshop-setup.sh` and verify that it is absent. Never store the key in source, a Launchable default, documentation, logs, chat, screenshots, or workshop files. Monitor its use during the workshop and revoke it after the workshop.
+8. Create a future fresh deployment from the saved definition. Verify automatic OpenClaw sign-in, completion of all four prompts, display of all four images, and the **Download Results** service.
+9. Only after this fresh-deployment pass may access change to **Anyone with the link**.
 
-Preserve the existing API-key field, one NVIDIA L4, Secure Link ports `18788` and `8765`, and all other access settings during the update.
+Preserve one NVIDIA L4, Secure Link ports `18788` and `8765`, and all other access settings during the update.

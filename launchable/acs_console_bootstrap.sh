@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+set +x +v
 
 umask 077
 
@@ -23,10 +24,17 @@ require_clean_checkout() {
   [[ -z "${checkout_status}" ]] || die "the pinned checkout is not clean."
 }
 
-[[ -n "${NVIDIA_INFERENCE_API_KEY:-}" ]] ||
-  die "NVIDIA_INFERENCE_API_KEY is required."
-launch_key="${NVIDIA_INFERENCE_API_KEY}"
-unset NVIDIA_INFERENCE_API_KEY
+unset launch_key
+launch_key=__NVIDIA_INFERENCE_API_KEY__
+unset NVIDIA_INFERENCE_API_KEY NVIDIA_API_KEY
+if [[ "${launch_key}" == __NVIDIA_INFERENCE_API_KEY_[_] ]]; then
+  unset launch_key
+  die "the ACS bootstrap is unrendered; use the private rendered bootstrap."
+fi
+if [[ "${launch_key}" != nvapi-* || "${launch_key}" == "nvapi-" ]]; then
+  unset launch_key
+  die "the ACS bootstrap key must begin with nvapi- and must not be bare nvapi-."
+fi
 
 [[ "${repo_commit}" =~ ^[0-9a-f]{40}$ ]] ||
   die "repo_commit must be a full commit SHA."

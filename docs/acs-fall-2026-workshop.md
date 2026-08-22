@@ -27,20 +27,20 @@ Complete these steps before you arrive:
 2. Sign in to [NVIDIA Brev](https://brev.nvidia.com/). Complete its onboarding
    and make sure your organization has Brev credits or a payment method.
 3. Open the [NVIDIA API-key page](https://build.nvidia.com/settings/api-keys).
-   Generate and copy one API key. Complete phone verification if requested. The
-   conversational lab uses
-   [NVIDIA Nemotron 3 Super 120B-A12B](https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b?nim=hosted).
+   Generate and copy one API key. This key is only for the nvMolKit + Nemotron
+   Notebook. Complete phone verification if requested.
 
 Hosted prototype access can be rate-limited. Brev GPU compute is separate and billable.
 Never paste the key into chat, a screenshot, or a file. Paste it only into the
-correct Launchable setup field:
+Notebook Launchable field shown below. Conversational OpenClaw is already
+configured for the workshop and does not ask you for a credential.
 
-| Required environment | Launchable ID | API-key field | Model use |
+| Required environment | Launchable ID | Attendee setup | Model use |
 | --- | --- | --- | --- |
-| nvMolKit + Nemotron Notebook | `env-3HJtJW3qHg4Dw1I3xt75BfpBmZW` | `NVIDIA_API_KEY` | Module 1: no LLM; hosted Modules 2–3 and companion: `nvidia/nemotron-3-nano-30b-a3b` |
-| Conversational OpenClaw | `env-3Hlp4pHBlTTlfDxfH41KkGhTeCV` | `NVIDIA_INFERENCE_API_KEY` | [NVIDIA Nemotron 3 Super 120B-A12B](https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b?nim=hosted) |
+| nvMolKit + Nemotron Notebook | `env-3HJtJW3qHg4Dw1I3xt75BfpBmZW` | Enter the API key in `NVIDIA_API_KEY` | Module 1: no LLM; hosted Modules 2–3 and companion: `nvidia/nemotron-3-nano-30b-a3b` |
+| Conversational OpenClaw | `env-3Hlp4pHBlTTlfDxfH41KkGhTeCV` | No API key or Setup values | [NVIDIA Nemotron 3 Super 120B-A12B](https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b?nim=hosted) |
 
-Use the same private API-key value in both fields.
+Keep the Notebook key private. You will not use it in Conversational OpenClaw.
 
 ## Complete both required labs
 
@@ -54,9 +54,11 @@ Use the same private API-key value in both fields.
 Both Launchables are required. Complete the nvMolKit + Nemotron notebook first,
 then complete the conversational OpenClaw lab.
 
-For each deployment, use the signed-in Launchable page and confirm that the
-required setup field is present, setup completes, and the expected app opens.
-Repeat these checks for each new deployment. This guide makes no live-readiness claim.
+For the Notebook deployment, use the signed-in Launchable page and confirm that
+the required `NVIDIA_API_KEY` Setup field is present, setup completes, and the
+expected app opens. For the conversational OpenClaw deployment, confirm that
+there are no Setup values, setup completes, and the expected app opens. Repeat
+these checks for each new deployment. This guide makes no live-readiness claim.
 
 ## Required Lab 1 — nvMolKit + Nemotron Notebook
 
@@ -111,10 +113,14 @@ data, and configured
 [nvMolKit](https://github.com/NVIDIA-BioNeMo/nvMolKit) capabilities.
 
 1. Use the default hardware. Confirm that the visible row shows one NVIDIA L4,
-   x86-64, 4 CPUs, 16 GiB RAM, and 128 GiB disk. The row does not need to show `g6.xlarge`.
-2. Enter the API key in `NVIDIA_INFERENCE_API_KEY`, then deploy.
-3. Wait until setup is ready. Open **Open Chemistry Agent** and create one new session.
-4. For the tested workshop path, paste the four prompts below unchanged and in order into that same session. Wait for each answer before sending the next prompt.
+   x86-64, 4 CPUs, 16 GiB RAM, and 128 GiB disk. The row does not need to show
+   `g6.xlarge`. There are no Setup values to enter. Select **Deploy**.
+2. Wait until setup is ready.
+3. Open **Open Chemistry Agent**. Access is automatic.
+4. Create one new session.
+5. For the tested workshop path, paste the four prompts below unchanged and in
+   order into that same session. Wait for each answer before sending the next
+   prompt.
 
 The installed `nvmolkit-usage` skill remains available for optional exploration
 after the tested exercise. It describes the supported

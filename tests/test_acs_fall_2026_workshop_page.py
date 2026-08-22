@@ -308,9 +308,10 @@ def test_agentic_ai_sandbox_and_chemistry_roles_are_clear() -> None:
     assert "https://github.com/NVIDIA-BioNeMo/nvMolKit" in official_links
 
 
-def test_prework_keeps_one_account_one_secret_and_separate_setup_fields() -> None:
+def test_prework_keeps_the_notebook_key_and_makes_openclaw_zero_input() -> None:
     source = _source()
     prework = _section(source, "Before the workshop")
+    compact_prework = " ".join(prework.split())
 
     for required in (
         "one NVIDIA account",
@@ -322,24 +323,27 @@ def test_prework_keeps_one_account_one_secret_and_separate_setup_fields() -> Non
         "Brev GPU compute is separate and billable",
         "Never paste the key into chat, a screenshot, or a file",
         "`NVIDIA_API_KEY`",
-        "`NVIDIA_INFERENCE_API_KEY`",
-        "same private API-key value",
+        "This key is only for the nvMolKit + Nemotron Notebook",
+        "No API key or Setup values",
     ):
-        assert required in prework
+        assert required in compact_prework
 
     expected_table = (
-        "| Required environment | Launchable ID | API-key field | Model use |\n"
+        "| Required environment | Launchable ID | Attendee setup | Model use |\n"
         "| --- | --- | --- | --- |\n"
         "| nvMolKit + Nemotron Notebook | "
-        "`env-3HJtJW3qHg4Dw1I3xt75BfpBmZW` | `NVIDIA_API_KEY` | "
+        "`env-3HJtJW3qHg4Dw1I3xt75BfpBmZW` | Enter the API key in "
+        "`NVIDIA_API_KEY` | "
         "Module 1: no LLM; hosted Modules 2–3 and companion: "
         "`nvidia/nemotron-3-nano-30b-a3b` |\n"
         "| Conversational OpenClaw | `env-3Hlp4pHBlTTlfDxfH41KkGhTeCV` | "
-        "`NVIDIA_INFERENCE_API_KEY` | "
+        "No API key or Setup values | "
         "[NVIDIA Nemotron 3 Super 120B-A12B]"
         "(https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b?nim=hosted) |"
     )
     assert expected_table in prework
+    assert "`NVIDIA_INFERENCE_API_KEY`" not in prework
+    assert "Use the same private API-key value in both fields." not in prework
 
 
 def test_models_are_separate_by_required_lab_and_notebook_module() -> None:
@@ -532,6 +536,7 @@ def test_notebook_module_2_and_3_attendee_actions_are_explicit() -> None:
 
 def test_conversational_lab_keeps_hardware_session_and_recovery_contract() -> None:
     lab_2 = _section(_source(), "Required Lab 2 — Conversational OpenClaw")
+    compact_lab_2 = " ".join(lab_2.split())
 
     for required in (
         "sandboxed conversational workspace",
@@ -541,10 +546,11 @@ def test_conversational_lab_keeps_hardware_session_and_recovery_contract() -> No
         "16 GiB RAM",
         "128 GiB disk",
         "does not need to show `g6.xlarge`",
-        "Enter the API key in `NVIDIA_INFERENCE_API_KEY`",
+        "There are no Setup values to enter. Select **Deploy**",
         "Wait until setup is ready",
         "Open **Open Chemistry Agent**",
-        "create one new session",
+        "Access is automatic",
+        "Create one new session",
         "paste the four prompts below unchanged and in order",
         "optional exploration",
         "If an LLM request times out",
@@ -552,14 +558,38 @@ def test_conversational_lab_keeps_hardware_session_and_recovery_contract() -> No
         "Do not retry individual commands",
         "After a second timeout, ask the facilitator",
     ):
-        assert required in lab_2
+        assert required in compact_lab_2
+
+    attendee_actions = (
+        "Use the default hardware",
+        "There are no Setup values to enter. Select **Deploy**",
+        "Wait until setup is ready",
+        "Open **Open Chemistry Agent**",
+        "Access is automatic",
+        "Create one new session",
+        "paste the four prompts below unchanged and in order",
+    )
+    positions = [compact_lab_2.index(action) for action in attendee_actions]
+    assert positions == sorted(positions)
+    for forbidden in (
+        "NVIDIA_INFERENCE_API_KEY",
+        "Enter the API key",
+        "token",
+        "password",
+        "administrator",
+        "setup-script",
+    ):
+        assert forbidden not in compact_lab_2
 
 
 def test_deployment_checks_are_evergreen_without_a_live_readiness_claim() -> None:
     both_labs = _section(_source(), "Complete both required labs")
 
-    assert "For each deployment" in both_labs
     assert "signed-in Launchable page" in both_labs
+    assert "For the Notebook deployment" in both_labs
+    assert "required `NVIDIA_API_KEY` Setup field" in both_labs
+    assert "For the conversational OpenClaw deployment" in both_labs
+    assert "no Setup values" in both_labs
     assert "setup completes" in both_labs
     assert "expected app opens" in both_labs
     assert "This guide makes no live-readiness claim." in both_labs
