@@ -349,3 +349,84 @@ The release is complete only when:
 - concurrent first-run locking;
 - automated use of an undocumented Brev Console endpoint; and
 - claiming browser acceptance from terminal, trajectory, or artifact evidence.
+
+## Approved Post-Rollback Stabilization Amendment
+
+This section is authoritative over conflicting live-operation, QA-count, and
+Launchable-handoff text above. The user approved this bounded continuation on
+2026-08-21 after the first live patch attempt was rolled back and the trusted
+backup was verified.
+
+### One-process transaction lock and stale prepared recovery
+
+The host patch process must acquire one fixed, non-blocking host lock before it
+reads, reconciles, creates, or changes any operation journal. It holds that lock
+until apply or rollback exits. A second cooperating operation, including one
+that uses the same state directory, must fail before backup or workspace
+mutation.
+
+Only the current lock holder may recover a stale `prepared` reservation. It may
+remove the reservation only when the journal proves that no authoritative
+backup was committed and no workspace mutation began. The operating system
+releases the lock after a hard kill, so the next exact apply can recover that
+pre-mutation reservation. Any evidence of a committed backup, apply start, or
+ambiguous state remains fail closed and requires the normal rollback path.
+
+### No-replay Brev transport controller
+
+State-changing patch execution must not expose the patch exit status directly
+to `brev exec`, because the observed transport can repeat a command after a
+nonzero remote exit. A small reviewed host controller accepts an exact
+invocation ID and exact patch arguments, claims a private mode-`0700`
+invocation directory atomically, and invokes the patch at most once.
+
+The controller captures the patch's single closed JSON receipt and inner exit
+code, validates their types and closure, and atomically writes one terminal
+transport receipt. After the invocation is claimed, the controller returns
+outer exit `0` for pass and fail outcomes. A duplicate controller invocation
+with the same ID never calls the patch; it reports the existing terminal state
+or `in_progress` and returns `0`. A separate read-only command retrieves the
+terminal receipt. Pre-invocation validation failures are also recorded without
+calling the patch.
+
+The controller must not emit secrets, session IDs, tokenized URLs, backup
+contents, or unrestricted paths. Its tests must prove one patch call across
+duplicate invocations, faithful inner failure recording, closed receipts, and
+safe rejection of malformed IDs and directories.
+
+### Final local and live decision
+
+After independent implementation and review, run the existing verifier suite
+and live-operation suite once against the final `HEAD`. New non-Critical
+findings are residual risks; a Critical finding blocks the canary.
+
+Make one canary attempt on exact instance `8id74izoa` with a new state directory
+and invocation ID. Preserve the already trusted backup and create a separate
+trusted backup for the canary. Install only the reviewed runner, `TOOLS.md`,
+manifest, patch, controller, QA driver, and verifier package. Run exactly one
+fresh four-prompt QA trajectory. Verify that trajectory, the ZIP, the four PNG
+files, installed hashes, modes, manifest, loop setting, GPU, and untouched main
+session. Keep the patch only if all required checks pass; otherwise invoke the
+reviewed rollback through the same no-replay controller and verify exact
+restoration.
+
+### Publication and future-deployment boundary
+
+Only a validated canary permits source push, public workshop-page push, and
+bootstrap repinning. Update saved Launchable
+`env-3Hlp4pHBlTTlfDxfH41KkGhTeCV` only through a supported, callable,
+authenticated Console, CLI, connector, or API. Do not automate an undocumented
+private endpoint or reuse raw browser credentials. If no supported authoring
+surface is callable, report that exact remaining manual action.
+
+After the saved definition is confirmed, make at most one fresh deployment,
+after read-only confirmation of its exact type and price and duplicate-create
+protection. Browser auto-login, native image rendering, and clicked-download
+hash verification are distinct required gates on that fresh deployment.
+
+### Residual boundary
+
+The host lock coordinates reviewed patch processes. It does not stop an
+actively hostile same-UID process from writing the workspace while a patch is
+running. Record that limitation as a residual risk unless the platform exposes
+a supported quiesce boundary.

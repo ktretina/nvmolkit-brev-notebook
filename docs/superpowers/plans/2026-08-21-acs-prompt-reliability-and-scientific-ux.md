@@ -41,6 +41,16 @@ env PYTHONPATH=. MPLCONFIGDIR=/private/tmp/acs-workshop-mpl \
 
 Run only one heavy test command at a time on the Mac.
 
+## Verified implementation amendments
+
+Live CLI inspection and independent review produced these corrections. They are authoritative over older pseudocode later in this plan:
+
+- Prompt 2 asks how Butina groups molecules from distances **derived from GPU-computed Tanimoto similarities**. Its approved prompt SHA-256 is `5d556991910812a24bb09b23cd250fd4a7157986948082fb8cc05cb3d52c1f5e`.
+- NemoClaw `v0.0.102` does not provide `nemoclaw <sandbox> config`. Runtime settings use `nemoclaw <sandbox> exec --workdir /sandbox/.openclaw/workspace -- openclaw config set/get/unset`, strict JSON, and one explicit `gateway restart --quiet`.
+- OpenClaw `2026.7.1` tool calls include `partialArgs`, which must decode to the exact `arguments` object. Accepted result messages require `toolName == "exec"` and `isError is false`. Events use `schemaVersion == 1` and `traceSchema == "openclaw-trajectory"`.
+- Terminal objective publication uses a private intended terminal-ZIP digest and a trusted prepare, journal, then public-commit sequence. Prompt 3 replay never creates its first trust binding from public directory/ZIP copies. Raw ZIP size is capped before reading.
+- The verifier independently reconstructs every canonical lesson/objective answer, validates complete causal result schemas, parses and decodes complete PNG chunk streams, and checks both local and central ZIP headers without extraction.
+
 ### Task 1: Add closed execution provenance to compact stage results
 
 **Files:**
@@ -312,7 +322,8 @@ def test_lesson_answers_ground_cpu_gpu_work_without_performance_claims(
     )
     assert answer == (
         "## Question\nWhich molecules are similar, and how does Butina group "
-        "them from GPU-computed Tanimoto distances?\n\n"
+        "them from distances derived from GPU-computed Tanimoto "
+        "similarities?\n\n"
         f"## What ran\n{expected_what_ran}\n\n"
         "## Measured result\n"
         f"- {EXPECTED_STAGE_RESULTS['measure_tanimoto_similarity']}\n"
@@ -420,7 +431,7 @@ LESSON_ANSWER_SPECS: Final = {
     "relationships-and-groups": LessonAnswerSpec(
         question=(
             "Which molecules are similar, and how does Butina group them from "
-            "GPU-computed Tanimoto distances?"
+            "distances derived from GPU-computed Tanimoto similarities?"
         ),
         meaning=(
             "The similarity stage compares the fixed fingerprints; Butina then "
@@ -1175,7 +1186,7 @@ MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/01-inspection/library_previe
 Prompt 2:
 
 ```text
-Question: Which molecules are similar, and how does Butina group them from the GPU-computed Tanimoto distances?
+Question: Which molecules are similar, and how does Butina group them from distances derived from GPU-computed Tanimoto similarities?
 
 Scientific objective:
 Find the strongest fingerprint-space relationships in the fixed sample, then group molecules with a fixed Butina distance rule. Keep similarity, distance, and CPU/GPU responsibilities distinct.
@@ -1960,7 +1971,7 @@ PROMPT_IDS: Final = (
 )
 PROMPT_SHA256: Final = (
     "39ca26c1b494dbe01bcbaabf27d72d755b444915e9ff26c874e629f09610bf22",
-    "b9da36b3ce4d6a1bb3e3965e8dacfe72f2fd8ab6f05b54b43862aa0c4cddd5c9",
+    "5d556991910812a24bb09b23cd250fd4a7157986948082fb8cc05cb3d52c1f5e",
     "6779b1bfbe141a72c795d5e648ad33a5e7ddd55a8bc953b0c1ae116f757be34a",
     "ec93fcfa236b6000980178626b322aeb0786a52a53a0132338784221c24550ea",
 )
@@ -3033,3 +3044,79 @@ Report:
 - the saved Launchable Console bootstrap action still required from the user.
 
 Do not claim full attendee/browser qualification until authenticated auto-login, all four native image renders, and the clicked-download SHA check all pass.
+
+### Task 11: Execute the approved post-rollback stabilization
+
+This task is authoritative over conflicting live-QA counts and Console-handoff
+steps above.
+
+- [ ] **Step 1: Add RED tests for the two stabilization controls**
+
+Add focused live-operation tests that prove a hard kill during the pre-backup
+`prepared` phase releases the full-process lock and permits one safe next apply,
+while a concurrent same-state or different-state apply fails before backup.
+Add controller tests that prove a repeated invocation ID calls the patch at
+most once, stores the exact inner exit outcome, returns outer exit `0` after the
+claim, and rejects malformed input before patch execution.
+
+- [ ] **Step 2: Implement the smallest GREEN changes**
+
+Hold one fixed non-blocking host lock for the full patch process. Reconcile only
+an unambiguously pre-mutation stale `prepared` journal while holding that lock.
+Add the no-replay controller with atomic claim and terminal receipt files. Do
+not add general transaction, archive, metadata, or verifier features.
+
+- [ ] **Step 3: Obtain independent spec and quality reviews**
+
+Require no open Critical finding. Record any new non-Critical finding as a
+residual risk instead of expanding scope.
+
+- [ ] **Step 4: Run the two required final suites once**
+
+Run, one heavy command at a time:
+
+```bash
+env PYTHONPATH=. MPLCONFIGDIR=/private/tmp/acs-workshop-mpl \
+  /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 -m pytest -q \
+  tests/test_verify_acs_openclaw_trajectory.py
+
+env PYTHONPATH=. MPLCONFIGDIR=/private/tmp/acs-workshop-mpl \
+  /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 -m pytest -q \
+  tests/test_acs_live_instance_patch.py
+```
+
+Record the exact counts and duration. Do not rerun either complete suite during
+this release decision unless the code changes again; if code changes, the old
+result no longer describes final `HEAD` and the release remains blocked.
+
+- [ ] **Step 5: Make one exact live canary decision**
+
+Re-list organization `agents-in-ls`; verify exact instance name, ID
+`8id74izoa`, state, type, GPU, shared ownership, and task namespaces. Stage the
+reviewed package. Use a new private state directory and no-replay invocation ID.
+Apply once, retrieve the terminal receipt read-only, and verify the installed
+state. Run exactly one fresh four-prompt QA trajectory and the committed
+verifier, plus direct ZIP and PNG checks. Keep the update only after every gate
+passes. Otherwise roll back once through a new no-replay invocation and verify
+the trusted restoration. Preserve both trusted backups.
+
+- [ ] **Step 6: Publish only after the live pass**
+
+Repin the generated bootstrap to the final source commit, verify its size and
+syntax, and create the later bootstrap commit. Push the source branch without
+force. Synchronize the accepted workshop page to `NVIDIA/digital-biology-examples`
+on `gh-pages` byte-for-byte, commit, and push without force.
+
+- [ ] **Step 7: Update and qualify one future deployment**
+
+Use only a supported authenticated Launchable authoring surface to update exact
+Launchable `env-3Hlp4pHBlTTlfDxfH41KkGhTeCV`. Preserve its secret field,
+hardware, ports, organization, and access settings. If no supported surface is
+callable, stop and report the exact manual field update.
+
+After read-only confirmation of exact deployment type and price, prevent a
+duplicate create and make at most one fresh deployment under the user's
+approved scope. Verify fresh browser auto-login, all four native images in one
+four-prompt session, and a clicked `Download Results` ZIP whose hash equals the
+accepted artifact. Report each gate separately and do not infer browser results
+from terminal evidence.
