@@ -361,8 +361,10 @@ if operation == "upload":
         raise SystemExit(23)
     source = Path(source_raw)
     destination = mapped(destination_raw)
-    destination.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination / source.name)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_dir() and not destination.is_symlink():
+        shutil.rmtree(destination)
+    shutil.copy2(source, destination)
 elif operation == "download":
     source = mapped(source_raw)
     destination = Path(destination_raw)
@@ -854,6 +856,16 @@ def test_trusted_backup_transfer_uses_private_sandbox_path(
     assert downloads[0][4].startswith(expected_root)
     assert len(uploads) == 3
     assert all(call[5].startswith(expected_root) for call in uploads)
+    destinations_by_source = {Path(call[4]).name: call[5] for call in uploads}
+    assert destinations_by_source["acs_workshop_runner.py"].endswith(
+        "/stage/acs_workshop_runner.py"
+    )
+    assert destinations_by_source["acs_workspace_tools.md"].endswith(
+        "/stage/acs_workspace_tools.md"
+    )
+    assert destinations_by_source["backup-package.json"].endswith(
+        "/backup-package.json"
+    )
     assert all(
         "/tmp/acs-prompt-reliability-20260821" not in argument
         for call in calls

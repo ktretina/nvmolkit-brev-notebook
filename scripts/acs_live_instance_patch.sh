@@ -1351,7 +1351,7 @@ stage_trusted_backup() {
   sandbox_action prepare-restore "${operation_id}" "${restore_id}" || return 1
   "${openshell}" sandbox upload "${sandbox}" \
     "${state_dir}/${operation_id}/backup-package.json" \
-    "${sandbox_state_root}/${operation_id}/restore/${restore_id}" \
+    "${sandbox_state_root}/${operation_id}/restore/${restore_id}/backup-package.json" \
     >/dev/null 2>&1 || return 1
 }
 
@@ -1451,10 +1451,12 @@ if [[ "${mode}" == "apply" ]]; then
 
   "${openshell}" sandbox upload "${sandbox}" \
     "${bundle_dir}/acs_workshop_runner.py" \
-    "${sandbox_state_root}/${operation_id}/stage" >/dev/null 2>&1
+    "${sandbox_state_root}/${operation_id}/stage/acs_workshop_runner.py" \
+    >/dev/null 2>&1
   "${openshell}" sandbox upload "${sandbox}" \
     "${bundle_dir}/launchable/acs_workspace_tools.md" \
-    "${sandbox_state_root}/${operation_id}/stage" >/dev/null 2>&1
+    "${sandbox_state_root}/${operation_id}/stage/acs_workspace_tools.md" \
+    >/dev/null 2>&1
   sandbox_action install "${operation_id}" "${runner_hash}" "${tools_hash}"
   "${nemoclaw}" "${sandbox}" exec --workdir "${workspace}" -- \
     env PYTHONDONTWRITEBYTECODE=1 python3 \
