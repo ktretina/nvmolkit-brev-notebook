@@ -138,16 +138,20 @@ def test_rendered_setup_persists_workshop_key_and_ignores_environment_keys(tmp_p
     ) < invocations.index("HEALTH")
 
 
-def test_rendered_setup_rejects_non_inference_key_without_leaking(tmp_path):
-    invalid_key = "nvapi-rendered-build-key-must-not-leak"
-    result, fake_home, log = _run_setup(tmp_path, rendered_key=invalid_key)
+def test_renderer_rejects_invalid_prefix_before_script_exists(tmp_path):
+    invalid_key = "nvapi-rendered-sentinel-must-not-leak"
 
-    assert result.returncode != 0
-    assert "Inference Hub key beginning with sk-" in result.stderr
-    assert invalid_key not in result.stdout + result.stderr
-    assert not log.exists()
+    with pytest.raises(ValueError, match="beginning with sk-"):
+        _run_setup(tmp_path, rendered_key=invalid_key)
+
+    assert not (tmp_path / "brev-generated-setup.sh").exists()
+    assert not (tmp_path / "invocations.log").exists()
     assert not (
-        fake_home / ".config" / "nvmolkit" / "NVIDIA_INFERENCE_API_KEY"
+        tmp_path
+        / "home"
+        / ".config"
+        / "nvmolkit"
+        / "NVIDIA_INFERENCE_API_KEY"
     ).exists()
 ```
 

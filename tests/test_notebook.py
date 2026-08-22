@@ -103,6 +103,14 @@ def test_plan_routes_fake_key_rendering_through_the_trusted_renderer():
     assert re.search(r"pure\s+renderer validates", plan)
     assert "`shlex.quote`" in plan
     assert "fake keys" in plan
+    assert (
+        "result, fake_home, log = _run_setup(tmp_path, rendered_key=invalid_key)"
+        not in plan
+    )
+    assert "test_renderer_rejects_invalid_prefix_before_script_exists" in plan
+    assert 'with pytest.raises(ValueError, match="beginning with sk-"):' in plan
+    assert 'tmp_path / "brev-generated-setup.sh"' in plan
+    assert 'tmp_path / "invocations.log"' in plan
 
 
 def test_setup_uses_brev_managed_python_and_leaves_jupyter_to_brev():
