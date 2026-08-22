@@ -153,6 +153,14 @@ if len(args) < 2 or args[0] != "acs-chemistry-agent":
 
 root = Path(os.environ["ACS_FAKE_SANDBOX_ROOT"])
 loop_path = Path(os.environ["ACS_FAKE_LOOP_STATE"])
+protected = (
+    "TOOLS.md",
+    "acs_workshop_runner.py",
+    "chemistry_workflow.py",
+    "data/sample_molecules.csv",
+    "data/PROVENANCE.md",
+    "objective_challenge.py",
+)
 
 
 def mapped(value: str) -> str:
@@ -221,6 +229,14 @@ if operation == "sessions" and args[2:3] == ["export"]:
     raise SystemExit(0)
 
 if operation == "gateway" and args[2:] == ["restart", "--quiet"]:
+    if os.environ.get("ACS_FAKE_GATEWAY_NORMALIZE_PROTECTED_MODES") == "1":
+        for relative in protected:
+            (root / "sandbox/.openclaw/workspace" / relative).chmod(0o460)
+    restarted = os.environ.get("ACS_FAKE_GATEWAY_RESTARTED")
+    if restarted:
+        Path(restarted).touch()
+    if os.environ.get("ACS_FAKE_FAIL_GATEWAY_RESTART") == "1":
+        raise SystemExit(28)
     raise SystemExit(0)
 
 if operation != "exec" or "--" not in args:
@@ -230,6 +246,14 @@ command = args[args.index("--") + 1 :]
 if command[:3] == ["env", "NO_COLOR=1", "NODE_NO_WARNINGS=1"]:
     command = command[3:]
 if command[:3] == ["openclaw", "config", "get"]:
+    restarted = os.environ.get("ACS_FAKE_GATEWAY_RESTARTED")
+    if (
+        os.environ.get("ACS_FAKE_FAIL_LOOP_READBACK_AFTER_RESTART") == "1"
+        and restarted
+        and Path(restarted).exists()
+    ):
+        print("injected post-restart readback failure", file=sys.stderr)
+        raise SystemExit(9)
     state = load_loop()
     if state["presence"] == "absent":
         if os.environ.get("ACS_FAKE_ABSENT_STDOUT_NEWLINE") == "1":
@@ -254,12 +278,21 @@ if command[:3] == ["openclaw", "config", "unset"]:
         raise SystemExit(
             0 if os.environ.get("ACS_FAKE_UNSET_SUPPORTED", "1") == "1" else 2
         )
+    if os.environ.get("ACS_FAKE_FAIL_CONFIG_MUTATION") == "1":
+        raise SystemExit(27)
     save_loop("absent")
     raise SystemExit(0)
 if command[:3] == ["openclaw", "config", "set"]:
-    if os.environ.get("ACS_FAKE_TERM_ON_CONFIG_SET") == "1":
+    term_marker = loop_path.with_name(f"{loop_path.name}.term-on-config-set")
+    if (
+        os.environ.get("ACS_FAKE_TERM_ON_CONFIG_SET") == "1"
+        and not term_marker.exists()
+    ):
+        term_marker.touch()
         os.kill(os.getppid(), signal.SIGTERM)
         raise SystemExit(143)
+    if os.environ.get("ACS_FAKE_FAIL_CONFIG_MUTATION") == "1":
+        raise SystemExit(27)
     save_loop("present", command[4] == "true")
     raise SystemExit(0)
 
@@ -267,6 +300,16 @@ mapped_command = [mapped(value) for value in command]
 if "-c" in mapped_command and len(mapped_command) > mapped_command.index("-c") + 2:
     code_index = mapped_command.index("-c") + 1
     helper_action = mapped_command[code_index + 1]
+    if (
+        helper_action == "reharden-protected"
+        and os.environ.get("ACS_FAKE_REHARDEN_UID_MISMATCH") == "1"
+    ):
+        mapped_command[code_index] = (
+            "import os\n"
+            "_acs_real_getuid = os.getuid\n"
+            "os.getuid = lambda: _acs_real_getuid() + 1\n"
+            + mapped_command[code_index]
+        )
     if helper_action == "backup" and os.environ.get("ACS_FAKE_BACKUP_STARTED"):
         started = Path(os.environ["ACS_FAKE_BACKUP_STARTED"])
         release = Path(os.environ["ACS_FAKE_BACKUP_RELEASE"])
@@ -488,6 +531,28 @@ def _read_commands(path: Path) -> tuple[tuple[str, ...], ...]:
     if not path.exists():
         return ()
     return tuple(tuple(json.loads(line)) for line in path.read_text().splitlines())
+
+
+def _last_helper_call(path: Path, action: str) -> tuple[str, ...]:
+    return next(call for call in reversed(_read_commands(path)) if action in call)
+
+
+def _replay_helper_call(
+    call: tuple[str, ...], environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        call,
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _set_protected_modes(workspace: Path, mode: int) -> None:
+    for relative in PROTECTED_FILES:
+        (workspace / relative).chmod(mode)
 
 
 def _base_environment(
@@ -808,6 +873,257 @@ def test_patch_apply_and_idempotent_rollback_restore_exact_prior_state(
     assert sum(call[2:] == ("gateway", "restart", "--quiet") for call in calls) == 2
     if prior_state["presence"] == "absent":
         assert any("unset" in call for call in calls)
+
+
+def test_gateway_mode_normalization_is_rehardened_for_apply_and_rollback(
+    tmp_path: Path,
+    fake_environment: tuple[dict[str, str], Path, Path, Path],
+) -> None:
+    environment, command_log, _, sandbox_root = fake_environment
+    workspace = sandbox_root / WORKSPACE
+    original = _snapshot(workspace)
+    bundle = _seed_bundle(tmp_path)
+    environment["ACS_FAKE_GATEWAY_NORMALIZE_PROTECTED_MODES"] = "1"
+    environment["ACS_FAKE_FAIL_FINAL_VERIFY"] = "1"
+
+    failed = _run_patch("apply", bundle, tmp_path / "failed-state", environment)
+
+    assert failed.returncode != 0
+    assert json.loads(failed.stdout)["rollback"] is True
+    assert _snapshot(workspace) == original
+    assert all(
+        stat.S_IMODE((workspace / relative).stat().st_mode) == 0o444
+        for relative in PROTECTED_FILES
+    )
+
+    environment.pop("ACS_FAKE_FAIL_FINAL_VERIFY")
+    state_dir = tmp_path / "successful-state"
+    applied = _run_patch("apply", bundle, state_dir, environment)
+
+    assert applied.returncode == 0, (applied.stdout, applied.stderr)
+    assert all(
+        stat.S_IMODE((workspace / relative).stat().st_mode) == 0o444
+        for relative in PROTECTED_FILES
+    )
+
+    rolled_back = _run_patch("rollback", bundle, state_dir, environment)
+
+    assert rolled_back.returncode == 0, (rolled_back.stdout, rolled_back.stderr)
+    assert _snapshot(workspace) == original
+    calls = _read_commands(command_log)
+    reharden_calls = [
+        call
+        for call in calls
+        if call[0] == "nemoclaw" and "reharden-protected" in call
+    ]
+    assert len(reharden_calls) == 4
+    restart_indices = [
+        index
+        for index, call in enumerate(calls)
+        if call[2:] == ("gateway", "restart", "--quiet")
+    ]
+    assert len(restart_indices) == 4
+    for index in restart_indices:
+        assert "reharden-protected" in calls[index + 1]
+        assert "reharden-protected" not in calls[index + 2]
+
+
+def test_rollback_rehardens_before_fallible_post_restart_readback(
+    tmp_path: Path,
+    fake_environment: tuple[dict[str, str], Path, Path, Path],
+) -> None:
+    environment, command_log, _, sandbox_root = fake_environment
+    workspace = sandbox_root / WORKSPACE
+    bundle = _seed_bundle(tmp_path)
+    state_dir = tmp_path / "state"
+    applied = _run_patch("apply", bundle, state_dir, environment)
+    assert applied.returncode == 0, (applied.stdout, applied.stderr)
+    calls_before_rollback = len(_read_commands(command_log))
+    environment.update(
+        {
+            "ACS_FAKE_FAIL_LOOP_READBACK_AFTER_RESTART": "1",
+            "ACS_FAKE_GATEWAY_NORMALIZE_PROTECTED_MODES": "1",
+            "ACS_FAKE_GATEWAY_RESTARTED": str(tmp_path / "gateway-restarted"),
+        }
+    )
+
+    failed = _run_patch("rollback", bundle, state_dir, environment)
+
+    assert failed.returncode != 0
+    assert all(
+        stat.S_IMODE((workspace / relative).stat().st_mode) == 0o444
+        for relative in PROTECTED_FILES
+    )
+    rollback_calls = _read_commands(command_log)[calls_before_rollback:]
+    restart_indices = [
+        index
+        for index, call in enumerate(rollback_calls)
+        if call[2:] == ("gateway", "restart", "--quiet")
+    ]
+    assert restart_indices
+    assert all(
+        "reharden-protected" in rollback_calls[index + 1]
+        for index in restart_indices
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        ("config", "rollback_config_set_27"),
+        ("gateway", "rollback_gateway_restart_28"),
+    ],
+)
+def test_rollback_propagates_loop_restore_command_failures_without_completion(
+    tmp_path: Path,
+    fake_environment: tuple[dict[str, str], Path, Path, Path],
+    failure: str,
+    expected_code: str,
+) -> None:
+    environment, _, _, sandbox_root = fake_environment
+    workspace = sandbox_root / WORKSPACE
+    original = _snapshot(workspace)
+    bundle = _seed_bundle(tmp_path)
+    state_dir = tmp_path / "state"
+    applied = _run_patch("apply", bundle, state_dir, environment)
+    assert applied.returncode == 0, (applied.stdout, applied.stderr)
+    if failure == "config":
+        environment["ACS_FAKE_FAIL_CONFIG_MUTATION"] = "1"
+    else:
+        environment.update(
+            {
+                "ACS_FAKE_FAIL_GATEWAY_RESTART": "1",
+                "ACS_FAKE_GATEWAY_NORMALIZE_PROTECTED_MODES": "1",
+            }
+        )
+
+    failed = _run_patch("rollback", bundle, state_dir, environment)
+
+    assert failed.returncode != 0
+    receipt = json.loads(failed.stdout)
+    assert receipt["code"] == expected_code
+    assert receipt["rollback"] is False
+    operation_id = json.loads(
+        (state_dir / "current.json").read_text(encoding="utf-8")
+    )["operation_id"]
+    operation = json.loads(
+        (state_dir / operation_id / "operation.json").read_text(encoding="utf-8")
+    )
+    assert operation["rolled_back"] is False
+    global_state = (
+        Path("/tmp").resolve()
+        / f"acs-prompt-reliability-20260821-host-{environment['ACS_FAKE_UID']}"
+    )
+    active = json.loads((global_state / "active.json").read_text(encoding="utf-8"))
+    assert active["operation_id"] == operation_id
+    assert active["phase"] == "active"
+    assert all(
+        stat.S_IMODE((workspace / relative).stat().st_mode) == 0o444
+        for relative in PROTECTED_FILES
+    )
+
+    environment.pop("ACS_FAKE_FAIL_CONFIG_MUTATION", None)
+    environment.pop("ACS_FAKE_FAIL_GATEWAY_RESTART", None)
+    environment.pop("ACS_FAKE_GATEWAY_NORMALIZE_PROTECTED_MODES", None)
+    recovered = _run_patch("rollback", bundle, state_dir, environment)
+
+    assert recovered.returncode == 0, (recovered.stdout, recovered.stderr)
+    assert _snapshot(workspace) == original
+
+
+def test_direct_and_idempotent_rollback_accept_all_protected_at_0460(
+    tmp_path: Path,
+    fake_environment: tuple[dict[str, str], Path, Path, Path],
+) -> None:
+    environment, _, _, sandbox_root = fake_environment
+    workspace = sandbox_root / WORKSPACE
+    original = _snapshot(workspace)
+    bundle = _seed_bundle(tmp_path)
+    state_dir = tmp_path / "state"
+    applied = _run_patch("apply", bundle, state_dir, environment)
+    assert applied.returncode == 0, (applied.stdout, applied.stderr)
+    _set_protected_modes(workspace, 0o460)
+
+    rolled_back = _run_patch("rollback", bundle, state_dir, environment)
+
+    assert rolled_back.returncode == 0, (rolled_back.stdout, rolled_back.stderr)
+    assert json.loads(rolled_back.stdout)["idempotent"] is False
+    assert _snapshot(workspace) == original
+    _set_protected_modes(workspace, 0o460)
+
+    idempotent = _run_patch("rollback", bundle, state_dir, environment)
+
+    assert idempotent.returncode == 0, (idempotent.stdout, idempotent.stderr)
+    assert json.loads(idempotent.stdout)["idempotent"] is True
+    assert _snapshot(workspace) == original
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["manifest", "hash", "symlink", "hardlink", "wrong-owner", "mode"],
+)
+def test_reharden_rejects_invalid_state_before_any_chmod(
+    tmp_path: Path,
+    fake_environment: tuple[dict[str, str], Path, Path, Path],
+    mutation: str,
+) -> None:
+    environment, command_log, _, sandbox_root = fake_environment
+    workspace = sandbox_root / WORKSPACE
+    bundle = _seed_bundle(tmp_path)
+    applied = _run_patch("apply", bundle, tmp_path / "state", environment)
+    assert applied.returncode == 0, (applied.stdout, applied.stderr)
+    reharden_call = _last_helper_call(command_log, "reharden-protected")
+    _set_protected_modes(workspace, 0o460)
+    target = workspace / "chemistry_workflow.py"
+    if mutation == "manifest":
+        manifest = workspace / ".acs-workshop-state/manifest.json"
+        manifest.chmod(0o600)
+        manifest.write_text('{"malformed":true}\n', encoding="utf-8")
+        manifest.chmod(0o444)
+    elif mutation == "hash":
+        target.chmod(0o600)
+        target.write_text("tampered\n", encoding="utf-8")
+        target.chmod(0o460)
+    elif mutation == "symlink":
+        target.unlink()
+        target.symlink_to(workspace / "unrelated.txt")
+    elif mutation == "hardlink":
+        os.link(target, workspace / "hardlink-canary")
+    elif mutation == "wrong-owner":
+        environment["ACS_FAKE_REHARDEN_UID_MISMATCH"] = "1"
+    else:
+        target.chmod(0o640)
+    before = _snapshot(workspace)
+
+    rejected = _replay_helper_call(reharden_call, environment)
+
+    assert rejected.returncode != 0
+    assert _snapshot(workspace) == before
+
+
+@pytest.mark.parametrize("action", ["verify-installed", "verify-restored"])
+def test_verify_only_actions_reject_0460_without_mutation(
+    tmp_path: Path,
+    fake_environment: tuple[dict[str, str], Path, Path, Path],
+    action: str,
+) -> None:
+    environment, command_log, _, sandbox_root = fake_environment
+    workspace = sandbox_root / WORKSPACE
+    bundle = _seed_bundle(tmp_path)
+    state_dir = tmp_path / "state"
+    applied = _run_patch("apply", bundle, state_dir, environment)
+    assert applied.returncode == 0, (applied.stdout, applied.stderr)
+    if action == "verify-restored":
+        rolled_back = _run_patch("rollback", bundle, state_dir, environment)
+        assert rolled_back.returncode == 0, (rolled_back.stdout, rolled_back.stderr)
+    verify_call = _last_helper_call(command_log, action)
+    _set_protected_modes(workspace, 0o460)
+    before = _snapshot(workspace)
+
+    rejected = _replay_helper_call(verify_call, environment)
+
+    assert rejected.returncode != 0
+    assert _snapshot(workspace) == before
 
 
 def test_patch_accepts_standard_sticky_sandbox_tmp_parent(

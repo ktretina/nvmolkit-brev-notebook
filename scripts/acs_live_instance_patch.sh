@@ -1052,7 +1052,7 @@ def ensure_base():
     ensure_directory(BASE)
 
 
-def verify_protected_manifest():
+def validate_protected_contents():
     state = WORKSPACE / ".acs-workshop-state"
     safe_components(state)
     state_metadata = os.lstat(state)
@@ -1064,11 +1064,56 @@ def verify_protected_manifest():
     payload = decode(raw)
     if encoded(payload) != raw or type(payload) is not dict or set(payload) != {"files", "schema_version"} or payload["schema_version"] != 1 or type(payload["files"]) is not dict or set(payload["files"]) != set(PROTECTED):
         raise ValueError
+    metadata = {}
     for relative in PROTECTED:
         digest = payload["files"][relative]
         protected_raw, protected_metadata = read_regular(WORKSPACE / relative)
-        if type(digest) is not str or HEX.fullmatch(digest) is None or stat.S_IMODE(protected_metadata.st_mode) != 0o444 or hashlib.sha256(protected_raw).hexdigest() != digest:
+        if type(digest) is not str or HEX.fullmatch(digest) is None or hashlib.sha256(protected_raw).hexdigest() != digest:
             raise ValueError
+        metadata[relative] = protected_metadata
+    return metadata
+
+
+def verify_protected_manifest():
+    metadata = validate_protected_contents()
+    if any(stat.S_IMODE(value.st_mode) != 0o444 for value in metadata.values()):
+        raise ValueError
+
+
+def reharden_protected():
+    metadata = validate_protected_contents()
+    if any(stat.S_IMODE(value.st_mode) not in {0o444, 0o460} for value in metadata.values()):
+        raise ValueError
+    for relative in PROTECTED:
+        expected = metadata[relative]
+        descriptor = os.open(WORKSPACE / relative, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_mode,
+                opened.st_nlink,
+                opened.st_uid,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            ) != (
+                expected.st_dev,
+                expected.st_ino,
+                expected.st_mode,
+                expected.st_nlink,
+                expected.st_uid,
+                expected.st_size,
+                expected.st_mtime_ns,
+                expected.st_ctime_ns,
+            ):
+                raise ValueError
+            os.fchmod(descriptor, 0o444)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    verify_protected_manifest()
 
 
 def backup(operation):
@@ -1304,6 +1349,7 @@ def rollback(operation, restore_id, expected_hash):
         for label, temporary in prepared.items():
             quarantine_prepared(temporary, quarantine, label)
         raise
+    reharden_protected()
     verify_restored_targets(targets)
 
 
@@ -1333,6 +1379,8 @@ elif action == "verify-restored":
     verify_restored(*sys.argv[2:])
 elif action == "verify-installed":
     verify_installed(*sys.argv[2:])
+elif action == "reharden-protected":
+    reharden_protected()
 elif action == "reset":
     reset(*sys.argv[2:])
 else:
@@ -1414,14 +1462,38 @@ sandbox_action_capture() {
 restore_loop_state() {
   local presence="$1"
   local value="$2"
+  local mutation_status
   if [[ "${presence}" == "absent" ]]; then
-    "${nemoclaw}" "${sandbox}" exec --workdir "${workspace}" -- \
-      openclaw config unset "${loop_key}" >/dev/null 2>&1
+    if "${nemoclaw}" "${sandbox}" exec --workdir "${workspace}" -- \
+      openclaw config unset "${loop_key}" >/dev/null 2>&1; then
+      :
+    else
+      mutation_status=$?
+      failure_code="rollback_config_unset_${mutation_status}"
+      return 1
+    fi
   else
-    "${nemoclaw}" "${sandbox}" exec --workdir "${workspace}" -- \
-      openclaw config set "${loop_key}" "${value}" --strict-json >/dev/null 2>&1
+    if "${nemoclaw}" "${sandbox}" exec --workdir "${workspace}" -- \
+      openclaw config set "${loop_key}" "${value}" --strict-json >/dev/null 2>&1; then
+      :
+    else
+      mutation_status=$?
+      failure_code="rollback_config_set_${mutation_status}"
+      return 1
+    fi
   fi
-  "${nemoclaw}" "${sandbox}" gateway restart --quiet >/dev/null 2>&1
+  local restart_status
+  if "${nemoclaw}" "${sandbox}" gateway restart --quiet >/dev/null 2>&1; then
+    restart_status=0
+  else
+    restart_status=$?
+  fi
+  failure_code="rollback_modes"
+  sandbox_action reharden-protected || return 1
+  if (( restart_status != 0 )); then
+    failure_code="rollback_gateway_restart_${restart_status}"
+    return 1
+  fi
   local observed observed_presence observed_value
   local query_status
   if observed="$(query_loop_state "${state_dir}/.loop-restore-readback")"; then
@@ -1573,6 +1645,7 @@ if [[ "${mode}" == "apply" ]]; then
   "${nemoclaw}" "${sandbox}" exec --workdir "${workspace}" -- \
     openclaw config set "${loop_key}" true --strict-json >/dev/null 2>&1
   "${nemoclaw}" "${sandbox}" gateway restart --quiet >/dev/null 2>&1
+  sandbox_action reharden-protected
   observed_presence=""
   observed_value=""
   IFS=$'\t' read -r observed_presence observed_value < <(
@@ -1596,6 +1669,7 @@ IFS=$'\t' read -r operation_id prior_presence prior_value rolled_back runner_has
 if [[ "${mode}" == "rollback" ]]; then
   if [[ "${rolled_back}" == "true" ]]; then
     if ! stage_trusted_backup || ! \
+      sandbox_action reharden-protected || ! \
       sandbox_action verify-restored \
         "${operation_id}" "${restore_id}" "${backup_hash}" || ! \
       IFS=$'\t' read -r observed_presence observed_value < <(
