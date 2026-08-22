@@ -87,7 +87,7 @@ def _run_detached_phase_zero(
         '[[ -z "${NVIDIA_INFERENCE_API_KEY:-}" ]] || exit 82\n'
         '[[ "${NEMOCLAW_PROVIDER:-}" == custom ]] || exit 83\n'
         '[[ "${NEMOCLAW_ENDPOINT_URL:-}" == https://inference-api.nvidia.com/v1 ]] || exit 84\n'
-        '[[ "${NEMOCLAW_MODEL:-}" == nvidia/nvidia/nemotron-3-super-120b-a12b ]] || exit 85\n'
+        '[[ "${NEMOCLAW_MODEL:-}" == nvidia/nvidia/nemotron-3-super-v3 ]] || exit 85\n'
         '[[ "${NEMOCLAW_PREFERRED_API:-}" == openai-completions ]] || exit 86\n'
         '/bin/mkdir -p "$HOME/.local/bin" "$HOME/.nemoclaw"\n'
         'if [[ "$INSTALL_NEMOCLAW" == 1 ]]; then\n'
@@ -177,7 +177,7 @@ def test_phase_zero_setup_is_pinned_and_removes_transport_key_before_install():
     assert "b52f053a550fab90ab1dff4ab7f3a0b55b2506aeafd2062832e65632fdbcae70" in source
     assert "NEMOCLAW_PROVIDER=custom" in source
     assert "NEMOCLAW_ENDPOINT_URL=https://inference-api.nvidia.com/v1" in source
-    assert "NEMOCLAW_MODEL=nvidia/nvidia/nemotron-3-super-120b-a12b" in source
+    assert "NEMOCLAW_MODEL=nvidia/nvidia/nemotron-3-super-v3" in source
     assert "NEMOCLAW_PREFERRED_API=openai-completions" in source
     assert "NEMOCLAW_PROVIDER=build" not in source
     assert "NEMOCLAW_TRUSTED_PRIVATE_INFERENCE_HOSTS" not in source
