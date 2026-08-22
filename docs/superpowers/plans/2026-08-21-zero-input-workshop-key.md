@@ -4,7 +4,16 @@
 
 **Goal:** Remove every attendee-facing API-key input from the nvMolKit + Nemotron Notebook Launchable while keeping the shared workshop credential out of the repository.
 
-**Architecture:** `launchable/setup.sh` becomes a redacted operator template with one replaceable sentinel. The private Brev Console copy contains the workshop key and persists it to the existing protected file; repository tests render only fake keys. Launchable and notebook copy state that deployment has no Setup values and attendees do not create or enter an NVIDIA API key.
+**Architecture:** `launchable/setup.sh` becomes a redacted operator template with one replaceable sentinel. The trusted offline `launchable/render_setup.py` reads the workshop key at a hidden prompt and creates the private Brev Console copy outside the repository with mode `0600`; repository tests render only fake keys. The Console copy persists the key to the existing protected file. Launchable and notebook copy state that deployment has no Setup values and attendees do not create or enter an NVIDIA API key.
+
+## Security-review amendment
+
+Any later raw sentinel-replacement or private-working-copy snippet in this plan
+is superseded by `launchable/render_setup.py`. Operators must run
+`python3 launchable/render_setup.py /private/tmp/nvmolkit-workshop-setup.sh`
+from the repository, enter the workshop-only key at the hidden prompt, paste
+only the rendered file's contents into the saved Brev Console setup body, and
+delete the private rendered file after saving. Manual replacement is forbidden.
 
 **Tech Stack:** Bash, Python 3.12, pytest, Jupyter notebook JSON, Brev Launchable documentation.
 
@@ -219,6 +228,8 @@ git commit -m "Remove attendee key input from setup"
 - Modify: `README.md`
 - Modify: `launchable/fields.md`
 - Modify: `notebooks/02_agent_assisted_reframe_neighborhoods.ipynb`
+- Modify: `docs/superpowers/specs/2026-08-21-zero-input-workshop-key-design.md`
+- Modify: `docs/superpowers/plans/2026-08-21-zero-input-workshop-key.md`
 
 - [ ] **Step 1: Write failing documentation-contract tests**
 
@@ -238,7 +249,14 @@ def test_launchable_contract_fixes_storage_model_port_and_zero_setup_values():
     assert "port `8888`" in fields
     assert "Remove `NVIDIA_INFERENCE_API_KEY`, `NVIDIA_API_KEY`, `NEMOTRON_MODEL`, and `JUPYTER_PORT`" in fields
     assert "redacted operator template" in fields
-    assert "private working copy" in fields
+    assert "python3 launchable/render_setup.py /private/tmp/nvmolkit-workshop-setup.sh" in fields
+    assert "hidden prompt" in fields.lower()
+    assert "outside the repository" in fields
+    assert "mode `0600`" in fields
+    assert "paste only the rendered file" in fields.lower()
+    assert "delete the private rendered file after saving" in fields.lower()
+    assert "controls a deployed VM can recover" in fields
+    assert "rotate or revoke" in fields
 ```
 
 In `test_readme_preserves_launch_and_separate_acceptance_gates`, add:
@@ -247,6 +265,9 @@ In `test_readme_preserves_launch_and_separate_acceptance_gates`, add:
     assert "No Launch parameters or Setup values" in readme
     assert "Attendees enter no API key" in readme
     assert "required Text parameter" not in readme
+    assert "paste the current contents of `launchable/setup.sh`" not in readme
+    assert "python3 launchable/render_setup.py /private/tmp/nvmolkit-workshop-setup.sh" in readme
+    assert "hidden prompt" in readme.lower()
 ```
 
 In `test_release_docs_publish_the_three_notebook_path_and_launch_contract`, add
@@ -292,16 +313,23 @@ copy.
 Replace the numbered list under `## Launch` with this exact content:
 
 ```markdown
-1. Create or edit the Launchable in the Brev web Console using [`launchable/fields.md`](launchable/fields.md). Set the default disk storage to **75 GiB**. `launchable/setup.sh` is a redacted operator template, not a deployable script. Make a private working copy, replace its credential placeholder with the approved workshop-only Inference Hub key, and paste only that rendered copy into the Software configuration setup-script field. Never commit, upload, or share the rendered copy. Updating the repository does not replace the script body already saved in a Launchable.
-2. Configure **No Launch parameters or Setup values**. Remove `NVIDIA_INFERENCE_API_KEY`, `NVIDIA_API_KEY`, `NEMOTRON_MODEL`, and `JUPYTER_PORT`. The saved setup script provisions the organizer-supplied credential. Attendees enter no API key and do not need to create an NVIDIA API account or key.
-3. Enable Jupyter and keep access set to **Only my organization** with a Secure Link on the fixed port `8888`; do not expose unrestricted public TCP. The hosted model is fixed to `nvidia/nvidia/nemotron-3-nano-30b-a3b` at `https://inference-api.nvidia.com/v1`.
-4. The rendered setup script stores the workshop key outside the repository in `${HOME}/.config/nvmolkit/NVIDIA_INFERENCE_API_KEY` with file mode `0600`; notebook preflight loads it automatically without a prompt. A person who controls a deployed VM can recover this shared key. Use a workshop-only key, monitor it, and rotate or revoke it after the event.
-5. Open JupyterLab through the Secure Link and start with `notebooks/01_direct_nvmolkit_reframe.ipynb`.
+1. Create or edit the Launchable in the Brev web Console using [`launchable/fields.md`](launchable/fields.md), and set the default disk storage to **75 GiB**. From the repository, run `python3 launchable/render_setup.py /private/tmp/nvmolkit-workshop-setup.sh`. Enter the approved workshop-only Inference Hub key at the hidden prompt. The trusted offline renderer writes the private file outside the repository with mode `0600` and refuses to overwrite an existing file or use an unsafe output path.
+2. Paste only the rendered file's contents into the Brev Console saved setup body. Never commit, upload, attach, or share the rendered file. Delete the private rendered file after saving the Console body. A repository push does not replace the setup body already saved in the Console.
+3. Configure **No Launch parameters or Setup values**. Remove `NVIDIA_INFERENCE_API_KEY`, `NVIDIA_API_KEY`, `NEMOTRON_MODEL`, and `JUPYTER_PORT`. The saved setup body preprovisions the organizer-supplied credential. Attendees enter no API key and do not need an NVIDIA API account or key.
+4. Enable Jupyter and keep access set to **Only my organization** with a Secure Link on the fixed port `8888`; do not expose unrestricted public TCP. The hosted model is fixed to `nvidia/nvidia/nemotron-3-nano-30b-a3b` at `https://inference-api.nvidia.com/v1`.
+5. The saved setup body stores the workshop key outside the repository in `${HOME}/.config/nvmolkit/NVIDIA_INFERENCE_API_KEY`, with directory mode `0700` and file mode `0600`. Notebook preflight loads it automatically without a prompt. A person who controls a deployed VM can recover this shared key. Use a workshop-only key, monitor it during the event, and rotate or revoke it afterward.
+6. Open JupyterLab through the Secure Link and start with `notebooks/01_direct_nvmolkit_reframe.ipynb`.
 ```
 
 Keep the rest of the README unchanged.
 
 - [ ] **Step 4: Update the Brev Console field contract**
+
+Replace the Setup-script bullet in `launchable/fields.md` with:
+
+```markdown
+- **Setup script source:** `launchable/setup.sh` is a redacted operator template. Do not paste it as-is; use the renderer workflow below.
+```
 
 Replace the Launch-parameter bullet in `launchable/fields.md` with:
 
@@ -314,9 +342,11 @@ Replace the two credential paragraphs after the notebook list with:
 ```markdown
 The organizer preprovisions an approved workshop-only Inference Hub key. Attendees enter no API key and do not need to create an NVIDIA API account or key.
 
-Author this Launchable in the Brev web Console only. `launchable/setup.sh` is a redacted operator template and must not be pasted as-is. Make a private working copy, replace `__NVIDIA_INFERENCE_API_KEY__` with the approved `sk-` workshop key, and paste only the rendered copy into the saved setup-script field. Never commit, upload, attach, or share that rendered copy. A repository update does not replace the saved Console body.
+Author this Launchable in the Brev web Console only. `launchable/setup.sh` is a redacted operator template and must not be pasted as-is. From the repository, run `python3 launchable/render_setup.py /private/tmp/nvmolkit-workshop-setup.sh`. Enter the workshop-only key at the hidden prompt. The trusted offline renderer writes the private rendered file outside the repository with mode `0600` and refuses to overwrite an existing file or use an unsafe output path.
 
-The rendered setup script stores the key at `${HOME}/.config/nvmolkit/NVIDIA_INFERENCE_API_KEY`, outside the repository, with directory mode `0700` and file mode `0600`. The notebooks load it automatically and do not request it. A person who controls a deployed VM can recover the key. Use a workshop-only key, monitor it during the event, and rotate or revoke it afterward. Deleting a VM removes that VM's file but does not replace key revocation.
+Paste only the rendered file's contents into the Brev Console saved setup body. Never commit, upload, attach, or share the rendered file. Delete the private rendered file after saving the Console body. A repository push does not replace the setup body already saved in the Console.
+
+The saved setup body stores the key at `${HOME}/.config/nvmolkit/NVIDIA_INFERENCE_API_KEY`, outside the repository, with directory mode `0700` and file mode `0600`. The notebooks load it automatically and do not request it. A person who controls a deployed VM can recover this shared key. Use a workshop-only key, monitor it during the event, and rotate or revoke it afterward. Deleting a VM removes that VM's file but does not replace key revocation.
 ```
 
 - [ ] **Step 5: Update the Module 2 attendee copy only**
@@ -371,7 +401,7 @@ Run:
 bash -n launchable/setup.sh
 test "$(wc -c < launchable/setup.sh)" -le 16384
 ! rg -n 'sk-[A-Za-z0-9_-]{20,}' README.md launchable notebooks
-! rg -n 'required Text parameter `NVIDIA_INFERENCE_API_KEY`|entered once in Brev Setup values|Keep exactly one parameter' README.md launchable notebooks/02_agent_assisted_reframe_neighborhoods.ipynb
+! rg -n 'required Text parameter `NVIDIA_INFERENCE_API_KEY`|entered once in Brev Setup values|Keep exactly one parameter|paste the current contents of `launchable/setup.sh`|short-lived setup environment' README.md launchable notebooks/02_agent_assisted_reframe_neighborhoods.ipynb
 git diff --check origin/main...HEAD
 ```
 
@@ -399,10 +429,11 @@ git diff --name-only origin/main...HEAD
 git log --oneline origin/main..HEAD
 ```
 
-Expected changed production surfaces are only `launchable/setup.sh`,
-`launchable/fields.md`, `README.md`, and the introductory markdown in Module 2.
-Tests, this plan, and the approved design may also differ. No other notebook,
-Launchable, or remote environment changes are allowed.
+Expected changed production surfaces are only `launchable/setup.sh`, the
+trusted offline `launchable/render_setup.py`, `launchable/fields.md`,
+`README.md`, and the introductory markdown in Module 2. Tests, this plan, and
+the approved design may also differ. No other notebook, Launchable, or remote
+environment changes are allowed.
 
 The user's saved Brev Console update is configuration evidence only. Do not
 claim future-instance acceptance until the user deploys a fresh instance and

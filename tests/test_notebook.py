@@ -30,13 +30,31 @@ def _load_render_setup():
 def test_readme_preserves_launch_and_separate_acceptance_gates():
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     fields = (REPO_ROOT / "launchable" / "fields.md").read_text(encoding="utf-8")
+    renderer_command = (
+        "python3 launchable/render_setup.py "
+        "/private/tmp/nvmolkit-workshop-setup.sh"
+    )
     for instructions in (readme, fields):
         assert "Brev-managed Jupyter" in instructions
         assert "Only my organization" in instructions
         assert "Secure Link" in instructions
         assert "CPython 3.12" in instructions
         assert "mode `0600`" in instructions
-        assert "hidden prompt" not in instructions.lower()
+        assert "No Launch parameters or Setup values" in instructions
+        assert "required Text parameter" not in instructions
+        assert "no default" not in instructions.lower()
+        assert "paste the current contents of `launchable/setup.sh`" not in instructions
+        assert "short-lived setup environment" not in instructions
+        assert "legacy variable name" not in instructions
+        assert "entered once in Brev Setup values" not in instructions
+        assert "Enter the supplied value once in Setup values" not in instructions
+        assert renderer_command in instructions
+        assert "hidden prompt" in instructions.lower()
+        assert "outside the repository" in instructions
+        assert "paste only the rendered file" in instructions.lower()
+        assert "delete the private rendered file after saving" in instructions.lower()
+        assert "controls a deployed VM can recover" in instructions
+        assert "rotate or revoke" in instructions
     lowered = readme.lower()
     for gate in ("local deterministic acceptance", "gpu acceptance", "hosted inference acceptance", "rendered deployment acceptance"):
         assert gate in lowered
@@ -51,6 +69,8 @@ def test_readme_preserves_launch_and_separate_acceptance_gates():
     assert "pytest -q" in readme
     assert "RUN_GPU_TESTS=1 .venv/bin/python -m pytest -q" in readme
     assert "not yet live-qualified" in lowered
+    assert "Attendees enter no API key" in readme
+    assert "do not need an NVIDIA API account or key" in readme
 
 
 def test_setup_uses_brev_managed_python_and_leaves_jupyter_to_brev():
@@ -569,18 +589,33 @@ def test_renderer_rejects_invalid_prefix_before_script_exists(tmp_path):
     ).exists()
 
 
-def test_launchable_contract_fixes_storage_model_port_and_one_setup_value():
+def test_launchable_contract_fixes_storage_model_port_and_zero_setup_values():
     fields = (REPO_ROOT / "launchable" / "fields.md").read_text(encoding="utf-8")
     assert "75 GiB" in fields
     assert "50 GiB" not in fields
-    assert "required Text parameter `NVIDIA_INFERENCE_API_KEY`" in fields
-    assert "required" in fields.lower()
-    assert "no default" in fields.lower()
+    assert "No Launch parameters or Setup values" in fields
+    assert "required Text parameter" not in fields
+    assert "no default" not in fields.lower()
     assert "`nvidia/nvidia/nemotron-3-nano-30b-a3b`" in fields
     assert "`https://inference-api.nvidia.com/v1`" in fields
     assert "port `8888`" in fields
-    assert "Remove `NVIDIA_API_KEY`, `NEMOTRON_MODEL`, and `JUPYTER_PORT`" in fields
-    assert "paste the current contents of `launchable/setup.sh`" in fields
+    assert (
+        "Remove `NVIDIA_INFERENCE_API_KEY`, `NVIDIA_API_KEY`, "
+        "`NEMOTRON_MODEL`, and `JUPYTER_PORT`" in fields
+    )
+    assert "redacted operator template" in fields
+    assert (
+        "python3 launchable/render_setup.py "
+        "/private/tmp/nvmolkit-workshop-setup.sh" in fields
+    )
+    assert "hidden prompt" in fields.lower()
+    assert "outside the repository" in fields
+    assert "mode `0600`" in fields
+    assert "paste only the rendered file" in fields.lower()
+    assert "delete the private rendered file after saving" in fields.lower()
+    assert "controls a deployed VM can recover" in fields
+    assert "rotate or revoke" in fields
+    assert "paste the current contents of `launchable/setup.sh`" not in fields
 
 
 def health_probe_source():

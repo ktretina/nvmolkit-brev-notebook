@@ -102,9 +102,12 @@ def test_release_docs_publish_the_three_notebook_path_and_launch_contract():
         assert "8888" in document
         assert "75 GiB" in document
         assert "Only my organization" in document
+        assert "No Launch parameters or Setup values" in document
+        assert "required Text parameter" not in document
+        assert "entered once in Brev Setup values" not in document
 
 
-def test_module2_explains_the_organizer_supplied_inference_hub_key():
+def test_module2_explains_the_preprovisioned_inference_hub_key():
     module2 = nbformat.read(
         NOTEBOOK_DIR / "02_agent_assisted_reframe_neighborhoods.ipynb", as_version=4
     )
@@ -113,7 +116,10 @@ def test_module2_explains_the_organizer_supplied_inference_hub_key():
     )
     assert "organizer-supplied" in markdown
     assert "Inference Hub" in markdown
-    assert "`sk-`" in markdown
+    assert "preprovisions" in markdown
+    assert "do not create or enter" in markdown
+    assert "entered once in Brev Setup values" not in markdown
+    assert "Brev Setup values" not in markdown
     assert "`nvapi-`" not in markdown
 
 
