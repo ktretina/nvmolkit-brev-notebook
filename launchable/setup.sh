@@ -1,5 +1,21 @@
 #!/bin/bash
+set +x +v
 set -euo pipefail
+
+launch_api_key=__NVIDIA_INFERENCE_API_KEY__
+unset NVIDIA_INFERENCE_API_KEY NVIDIA_API_KEY
+
+if [[ "${launch_api_key}" == __NVIDIA_* ]]; then
+  unset launch_api_key
+  echo "Error: render a private Brev Console copy by replacing the credential placeholder." >&2
+  exit 1
+fi
+
+if [[ "${launch_api_key}" != sk-* ]]; then
+  unset launch_api_key
+  echo "Error: provide an NVIDIA Inference Hub key beginning with sk-." >&2
+  exit 1
+fi
 
 if [[ -f "${PWD}/requirements.txt" && -f "${PWD}/demo_agent.py" ]]; then
   PROJECT_DIR="${PWD}"
@@ -11,22 +27,6 @@ else
 fi
 
 cd "${PROJECT_DIR}"
-
-if [[ -n "${NVIDIA_INFERENCE_API_KEY+x}" ]]; then
-  launch_api_key="${NVIDIA_INFERENCE_API_KEY}"
-elif [[ -n "${NVIDIA_API_KEY+x}" ]]; then
-  launch_api_key="${NVIDIA_API_KEY}"
-else
-  echo "Error: NVIDIA_INFERENCE_API_KEY is required in Brev Setup values." >&2
-  exit 1
-fi
-unset NVIDIA_INFERENCE_API_KEY NVIDIA_API_KEY
-
-if [[ "${launch_api_key}" != sk-* ]]; then
-  unset launch_api_key
-  echo "Error: provide an NVIDIA Inference Hub key beginning with sk-." >&2
-  exit 1
-fi
 
 api_key_directory="${HOME}/.config/nvmolkit"
 api_key_path="${HOME}/.config/nvmolkit/NVIDIA_INFERENCE_API_KEY"
