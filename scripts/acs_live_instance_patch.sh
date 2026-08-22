@@ -949,7 +949,9 @@ def ensure_directory(path):
 
 
 def ensure_base():
-    ensure_directory(BASE.parent)
+    safe_components(BASE.parent)
+    if not stat.S_ISDIR(os.lstat(BASE.parent).st_mode):
+        raise ValueError
     ensure_directory(BASE)
 
 

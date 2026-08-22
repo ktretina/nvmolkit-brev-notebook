@@ -807,6 +807,25 @@ def test_patch_apply_and_idempotent_rollback_restore_exact_prior_state(
         assert any("unset" in call for call in calls)
 
 
+def test_patch_accepts_standard_sticky_sandbox_tmp_parent(
+    tmp_path: Path,
+    fake_environment: tuple[dict[str, str], Path, Path, Path],
+) -> None:
+    environment, _, _, sandbox_root = fake_environment
+    sandbox_tmp = sandbox_root / "tmp"
+    sandbox_tmp.mkdir()
+    sandbox_tmp.chmod(0o1777)
+    bundle = _seed_bundle(tmp_path)
+    state_dir = tmp_path / "state"
+
+    applied = _run_patch("apply", bundle, state_dir, environment)
+
+    assert applied.returncode == 0, (applied.stdout, applied.stderr)
+    assert stat.S_IMODE(sandbox_tmp.stat().st_mode) == 0o1777
+    rolled_back = _run_patch("rollback", bundle, state_dir, environment)
+    assert rolled_back.returncode == 0, (rolled_back.stdout, rolled_back.stderr)
+
+
 def test_apply_stops_before_sandbox_mutation_when_absence_cannot_be_unset(
     tmp_path: Path,
     fake_environment: tuple[dict[str, str], Path, Path, Path],
