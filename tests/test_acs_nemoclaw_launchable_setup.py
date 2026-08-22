@@ -79,6 +79,15 @@ def _fake_nvidia_smi(tmp_path: Path, inventory: str) -> Path:
         encoding="utf-8",
     )
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    sleep = fake_bin / "sleep"
+    sleep.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    sleep.chmod(sleep.stat().st_mode | stat.S_IXUSR)
+    timeout = fake_bin / "timeout"
+    timeout.write_text(
+        "#!/usr/bin/env bash\nshift 3\nexec \"$@\"\n",
+        encoding="utf-8",
+    )
+    timeout.chmod(timeout.stat().st_mode | stat.S_IXUSR)
     return fake_bin
 
 
@@ -859,6 +868,63 @@ def test_setup_fails_closed_before_secret_storage_without_exactly_one_l4(
         tmp_path / "home/.config/acs-phase-zero/NVIDIA_INFERENCE_API_KEY"
     ).exists()
     assert not (tmp_path / "home/.local/state/acs-nemoclaw-launchable/ready").exists()
+
+
+def test_setup_waits_for_one_l4_when_nvidia_smi_is_initially_unavailable(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    counter = tmp_path / "nvidia-smi.calls"
+    nvidia_smi = fake_bin / "nvidia-smi"
+    nvidia_smi.write_text(
+        f"""#!/usr/bin/env bash
+set -Eeuo pipefail
+counter={str(counter)!r}
+calls=0
+if [[ -f "${{counter}}" ]]; then
+  calls="$(<"${{counter}}")"
+fi
+calls=$((calls + 1))
+printf '%s\n' "${{calls}}" > "${{counter}}"
+if [[ "${{calls}}" == "1" ]]; then
+  exit 1
+fi
+printf 'NVIDIA L4\n'
+""",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(nvidia_smi.stat().st_mode | stat.S_IXUSR)
+    sleep = fake_bin / "sleep"
+    sleep.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    sleep.chmod(sleep.stat().st_mode | stat.S_IXUSR)
+    timeout = fake_bin / "timeout"
+    timeout.write_text(
+        "#!/usr/bin/env bash\nshift 3\nexec \"$@\"\n",
+        encoding="utf-8",
+    )
+    timeout.chmod(timeout.stat().st_mode | stat.S_IXUSR)
+
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(tmp_path / "home"),
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+        }
+    )
+    environment.pop("NVIDIA_INFERENCE_API_KEY", None)
+    completed = subprocess.run(
+        ["bash", str(SCRIPT)],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "NVIDIA_INFERENCE_API_KEY is required" in completed.stderr
+    assert counter.read_text(encoding="utf-8").strip() == "2"
 
 
 def test_setup_requires_the_inference_key_before_phase_zero(tmp_path: Path) -> None:

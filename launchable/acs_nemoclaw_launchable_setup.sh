@@ -122,9 +122,21 @@ trap 'exit 143' TERM
 
 phase "Validate hardware"
 gpu_inventory=""
-if ! gpu_inventory="$(nvidia-smi --query-gpu=name --format=csv,noheader,nounits 2>/dev/null)"; then
+gpu_probe_succeeded=0
+for gpu_probe_attempt in {1..6}; do
+  if gpu_inventory="$(timeout --signal=TERM --kill-after=1s 5s \
+    nvidia-smi --query-gpu=name --format=csv,noheader,nounits 2>/dev/null)" \
+    && [[ -n "${gpu_inventory}" ]]; then
+    gpu_probe_succeeded=1
+    break
+  fi
+  gpu_inventory=""
+  if [[ "${gpu_probe_attempt}" != "6" ]]; then
+    sleep 5
+  fi
+done
+[[ "${gpu_probe_succeeded}" == "1" ]] ||
   die "this Launchable requires exactly one NVIDIA L4."
-fi
 gpu_count="$(printf '%s\n' "${gpu_inventory}" | awk 'NF { count += 1 } END { print count + 0 }')"
 if [[ "${gpu_count}" != "1" || "${gpu_inventory}" != "NVIDIA L4" ]]; then
   die "this Launchable requires exactly one NVIDIA L4."
