@@ -27,10 +27,12 @@ delete the private rendered file after saving. Manual replacement is forbidden.
 
 - [ ] **Step 1: Add the sentinel and render-only test harness**
 
-Add this constant below `REPO_ROOT` in `tests/test_notebook.py`:
+Add these constants below `REPO_ROOT` in `tests/test_notebook.py` and retain the
+loader that imports the trusted renderer from that path:
 
 ```python
 SETUP_KEY_SENTINEL = "__NVIDIA_INFERENCE_API_KEY__"
+RENDER_SETUP_PATH = REPO_ROOT / "launchable" / "render_setup.py"
 ```
 
 Change `_run_setup` so tests render only a fake key into the temporary copied
@@ -47,14 +49,19 @@ logic. Apply these exact changes:
 +    } | (setup_values or {})
      copied_setup = tmp_path / "brev-generated-setup.sh"
 -    copied_setup.write_bytes((REPO_ROOT / "launchable" / "setup.sh").read_bytes())
++    renderer = _load_render_setup()
 +    setup_source = (REPO_ROOT / "launchable" / "setup.sh").read_text(
 +        encoding="utf-8"
 +    )
 +    if rendered_key is not None:
-+        assert setup_source.count(SETUP_KEY_SENTINEL) == 1
-+        setup_source = setup_source.replace(SETUP_KEY_SENTINEL, rendered_key)
++        setup_source = renderer.render_setup(setup_source, rendered_key)
 +    copied_setup.write_text(setup_source, encoding="utf-8")
 ```
+
+Tests call the pure renderer through `launchable/render_setup.py`. The pure
+renderer validates fake keys and applies `shlex.quote` before returning the
+rendered text. Do not use raw string replacement. Operators use the CLI command
+in the Security-review amendment above.
 
 In `test_setup_uses_brev_managed_python_and_leaves_jupyter_to_brev`, replace
 the environment-input cleanup assertions with this template contract:

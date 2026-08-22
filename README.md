@@ -55,7 +55,7 @@ RUN_GPU_TESTS=1 .venv/bin/python -m pytest -q
 
 - **Local deterministic acceptance:** run `pytest` to validate notebook structure, scientific state transitions, serialization boundaries, and agent wiring without claiming GPU or hosted execution.
 - **GPU acceptance receipt:** on a compatible NVIDIA GPU, run `RUN_GPU_TESTS=1 .venv/bin/python -m pytest -q` and retain the result before calling the nvMolKit runtime GPU-accepted.
-- **Persistence receipt:** after a fresh stop/start, record Jupyter, kernel, notebook, and credential-reentry checks separately. Cross-reference it to the hosted and GPU receipts; do not merge their claims.
+- **Persistence receipt:** after a fresh stop/start, record separate checks for Jupyter, kernel, notebook, and protected credential persistence, including confirmation of no credential re-entry. Cross-reference them to the hosted and GPU receipts; do not merge their claims.
 - **Hosted inference acceptance:** in a fresh Brev kernel, verify the Module 2 bounded policy response and the Module 3 strict plan and strict audit using the organizer-supplied Inference Hub key.
 - **Rendered deployment acceptance:** inspect the Module 1 fingerprint, similarity, and cluster views; the Module 2 policy receipt and neighborhood comparison; and the Module 3 approval widget, authoritative receipt, and chemistry gallery through the organization-only Secure Link.
 

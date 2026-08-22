@@ -73,6 +73,38 @@ def test_readme_preserves_launch_and_separate_acceptance_gates():
     assert "do not need an NVIDIA API account or key" in readme
 
 
+def test_readme_persistence_receipt_requires_no_credential_reentry():
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    persistence_receipt = next(
+        line
+        for line in readme.splitlines()
+        if line.startswith("- **Persistence receipt:**")
+    )
+    lowered = persistence_receipt.lower()
+
+    assert "protected credential persistence" in lowered
+    assert "no credential re-entry" in lowered
+    assert "credential-reentry" not in lowered
+    assert "credential re-entry checks" not in lowered
+
+
+def test_plan_routes_fake_key_rendering_through_the_trusted_renderer():
+    plan = (
+        REPO_ROOT
+        / "docs"
+        / "superpowers"
+        / "plans"
+        / "2026-08-21-zero-input-workshop-key.md"
+    ).read_text(encoding="utf-8")
+
+    assert "setup_source.replace(SETUP_KEY_SENTINEL, rendered_key)" not in plan
+    assert "renderer.render_setup(setup_source, rendered_key)" in plan
+    assert "`launchable/render_setup.py`" in plan
+    assert re.search(r"pure\s+renderer validates", plan)
+    assert "`shlex.quote`" in plan
+    assert "fake keys" in plan
+
+
 def test_setup_uses_brev_managed_python_and_leaves_jupyter_to_brev():
     setup = (REPO_ROOT / "launchable" / "setup.sh").read_text(encoding="utf-8")
     requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
