@@ -230,6 +230,7 @@ if operation == "sessions" and args[2:3] == ["export"]:
 
 if operation == "gateway" and args[2:] == ["restart", "--quiet"]:
     if os.environ.get("ACS_FAKE_GATEWAY_NORMALIZE_PROTECTED_MODES") == "1":
+        (root / "sandbox/.openclaw/workspace/.acs-workshop-state").chmod(0o2770)
         for relative in protected:
             (root / "sandbox/.openclaw/workspace" / relative).chmod(0o460)
     restarted = os.environ.get("ACS_FAKE_GATEWAY_RESTARTED")
@@ -300,6 +301,32 @@ mapped_command = [mapped(value) for value in command]
 if "-c" in mapped_command and len(mapped_command) > mapped_command.index("-c") + 2:
     code_index = mapped_command.index("-c") + 1
     helper_action = mapped_command[code_index + 1]
+    if (
+        helper_action in {"reharden-protected", "rollback"}
+        and os.environ.get("ACS_FAKE_GATEWAY_NORMALIZE_PROTECTED_MODES") == "1"
+    ):
+        state_path = root / "sandbox/.openclaw/workspace/.acs-workshop-state"
+        mapped_command[code_index] = (
+            "import os as _acs_os\n"
+            "import stat as _acs_stat\n"
+            f"_acs_state_path = {str(state_path)!r}\n"
+            "_acs_real_lstat = _acs_os.lstat\n"
+            "_acs_real_fstat = _acs_os.fstat\n"
+            "_acs_state = _acs_real_lstat(_acs_state_path)\n"
+            "def _acs_gateway_state_mode(value):\n"
+            "    if (value.st_dev, value.st_ino) == "
+            "(_acs_state.st_dev, _acs_state.st_ino) and "
+            "_acs_stat.S_IMODE(value.st_mode) == 0o770:\n"
+            "        fields = list(value)\n"
+            "        fields[0] = (fields[0] & ~0o7777) | 0o2770\n"
+            "        return _acs_os.stat_result(fields)\n"
+            "    return value\n"
+            "_acs_os.lstat = lambda path, *args, **kwargs: "
+            "_acs_gateway_state_mode(_acs_real_lstat(path, *args, **kwargs))\n"
+            "_acs_os.fstat = lambda descriptor: "
+            "_acs_gateway_state_mode(_acs_real_fstat(descriptor))\n"
+            + mapped_command[code_index]
+        )
     if (
         helper_action == "reharden-protected"
         and os.environ.get("ACS_FAKE_REHARDEN_UID_MISMATCH") == "1"
@@ -889,7 +916,10 @@ def test_gateway_mode_normalization_is_rehardened_for_apply_and_rollback(
     failed = _run_patch("apply", bundle, tmp_path / "failed-state", environment)
 
     assert failed.returncode != 0
-    assert json.loads(failed.stdout)["rollback"] is True
+    assert json.loads(failed.stdout)["rollback"] is True, (
+        failed.stdout,
+        failed.stderr,
+    )
     assert _snapshot(workspace) == original
     assert all(
         stat.S_IMODE((workspace / relative).stat().st_mode) == 0o444
@@ -901,6 +931,9 @@ def test_gateway_mode_normalization_is_rehardened_for_apply_and_rollback(
     applied = _run_patch("apply", bundle, state_dir, environment)
 
     assert applied.returncode == 0, (applied.stdout, applied.stderr)
+    assert stat.S_IMODE(
+        (workspace / ".acs-workshop-state").stat().st_mode
+    ) == 0o700
     assert all(
         stat.S_IMODE((workspace / relative).stat().st_mode) == 0o444
         for relative in PROTECTED_FILES
@@ -1096,7 +1129,16 @@ def test_direct_and_idempotent_rollback_accept_all_protected_at_0460(
 
 @pytest.mark.parametrize(
     "mutation",
-    ["manifest", "hash", "symlink", "hardlink", "wrong-owner", "mode"],
+    [
+        "manifest",
+        "hash",
+        "symlink",
+        "hardlink",
+        "state-owner",
+        "mode",
+        "state-mode",
+        "state-symlink",
+    ],
 )
 def test_reharden_rejects_invalid_state_before_any_chmod(
     tmp_path: Path,
@@ -1125,10 +1167,17 @@ def test_reharden_rejects_invalid_state_before_any_chmod(
         target.symlink_to(workspace / "unrelated.txt")
     elif mutation == "hardlink":
         os.link(target, workspace / "hardlink-canary")
-    elif mutation == "wrong-owner":
+    elif mutation == "state-owner":
         environment["ACS_FAKE_REHARDEN_UID_MISMATCH"] = "1"
-    else:
+    elif mutation == "mode":
         target.chmod(0o640)
+    elif mutation == "state-mode":
+        (workspace / ".acs-workshop-state").chmod(0o2771)
+    else:
+        state = workspace / ".acs-workshop-state"
+        moved = workspace / ".acs-workshop-state-real"
+        state.rename(moved)
+        state.symlink_to(moved, target_is_directory=True)
     before = _snapshot(workspace)
 
     rejected = _replay_helper_call(reharden_call, environment)
@@ -1138,10 +1187,12 @@ def test_reharden_rejects_invalid_state_before_any_chmod(
 
 
 @pytest.mark.parametrize("action", ["verify-installed", "verify-restored"])
-def test_verify_only_actions_reject_0460_without_mutation(
+@pytest.mark.parametrize("mutation", ["protected", "state"])
+def test_verify_only_actions_reject_normalized_modes_without_mutation(
     tmp_path: Path,
     fake_environment: tuple[dict[str, str], Path, Path, Path],
     action: str,
+    mutation: str,
 ) -> None:
     environment, command_log, _, sandbox_root = fake_environment
     workspace = sandbox_root / WORKSPACE
@@ -1153,7 +1204,10 @@ def test_verify_only_actions_reject_0460_without_mutation(
         rolled_back = _run_patch("rollback", bundle, state_dir, environment)
         assert rolled_back.returncode == 0, (rolled_back.stdout, rolled_back.stderr)
     verify_call = _last_helper_call(command_log, action)
-    _set_protected_modes(workspace, 0o460)
+    if mutation == "protected":
+        _set_protected_modes(workspace, 0o460)
+    else:
+        (workspace / ".acs-workshop-state").chmod(0o2770)
     before = _snapshot(workspace)
 
     rejected = _replay_helper_call(verify_call, environment)

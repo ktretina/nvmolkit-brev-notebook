@@ -1052,11 +1052,12 @@ def ensure_base():
     ensure_directory(BASE)
 
 
-def validate_protected_contents():
+def validate_protected_contents(*, allow_gateway_state_mode=False):
     state = WORKSPACE / ".acs-workshop-state"
     safe_components(state)
     state_metadata = os.lstat(state)
-    if not stat.S_ISDIR(state_metadata.st_mode) or stat.S_IMODE(state_metadata.st_mode) != 0o700 or state_metadata.st_uid != os.getuid():
+    allowed_state_modes = {0o700, 0o2770} if allow_gateway_state_mode else {0o700}
+    if not stat.S_ISDIR(state_metadata.st_mode) or stat.S_IMODE(state_metadata.st_mode) not in allowed_state_modes or state_metadata.st_uid != os.getuid():
         raise ValueError
     raw, manifest_metadata = read_regular(state / "manifest.json")
     if stat.S_IMODE(manifest_metadata.st_mode) != 0o444:
@@ -1071,19 +1072,47 @@ def validate_protected_contents():
         if type(digest) is not str or HEX.fullmatch(digest) is None or hashlib.sha256(protected_raw).hexdigest() != digest:
             raise ValueError
         metadata[relative] = protected_metadata
-    return metadata
+    return state_metadata, metadata
 
 
 def verify_protected_manifest():
-    metadata = validate_protected_contents()
+    _, metadata = validate_protected_contents()
     if any(stat.S_IMODE(value.st_mode) != 0o444 for value in metadata.values()):
         raise ValueError
 
 
 def reharden_protected():
-    metadata = validate_protected_contents()
+    state_metadata, metadata = validate_protected_contents(allow_gateway_state_mode=True)
     if any(stat.S_IMODE(value.st_mode) not in {0o444, 0o460} for value in metadata.values()):
         raise ValueError
+    state = WORKSPACE / ".acs-workshop-state"
+    state_descriptor = os.open(state, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened_state = os.fstat(state_descriptor)
+        if (
+            opened_state.st_dev,
+            opened_state.st_ino,
+            opened_state.st_mode,
+            opened_state.st_nlink,
+            opened_state.st_uid,
+            opened_state.st_size,
+            opened_state.st_mtime_ns,
+            opened_state.st_ctime_ns,
+        ) != (
+            state_metadata.st_dev,
+            state_metadata.st_ino,
+            state_metadata.st_mode,
+            state_metadata.st_nlink,
+            state_metadata.st_uid,
+            state_metadata.st_size,
+            state_metadata.st_mtime_ns,
+            state_metadata.st_ctime_ns,
+        ):
+            raise ValueError
+        os.fchmod(state_descriptor, 0o700)
+        os.fsync(state_descriptor)
+    finally:
+        os.close(state_descriptor)
     for relative in PROTECTED:
         expected = metadata[relative]
         descriptor = os.open(WORKSPACE / relative, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
