@@ -91,8 +91,9 @@ def test_console_bootstrap_is_syntax_valid_and_pins_a_detached_checkout(
 def test_console_bootstrap_hides_the_key_from_setup_children_then_executes_with_it(
     tmp_path: Path,
 ) -> None:
-    canary = "nvapi-console-bootstrap-canary"
+    canary = "inference-hub-console-bootstrap-canary"
     parent_key_canary = "nvapi-parent-env-must-not-win"
+    parent_compatible_canary = "parent-compatible-key-must-not-win"
     rendered = _rendered_bootstrap(canary)
     script = tmp_path / "bootstrap.sh"
     script.write_text(rendered, encoding="utf-8")
@@ -104,7 +105,7 @@ def test_console_bootstrap_hides_the_key_from_setup_children_then_executes_with_
     fake_install = fake_bin / "install"
     fake_install.write_text(
         "#!/usr/bin/env bash\n"
-        'printf \'install:%s:%s\\n\' "${NVIDIA_INFERENCE_API_KEY-unset}" "${launch_key-unset}" >> "${ACS_CHILD_LOG}"\n'
+        'printf \'install:%s:%s:%s\\n\' "${NVIDIA_INFERENCE_API_KEY-unset}" "${launch_key-unset}" "${COMPATIBLE_API_KEY-unset}" >> "${ACS_CHILD_LOG}"\n'
         'destination="${!#}"\n'
         'mkdir -p -- "${destination}"\n'
         'chmod 700 "${destination}"\n',
@@ -116,13 +117,13 @@ def test_console_bootstrap_hides_the_key_from_setup_children_then_executes_with_
     fake_git.write_text(
         "#!/usr/bin/env bash\n"
         "set -u\n"
-        'printf \'git:%s:%s:%s\\n\' "${NVIDIA_INFERENCE_API_KEY-unset}" "${launch_key-unset}" "$*" >> "${ACS_CHILD_LOG}"\n'
+        'printf \'git:%s:%s:%s:%s\\n\' "${NVIDIA_INFERENCE_API_KEY-unset}" "${launch_key-unset}" "${COMPATIBLE_API_KEY-unset}" "$*" >> "${ACS_CHILD_LOG}"\n'
         'if [[ "${1:-}" == clone ]]; then\n'
         '  destination="${!#}"\n'
         '  mkdir -p -- "${destination}/.git" "${destination}/launchable"\n'
         "  cat > \"${destination}/launchable/acs_nemoclaw_launchable_setup.sh\" <<'EOF'\n"
         "#!/usr/bin/env bash\n"
-        'printf \'setup:%s:%s\\n\' "${NVIDIA_INFERENCE_API_KEY-unset}" "${launch_key-unset}" >> "${ACS_CHILD_LOG}"\n'
+        'printf \'setup:%s:%s:%s\\n\' "${NVIDIA_INFERENCE_API_KEY-unset}" "${launch_key-unset}" "${COMPATIBLE_API_KEY-unset}" >> "${ACS_CHILD_LOG}"\n'
         'printf \'%s\' "${NVIDIA_INFERENCE_API_KEY:-}" > "${ACS_FINAL_KEY}"\n'
         "EOF\n"
         "  exit 0\n"
@@ -146,6 +147,7 @@ def test_console_bootstrap_hides_the_key_from_setup_children_then_executes_with_
             "ACS_COMMIT": DUMMY_COMMIT,
             "ACS_FINAL_KEY": str(final_key),
             "ACS_REPO_URL": REPO_URL,
+            "COMPATIBLE_API_KEY": parent_compatible_canary,
             "HOME": str(tmp_path / "home"),
             "NVIDIA_INFERENCE_API_KEY": parent_key_canary,
             "launch_key": "nvapi-parent-launch-key-must-not-win",
@@ -164,14 +166,21 @@ def test_console_bootstrap_hides_the_key_from_setup_children_then_executes_with_
     assert completed.returncode == 0, completed.stderr
     assert canary not in completed.stdout + completed.stderr
     assert parent_key_canary not in completed.stdout + completed.stderr
+    assert parent_compatible_canary not in completed.stdout + completed.stderr
     assert final_key.read_text(encoding="utf-8") == canary
     assert parent_key_canary not in final_key.read_text(encoding="utf-8")
     child_records = child_log.read_text(encoding="utf-8").splitlines()
     assert child_records
     assert parent_key_canary not in "\n".join(child_records)
-    assert all(record.split(":")[2] == "unset" for record in child_records)
+    assert parent_compatible_canary not in "\n".join(child_records)
     assert all(
-        record.startswith(("git:unset:", "install:unset:", f"setup:{canary}:"))
+        record.startswith(
+            (
+                "git:unset:unset:unset:",
+                "install:unset:unset:unset",
+                f"setup:{canary}:unset:unset",
+            )
+        )
         for record in child_records
     )
     checkout = (
@@ -307,7 +316,7 @@ def test_public_template_is_unrendered_and_fails_before_git(tmp_path: Path) -> N
     assert source.count(SENTINEL) == 1
     assert "set +x +v" in source
     assert "launch_key=__NVIDIA_INFERENCE_API_KEY__" in source
-    assert "unset NVIDIA_INFERENCE_API_KEY NVIDIA_API_KEY" in source
+    assert "unset NVIDIA_INFERENCE_API_KEY NVIDIA_API_KEY COMPATIBLE_API_KEY" in source
     assert source.index("unrendered") < source.index("git clone")
 
     fake_bin = tmp_path / "bin"
@@ -346,7 +355,7 @@ def test_public_template_is_unrendered_and_fails_before_git(tmp_path: Path) -> N
 def test_renderer_validates_and_shell_quotes_api_key() -> None:
     renderer = _renderer_module()
     template = "launch_key=__NVIDIA_INFERENCE_API_KEY__\n"
-    key = "nvapi-a'b$\n".replace("\n", "")
+    key = "inference-hub-a'b$"
     rendered = renderer.render_acs_console_bootstrap(template, key)
     assert rendered == f'launch_key={shlex.quote(key)}\n'
     assert rendered.count(SENTINEL) == 0
@@ -360,7 +369,18 @@ def test_renderer_validates_and_shell_quotes_api_key() -> None:
             pass
         else:
             raise AssertionError("renderer accepted a malformed sentinel count")
-    for invalid in ("", "nvapi-", "sk-invalid", "nvapi-a\n b", "nvapi-a\rb", "nvapi-a\x00b"):
+    for invalid in (
+        "",
+        " ",
+        "\t",
+        "hub key",
+        SENTINEL,
+        "hub-a\x07b",
+        "hub-a\x7fb",
+        "hub-a\n b",
+        "hub-a\rb",
+        "hub-a\x00b",
+    ):
         try:
             renderer.render_acs_console_bootstrap(template, invalid)
         except ValueError:
@@ -376,7 +396,7 @@ def test_renderer_writes_new_private_output_without_leaking_key(
     template = "launch_key=__NVIDIA_INFERENCE_API_KEY__\n"
     monkeypatch.setattr(renderer, "TEMPLATE_PATH", tmp_path / "template.sh")
     renderer.TEMPLATE_PATH.write_text(template, encoding="utf-8")
-    key = "nvapi-output-canary"
+    key = "inference-hub-output-canary"
     monkeypatch.setattr(renderer.getpass, "getpass", lambda prompt: key)
     output = tmp_path / "private.sh"
     assert renderer.main([str(output)]) == 0
@@ -397,7 +417,7 @@ def test_renderer_default_input_is_the_pinned_public_bootstrap(
     tmp_path: Path, monkeypatch
 ) -> None:
     renderer = _renderer_module()
-    key = "nvapi-default-template-canary"
+    key = "inference-hub-default-template-canary"
     monkeypatch.setattr(renderer.getpass, "getpass", lambda prompt: key)
     output = tmp_path / "private.sh"
     assert renderer.main([str(output)]) == 0
@@ -419,7 +439,8 @@ def test_renderer_malformed_cli_input_leaves_no_output_and_does_not_print_key(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     renderer = _renderer_module()
-    monkeypatch.setattr(renderer.getpass, "getpass", lambda prompt: "bad-key-canary")
+    key = " \t "
+    monkeypatch.setattr(renderer.getpass, "getpass", lambda prompt: key)
     output = tmp_path / "private.sh"
     try:
         renderer.main([str(output)])
@@ -428,7 +449,7 @@ def test_renderer_malformed_cli_input_leaves_no_output_and_does_not_print_key(
     else:
         raise AssertionError("renderer accepted malformed CLI input")
     captured = capsys.readouterr()
-    assert "bad-key-canary" not in captured.out + captured.err
+    assert key not in captured.out + captured.err
     assert not output.exists()
 
 
@@ -437,27 +458,26 @@ def test_rendered_bootstrap_has_separate_unrendered_and_malformed_key_failures(
 ) -> None:
     for key_text, expected_error in (
         (SENTINEL, "unrendered"),
-        ("not-an-inference-key", "must begin with nvapi-"),
-        ("nvapi-", "must begin with nvapi-"),
+        ("", "must not be empty or contain whitespace"),
+        ("   ", "must not be empty or contain whitespace"),
+        ("hub key", "must not be empty or contain whitespace"),
+        ("hub-a\x07b", "must not contain control characters"),
+        ("hub-a\x7fb", "must not contain control characters"),
     ):
-        rendered = _rendered_bootstrap("nvapi-valid-canary").replace(
-            "'nvapi-valid-canary'", shlex.quote(key_text), 1
-        )
-        # The valid key is unquoted in this template when it is not shell-special.
-        rendered = rendered.replace("nvapi-valid-canary", key_text, 1)
+        rendered = _rendered_bootstrap(key_text)
         script = tmp_path / f"bootstrap-{expected_error}-{len(key_text)}.sh"
         script.write_text(rendered, encoding="utf-8")
         completed = subprocess.run(
             ["bash", str(script)],
             cwd=ROOT,
-            env={**os.environ, "launch_key": "nvapi-parent-canary"},
+            env={**os.environ, "launch_key": "parent-key-canary"},
             capture_output=True,
             text=True,
             check=False,
         )
         assert completed.returncode != 0
         assert expected_error in completed.stderr
-        assert "nvapi-parent-canary" not in completed.stdout + completed.stderr
+        assert "parent-key-canary" not in completed.stdout + completed.stderr
 
 
 def test_renderer_rejects_repo_and_symlinked_parent_paths(tmp_path: Path) -> None:
@@ -599,7 +619,7 @@ def test_authoring_sheet_has_the_zero_input_private_render_workflow() -> None:
     for section in (create_section, update_section):
         assert "The OpenClaw Launchable has no Launch parameters or Setup values." in section
         assert render_command in section
-        assert "workshop-only `nvapi-` key only at the hidden prompt" in section
+        assert "workshop-only `inference.nvidia.com` API key only at the hidden prompt" in section
         assert "owner, regular-file type, mode `0600`" in section
         assert "Bash syntax" in section
         assert "byte size" in section

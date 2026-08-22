@@ -248,7 +248,6 @@ def test_page_has_current_account_repository_and_official_links() -> None:
         "https://brev.nvidia.com/",
         "https://account.nvidia.com/",
         "https://build.nvidia.com/settings/api-keys",
-        "https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b?nim=hosted",
         "https://github.com/ktretina/nvmolkit-brev-notebook",
         "https://github.com/NVIDIA-BioNeMo/bionemo-agent-toolkit",
         "https://github.com/NVIDIA-BioNeMo/nvMolKit",
@@ -338,8 +337,7 @@ def test_prework_keeps_the_notebook_key_and_makes_openclaw_zero_input() -> None:
         "`nvidia/nemotron-3-nano-30b-a3b` |\n"
         "| Conversational OpenClaw | `env-3Hlp4pHBlTTlfDxfH41KkGhTeCV` | "
         "No API key or Setup values | "
-        "[NVIDIA Nemotron 3 Super 120B-A12B]"
-        "(https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b?nim=hosted) |"
+        "NVIDIA Nemotron 3 Super 120B-A12B |"
     )
     assert expected_table in prework
     assert "`NVIDIA_INFERENCE_API_KEY`" not in prework
@@ -353,7 +351,7 @@ def test_models_are_separate_by_required_lab_and_notebook_module() -> None:
     lab_2 = _section(source, "Required Lab 2 — Conversational OpenClaw")
     notebook_model = "`nvidia/nemotron-3-nano-30b-a3b`"
     conversational_model = "Nemotron 3 Super 120B-A12B"
-    conversational_model_url = (
+    public_build_model_url = (
         "https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b?nim=hosted"
     )
 
@@ -363,9 +361,11 @@ def test_models_are_separate_by_required_lab_and_notebook_module() -> None:
     assert "optional companion" in lab_1
     assert conversational_model not in lab_1
     assert conversational_model in prework
-    assert conversational_model_url in prework
     assert conversational_model in lab_2
-    assert conversational_model_url in lab_2
+    assert public_build_model_url not in prework
+    assert public_build_model_url not in lab_2
+    assert "build.nvidia.com" not in lab_2
+    assert "inference-api.nvidia.com" not in lab_2
     assert notebook_model not in lab_2
 
 

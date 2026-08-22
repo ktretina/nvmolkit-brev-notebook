@@ -80,10 +80,12 @@ cleanup() {
   if [[ -n "${installer}" ]]; then
     rm -f -- "${installer}"
   fi
-  unset NVIDIA_INFERENCE_API_KEY || true
+  unset COMPATIBLE_API_KEY NVIDIA_INFERENCE_API_KEY || true
   record_status "${status_file}" "${exit_code}"
 }
 trap cleanup EXIT
+
+unset COMPATIBLE_API_KEY NVIDIA_INFERENCE_API_KEY || true
 
 if [[ ! -f "${key_file}" || -L "${key_file}" || ! -O "${key_file}" ]]; then
   printf 'Protected NVIDIA inference key file is missing or unsafe.\n' >&2
@@ -94,25 +96,50 @@ if [[ "$(stat -c '%a' "${key_file}")" != "600" || ! -s "${key_file}" ]]; then
   exit 2
 fi
 
+if ! python3 - "${key_file}" <<'PY'
+from pathlib import Path
+import sys
+
+payload = Path(sys.argv[1]).read_bytes()
+if not payload.endswith(b"\n") or payload.count(b"\n") != 1:
+    raise SystemExit(1)
+key = payload[:-1]
+if (
+    not key
+    or key == b"__NVIDIA_INFERENCE_API_KEY__"
+    or any(byte < 0x21 or byte == 0x7F for byte in key)
+):
+    raise SystemExit(1)
+PY
+then
+  printf 'Protected NVIDIA inference key is malformed.\n' >&2
+  exit 2
+fi
+
 installer="$(mktemp "${TMPDIR:-/tmp}/nemoclaw-install.XXXXXX")"
 curl -fsSL "${install_url}" -o "${installer}"
 printf '%s  %s\n' "${installer_sha}" "${installer}" | sha256sum -c -
 
-IFS= read -r NVIDIA_INFERENCE_API_KEY < "${key_file}"
-if [[ "${NVIDIA_INFERENCE_API_KEY}" != nvapi-* ]]; then
-  printf 'NVIDIA inference key does not have the expected prefix.\n' >&2
+IFS= read -r COMPATIBLE_API_KEY < "${key_file}"
+if [[ -z "${COMPATIBLE_API_KEY}" \
+  || "${COMPATIBLE_API_KEY}" == __NVIDIA_INFERENCE_API_KEY_[_] \
+  || "${COMPATIBLE_API_KEY}" =~ [[:space:]] \
+  || "${COMPATIBLE_API_KEY}" =~ [[:cntrl:]] ]]; then
+  printf 'Protected NVIDIA inference key is malformed.\n' >&2
   exit 2
 fi
-export NVIDIA_INFERENCE_API_KEY
+export COMPATIBLE_API_KEY
 rm -f -- "${key_file}"
 
 export NEMOCLAW_INSTALL_REF="${install_ref}"
 export NEMOCLAW_NON_INTERACTIVE=1
 export NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE=1
 export NEMOCLAW_AGENT=openclaw
-export NEMOCLAW_PROVIDER=build
+export NEMOCLAW_PROVIDER=custom
+export NEMOCLAW_ENDPOINT_URL=https://inference-api.nvidia.com/v1
 export NEMOCLAW_SANDBOX_NAME=acs-chemistry-agent
-export NEMOCLAW_MODEL=nvidia/nemotron-3-super-120b-a12b
+export NEMOCLAW_MODEL=nvidia/nvidia/nemotron-3-super-120b-a12b
+export NEMOCLAW_PREFERRED_API=openai-completions
 export NEMOCLAW_POLICY_TIER=balanced
 export NEMOCLAW_POLICY_MODE=suggested
 export NEMOCLAW_WEB_SEARCH_PROVIDER=none

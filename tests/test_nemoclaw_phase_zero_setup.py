@@ -21,6 +21,8 @@ def _write_executable(path: Path, source: str) -> None:
 def _run_detached_phase_zero(
     tmp_path: Path,
     *,
+    key_value: str = "inference-hub-test-secret",
+    key_payload: bytes | None = None,
     installer_exit: int = 1,
     failure_step: str = "provider_selection",
     interrupted: bool = True,
@@ -37,7 +39,10 @@ def _run_detached_phase_zero(
     (home / ".config" / "acs-phase-zero").mkdir(parents=True)
 
     key_file = home / ".config" / "acs-phase-zero" / "NVIDIA_INFERENCE_API_KEY"
-    key_file.write_text("nvapi-test-secret\n")
+    if key_payload is None:
+        key_file.write_text(f"{key_value}\n")
+    else:
+        key_file.write_bytes(key_payload)
     key_file.chmod(0o600)
 
     resume_log = tmp_path / "resume.log"
@@ -63,7 +68,8 @@ def _run_detached_phase_zero(
     _write_executable(
         fake_nemoclaw,
         "#!/usr/bin/env bash\n"
-        '[[ "${NVIDIA_INFERENCE_API_KEY:-}" == "nvapi-test-secret" ]] || exit 91\n'
+        '[[ "${COMPATIBLE_API_KEY:-}" == "inference-hub-test-secret" ]] || exit 91\n'
+        '[[ -z "${NVIDIA_INFERENCE_API_KEY:-}" ]] || exit 93\n'
         '[[ "${NEMOCLAW_ONBOARD_VALIDATION_TIMEOUT_SECONDS:-}" == 60 ]] || exit 92\n'
         'printf \'%s\\n\' "$*" >> "$RESUME_LOG"\n'
         'openshell "$@"\n',
@@ -77,6 +83,12 @@ def _run_detached_phase_zero(
     _write_executable(
         fake_installer,
         "#!/usr/bin/env bash\n"
+        '[[ "${COMPATIBLE_API_KEY:-}" == "inference-hub-test-secret" ]] || exit 81\n'
+        '[[ -z "${NVIDIA_INFERENCE_API_KEY:-}" ]] || exit 82\n'
+        '[[ "${NEMOCLAW_PROVIDER:-}" == custom ]] || exit 83\n'
+        '[[ "${NEMOCLAW_ENDPOINT_URL:-}" == https://inference-api.nvidia.com/v1 ]] || exit 84\n'
+        '[[ "${NEMOCLAW_MODEL:-}" == nvidia/nvidia/nemotron-3-super-120b-a12b ]] || exit 85\n'
+        '[[ "${NEMOCLAW_PREFERRED_API:-}" == openai-completions ]] || exit 86\n'
         '/bin/mkdir -p "$HOME/.local/bin" "$HOME/.nemoclaw"\n'
         'if [[ "$INSTALL_NEMOCLAW" == 1 ]]; then\n'
         '  /bin/cp "$FAKE_NEMOCLAW" "$HOME/.local/bin/nemoclaw"\n'
@@ -94,6 +106,7 @@ def _run_detached_phase_zero(
     _write_executable(
         fake_bin / "curl",
         "#!/usr/bin/env bash\n"
+        '[[ -z "${COMPATIBLE_API_KEY:-}" && -z "${NVIDIA_INFERENCE_API_KEY:-}" ]] || exit 71\n'
         "while (( $# )); do\n"
         '  if [[ "$1" == -o ]]; then /bin/cp "$FAKE_INSTALLER" "$2"; exit 0; fi\n'
         "  shift\n"
@@ -102,7 +115,9 @@ def _run_detached_phase_zero(
     )
     _write_executable(
         fake_bin / "sha256sum",
-        "#!/usr/bin/env bash\n/bin/cat >/dev/null\n",
+        "#!/usr/bin/env bash\n"
+        '[[ -z "${COMPATIBLE_API_KEY:-}" && -z "${NVIDIA_INFERENCE_API_KEY:-}" ]] || exit 72\n'
+        "/bin/cat >/dev/null\n",
     )
     _write_executable(
         fake_bin / "stat",
@@ -120,6 +135,7 @@ def _run_detached_phase_zero(
             "ACS_PHASE_ZERO_DETACHED": "1",
             "ACS_PHASE_ZERO_KEY_FILE": str(key_file),
             "ACS_PHASE_ZERO_STATE_DIR": str(state_dir),
+            "COMPATIBLE_API_KEY": "parent-compatible-key-must-not-reach-children",
             "FAKE_INSTALLER": str(fake_installer),
             "FAKE_NEMOCLAW": str(fake_nemoclaw),
             "FAKE_OPENSHELL": str(fake_openshell),
@@ -127,6 +143,7 @@ def _run_detached_phase_zero(
             "HOME": str(home),
             "INSTALLER_EXIT": str(installer_exit),
             "INSTALL_NEMOCLAW": "1" if install_nemoclaw else "0",
+            "NVIDIA_INFERENCE_API_KEY": "parent-nvidia-key-must-not-reach-children",
             "OPENSHELL_LOG": str(openshell_log),
             "PATH": f"{fake_bin}:/usr/bin:/bin",
             "RESUME_LOG": str(resume_log),
@@ -158,9 +175,19 @@ def test_phase_zero_setup_is_pinned_and_removes_transport_key_before_install():
     source = SCRIPT.read_text()
     assert "0d1cb93888c817daec44b2cc996afa75eebcbd46" in source
     assert "b52f053a550fab90ab1dff4ab7f3a0b55b2506aeafd2062832e65632fdbcae70" in source
-    assert "NEMOCLAW_PROVIDER=build" in source
-    assert "NEMOCLAW_MODEL=nvidia/nemotron-3-super-120b-a12b" in source
+    assert "NEMOCLAW_PROVIDER=custom" in source
+    assert "NEMOCLAW_ENDPOINT_URL=https://inference-api.nvidia.com/v1" in source
+    assert "NEMOCLAW_MODEL=nvidia/nvidia/nemotron-3-super-120b-a12b" in source
+    assert "NEMOCLAW_PREFERRED_API=openai-completions" in source
+    assert "NEMOCLAW_PROVIDER=build" not in source
+    assert "NEMOCLAW_TRUSTED_PRIVATE_INFERENCE_HOSTS" not in source
+    assert "NEMOCLAW_E2E_USE_HOSTED_INFERENCE" not in source
     assert "NEMOCLAW_SANDBOX_GPU=1" in source
+    assert "export COMPATIBLE_API_KEY" in source
+    assert "export NVIDIA_INFERENCE_API_KEY" not in source
+    assert source.index("unset COMPATIBLE_API_KEY NVIDIA_INFERENCE_API_KEY") < source.index(
+        'curl -fsSL "${install_url}"'
+    )
     assert source.index('rm -f -- "${key_file}"') < source.index('bash "${installer}"')
 
 
@@ -208,8 +235,8 @@ def test_phase_zero_resumes_one_interrupted_provider_selection_failure(tmp_path)
 
     assert completed.returncode == 0, completed.stderr
     assert not key_file.exists()
-    assert "nvapi-test-secret" not in completed.stdout
-    assert "nvapi-test-secret" not in completed.stderr
+    assert "inference-hub-test-secret" not in completed.stdout
+    assert "inference-hub-test-secret" not in completed.stderr
     assert (state_dir / "install.first.exit").read_text() == "1\n"
     assert (state_dir / "install.resume.exit").read_text() == "0\n"
     assert (state_dir / "install.exit").read_text() == "0\n"
@@ -231,8 +258,8 @@ def test_phase_zero_preserves_the_single_resume_failure_as_final_status(tmp_path
 
     assert completed.returncode == 17
     assert not key_file.exists()
-    assert "nvapi-test-secret" not in completed.stdout
-    assert "nvapi-test-secret" not in completed.stderr
+    assert "inference-hub-test-secret" not in completed.stdout
+    assert "inference-hub-test-secret" not in completed.stderr
     assert (state_dir / "install.first.exit").read_text() == "1\n"
     assert (state_dir / "install.resume.exit").read_text() == "17\n"
     assert (state_dir / "install.exit").read_text() == "17\n"
@@ -250,6 +277,48 @@ def test_phase_zero_does_not_resume_a_nonstandard_installer_failure(tmp_path):
     assert not (state_dir / "install.resume.exit").exists()
     assert (state_dir / "install.exit").read_text() == "2\n"
     assert not resume_log.exists()
+
+
+def test_phase_zero_rejects_empty_or_whitespace_inference_hub_keys(tmp_path):
+    for case, key_value in (("empty", "   "), ("embedded", "hub key")):
+        case_dir = tmp_path / case
+        case_dir.mkdir()
+        completed, state_dir, resume_log = _run_detached_phase_zero(
+            case_dir,
+            key_value=key_value,
+        )
+
+        assert completed.returncode == 2
+        assert "Protected NVIDIA inference key is malformed." in completed.stderr
+        assert key_value not in completed.stdout
+        assert not (state_dir / "install.first.exit").exists()
+        assert (state_dir / "install.exit").read_text() == "2\n"
+        assert not resume_log.exists()
+
+
+def test_phase_zero_rejects_control_multiline_nul_and_sentinel_keys(tmp_path):
+    malformed_payloads = (
+        ("empty", b"\n"),
+        ("bel", b"hub\x07key\n"),
+        ("del", b"hub\x7fkey\n"),
+        ("carriage-return", b"hub\rkey\n"),
+        ("multiline", b"hub-key\nsecond-line\n"),
+        ("nul", b"hub\x00key\n"),
+        ("sentinel", b"__NVIDIA_INFERENCE_API_KEY__\n"),
+    )
+    for case, key_payload in malformed_payloads:
+        case_dir = tmp_path / case
+        case_dir.mkdir()
+        completed, state_dir, resume_log = _run_detached_phase_zero(
+            case_dir,
+            key_payload=key_payload,
+        )
+
+        assert completed.returncode == 2, case
+        assert "Protected NVIDIA inference key is malformed." in completed.stderr, case
+        assert not (state_dir / "install.first.exit").exists(), case
+        assert (state_dir / "install.exit").read_text() == "2\n", case
+        assert not resume_log.exists(), case
 
 
 def test_phase_zero_does_not_resume_an_unsafe_or_unrelated_failure(tmp_path):

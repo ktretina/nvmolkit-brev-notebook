@@ -21,12 +21,12 @@ def render_acs_console_bootstrap(template_text: str, key: str) -> str:
     """Return the template with one validated key encoded as a shell word."""
     if template_text.count(SENTINEL) != 1:
         raise ValueError("ACS bootstrap template must contain exactly one credential sentinel")
-    if not key.startswith("nvapi-"):
-        raise ValueError("credential must be an Inference Hub key beginning with nvapi-")
-    if key == "nvapi-":
-        raise ValueError("credential must not be empty after nvapi-")
-    if any(character in key for character in ("\r", "\n", "\x00")):
-        raise ValueError("credential must be one line without NUL")
+    if any(character.isspace() for character in key):
+        raise ValueError("credential must not contain whitespace")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in key):
+        raise ValueError("credential must not contain control characters")
+    if not key or key == SENTINEL:
+        raise ValueError("credential must not be empty or unrendered")
     return template_text.replace(SENTINEL, shlex.quote(key), 1)
 
 
@@ -111,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(error))
 
     template_text = TEMPLATE_PATH.read_text(encoding="utf-8")
-    key = getpass.getpass("NVIDIA Inference Hub key: ")
+    key = getpass.getpass("inference.nvidia.com API key: ")
     try:
         rendered_text = render_acs_console_bootstrap(template_text, key)
         _write_private_output(output_path, parent_status, rendered_text)

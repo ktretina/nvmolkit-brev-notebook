@@ -38,7 +38,7 @@ configured for the workshop and does not ask you for a credential.
 | Required environment | Launchable ID | Attendee setup | Model use |
 | --- | --- | --- | --- |
 | nvMolKit + Nemotron Notebook | `env-3HJtJW3qHg4Dw1I3xt75BfpBmZW` | Enter the API key in `NVIDIA_API_KEY` | Module 1: no LLM; hosted Modules 2–3 and companion: `nvidia/nemotron-3-nano-30b-a3b` |
-| Conversational OpenClaw | `env-3Hlp4pHBlTTlfDxfH41KkGhTeCV` | No API key or Setup values | [NVIDIA Nemotron 3 Super 120B-A12B](https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b?nim=hosted) |
+| Conversational OpenClaw | `env-3Hlp4pHBlTTlfDxfH41KkGhTeCV` | No API key or Setup values | NVIDIA Nemotron 3 Super 120B-A12B |
 
 Keep the Notebook key private. You will not use it in Conversational OpenClaw.
 
@@ -104,7 +104,7 @@ Open `notebooks/nvmolkit_nemotron_demo.ipynb` only within the required notebook 
 Open the
 [Conversational OpenClaw Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Hlp4pHBlTTlfDxfH41KkGhTeCV)
 (Launchable ID `env-3Hlp4pHBlTTlfDxfH41KkGhTeCV`). This required lab uses
-[NVIDIA Nemotron 3 Super 120B-A12B](https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b?nim=hosted)
+NVIDIA Nemotron 3 Super 120B-A12B
 in a sandboxed conversational workspace to explore the configured agentic
 chemistry analyses. The four preset prompts below are tested starting points.
 You can change the questions and the requested interpretation about these

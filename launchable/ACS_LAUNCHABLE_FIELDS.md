@@ -41,7 +41,7 @@ The bootstrap keeps the saved workshop credential out of clone and checkout chil
 The OpenClaw Launchable has no Launch parameters or Setup values.
 
 1. Run `python3 launchable/render_acs_console_bootstrap.py /private/tmp/acs-openclaw-workshop-setup.sh` from the reviewed checkout.
-2. Enter the workshop-only `nvapi-` key only at the hidden prompt.
+2. Enter the workshop-only `inference.nvidia.com` API key only at the hidden prompt.
 3. Validate the output owner, regular-file type, mode `0600`, reviewed source pin, Bash syntax, and byte size without printing its contents. It must be no larger than 16,384 bytes.
 4. Save only the private rendered body in the new definition's setup-script field. Add no Launch parameters or Setup values.
 5. After the save is confirmed, delete `/private/tmp/acs-openclaw-workshop-setup.sh` and verify that it is absent.
@@ -79,7 +79,7 @@ Use this section for the existing saved Launchable `env-3Hlp4pHBlTTlfDxfH41KkGhT
 2. After that in-place pass succeeds, publish the reviewed source commit. Generate `launchable/acs_console_bootstrap.sh` with that public source commit pinned.
 3. Commit and push the generated bootstrap second.
 4. The OpenClaw Launchable has no Launch parameters or Setup values. Run `python3 launchable/render_acs_console_bootstrap.py /private/tmp/acs-openclaw-workshop-setup.sh` from the reviewed checkout.
-5. Enter the workshop-only `nvapi-` key only at the hidden prompt. Validate the output owner, regular-file type, mode `0600`, reviewed source pin, Bash syntax, and byte size without printing its contents. It must be no larger than 16,384 bytes.
+5. Enter the workshop-only `inference.nvidia.com` API key only at the hidden prompt. Validate the output owner, regular-file type, mode `0600`, reviewed source pin, Bash syntax, and byte size without printing its contents. It must be no larger than 16,384 bytes.
 6. Keep access set to **Only my organization** during this update. Save only the private rendered body in the setup-script field of the existing saved Launchable `env-3Hlp4pHBlTTlfDxfH41KkGhTeCV`. Remove every Launch parameter and Setup value, then save once.
 7. After the save is confirmed, delete `/private/tmp/acs-openclaw-workshop-setup.sh` and verify that it is absent. Never store the key in source, a Launchable default, documentation, logs, chat, screenshots, or workshop files. Monitor its use during the workshop and revoke it after the workshop.
 8. Create a future fresh deployment from the saved definition. Verify automatic OpenClaw sign-in, completion of all four prompts, display of all four images, and the **Download Results** service.
