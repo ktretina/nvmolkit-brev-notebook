@@ -1684,7 +1684,7 @@ if [[ "${mode}" == "rollback" ]]; then
     printf '%s\n' '{"idempotent":true,"main_session_touched":false,"mode":"rollback","restored":true,"schema_version":1,"status":"pass"}'
     exit 0
   fi
-  rollback_ready=1
+  rollback_ready=0
   trap 'handle_failure $?' ERR
   trap 'handle_failure 130' INT
   trap 'handle_failure 143' TERM

@@ -1031,6 +1031,42 @@ def test_rollback_propagates_loop_restore_command_failures_without_completion(
     assert _snapshot(workspace) == original
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        ("helper", "rollback_files"),
+        ("config", "rollback_config_set_27"),
+        ("gateway", "rollback_gateway_restart_28"),
+    ],
+)
+def test_explicit_rollback_failure_does_not_replay_the_rollback_attempt(
+    tmp_path: Path,
+    fake_environment: tuple[dict[str, str], Path, Path, Path],
+    failure: str,
+    expected_code: str,
+) -> None:
+    environment, command_log, _, _ = fake_environment
+    bundle = _seed_bundle(tmp_path)
+    state_dir = tmp_path / "state"
+    applied = _run_patch("apply", bundle, state_dir, environment)
+    assert applied.returncode == 0, (applied.stdout, applied.stderr)
+    calls_before_rollback = len(_read_commands(command_log))
+    if failure == "helper":
+        environment["ACS_FAKE_FAIL_HELPER_ACTION"] = "rollback"
+    elif failure == "config":
+        environment["ACS_FAKE_FAIL_CONFIG_MUTATION"] = "1"
+    else:
+        environment["ACS_FAKE_FAIL_GATEWAY_RESTART"] = "1"
+
+    failed = _run_patch("rollback", bundle, state_dir, environment)
+
+    assert failed.returncode != 0
+    assert json.loads(failed.stdout)["code"] == expected_code
+    rollback_calls = _read_commands(command_log)[calls_before_rollback:]
+    assert sum("prepare-restore" in call for call in rollback_calls) == 1
+    assert sum("rollback" in call for call in rollback_calls) == 1
+
+
 def test_direct_and_idempotent_rollback_accept_all_protected_at_0460(
     tmp_path: Path,
     fake_environment: tuple[dict[str, str], Path, Path, Path],
