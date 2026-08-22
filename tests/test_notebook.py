@@ -368,6 +368,45 @@ def test_renderer_cli_refuses_repository_symlink_alias_before_prompt(
     assert not os.path.lexists(output_path)
 
 
+def test_renderer_cli_refuses_nested_repository_symlink_alias_before_prompt(
+    monkeypatch,
+    tmp_path,
+):
+    renderer = _load_render_setup()
+    nested_repository_parent = REPO_ROOT / "launchable" / f".{tmp_path.name}"
+    nested_repository_parent.mkdir()
+    repository_subdirectory_alias = tmp_path / "launchable-alias"
+    repository_subdirectory_alias.symlink_to(
+        REPO_ROOT / "launchable",
+        target_is_directory=True,
+    )
+    output_path = (
+        repository_subdirectory_alias
+        / nested_repository_parent.name
+        / "forbidden-nested-alias-rendered-setup.sh"
+    )
+    physical_output_path = nested_repository_parent / output_path.name
+    try:
+        assert not os.path.lexists(output_path)
+        monkeypatch.setattr(
+            renderer.getpass,
+            "getpass",
+            lambda _prompt: pytest.fail(
+                "nested repository alias must fail before prompt"
+            ),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            renderer.main([str(output_path)])
+
+        assert exc_info.value.code == 2
+        assert not os.path.lexists(output_path)
+    finally:
+        if os.path.lexists(physical_output_path):
+            physical_output_path.unlink()
+        nested_repository_parent.rmdir()
+
+
 def test_renderer_cli_refuses_case_alias_of_repository_when_supported(
     monkeypatch,
 ):

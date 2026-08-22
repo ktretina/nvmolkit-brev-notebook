@@ -42,7 +42,13 @@ def _validate_output_path(value: str) -> tuple[Path, os.stat_result]:
         parent_status.st_mode
     ):
         raise ValueError("output parent must be a real directory, not a symlink")
-    for ancestor in (output_parent, *output_parent.parents):
+    physical_parent = output_parent.resolve(strict=True)
+    for ancestor in (
+        output_parent,
+        *output_parent.parents,
+        physical_parent,
+        *physical_parent.parents,
+    ):
         if os.path.samefile(ancestor, REPO_ROOT):
             raise ValueError("output path must be outside the repository")
     return output_path, parent_status
