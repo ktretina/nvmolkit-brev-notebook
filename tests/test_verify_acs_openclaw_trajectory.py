@@ -1135,11 +1135,13 @@ def test_rejects_page_and_trajectory_changed_together(tmp_path: Path) -> None:
     trajectory, archive, page = _valid_evidence(tmp_path)
     changed_page = tmp_path / "changed-page.md"
     changed_page.write_bytes(
-        page.read_bytes().replace(b"Question:", b"Question changed:", 1)
+        page.read_bytes().replace(
+            b"Use the preinstalled", b"Use a changed preinstalled", 1
+        )
     )
     snapshot = _latest_snapshot(trajectory)
     snapshot[0]["content"] = str(snapshot[0]["content"]).replace(
-        "Question:", "Question changed:", 1
+        "Use the preinstalled", "Use a changed preinstalled", 1
     )
     _write_snapshot(trajectory, snapshot)
     with pytest.raises(verifier.VerificationError, match="^prompt_contract$"):
@@ -2561,6 +2563,23 @@ def test_load_prompt_contracts_rejects_extra_region_text(tmp_path: Path) -> None
     )
     with pytest.raises(verifier.VerificationError, match="^prompt_contract$"):
         verifier.load_prompt_contracts(changed)
+
+
+def test_load_prompt_contracts_accepts_science_first_prompts_without_media_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_hashes = (
+        "ba3a7a11c86d5ec781537c23cc5e153e2f42f74d9300b91835d0d3361760642f",
+        "9287a0a5114149712210770b649fdda4157bef9165a514a350fbbae41a426aa0",
+        "46aa528617a52838a93fc5a37da159fcb33d76bb9d90a71181a20e8039a0f8e2",
+        "905bf47c129bbd01da7f630b09951194e042330fcf4f7a7f6f806975b0ea8c4c",
+    )
+    monkeypatch.setattr(verifier, "PROMPT_SHA256", expected_hashes)
+
+    contracts = verifier.load_prompt_contracts(PAGE)
+
+    assert tuple(contract[2] for contract in contracts) == expected_hashes
+    assert all("MEDIA:" not in contract[1] for contract in contracts)
 
 
 def test_load_prompt_contracts_rejects_symlink(tmp_path: Path) -> None:

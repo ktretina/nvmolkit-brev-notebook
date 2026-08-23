@@ -28,10 +28,10 @@ PROMPT_IDS: Final = (
     "04-objective",
 )
 PROMPT_SHA256: Final = (
-    "39ca26c1b494dbe01bcbaabf27d72d755b444915e9ff26c874e629f09610bf22",
-    "5d556991910812a24bb09b23cd250fd4a7157986948082fb8cc05cb3d52c1f5e",
-    "6779b1bfbe141a72c795d5e648ad33a5e7ddd55a8bc953b0c1ae116f757be34a",
-    "ec93fcfa236b6000980178626b322aeb0786a52a53a0132338784221c24550ea",
+    "ba3a7a11c86d5ec781537c23cc5e153e2f42f74d9300b91835d0d3361760642f",
+    "9287a0a5114149712210770b649fdda4157bef9165a514a350fbbae41a426aa0",
+    "46aa528617a52838a93fc5a37da159fcb33d76bb9d90a71181a20e8039a0f8e2",
+    "905bf47c129bbd01da7f630b09951194e042330fcf4f7a7f6f806975b0ea8c4c",
 )
 PROMPT_MEDIA: Final = (
     "MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/"
@@ -245,9 +245,7 @@ def load_prompts(page: Path) -> tuple[str, ...]:
         raise QAError
     prompts: list[str] = []
     prior_end = -1
-    for prompt_id, expected_digest, media_line in zip(
-        PROMPT_IDS, PROMPT_SHA256, PROMPT_MEDIA, strict=True
-    ):
+    for prompt_id, expected_digest in zip(PROMPT_IDS, PROMPT_SHA256, strict=True):
         begin = f"<!-- ACS_PROMPT:{prompt_id}:BEGIN -->"
         end = f"<!-- ACS_PROMPT:{prompt_id}:END -->"
         begin_index = source.find(begin)
@@ -270,10 +268,7 @@ def load_prompts(page: Path) -> tuple[str, ...]:
         ):
             raise QAError
         prompt = region[prompt_start:prompt_end]
-        if (
-            not prompt.endswith(media_line)
-            or hashlib.sha256(prompt.encode("utf-8")).hexdigest() != expected_digest
-        ):
+        if hashlib.sha256(prompt.encode("utf-8")).hexdigest() != expected_digest:
             raise QAError
         prompts.append(prompt)
         prior_end = end_index

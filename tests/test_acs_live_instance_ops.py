@@ -34,10 +34,10 @@ LOOP_MISSING_DIAGNOSTIC = (
     "Run openclaw config validate to inspect config shape."
 )
 PROMPT_SHA256 = (
-    "39ca26c1b494dbe01bcbaabf27d72d755b444915e9ff26c874e629f09610bf22",
-    "5d556991910812a24bb09b23cd250fd4a7157986948082fb8cc05cb3d52c1f5e",
-    "6779b1bfbe141a72c795d5e648ad33a5e7ddd55a8bc953b0c1ae116f757be34a",
-    "ec93fcfa236b6000980178626b322aeb0786a52a53a0132338784221c24550ea",
+    "ba3a7a11c86d5ec781537c23cc5e153e2f42f74d9300b91835d0d3361760642f",
+    "9287a0a5114149712210770b649fdda4157bef9165a514a350fbbae41a426aa0",
+    "46aa528617a52838a93fc5a37da159fcb33d76bb9d90a71181a20e8039a0f8e2",
+    "905bf47c129bbd01da7f630b09951194e042330fcf4f7a7f6f806975b0ea8c4c",
 )
 BUNDLE_FILES = (
     "acs_workshop_runner.py",
@@ -106,6 +106,26 @@ def _load_qa_module() -> ModuleType:
         assert sys.path[0] == scripts
         sys.path.pop(0)
     return module
+
+
+def test_qa_loads_science_first_prompts_without_media_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qa = _load_qa_module()
+    expected_hashes = (
+        "ba3a7a11c86d5ec781537c23cc5e153e2f42f74d9300b91835d0d3361760642f",
+        "9287a0a5114149712210770b649fdda4157bef9165a514a350fbbae41a426aa0",
+        "46aa528617a52838a93fc5a37da159fcb33d76bb9d90a71181a20e8039a0f8e2",
+        "905bf47c129bbd01da7f630b09951194e042330fcf4f7a7f6f806975b0ea8c4c",
+    )
+    monkeypatch.setattr(qa, "PROMPT_SHA256", expected_hashes)
+
+    prompts = qa.load_prompts(PAGE)
+
+    assert tuple(hashlib.sha256(prompt.encode()).hexdigest() for prompt in prompts) == (
+        expected_hashes
+    )
+    assert all("MEDIA:" not in prompt for prompt in prompts)
 
 
 def _write_executable(path: Path, source: str) -> None:
@@ -2420,7 +2440,9 @@ def test_qa_rejects_invalid_inputs_before_first_submission(
     elif violation == "page-hash":
         page = tmp_path / "page.md"
         page.write_text(
-            PAGE.read_text().replace("Scientific objective:", "Objective:", 1)
+            PAGE.read_text().replace(
+                "Use the preinstalled", "Use a changed preinstalled", 1
+            )
         )
     elif violation == "output-mode":
         output.chmod(0o755)
