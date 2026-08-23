@@ -3610,6 +3610,25 @@ def test_objective_commands_reject_nonprivate_state_root_without_mutation(
     assert workshop_paths.history_path.read_bytes() == before
 
 
+def test_objective_start_accepts_openshell_private_state_modes(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+) -> None:
+    execution = _objective_execution(workflow_executions)
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    workshop_paths.state_root.chmod(0o2700)
+    workshop_paths.context_path.chmod(0o660)
+    workshop_paths.history_path.chmod(0o660)
+
+    result = runner.objective_start(paths=workshop_paths)
+
+    assert result["status"] == "pending"
+
+
 def test_new_objective_action_is_evaluated_exactly_once(
     workshop_paths: runner.WorkshopPaths,
     workflow_executions: dict[str, runner.WorkflowExecution],

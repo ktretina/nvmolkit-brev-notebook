@@ -1828,9 +1828,15 @@ def _validated_objective_directory_below_root(
 
 
 def _validated_private_root(paths: WorkshopPaths) -> Path:
-    return _validated_objective_directory_below_root(
-        paths, paths.state_root, required_mode=0o700
-    )
+    root = _validated_objective_directory_below_root(paths, paths.state_root)
+    try:
+        metadata = os.lstat(root)
+        mode = stat.S_IMODE(metadata.st_mode)
+        if metadata.st_uid != os.geteuid() or mode not in {0o700, 0o2700}:
+            raise ValueError
+    except (OSError, ValueError) as error:
+        raise _objective_error() from error
+    return root
 
 
 def _sha256_file(path: Path) -> str:
@@ -1861,8 +1867,25 @@ def _atomic_private_json(path: Path, payload: dict[str, Any]) -> None:
 
 def _read_private_json(path: Path) -> tuple[dict[str, Any], bytes]:
     try:
-        mode = os.lstat(path).st_mode
-        if not stat.S_ISREG(mode) or stat.S_ISLNK(mode) or stat.S_IMODE(mode) != 0o600:
+        metadata = os.lstat(path)
+        mode = metadata.st_mode
+        private_mode = stat.S_IMODE(mode) == 0o600
+        openshell_mode = False
+        if stat.S_IMODE(mode) == 0o660:
+            parent = os.lstat(path.parent)
+            openshell_mode = (
+                stat.S_ISDIR(parent.st_mode)
+                and not stat.S_ISLNK(parent.st_mode)
+                and stat.S_IMODE(parent.st_mode) == 0o2700
+                and parent.st_uid == os.geteuid()
+                and metadata.st_gid == parent.st_gid
+            )
+        if (
+            not stat.S_ISREG(mode)
+            or stat.S_ISLNK(mode)
+            or metadata.st_uid != os.geteuid()
+            or not (private_mode or openshell_mode)
+        ):
             raise _objective_error()
         payload_bytes = _read_regular_file(path)
         payload = json.loads(
