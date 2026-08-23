@@ -15,6 +15,7 @@ from chemistry_workflow import (
     EvidenceRecord,
     WorkflowPhase,
     WorkflowState,
+    build_molecule_grid_image,
     eligible_representative_groups,
     validated_similarity_matrix,
 )
@@ -950,7 +951,6 @@ def validate_objective_evidence(
 def objective_figures(run: ObjectiveRun, state: WorkflowState) -> tuple[Any, ...]:
     """Render the compact attempt trajectory, final structures, and heatmap."""
     from matplotlib.figure import Figure
-    from rdkit.Chem import Draw
 
     context = run.context
     trajectory = Figure(figsize=(6.2, 2.8), layout="constrained")
@@ -970,11 +970,11 @@ def objective_figures(run: ObjectiveRun, state: WorkflowState) -> tuple[Any, ...
         state.molecules[candidate_by_id[molecule_id].molecule_index]
         for molecule_id in run.final_ids
     ]
-    structures = Draw.MolsToGridImage(
+    structures = build_molecule_grid_image(
         final_molecules,
-        legends=list(run.final_ids),
-        molsPerRow=PANEL_SIZE,
-        subImgSize=(180, 150),
+        list(run.final_ids),
+        molecules_per_row=PANEL_SIZE,
+        sub_image_size=(180, 150),
     )
 
     positions = {

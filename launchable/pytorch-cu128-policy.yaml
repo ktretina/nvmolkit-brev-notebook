@@ -1,0 +1,30 @@
+preset:
+  name: pytorch-cu128
+  description: PyTorch CUDA 12.8 wheels
+network_policies:
+  pytorch_cu128:
+    name: pytorch_cu128
+    endpoints:
+      - host: download.pytorch.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {method: GET, path: "/**"}
+          - allow: {method: HEAD, path: "/**"}
+      - host: download-r2.pytorch.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {method: GET, path: "/**"}
+          - allow: {method: HEAD, path: "/**"}
+      - host: pypi.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {method: GET, path: "/**"}
+          - allow: {method: HEAD, path: "/**"}
+    binaries:
+      - {path: /usr/bin/python3*}
