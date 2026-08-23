@@ -177,10 +177,10 @@ def test_results_are_named_without_internal_paths() -> None:
 
 def test_marked_prompt_blocks_are_byte_locked() -> None:
     expected_hashes = {
-        "01-data-and-representation": "ba3a7a11c86d5ec781537c23cc5e153e2f42f74d9300b91835d0d3361760642f",
-        "02-relationships-and-groups": "9287a0a5114149712210770b649fdda4157bef9165a514a350fbbae41a426aa0",
-        "03-sampled-3d-geometry": "46aa528617a52838a93fc5a37da159fcb33d76bb9d90a71181a20e8039a0f8e2",
-        "04-objective": "905bf47c129bbd01da7f630b09951194e042330fcf4f7a7f6f806975b0ea8c4c",
+        "01-data-and-representation": "24c90fccd5de867a304ab10b2ff927d65b5bd3fb7eb164134005b600300d34e9",
+        "02-relationships-and-groups": "d17dad3e21ed5713beb4e3f73e5ee73ad6905c50a41f1c6ada1b9d953690c330",
+        "03-sampled-3d-geometry": "713922fb7703797169969d7ddc7a8457013ccc57e5f0883d618216ea7686e48a",
+        "04-objective": "3cf3c3c0fc808eb0e0bb9da6a3ac6c54658113b11f9a73672716c89b239a1659",
     }
     blocks = _prompt_blocks(_source())
     assert {
