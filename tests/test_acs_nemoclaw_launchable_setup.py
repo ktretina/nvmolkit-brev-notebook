@@ -21,9 +21,34 @@ CONFIG_ARGV = (
         "--",
         "openclaw",
         "config",
+        "get",
+        "models.providers.inference.models.0.id",
+        "--json",
+    ),
+    (
+        "acs-chemistry-agent",
+        "exec",
+        "--workdir",
+        "/sandbox/.openclaw/workspace",
+        "--",
+        "openclaw",
+        "config",
         "set",
         "models.providers.inference.timeoutSeconds",
         "300",
+        "--strict-json",
+    ),
+    (
+        "acs-chemistry-agent",
+        "exec",
+        "--workdir",
+        "/sandbox/.openclaw/workspace",
+        "--",
+        "openclaw",
+        "config",
+        "set",
+        "models.providers.inference.models.0.maxTokens",
+        "8192",
         "--strict-json",
     ),
     (
@@ -50,6 +75,18 @@ CONFIG_ARGV = (
         "config",
         "get",
         "models.providers.inference.timeoutSeconds",
+        "--json",
+    ),
+    (
+        "acs-chemistry-agent",
+        "exec",
+        "--workdir",
+        "/sandbox/.openclaw/workspace",
+        "--",
+        "openclaw",
+        "config",
+        "get",
+        "models.providers.inference.models.0.maxTokens",
         "--json",
     ),
     (
@@ -157,8 +194,12 @@ if [[ "${ACS_FAIL_CALL}" == "${call_number}" ]]; then
   exit 17
 fi
 arguments=" $* "
-if [[ "${arguments}" == *" openclaw config get models.providers.inference.timeoutSeconds --json "* ]]; then
+if [[ "${arguments}" == *" openclaw config get models.providers.inference.models.0.id --json "* ]]; then
+  printf '%s\n' "${ACS_MODEL_ID_JSON}"
+elif [[ "${arguments}" == *" openclaw config get models.providers.inference.timeoutSeconds --json "* ]]; then
   printf '%s\n' "${ACS_PROVIDER_JSON}"
+elif [[ "${arguments}" == *" openclaw config get models.providers.inference.models.0.maxTokens --json "* ]]; then
+  printf '%s\n' "${ACS_MAX_TOKENS_JSON}"
 elif [[ "${arguments}" == *" openclaw config get tools.loopDetection.enabled --json "* ]]; then
   printf '%s\n' "${ACS_LOOP_JSON}"
 else
@@ -175,7 +216,9 @@ def _run_runtime_config(
     tmp_path: Path,
     *,
     fail_call: int = 0,
+    model_id_json: str = '"nvidia/nvidia/nemotron-3-super-v3"',
     provider_json: str = "300",
+    max_tokens_json: str = "8192",
     loop_json: str = "true",
 ) -> tuple[subprocess.CompletedProcess[str], tuple[tuple[str, ...], ...], Path]:
     fake_nemoclaw = _fake_nemoclaw(tmp_path)
@@ -203,6 +246,8 @@ printf 'ready\n' > "${ACS_READY_MARKER}"
             "ACS_FAKE_LOG": str(call_log),
             "ACS_FAKE_NEMOCLAW": str(fake_nemoclaw),
             "ACS_LOOP_JSON": loop_json,
+            "ACS_MAX_TOKENS_JSON": max_tokens_json,
+            "ACS_MODEL_ID_JSON": model_id_json,
             "ACS_PROVIDER_JSON": provider_json,
             "ACS_RAW_CANARY": "raw-config-output-canary",
             "ACS_READY_MARKER": str(ready_marker),
@@ -321,9 +366,38 @@ def test_setup_reads_config_without_printing_values_or_secrets() -> None:
     assert "NVIDIA_INFERENCE_API_KEY" not in block
     assert "printf" not in block
     assert "echo" not in block
-    assert block.count(">/dev/null 2>&1") == 3
-    assert block.count("--json 2>/dev/null") == 2
+    assert block.count(">/dev/null 2>&1") == 4
+    assert block.count("--json 2>/dev/null") == 4
     assert "|| true" not in block
+
+
+def test_setup_binds_and_persists_exact_json_provider_model_max_tokens() -> None:
+    source = _source()
+    config_start = source.index("configure_openclaw_runtime() {")
+    config_end = source.index("\n}\n\nif [[", config_start)
+    block = source[config_start:config_end]
+
+    model_id_read = "models.providers.inference.models.0.id --json 2>/dev/null"
+    model_id_check = (
+        '[[ "${provider_model_id}" == '
+        "'\"nvidia/nvidia/nemotron-3-super-v3\"' ]]"
+    )
+    max_tokens_write = (
+        "models.providers.inference.models.0.maxTokens 8192 --strict-json"
+    )
+    max_tokens_read = (
+        "models.providers.inference.models.0.maxTokens --json 2>/dev/null"
+    )
+
+    assert block.count(model_id_read) == 1
+    assert block.count(model_id_check) == 1
+    assert block.count(max_tokens_write) == 1
+    assert block.count(max_tokens_read) == 1
+    assert block.count('[[ "${provider_max_tokens}" == "8192" ]]') == 1
+    assert block.index(model_id_read) < block.index(model_id_check)
+    assert block.index(model_id_check) < block.index(max_tokens_write)
+    assert "models.providers.inference.maxTokens" not in block
+    assert "NEMOCLAW_MAX_TOKENS" not in block
 
 
 def test_runtime_config_executes_exact_order_and_suppresses_cli_output(
@@ -343,11 +417,14 @@ def test_runtime_config_executes_exact_order_and_suppresses_cli_output(
 @pytest.mark.parametrize(
     ("fail_call", "expected_error"),
     (
-        (1, "could not set the inference provider timeout."),
-        (2, "could not enable OpenClaw tool-loop detection."),
-        (3, "could not restart the OpenClaw gateway."),
-        (4, "could not read back the inference provider timeout."),
-        (5, "could not read back OpenClaw tool-loop detection."),
+        (1, "could not read the active inference provider model ID."),
+        (2, "could not set the inference provider timeout."),
+        (3, "could not set the inference provider maximum output tokens."),
+        (4, "could not enable OpenClaw tool-loop detection."),
+        (5, "could not restart the OpenClaw gateway."),
+        (6, "could not read back the inference provider timeout."),
+        (7, "could not read back the inference provider maximum output tokens."),
+        (8, "could not read back OpenClaw tool-loop detection."),
     ),
 )
 def test_runtime_config_nonzero_gate_stops_before_ready(
@@ -374,40 +451,61 @@ def test_runtime_config_failed_restart_rejects_stale_valid_values(
 ) -> None:
     completed, calls, ready_marker = _run_runtime_config(
         tmp_path,
-        fail_call=3,
+        fail_call=5,
+        model_id_json='"nvidia/nvidia/nemotron-3-super-v3"',
         provider_json="300",
+        max_tokens_json="8192",
         loop_json="true",
     )
 
     assert completed.returncode != 0
-    assert calls == CONFIG_ARGV[:3]
+    assert calls == CONFIG_ARGV[:5]
     assert not ready_marker.exists()
     assert "could not restart the OpenClaw gateway." in completed.stderr
 
 
 @pytest.mark.parametrize(
-    ("provider_json", "loop_json"),
     (
-        ('"300"', "true"),
-        ("300.0", "true"),
-        ("300", '"true"'),
-        ("300", "false"),
+        "model_id_json",
+        "provider_json",
+        "max_tokens_json",
+        "loop_json",
+        "expected_call_count",
+    ),
+    (
+        ('"nvidia/nvidia/other-model"', "300", "8192", "true", 1),
+        ("nvidia/nvidia/nemotron-3-super-v3", "300", "8192", "true", 1),
+        ('"nvidia/nvidia/nemotron-3-super-v3"', '"300"', "8192", "true", 6),
+        ('"nvidia/nvidia/nemotron-3-super-v3"', "300.0", "8192", "true", 6),
+        ('"nvidia/nvidia/nemotron-3-super-v3"', "300", '"8192"', "true", 7),
+        ('"nvidia/nvidia/nemotron-3-super-v3"', "300", "8192.0", "true", 7),
+        ('"nvidia/nvidia/nemotron-3-super-v3"', "300", "8191", "true", 7),
+        ('"nvidia/nvidia/nemotron-3-super-v3"', "300", "8192", '"true"', 8),
+        ('"nvidia/nvidia/nemotron-3-super-v3"', "300", "8192", "false", 8),
     ),
 )
-def test_runtime_config_accepts_only_exact_json_number_and_boolean(
+def test_runtime_config_accepts_only_exact_json_numbers_and_boolean(
     tmp_path: Path,
+    model_id_json: str,
     provider_json: str,
+    max_tokens_json: str,
     loop_json: str,
+    expected_call_count: int,
 ) -> None:
     completed, calls, ready_marker = _run_runtime_config(
         tmp_path,
+        model_id_json=model_id_json,
         provider_json=provider_json,
+        max_tokens_json=max_tokens_json,
         loop_json=loop_json,
     )
 
     assert completed.returncode != 0
-    assert calls in (CONFIG_ARGV[:4], CONFIG_ARGV)
+    assert calls == CONFIG_ARGV[:expected_call_count]
     assert not ready_marker.exists()
+    combined = completed.stdout + completed.stderr
+    assert "raw-config-output-canary" not in combined
+    assert "nvapi-config-secret-canary" not in combined
 
 
 def test_setup_script_orchestrates_only_the_lean_workshop_assets() -> None:
@@ -814,7 +912,7 @@ def test_setup_has_short_progress_without_raw_tool_output() -> None:
     ):
         assert f'phase "{label}"' in source
     assert "set -x" not in source
-    assert source.count("--json 2>/dev/null") == 2
+    assert source.count("--json 2>/dev/null") == 4
     assert "--json" not in source.replace("--json 2>/dev/null", "")
     assert source.count(">/dev/null 2>&1") >= 12
 

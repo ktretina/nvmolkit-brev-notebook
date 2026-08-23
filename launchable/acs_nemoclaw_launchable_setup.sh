@@ -56,15 +56,30 @@ configure_openclaw_runtime() {
   local nemoclaw_path="$1"
   local target_sandbox="$2"
   local target_workspace="$3"
+  local provider_model_id=""
   local provider_timeout=""
+  local provider_max_tokens=""
   local loop_detection=""
 
   phase "Configure OpenClaw runtime"
+  if ! provider_model_id="$("${nemoclaw_path}" "${target_sandbox}" exec \
+    --workdir "${target_workspace}" -- openclaw config get \
+    models.providers.inference.models.0.id --json 2>/dev/null)"; then
+    die "could not read the active inference provider model ID."
+  fi
+  [[ "${provider_model_id}" == '"nvidia/nvidia/nemotron-3-super-v3"' ]] ||
+    die "the active inference provider model ID was not the expected Nemotron model."
   if ! "${nemoclaw_path}" "${target_sandbox}" exec \
     --workdir "${target_workspace}" -- openclaw config set \
     models.providers.inference.timeoutSeconds 300 --strict-json \
     >/dev/null 2>&1; then
     die "could not set the inference provider timeout."
+  fi
+  if ! "${nemoclaw_path}" "${target_sandbox}" exec \
+    --workdir "${target_workspace}" -- openclaw config set \
+    models.providers.inference.models.0.maxTokens 8192 --strict-json \
+    >/dev/null 2>&1; then
+    die "could not set the inference provider maximum output tokens."
   fi
   if ! "${nemoclaw_path}" "${target_sandbox}" exec \
     --workdir "${target_workspace}" -- openclaw config set \
@@ -82,6 +97,13 @@ configure_openclaw_runtime() {
   fi
   [[ "${provider_timeout}" == "300" ]] ||
     die "the inference provider timeout was not set to 300 seconds."
+  if ! provider_max_tokens="$("${nemoclaw_path}" "${target_sandbox}" exec \
+    --workdir "${target_workspace}" -- openclaw config get \
+    models.providers.inference.models.0.maxTokens --json 2>/dev/null)"; then
+    die "could not read back the inference provider maximum output tokens."
+  fi
+  [[ "${provider_max_tokens}" == "8192" ]] ||
+    die "the inference provider maximum output token count was not set to 8192."
   if ! loop_detection="$("${nemoclaw_path}" "${target_sandbox}" exec \
     --workdir "${target_workspace}" -- openclaw config get \
     tools.loopDetection.enabled --json 2>/dev/null)"; then
