@@ -435,6 +435,18 @@ def test_workspace_note_exposes_only_the_bounded_workshop_commands_and_artifacts
 
 def test_workspace_note_stops_completed_lessons_and_copies_canonical_answers():
     source = WORKSPACE_TOOLS.read_text()
+    assert "Run only the workflow that matches the current user message." in source
+    assert "Never advance to a later lesson or the objective" in source
+    assert "Use the `exec` tool for the exact command shown below." in source
+    assert "Never call `acs_workshop_runner.py` as a tool name" in source
+    assert "never run the runner without the listed subcommand" in source
+    assert "If a command returns a nonzero exit code, stop tool use" in source
+    assert "do not retry it or choose another action" in source
+    assert "three lessons in order" not in source
+    assert (
+        "For the fourth attendee request, after the three separate lesson requests:"
+        in source
+    )
     assert "Each lesson command has a one-call budget." in source
     assert "top-level `status: complete`" in source
     assert "stop tool use and answer from that first result" in source
@@ -445,6 +457,7 @@ def test_workspace_note_stops_completed_lessons_and_copies_canonical_answers():
     assert "exact returned `state_id` and `swap_id`" in source
     assert "Keep both values single-quoted" in source
     assert "Run at most three objective-step commands" in source
+    assert "discard the prior menu and use only the new displayed menu" in source
 
 
 def test_workspace_note_preserves_scientific_boundaries():

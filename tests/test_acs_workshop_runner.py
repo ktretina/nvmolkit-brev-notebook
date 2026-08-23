@@ -3613,6 +3613,7 @@ def test_objective_commands_reject_nonprivate_state_root_without_mutation(
 def test_objective_start_accepts_openshell_private_state_modes(
     workshop_paths: runner.WorkshopPaths,
     workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     execution = _objective_execution(workflow_executions)
     runner.run_lesson(
@@ -3623,10 +3624,73 @@ def test_objective_start_accepts_openshell_private_state_modes(
     workshop_paths.state_root.chmod(0o2700)
     workshop_paths.context_path.chmod(0o660)
     workshop_paths.history_path.chmod(0o660)
+    real_lstat = runner.os.lstat
+
+    def openshell_lstat(path, *args, **kwargs):
+        metadata = real_lstat(path, *args, **kwargs)
+        if Path(path) == workshop_paths.state_root:
+            return os.stat_result((metadata.st_mode | stat.S_ISGID, *metadata[1:]))
+        return metadata
+
+    monkeypatch.setattr(runner.os, "lstat", openshell_lstat)
 
     result = runner.objective_start(paths=workshop_paths)
 
     assert result["status"] == "pending"
+
+
+def test_terminal_objective_publication_accepts_openshell_setgid_prepared_directory(
+    workshop_paths: runner.WorkshopPaths,
+    workflow_executions: dict[str, runner.WorkflowExecution],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution = _objective_execution(
+        workflow_executions, controlled_context_with_tied_paths(True)
+    )
+    runner.run_lesson(
+        "sampled-3d-geometry",
+        paths=workshop_paths,
+        workflow_executor=lambda _stage: execution,
+    )
+    result = runner.objective_start(paths=workshop_paths)
+    maximum = max(action["predicted_score"] for action in result["actions"])
+    selected = next(
+        action for action in result["actions"] if action["predicted_score"] == maximum
+    )
+    result = runner.objective_step(
+        result["state_id"], selected["swap_id"], paths=workshop_paths
+    )
+    assert result["status"] == "pending"
+
+    real_lstat = runner.os.lstat
+
+    def openshell_lstat(path, *args, **kwargs):
+        metadata = real_lstat(path, *args, **kwargs)
+        if Path(path).name.startswith(".acs-objective-prepared-"):
+            return os.stat_result((metadata.st_mode | stat.S_ISGID, *metadata[1:]))
+        return metadata
+
+    monkeypatch.setattr(runner.os, "lstat", openshell_lstat)
+    last_request = None
+    while not result["terminal"]:
+        maximum = max(action["predicted_score"] for action in result["actions"])
+        selected = next(
+            action
+            for action in result["actions"]
+            if action["predicted_score"] == maximum
+        )
+        last_request = (result["state_id"], selected["swap_id"])
+        result = runner.objective_step(*last_request, paths=workshop_paths)
+
+    assert result["status"] == "complete"
+    assert (workshop_paths.output_root / "07-objective/final_panel.png").is_file()
+    with zipfile.ZipFile(workshop_paths.output_root / "results.zip") as archive:
+        members = set(archive.namelist())
+    assert {f"07-objective/{name}" for name in runner._OBJECTIVE_FILES} <= members
+    history_bytes = workshop_paths.history_path.read_bytes()
+    assert last_request is not None
+    assert runner.objective_step(*last_request, paths=workshop_paths) == result
+    assert workshop_paths.history_path.read_bytes() == history_bytes
 
 
 def test_new_objective_action_is_evaluated_exactly_once(
