@@ -59,24 +59,22 @@ applies to the OpenClaw Launchable.
 
 ## Notebook Journey Text
 
-The notebook section keeps enough information to complete the existing
-notebooks without command-line work:
+The notebook section keeps enough information to complete the current
+`nvmolkit_nemotron_demo.ipynb` notebook without command-line work:
 
 1. Open the notebook Launchable.
 2. Enter its NVIDIA inference API key only in the named Launchable field when
    that field is present.
 3. Deploy and wait for setup to finish.
 4. Open JupyterLab through the port 8888 Secure Link.
-5. Open and run Modules 1, 2, and 3 in numeric order if participating in the
-   full notebook journey.
-6. Use hosted mode for the hosted Nemotron cells.
-7. Run the integrated companion only if desired.
+5. Open `nvmolkit_nemotron_demo.ipynb` and run its cells from top to bottom.
+6. In **Agent run**, select **Start Agent**, then select **Approve & Run** for each displayed stage.
+7. After the MMFF94 stage, select **Run Objective Challenge**.
 8. Download wanted files, then stop or delete the environment according to the
    Brev cost guidance.
 
-The section keeps the current scientific purpose of each notebook but removes
-participation mandates. It labels advanced runs, reference recovery, and the
-companion as optional choices.
+The section keeps the notebook's current scientific purpose and removes stale
+module, companion, and participation-mandate text.
 
 ## OpenClaw Journey Text
 
@@ -146,7 +144,7 @@ The attendee guide uses one recovery rule:
 > Send each prompt only once. If OpenClaw is still working, wait. If you
 > accidentally send the same prompt twice, do not try to repair anything; the
 > workshop should return the existing completed result. If a request reports an
-> error, stop that step and record the message.
+> error, take a screenshot and continue with another optional activity.
 
 No terminal, shell, file-edit, state-ID, swap-ID, or administrator procedure is
 shown to the attendee.
