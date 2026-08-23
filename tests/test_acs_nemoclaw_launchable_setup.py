@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 import stat
 import subprocess
@@ -10,6 +11,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "launchable" / "acs_nemoclaw_launchable_setup.sh"
+WORKFLOW = ROOT / "chemistry_workflow.py"
 CONFIG_ARGV = (
     (
         "acs-chemistry-agent",
@@ -68,6 +70,17 @@ CONFIG_ARGV = (
 def _source() -> str:
     assert SCRIPT.is_file(), "the unified ACS NemoClaw setup script is missing"
     return SCRIPT.read_text(encoding="utf-8")
+
+
+def test_rdkit_workflow_import_does_not_require_notebook_compatibility() -> None:
+    tree = ast.parse(WORKFLOW.read_text(encoding="utf-8"))
+    top_level_imports = {
+        node.module
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    }
+
+    assert "notebooks.nvmolkit_compat" not in top_level_imports
 
 
 def _fake_nvidia_smi(tmp_path: Path, inventory: str) -> Path:
