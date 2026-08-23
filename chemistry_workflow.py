@@ -10,9 +10,6 @@ import numpy as np
 import pandas as pd
 from rdkit import Chem
 
-from notebooks.nvmolkit_compat import normalize_fused_butina_result
-
-
 class WorkflowPhase(StrEnum):
     NEW = "new"
     INSPECTED = "inspected"
@@ -706,6 +703,8 @@ def discover_fused_butina_clusters(
     cutoff = float(cluster_cutoff)
     molecule_count = len(state.molecules)
     if backend == "fused":
+        from notebooks.nvmolkit_compat import normalize_fused_butina_result
+
         cluster_backend = "fused"
         cluster_result = _fused_butina(
             state.fingerprints.torch(),
