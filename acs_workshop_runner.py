@@ -2903,12 +2903,13 @@ def _prepare_objective_publication(
     archive_path = output_root / "results.zip"
     try:
         validated = _validated_objective_directory_below_root(paths, directory)
-        mode = os.lstat(validated).st_mode
+        metadata = os.lstat(validated)
         if (
             validated != directory
             or directory.parent != output_root
             or not directory.name.startswith(".acs-objective-prepared-")
-            or stat.S_IMODE(mode) != 0o700
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) not in {0o700, 0o2700}
         ):
             raise _objective_error()
         _write_objective_directory(directory, run, paths)

@@ -4,16 +4,18 @@ The installed `nvmolkit-usage` skill remains available after the bounded exercis
 
 ## Completion state
 
+The attendee sends four separate requests. Run only the workflow that matches the current user message. Never advance to a later lesson or the objective in the same turn. Use the `exec` tool for the exact command shown below. If it is not available, use tool search once for the exact tool ID `openclaw:core:exec`. Never call `acs_workshop_runner.py` as a tool name, and never run the runner without the listed subcommand. If a command returns a nonzero exit code, stop tool use and report the failure; do not retry it or choose another action.
+
 Each lesson command has a one-call budget. After the first top-level `status: complete`, stop tool use and answer from that first result. Never run that lesson again in the same prompt. An empty assistant response does not permit another tool call. Copy the decoded `answer_markdown` string exactly, with no added opening or closing text. The `sampled-3d-geometry` command returns both conformer stages; run it only once.
 
-For the objective, run `objective-start` once. If that result is terminal, run no objective-step command. Otherwise, select only a displayed action tied for the maximum numeric `predicted_score`. Use the exact returned `state_id` and `swap_id`. Keep both values single-quoted. Run at most three objective-step commands and stop at the first terminal result. Copy its decoded `answer_markdown` string exactly.
+For the objective, run `objective-start` once. If that result is terminal, run no objective-step command. Otherwise, select only a displayed action tied for the maximum numeric `predicted_score`. After every pending result, discard the prior menu and use only the new displayed menu with the exact returned `state_id` and `swap_id`. Keep both values single-quoted. Run at most three objective-step commands and stop at the first terminal result. Copy its decoded `answer_markdown` string exactly.
 
 The library is a deterministic 256-record ChEMBL convenience sample and is non-representative chemical space. Fingerprint conclusions depend on the radius-2, 1024-bit hashed fingerprint. Report real GPU execution with no acceleration or speedup claim. The cutoff `0.40` is Tanimoto distance, and similarity `1.0` does not prove molecular identity. nvMolKit computes fingerprints and Tanimoto similarities on GPU; RDKit runs Butina clustering on CPU.
 
 The deterministic selected molecules are not centroids, medoids, or globally optimal representatives. Sampled conformers are not experimental structures, and MMFF94 energies compare sampled conformers within one molecule only. `D_min` is the minimum pairwise Tanimoto distance, with `D_min = min(1 - Tanimoto similarity)`; higher `D_min` means greater separation. It is the weakest-link diversity score within eight fixed candidates. Never call `D_min` a similarity score. Do not report intermediate, predicted, target, or per-step scores. This structural-descriptor objective does not demonstrate unrestricted autonomous design or biological performance.
 
-Do not read files during these four prompts. Use only the commands below. Run the
-three lessons in order.
+Do not read files during these four prompts. Use only the one command section
+that matches the current user message. The sections appear in attendee order.
 
 ```bash
 env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages python3 /sandbox/.openclaw/workspace/acs_workshop_runner.py run-lesson data-and-representation
@@ -36,7 +38,7 @@ env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages python3 /sandbox/.opencl
 Display:
 `MEDIA:/sandbox/.openclaw/workspace/outputs/workshop/06-mmff94/optimized_structures.png`
 
-Start the objective after all three lessons:
+For the fourth attendee request, after the three separate lesson requests:
 
 ```bash
 env PYTHONPATH=/tmp/.local/lib/python3.13/site-packages python3 /sandbox/.openclaw/workspace/acs_workshop_runner.py objective-start
