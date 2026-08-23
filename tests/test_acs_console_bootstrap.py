@@ -17,7 +17,7 @@ PLACEHOLDER = "@REVIEWED_PUBLIC_COMMIT_SHA@"
 SENTINEL = "__NVIDIA_INFERENCE_API_KEY__"
 REPO_URL = "https://github.com/ktretina/nvmolkit-brev-notebook.git"
 DUMMY_COMMIT = "a" * 40
-PINNED_SETUP_COMMIT = "84797b6853a331b36518d44b738c721337f4d70e"
+PINNED_SETUP_COMMIT = "d84599567f5bacc07f8a1f4a3054e18e111b75b6"
 
 
 def _rendered_bootstrap(key: str | None = None) -> str:
