@@ -5,7 +5,7 @@ set +x +v
 umask 077
 
 readonly repo_url="https://github.com/ktretina/nvmolkit-brev-notebook.git"
-readonly repo_commit="6f97e52ee522122c15fa26d0086248a743c9ee58"
+readonly repo_commit="4104186b8118bd2c8afbe5195d18e57d645625a1"
 readonly source_root="${HOME}/.local/share/acs-nemoclaw-launchable"
 readonly checkout_dir="${source_root}/source-${repo_commit}"
 
