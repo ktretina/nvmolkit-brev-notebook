@@ -9,8 +9,8 @@ focus on the chemistry and the scientific limits of the results.
 
 - Use a current desktop browser.
 - Brev GPU time is billable. Stop your environment when you finish.
-- Keep API keys private. Enter a key only in the named Launchable field. Never
-  paste it into a notebook, chat, or workshop result.
+- Attendees do not enter an API key in either journey. Never paste a key into a
+  notebook, chat, or workshop result.
 - Hosted inference can be rate-limited. If a request reports an error, take a
   screenshot and continue with another optional activity.
 
@@ -26,22 +26,20 @@ neither.
 
 ## Notebook journey
 
-1. Open [NVIDIA inference](https://inference.nvidia.com), sign in, and create or
-   copy an NVIDIA inference API key.
-2. Open the Notebook Launchable. Enter the key in `NVIDIA_API_KEY`, only in this
-   Launchable field, and deploy the default hardware.
-3. Wait for setup to finish. Open JupyterLab from the port 8888 Secure Link.
-4. Open `nvmolkit_nemotron_demo.ipynb` and run its cells from top to bottom.
-5. In **Agent run**, select **Start Agent**. Review the bounded proposal, then
-   select **Approve & Run** for each displayed stage.
-6. After the MMFF94 stage, select **Run Objective Challenge**.
-7. Review the evidence-backed conclusion and download any results you want.
-8. Stop the Brev environment when you finish.
-
-The notebook validates inputs with RDKit on the CPU. nvMolKit performs the
-fingerprint, similarity, conformer-embedding, and MMFF94 operations on the GPU.
-Python validates every bounded agent action and independently measures the
-result.
+1. Open the Notebook Launchable. Leave **Setup** empty and deploy the default
+   hardware. Attendees do not create or enter an API key.
+2. Wait for setup to finish. Open JupyterLab from the port 8888 Secure Link.
+3. Open `01_direct_nvmolkit_reframe.ipynb` and run its cells in order. Module 1
+   uses direct nvMolKit on the GPU and RDKit on the CPU for reference work.
+4. Open `02_agent_assisted_reframe_neighborhoods.ipynb` and run its cells in
+   order.
+5. Open `03_full_agent_reframe_panel_design.ipynb` and run its cells in order.
+   When the bounded plan appears, select **Approve Plan & Run Agent**. Then
+   rerun Steps 5 and 6 in that notebook to display the retained result.
+6. Hosted mode in Modules 2 and 3 uses the protected workshop inference key.
+   Python validates every bounded agent action and owns chemistry execution.
+   Reference mode is an optional local recovery path with no hosted model call.
+7. Download any results you want, then stop the Brev environment.
 
 ## OpenClaw journey
 

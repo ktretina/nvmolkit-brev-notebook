@@ -83,28 +83,26 @@ def test_page_has_two_optional_independent_journeys() -> None:
     for stale in (
         "required lab",
         "complete both",
-        "hosted mode",
-        "module 1",
-        "module 2",
-        "module 3",
         "companion",
     ):
         assert stale not in lowered
 
 
-def test_notebook_journey_uses_current_controls_and_inference_key() -> None:
+def test_notebook_journey_uses_current_three_modules_without_attendee_key() -> None:
     section = _section(_source(), "Notebook journey")
-    compact_section = " ".join(section.split())
-    assert "https://inference.nvidia.com" in section
-    assert "NVIDIA inference API key" in section
-    assert "`NVIDIA_API_KEY`" in section
-    assert "only in this Launchable field" in compact_section
-    assert "`nvmolkit_nemotron_demo.ipynb`" in section
-    assert "top to bottom" in section
-    for control in ("**Start Agent**", "**Approve & Run**", "**Run Objective Challenge**"):
-        assert control in section
+    for notebook in (
+        "`01_direct_nvmolkit_reframe.ipynb`",
+        "`02_agent_assisted_reframe_neighborhoods.ipynb`",
+        "`03_full_agent_reframe_panel_design.ipynb`",
+    ):
+        assert notebook in section
+    assert "Module 1" in section and "direct nvMolKit" in section
+    assert "Hosted mode" in section and "Modules 2 and 3" in section
+    assert "**Approve Plan & Run Agent**" in section
+    assert "Attendees do not create or enter an API key" in section
+    assert "`NVIDIA_API_KEY`" not in section
+    assert "`nvmolkit_nemotron_demo.ipynb`" not in section
     assert "NGC API key" not in section
-    assert "must start" not in section
 
 
 def test_openclaw_journey_is_zero_input_and_attendee_directed() -> None:
