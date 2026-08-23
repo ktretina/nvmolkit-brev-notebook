@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 from rdkit import Chem
 
+from notebooks.nvmolkit_compat import normalize_fused_butina_result
+
 
 class WorkflowPhase(StrEnum):
     NEW = "new"
@@ -333,10 +335,14 @@ def _cross_tanimoto_similarity(fingerprints):
     return crossTanimotoSimilarity(fingerprints)
 
 
-def _fused_butina(fingerprints, *, cutoff: float):
+def _fused_butina(fingerprints, *, cutoff: float, return_centroids: bool):
     from nvmolkit.clustering import fused_butina
 
-    return fused_butina(fingerprints, cutoff=cutoff)
+    return fused_butina(
+        fingerprints,
+        cutoff=cutoff,
+        return_centroids=return_centroids,
+    )
 
 
 def _rdkit_butina_clusters(
@@ -698,10 +704,19 @@ def discover_fused_butina_clusters(
         raise ValueError("cluster cutoff must be 0.40 through 0.60 inclusive")
 
     cutoff = float(cluster_cutoff)
+    molecule_count = len(state.molecules)
     if backend == "fused":
         cluster_backend = "fused"
-        clusters_raw = _fused_butina(state.fingerprints.torch(), cutoff=cutoff)[0]
+        cluster_result = _fused_butina(
+            state.fingerprints.torch(),
+            cutoff=cutoff,
+            return_centroids=True,
+        )
         _synchronize_cuda()
+        _, clusters_raw, _ = normalize_fused_butina_result(
+            cluster_result,
+            molecule_count=molecule_count,
+        )
         backend_summary: dict[str, Any] = {"entry_point": "fused_butina"}
         display_label = "nvMolKit fused_butina with RDKit MMFF94 eligibility"
         figure_title = "Largest fused Butina clusters"
@@ -726,7 +741,6 @@ def discover_fused_butina_clusters(
     clusters = [
         [int(molecule_index) for molecule_index in cluster] for cluster in clusters_raw
     ]
-    molecule_count = len(state.molecules)
     assigned_indices = [index for cluster in clusters for index in cluster]
     if len(assigned_indices) != molecule_count or sorted(assigned_indices) != list(
         range(molecule_count)

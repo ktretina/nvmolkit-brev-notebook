@@ -1851,8 +1851,14 @@ class BoundedWorkflowController:
                 )
                 _raise_request_error(error)
             self.selection_response_count += 1
-            assistant = self._objective_assistant_payload(message)
-            calls = getattr(message, "tool_calls", None)
+            try:
+                assistant = self._objective_assistant_payload(message)
+                calls = getattr(message, "tool_calls", None)
+            except Exception:
+                self._terminalize_objective(
+                    TerminationReason.OBJECTIVE_PROVIDER_FAILURE
+                )
+                raise ToolCallError(_REQUEST_ERROR) from None
             call_ids = tuple(
                 call_id
                 for call in calls

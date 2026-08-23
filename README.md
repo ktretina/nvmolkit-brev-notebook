@@ -1,34 +1,39 @@
 # nvMolKit + Nemotron Notebook
 
-This standalone project asks one presentation-sized question: **can an AI chemistry agent use nvMolKit to autonomously execute a real cheminformatics workflow?** One stateful, bounded Nemotron conversation follows a fixed dependency chain:
+This standalone three-notebook workshop demonstrates how agentic AI can support a bounded chemistry workflow. It starts with direct [nvMolKit](https://github.com/NVIDIA-BioNeMo/nvMolKit) calls, then uses hosted Nemotron for constrained policy selection, planning, and audit. Python owns validation and executable chemistry code. Nemotron receives an aggregate input profile for planning and an independently validated aggregate report snapshot for audit, but no raw molecule rows, similarity matrices, rendered code, credentials, or local visualization artifacts.
 
-`plan → RDKit inspect → MorganFingerprintGenerator → crossTanimotoSimilarity → fused_butina → EmbedMolecules → MMFFOptimizeMoleculesConfs → objective attempts → evidence-linked, schema-checked conclusion`
+## Three-notebook workshop path
 
-The pinned BioNeMo Agent Toolkit nvMolKit skill grounds the conversation's initial context. Reading it is not an agent tool call and does not permanently teach or modify the model. The compact presentation is one plan, six approvals, six completed command receipts/result cards, one objective challenge, and one conclusion. The user may override only bounded scientific parameters through the supplied dropdowns and sliders. Python validates and executes approved calls, renders results, and preserves exact artifact-grounded evidence records E01–E06 plus the objective ledger O01; credentials, RDKit molecules, tensors, matrices, and coordinates remain local. The conclusion uses a Python-owned headline and facts with Nemotron-selected predicate-true emphasis.
+Start with **Module 1**. It is the recommended entry point and introduces the direct library calls before the agent exercises.
+
+1. [`notebooks/01_direct_nvmolkit_reframe.ipynb`](notebooks/01_direct_nvmolkit_reframe.ipynb) — use nvMolKit directly for fingerprints, similarity, and clustering.
+2. [`notebooks/02_agent_assisted_reframe_neighborhoods.ipynb`](notebooks/02_agent_assisted_reframe_neighborhoods.ipynb) — let Nemotron choose between bounded neighborhood-analysis policies while Python owns the executable implementation.
+3. [`notebooks/03_full_agent_reframe_panel_design.ipynb`](notebooks/03_full_agent_reframe_panel_design.ipynb) — use a bounded planning, approval, execution, and audit loop to design a 24-compound panel.
+
+**Hosted mode** (`interactive` in `NVMOLKIT_WORKSHOP_MODE`) is the attendee path for Modules 2 and 3. It uses `nvidia/nvidia/nemotron-3-nano-30b-a3b` at `https://inference-api.nvidia.com/v1` and the protected `NVIDIA_INFERENCE_API_KEY`. **Reference mode** is the deterministic recovery and local-acceptance path for Modules 2 and 3. It makes no hosted client call, needs no key, and is not evidence of hosted inference. Module 1 uses the library directly and does not call the hosted model.
 
 ## What runs where
 
 - **Brev** provides the GPU VM and organization-only Secure Link to JupyterLab.
-- **Hosted Nemotron** creates one plan, makes six validated tool calls using prior evidence, performs state-bound argmax action selection for up to three measured objective attempts, and selects predicate-true evidence emphasis for the conclusion. It does not execute Python.
-- **Python** owns the tool contract, dependency order, validation, execution, exact evidence, and presentation.
-- **RDKit** parses inputs, screens MMFF94 eligibility, and supports rendering.
-- **nvMolKit on the GPU** generates Morgan fingerprints, computes all-pairs Tanimoto similarity, runs fused Butina clustering, embeds conformers, and performs MMFF94 optimization.
+- **Hosted Nemotron** selects two bounded policies in Module 2. In Module 3, it returns one strict plan and one strict audit. It does not execute Python.
+- **Python** owns the allowed choices, tool contract, validation, execution, artifact gate, and presentation.
+- **RDKit** parses inputs, computes descriptors for bounded panel constraints, and supports rendering.
+- **nvMolKit on the GPU** generates Morgan fingerprints, computes Tanimoto similarity, and runs fused Butina clustering.
 
 ## Interactive flow
 
-Run the final code cell to display the interface; the cell returns after the interface is displayed. Click **Start Agent** to request the plan, review the validated tool call and concise decision, and optionally adjust only the bounded controls. Then click **Approve & Run** on each stage in order. A completed card keeps its validated command receipt beside the corresponding result.
-
-After all six approvals complete through MMFF94, click **Run Objective Challenge**. The bounded eight-candidate challenge asks Nemotron to improve a four-compound panel by maximizing its minimum pairwise Tanimoto distance. The target is 80% of the attainable improvement over the current largest-clusters-first baseline. At each of at most three attempts, the LLM receives the measured current panel, all co-limiting pairs, and up to four ranked legal replacements. It returns one state-bound argmax action selection; Python validates and executes that swap, then independently measures the result. Each visible attempt follows **Observe panel → Candidate menu → Agent chooses → Execute panel → Measure panel** with the actual retained RDKit molecules. A progress bar after every attempt shows the current D_min, remaining target gap, and fraction of required improvement achieved. The final structures and four-by-four similarity heatmap appear before the **Evidence-Backed Conclusion**. Guarded button failures stay inside the active card, leave it incomplete for review or retry, and do not mark the notebook cell failed.
+Module 2 asks Nemotron for two bounded policy values. Python validates them, renders the allow-listed function locally, and runs the neighborhood analysis and checks. Module 3 asks Nemotron for a strict plan, waits for attendee approval, runs one of two allow-listed strategies, validates the artifacts, and requests a strict audit. The panel must match or improve the first-24-row baseline on descriptor coverage and minimum Tanimoto distance, with at least one strict improvement.
 
 ## Launch
 
 Use Linux x86-64 with CPython 3.12 in VM mode. Enable Jupyter in the Brev Console so the Brev-managed Jupyter runtime is available; the setup script installs into that runtime and does not manage the Jupyter service.
 
-1. Create or edit the Launchable in the Brev web Console using [`launchable/fields.md`](launchable/fields.md). Set the default disk storage to **75 GiB**, then paste the current contents of `launchable/setup.sh` into the Software configuration setup-script field. Updating the repository does not replace the script body already saved in a Launchable.
-2. Keep only one Launch parameter: required `NVIDIA_API_KEY`, with no default. Remove `NEMOTRON_MODEL` and `JUPYTER_PORT` from Setup values.
-3. Enable Jupyter and keep access set to **Only my organization** with a Secure Link on the fixed port `8888`; do not expose unrestricted public TCP. The hosted model is fixed to `nvidia/nemotron-3-nano-30b-a3b`.
-4. From the Nemotron model page on build.nvidia.com, generate a hosted NVIDIA Developer API key beginning with `nvapi-`. Enter it once in Setup values when you deploy. The setup script stores it outside the repository in `${HOME}/.config/nvmolkit/NVIDIA_API_KEY` with file mode `0600`, and notebook preflight loads it automatically without a prompt. This is distinct from an NGC personal key. Never expose the key in notebook outputs, logs, screenshots, or chat.
-5. Open JupyterLab through the Secure Link and run `notebooks/nvmolkit_nemotron_demo.ipynb`.
+1. Create or edit the Launchable in the Brev web Console using [`launchable/fields.md`](launchable/fields.md), and set the default disk storage to **75 GiB**. From the repository, run `python3 launchable/render_setup.py /private/tmp/nvmolkit-workshop-setup.sh`. Enter the approved workshop-only Inference Hub key at the hidden prompt. The trusted offline renderer writes the private file outside the repository with mode `0600` and refuses to overwrite an existing file or use an unsafe output path.
+2. Paste only the rendered file's contents into the Brev Console saved setup body. Never commit, upload, attach, or share the rendered file. Delete the private rendered file after saving the Console body. A repository push does not replace the setup body already saved in the Console.
+3. Configure **No Launch parameters or Setup values**. Remove `NVIDIA_INFERENCE_API_KEY`, `NVIDIA_API_KEY`, `NEMOTRON_MODEL`, and `JUPYTER_PORT`. The saved setup body preprovisions the organizer-supplied credential. Attendees enter no API key and do not need an NVIDIA API account or key.
+4. Enable Jupyter and keep access set to **Only my organization** with a Secure Link on the fixed port `8888`; do not expose unrestricted public TCP. The hosted model is fixed to `nvidia/nvidia/nemotron-3-nano-30b-a3b` at `https://inference-api.nvidia.com/v1`.
+5. The saved setup body stores the workshop key outside the repository in `${HOME}/.config/nvmolkit/NVIDIA_INFERENCE_API_KEY`, with directory mode `0700` and file mode `0600`. Notebook preflight loads it automatically without a prompt. A person who controls a deployed VM can recover this shared key. Use a workshop-only key, monitor it during the event, and rotate or revoke it afterward.
+6. Open JupyterLab through the Secure Link and start with `notebooks/01_direct_nvmolkit_reframe.ipynb`.
 
 **Qualification:** This demo is designed for fresh deployment only and is not yet live-qualified. GPU execution, hosted inference, rendered visuals, Secure Link access, and credential persistence each require live acceptance. The protected key file remains on the VM disk until the environment is deleted or the file is removed. After a VM stop/start, verify the managed Jupyter service, restart the notebook kernel, and rerun the notebook; do not claim automatic restart without live evidence.
 
@@ -48,22 +53,15 @@ GPU suite on the task-owned compatible NVIDIA GPU:
 RUN_GPU_TESTS=1 .venv/bin/python -m pytest -q
 ```
 
-Hosted reliability qualification (20 isolated objective trials and three fresh end-to-end runs):
-
-```bash
-python scripts/run_objective_reliability.py --trials 20 --end-to-end-runs 3 --output objective-reliability-receipt.json
-```
-
 - **Local deterministic acceptance:** run `pytest` to validate notebook structure, scientific state transitions, serialization boundaries, and agent wiring without claiming GPU or hosted execution.
 - **GPU acceptance receipt:** on a compatible NVIDIA GPU, run `RUN_GPU_TESTS=1 .venv/bin/python -m pytest -q` and retain the result before calling the nvMolKit runtime GPU-accepted.
-- **Hosted reliability receipt:** retain the JSON emitted by `run_objective_reliability.py`; it proves only the bounded hosted trials recorded there. Keep it separate from the GPU acceptance receipt and cross-reference both by commit and run identifier.
-- **Persistence receipt:** after a fresh stop/start, record Jupyter, kernel, notebook, and credential-reentry checks separately. Cross-reference it to the reliability and GPU receipts; do not merge their claims.
-- **Hosted inference acceptance:** in a fresh Brev kernel, verify one plan, six approvals, six completed command receipts/result cards, up to three state-bound selections with measured feedback, and one evidence-controlled conclusion using a valid hosted Developer API key.
-- **Rendered deployment acceptance:** inspect the 24-molecule RDKit preview and invalid-input report, fingerprint histogram, similarity heatmap, cluster chart, conformer-energy chart, static conformer views, molecule-aware objective attempts, per-attempt progress bars, final four structures, and final-panel heatmap through the organization-only Secure Link.
+- **Persistence receipt:** after a fresh stop/start, record separate checks for Jupyter, kernel, notebook, and protected credential persistence, including confirmation of no credential re-entry. Cross-reference them to the hosted and GPU receipts; do not merge their claims.
+- **Hosted inference acceptance:** in a fresh Brev kernel, verify the Module 2 bounded policy response and the Module 3 strict plan and strict audit using the organizer-supplied Inference Hub key.
+- **Rendered deployment acceptance:** inspect the Module 1 fingerprint, similarity, and cluster views; the Module 2 policy receipt and neighborhood comparison; and the Module 3 approval widget, authoritative receipt, and chemistry gallery through the organization-only Secure Link.
 
 ## Boundaries
 
-This is a research and developer demonstration with bounded workflow autonomy. It makes no performance claims and does not establish binding, biological activity, ADMET, efficacy, safety, synthesizability, clinical relevance, or experimentally validated conformations. ETKDGv3 samples candidate geometries, and MMFF94 compares sampled force-field minima only within each molecule; those minima are not global or experimental. Independent computational and experimental validation is required for any intended scientific use.
+This is a research and developer demonstration with bounded workflow autonomy. It makes no performance claims. Fingerprints, Tanimoto similarity, clusters, descriptors, and 2D drawings do not establish binding, biological activity, ADMET, efficacy, safety, synthesizability, clinical relevance, or experimental structure. Independent computational and experimental validation is required for any intended scientific use.
 
 ## Official sources
 

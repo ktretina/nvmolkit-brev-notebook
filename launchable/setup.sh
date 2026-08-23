@@ -1,5 +1,21 @@
 #!/bin/bash
+set +x +v
 set -euo pipefail
+
+launch_api_key=__NVIDIA_INFERENCE_API_KEY__
+unset NVIDIA_INFERENCE_API_KEY NVIDIA_API_KEY
+
+if [[ "${launch_api_key}" == __NVIDIA_* ]]; then
+  unset launch_api_key
+  echo "Error: render a private Brev Console copy by replacing the credential placeholder." >&2
+  exit 1
+fi
+
+if [[ "${launch_api_key}" != sk-* ]]; then
+  unset launch_api_key
+  echo "Error: provide an NVIDIA Inference Hub key beginning with sk-." >&2
+  exit 1
+fi
 
 if [[ -f "${PWD}/requirements.txt" && -f "${PWD}/demo_agent.py" ]]; then
   PROJECT_DIR="${PWD}"
@@ -12,13 +28,8 @@ fi
 
 cd "${PROJECT_DIR}"
 
-if [[ -z "${NVIDIA_API_KEY:-}" ]]; then
-  echo "Error: NVIDIA_API_KEY is required in Brev Setup values." >&2
-  exit 1
-fi
-
 api_key_directory="${HOME}/.config/nvmolkit"
-api_key_path="${HOME}/.config/nvmolkit/NVIDIA_API_KEY"
+api_key_path="${HOME}/.config/nvmolkit/NVIDIA_INFERENCE_API_KEY"
 install -d -m 700 "${api_key_directory}"
 chmod 700 "${api_key_directory}"
 umask 077
@@ -27,11 +38,24 @@ cleanup_api_key_temp() {
   rm -f -- "${api_key_temp}"
 }
 trap cleanup_api_key_temp EXIT
-printf '%s' "${NVIDIA_API_KEY}" >"${api_key_temp}"
+printf '%s' "${launch_api_key}" >"${api_key_temp}"
 chmod 600 "${api_key_temp}"
 mv -f -- "${api_key_temp}" "${api_key_path}"
 trap - EXIT
-unset NVIDIA_API_KEY
+unset launch_api_key
+
+widget_settings_directory="${HOME}/.jupyter/lab/user-settings/@jupyter-widgets/jupyterlab-manager"
+widget_settings_path="${widget_settings_directory}/plugin.jupyterlab-settings"
+install -d -m 700 "${widget_settings_directory}"
+widget_settings_temp="$(mktemp "${widget_settings_path}.tmp.XXXXXX")"
+cleanup_widget_settings_temp() {
+  rm -f -- "${widget_settings_temp}"
+}
+trap cleanup_widget_settings_temp EXIT
+printf '%s\n' '{"saveState": true}' >"${widget_settings_temp}"
+chmod 600 "${widget_settings_temp}"
+mv -f -- "${widget_settings_temp}" "${widget_settings_path}"
+trap - EXIT
 
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "Error: this Launchable requires Linux x86-64 with CPython 3.12; found OS $(uname -s)." >&2
