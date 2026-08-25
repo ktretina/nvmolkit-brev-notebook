@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -13,6 +15,15 @@ from rdkit.Chem import Crippen, Descriptors, Lipinski, rdMolDescriptors
 
 REFRAME_URL = "https://reframedb.org/assets/csv/reframe_smiles_list.csv"
 SNAPSHOT_PATH = Path(__file__).with_name("data") / "reframe_teaching_snapshot.csv"
+MODULE1_SNAPSHOT_PATH = (
+    Path(__file__).with_name("data") / "reframe_module1_snapshot_10k.csv"
+)
+MODULE1_PROVENANCE_PATH = MODULE1_SNAPSHOT_PATH.with_suffix(".provenance.json")
+MODULE1_MIN_SAMPLE_SIZE = 96
+MODULE1_MAX_SAMPLE_SIZE = 10_000
+MODULE1_INTEGRITY_ERROR = (
+    "Bundled Module 1 ReFRAME snapshot failed its integrity check."
+)
 DEFAULT_MEMORY_LIMIT_MIB = 128
 REQUIRED_COLUMNS = {
     "smile",
@@ -75,6 +86,55 @@ def require_memory_within_limit(required_bytes, *, limit_mib=DEFAULT_MEMORY_LIMI
     return required_bytes
 
 
+def _load_module1_snapshot(requested_size):
+    try:
+        observed_hash = hashlib.sha256(MODULE1_SNAPSHOT_PATH.read_bytes()).hexdigest()
+        provenance = json.loads(
+            MODULE1_PROVENANCE_PATH.read_text(encoding="utf-8")
+        )
+        if observed_hash != provenance["final_sha256"]:
+            raise ValueError(MODULE1_INTEGRITY_ERROR)
+        frame = pd.read_csv(
+            MODULE1_SNAPSHOT_PATH, keep_default_na=False, dtype=str
+        )
+    except Exception:
+        raise ValueError(MODULE1_INTEGRITY_ERROR) from None
+
+    missing = REQUIRED_COLUMNS - set(frame.columns)
+    valid_smiles = frame["smile"].str.strip().ne("") if "smile" in frame else None
+    valid_keys = (
+        frame["canonical_ikey"].str.strip().ne("")
+        if "canonical_ikey" in frame
+        else None
+    )
+    valid_urls = (
+        frame["reframedb_url"].str.startswith("https://")
+        if "reframedb_url" in frame
+        else None
+    )
+    if (
+        missing
+        or len(frame) != MODULE1_MAX_SAMPLE_SIZE
+        or valid_smiles is None
+        or not valid_smiles.all()
+        or valid_keys is None
+        or not valid_keys.all()
+        or valid_urls is None
+        or not valid_urls.all()
+        or frame["canonical_ikey"].duplicated().any()
+    ):
+        raise ValueError(MODULE1_INTEGRITY_ERROR)
+
+    molecules = [Chem.MolFromSmiles(smiles) for smiles in frame["smile"]]
+    if any(molecule is None for molecule in molecules):
+        raise ValueError(MODULE1_INTEGRITY_ERROR)
+    result = frame.iloc[:requested_size].copy().reset_index(drop=True)
+    result["name"] = result["name"].replace("", "unnamed compound")
+    result["_mol"] = molecules[:requested_size]
+    result.attrs.update(source="bundled_snapshot_10k", invalid_count=0)
+    return result
+
+
 def load_reframe(
     sample_size=96,
     anchor_terms=(),
@@ -84,15 +144,27 @@ def load_reframe(
     use_configured_csv=False,
 ):
     """Load, deduplicate, deterministically sample, and parse ReFRAME compounds."""
-    if not isinstance(source, str) or source not in {"snapshot", "live"}:
-        raise ValueError("source must be 'snapshot' or 'live'.")
+    if not isinstance(source, str) or source not in {
+        "snapshot",
+        "snapshot_10k",
+        "live",
+    }:
+        raise ValueError("source must be 'snapshot', 'snapshot_10k', or 'live'.")
     if type(use_configured_csv) is not bool:
         raise TypeError("use_configured_csv must be a bool.")
-    if use_configured_csv and source == "live":
+    if source == "live" and use_configured_csv:
         raise ValueError(
             "source='live' cannot be combined with use_configured_csv=True."
         )
+    if source == "snapshot_10k" and use_configured_csv:
+        raise ValueError(
+            "source='snapshot_10k' cannot be combined with use_configured_csv=True."
+        )
     requested_size = _positive_integer(sample_size, name="sample_size")
+    if source == "snapshot_10k":
+        if not MODULE1_MIN_SAMPLE_SIZE <= requested_size <= MODULE1_MAX_SAMPLE_SIZE:
+            raise ValueError("source='snapshot_10k' supports 96 through 10,000 rows.")
+        return _load_module1_snapshot(requested_size)
     if use_configured_csv:
         configured_csv = os.environ.get("REFRAME_CSV", "")
         if not configured_csv:

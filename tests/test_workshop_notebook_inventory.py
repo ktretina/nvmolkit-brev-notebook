@@ -1,5 +1,6 @@
 import ast
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -278,12 +279,211 @@ def test_module1_setup_guidance_uses_the_exact_nvmolkit_release():
 def test_module1_default_and_advanced_controls_are_bounded():
     source = _module1_code_source()
 
-    assert 'DATA_SOURCE = "snapshot"' in source
+    assert 'DATA_SOURCE = "snapshot_10k"' in source
     assert "SAMPLE_SIZE = 96" in source
     assert "FP_BITS = 1024" in source
     assert "ADVANCED_LARGE_RUN = False" in source
     assert "ADVANCED_SAMPLE_SIZE = 10_000" in source
     assert 'source="live"' in source
+
+
+def test_module1_sample_size_exercise_is_bounded_to_steps_1_through_3():
+    source = _module1_code_source()
+    step1 = _module1_cell_source("cell-e51239292d22")
+    step3 = _module1_cell_source("cell-7dabc4a334bf")
+    step4 = _module1_cell_source("cell-00a63d6c51e3")
+
+    assert 'DATA_SOURCE = "snapshot_10k"' in source
+    assert "SAMPLE_SIZE = 96" in source
+    for value in ("512", "2_048", "10_000"):
+        assert value in step1 + step3
+    assert "rerun Steps 1 through 3" in step3
+    assert "restore `SAMPLE_SIZE = 96`" in step4
+    assert "Change <code>SAMPLE_SIZE</code> and observe" not in step4
+
+
+def test_module1_steps_1_through_3_do_not_allocate_an_n_by_n_result():
+    notebook = nbformat.read(MODULE1_NOTEBOOK_PATH, as_version=4)
+    end = next(
+        index
+        for index, cell in enumerate(notebook.cells)
+        if cell.id == "cell-c5e8c0433cbd"
+    )
+    source = "\n\n".join(
+        cell.source
+        for cell in notebook.cells[: end + 1]
+        if cell.cell_type == "code"
+    )
+    tree = ast.parse(source)
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def is_nested_in_function_body(node):
+        child = node
+        while child in parents:
+            parent = parents[child]
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if child in parent.body:
+                    return True
+            child = parent
+        return False
+
+    forbidden = []
+    cross_tanimoto_argument_pairs = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or is_nested_in_function_body(node):
+            continue
+        if isinstance(node.func, ast.Name):
+            name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            name = node.func.attr
+        else:
+            continue
+        if name in {
+            "empty",
+            "zeros",
+            "ones",
+            "full",
+            "pdist",
+            "squareform",
+            "tanimoto_matrix",
+        }:
+            forbidden.append(name)
+        if name == "crossTanimotoSimilarity":
+            assert len(node.args) >= 2
+            argument_pair = (
+                ast.unparse(node.args[0]),
+                ast.unparse(node.args[1]),
+            )
+            cross_tanimoto_argument_pairs.append(argument_pair)
+            assert argument_pair[0] != argument_pair[1]
+            assert "anchor" in argument_pair[0].lower()
+            assert "anchor" not in argument_pair[1].lower()
+
+    assert forbidden == []
+    assert cross_tanimoto_argument_pairs.count(("anchor_fps", "fingerprints")) == 1
+
+
+@pytest.mark.parametrize("sample_size", [96, 512, 2_048, 10_000])
+def test_module1_steps_1_through_3_execute_at_supported_sizes(
+    monkeypatch, tmp_path, sample_size
+):
+    notebook = nbformat.read(MODULE1_NOTEBOOK_PATH, as_version=4)
+    end = next(
+        index
+        for index, cell in enumerate(notebook.cells)
+        if cell.id == "cell-c5e8c0433cbd"
+    )
+    notebook.cells = notebook.cells[: end + 1]
+    sample_cell = next(
+        cell for cell in notebook.cells if cell.id == "cell-9f1999dd251d"
+    )
+    sample_cell.source = sample_cell.source.replace(
+        "SAMPLE_SIZE = 96", f"SAMPLE_SIZE = {sample_size}", 1
+    )
+    setup_index = next(
+        index
+        for index, cell in enumerate(notebook.cells)
+        if cell.id == "cell-a5ae8306d03b"
+    )
+    notebook.cells.insert(
+        setup_index + 1,
+        nbformat.v4.new_code_cell(
+            """\
+_original_read_csv = pd.read_csv
+_blocked_network_attempts = []
+def _local_only_read_csv(source, *args, **kwargs):
+    if str(source).startswith(("http://", "https://")):
+        _blocked_network_attempts.append(str(source))
+        raise AssertionError("Module 1 attempted network access")
+    return _original_read_csv(source, *args, **kwargs)
+pd.read_csv = _local_only_read_csv
+""",
+            id="test-module1-scale-preflight",
+        ),
+    )
+    notebook.cells.append(
+        nbformat.v4.new_code_cell(
+            """\
+import json
+import os
+import resource
+import sys
+assert DATA_SOURCE == "snapshot_10k"
+assert reframe.attrs["source"] == "bundled_snapshot_10k"
+assert len(reframe) == SAMPLE_SIZE
+assert len(characterized) == SAMPLE_SIZE
+assert FINGERPRINT_BATCH_SIZE == SAMPLE_SIZE
+assert len(anchors) == 3
+assert comparison_count == 3 * SAMPLE_SIZE
+assert rdkit_similarity.shape == (3, SAMPLE_SIZE)
+assert similarity.shape == (3, SAMPLE_SIZE)
+assert _blocked_network_attempts == []
+expected_backends = {"RDKit CPU"}
+if NVMOLKIT_READY:
+    expected_backends.add("nvMolKit GPU")
+assert set(fingerprint_runtime["backend"]) == expected_backends
+assert set(similarity_runtime["backend"]) == expected_backends
+if os.environ.get("RUN_GPU_TESTS") == "1":
+    assert NVMOLKIT_READY
+peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+peak_rss_bytes = peak_rss if sys.platform == "darwin" else peak_rss * 1024
+if NVMOLKIT_READY:
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    cuda_device_used_bytes = total_bytes - free_bytes
+else:
+    cuda_device_used_bytes = None
+receipt = {
+    "sample_size": SAMPLE_SIZE,
+    "similarity_shape": list(similarity.shape),
+    "nvmolkit_ready": bool(NVMOLKIT_READY),
+    "fingerprint_backends": fingerprint_runtime["backend"].tolist(),
+    "similarity_backends": similarity_runtime["backend"].tolist(),
+    "elapsed_seconds": time.perf_counter() - MODULE1_STARTED,
+    "peak_rss_bytes": peak_rss_bytes,
+    "cuda_device_used_bytes": cuda_device_used_bytes,
+}
+print("MODULE1_SCALE_RECEIPT_JSON=" + json.dumps(receipt, sort_keys=True))
+""",
+            id="test-module1-scale-receipt",
+        )
+    )
+
+    matplotlib_dir = tmp_path / f"matplotlib-{sample_size}"
+    matplotlib_dir.mkdir()
+    monkeypatch.setenv("MPLCONFIGDIR", str(matplotlib_dir))
+    monkeypatch.setenv("REFRAME_CSV", "https://hostile.invalid/ignored.csv")
+    executor = ExecutePreprocessor(timeout=900, kernel_name="python3")
+    executor.preprocess(notebook, {"metadata": {"path": str(NOTEBOOK_DIR)}})
+
+    stream_text = "\n".join(
+        output.get("text", "")
+        for cell in notebook.cells
+        for output in cell.get("outputs", [])
+        if output.output_type == "stream"
+    )
+    match = re.search(
+        r"^MODULE1_SCALE_RECEIPT_JSON=(\{.*\})$", stream_text, re.MULTILINE
+    )
+    assert match is not None
+    receipt = json.loads(match.group(1))
+    assert receipt["sample_size"] == sample_size
+    assert receipt["similarity_shape"] == [3, sample_size]
+    expected_backends = ["RDKit CPU"]
+    if receipt["nvmolkit_ready"]:
+        expected_backends.append("nvMolKit GPU")
+    assert receipt["fingerprint_backends"] == expected_backends
+    assert receipt["similarity_backends"] == expected_backends
+    assert receipt["elapsed_seconds"] > 0
+    assert receipt["peak_rss_bytes"] > 0
+    if os.environ.get("RUN_GPU_TESTS") == "1":
+        assert receipt["nvmolkit_ready"] is True
+        assert expected_backends == ["RDKit CPU", "nvMolKit GPU"]
+        assert receipt["cuda_device_used_bytes"] > 0
+    print(match.group(0))
 
 
 def test_module1_computation_summary_does_not_claim_unrun_3d_methods():
@@ -477,7 +677,7 @@ pd.read_csv = _local_only_read_csv
     match = re.search(r"^MODULE1_REPORT_JSON=(\{.*\})$", stream_text, re.MULTILINE)
     assert match is not None
     report = json.loads(match.group(1))
-    assert report["source"] == "bundled_snapshot"
+    assert report["source"] == "bundled_snapshot_10k"
     assert report["rows"] == 96
     assert report["fingerprint_bits"] == 1024
     assert report["backend"] in {
