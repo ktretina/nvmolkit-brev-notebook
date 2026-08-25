@@ -9,10 +9,6 @@ focus on the chemistry and the scientific limits of the results.
 
 - Use a current desktop browser.
 - Brev GPU time is billable. Stop your environment when you finish.
-- Attendees do not enter an API key in either journey. Never paste a key into a
-  notebook, chat, or workshop result.
-- Hosted inference can be rate-limited. If a request reports an error, take a
-  screenshot and continue with another optional activity.
 
 ## Choose either journey
 
@@ -27,7 +23,7 @@ neither.
 ## Notebook journey
 
 1. Open the Notebook Launchable. Leave **Setup** empty and deploy the default
-   hardware. Attendees do not create or enter an API key.
+   hardware.
 2. Wait for setup to finish. Open JupyterLab from the port 8888 Secure Link.
 3. Open `01_direct_nvmolkit_reframe.ipynb` and run its cells in order. Module 1
    uses direct nvMolKit on the GPU and RDKit on the CPU for reference work.
@@ -36,9 +32,7 @@ neither.
 5. Open `03_full_agent_reframe_panel_design.ipynb` and run its cells in order.
    When the bounded plan appears, select **Approve Plan & Run Agent**. Then
    rerun Steps 5 and 6 in that notebook to display the retained result.
-6. Hosted mode in Modules 2 and 3 uses the protected workshop inference key.
-   Python validates every bounded agent action and owns chemistry execution.
-   Reference mode is an optional local recovery path with no hosted model call.
+6. Python validates every bounded agent action and owns chemistry execution.
 7. Download any results you want, then stop the Brev environment.
 
 ## OpenClaw journey
@@ -46,7 +40,7 @@ neither.
 1. Open the OpenClaw Launchable. Leave **Setup** empty and deploy the default
    hardware.
 2. Wait for setup to finish, then open **Open Chemistry Agent**. The app should
-   open directly. It should not request an API key, gateway token, or password.
+   open directly.
 3. Start one new chat.
 4. Copy Prompt 1 below into the chat. Wait for the answer and image before you
    send the next prompt.
@@ -129,7 +123,7 @@ design.
 
 ## Official links
 
+- [Workshop presentation](NVIDIA-ACS-Fall-2026-Workshop.pdf)
 - [NVIDIA nvMolKit](https://github.com/NVIDIA-BioNeMo/nvMolKit)
-- [NVIDIA inference](https://inference.nvidia.com)
 - [Brev Launchables](https://docs.nvidia.com/brev/latest/launchables/index.html)
 - [Brev GPU instance lifecycle](https://docs.nvidia.com/brev/latest/concepts/gpu-instances.html)

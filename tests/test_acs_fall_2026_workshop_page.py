@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PAGE = ROOT / "docs" / "acs-fall-2026-workshop.md"
+PRESENTATION = ROOT / "docs" / "NVIDIA-ACS-Fall-2026-Workshop.pdf"
 
 PROMPT_IDS = (
     "01-data-and-representation",
@@ -88,7 +89,7 @@ def test_page_has_two_optional_independent_journeys() -> None:
         assert stale not in lowered
 
 
-def test_notebook_journey_uses_current_three_modules_without_attendee_key() -> None:
+def test_notebook_journey_uses_current_three_modules() -> None:
     section = _section(_source(), "Notebook journey")
     for notebook in (
         "`01_direct_nvmolkit_reframe.ipynb`",
@@ -97,12 +98,8 @@ def test_notebook_journey_uses_current_three_modules_without_attendee_key() -> N
     ):
         assert notebook in section
     assert "Module 1" in section and "direct nvMolKit" in section
-    assert "Hosted mode" in section and "Modules 2 and 3" in section
     assert "**Approve Plan & Run Agent**" in section
-    assert "Attendees do not create or enter an API key" in section
-    assert "`NVIDIA_API_KEY`" not in section
     assert "`nvmolkit_nemotron_demo.ipynb`" not in section
-    assert "NGC API key" not in section
 
 
 def test_openclaw_journey_is_zero_input_and_attendee_directed() -> None:
@@ -110,7 +107,6 @@ def test_openclaw_journey_is_zero_input_and_attendee_directed() -> None:
     assert "Leave **Setup** empty" in section
     assert "**Open Chemistry Agent**" in section
     assert "new chat" in section
-    assert "API key, gateway token, or password" in section
     assert "Wait for the answer and image" in section
     assert "**Download Results**" in section
 
@@ -234,9 +230,23 @@ def test_current_launchable_and_official_links_are_present() -> None:
     for value in (
         "env-3HJtJW3qHg4Dw1I3xt75BfpBmZW",
         "env-3Hlp4pHBlTTlfDxfH41KkGhTeCV",
-        "https://inference.nvidia.com",
+        "[Workshop presentation](NVIDIA-ACS-Fall-2026-Workshop.pdf)",
         "https://github.com/NVIDIA-BioNeMo/nvMolKit",
         "https://docs.nvidia.com/brev/latest/launchables/index.html",
         "https://docs.nvidia.com/brev/latest/concepts/gpu-instances.html",
     ):
         assert value in source
+    assert PRESENTATION.is_file()
+
+
+def test_page_has_no_obsolete_api_key_or_nvidia_inference_references() -> None:
+    lowered = _source().lower()
+    for value in (
+        "nvidia_api_key",
+        "nvidia inference",
+        "inference.nvidia.com",
+        "api key",
+        "inference key",
+        "hosted inference",
+    ):
+        assert value not in lowered
