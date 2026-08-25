@@ -1,0 +1,21 @@
+{
+  "asset": "reframe_module1_snapshot_10k.csv",
+  "authorization": "Written redistribution permission confirmed by the workshop organizer on 2026-08-24; the permission record is retained by the organizer.",
+  "core_order_sha256": "eec75f8f1dad7076211de4a25ad40ac051e9984a1e26ea2ca14c4726ff4efbba",
+  "curation_rules": [
+    "preserve the anchored 96-row Module 1 sequence",
+    "exclude the 96 core identifiers",
+    "retain the first RDKit-valid row per identifier",
+    "sort additions by canonical_ikey",
+    "normalize ReFRAME HYPERLINK page links to HTTPS URLs"
+  ],
+  "final_row_count": 10000,
+  "final_sha256": "4e7855a56ff07522a302be65fd6b60bbf077a2568bddd6fe31b46347b4c531ac",
+  "legacy_core_row_count": 96,
+  "raw_row_count": 13831,
+  "raw_sha256": "5a6043d65f7592f14cf3d879352a69089f3abac2b6c798dde5a283d05f90b522",
+  "rdkit_version": "2026.03.5",
+  "retrieved_date": "2026-08-24",
+  "skipped_raw_row_count": 814,
+  "source_url": "https://reframedb.org/assets/csv/reframe_smiles_list.csv"
+}
