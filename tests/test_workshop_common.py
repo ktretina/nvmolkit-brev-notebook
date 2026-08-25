@@ -1,4 +1,6 @@
+import hashlib
 import importlib.util
+import json
 import warnings
 from pathlib import Path
 
@@ -21,6 +23,19 @@ def _load_workshop_common():
 
 workshop_common = _load_workshop_common()
 
+LEGACY_MODULE1_ORDER_SHA256 = (
+    "eec75f8f1dad7076211de4a25ad40ac051e9984a1e26ea2ca14c4726ff4efbba"
+)
+LEGACY_MODULE3_ORDER_SHA256 = (
+    "cf4c96272124749412be6bdb2ad1c46e38998d7915c4d7c0271b5ef378beb6b1"
+)
+LEGACY_MODULE3_FIRST_24_ORDER_SHA256 = (
+    "444a91d7d6f7cf5faa8ba9166839f929326df0d5b74c6ca9677531c4f1776e7f"
+)
+MODULE1_INTEGRITY_ERROR = (
+    r"^Bundled Module 1 ReFRAME snapshot failed its integrity check\.$"
+)
+
 
 def _teaching_frame():
     return workshop_common.pd.DataFrame(
@@ -36,6 +51,53 @@ def _teaching_frame():
             }
         ]
     )
+
+
+def _write_corrupt_module1_snapshot(tmp_path, monkeypatch, corruption):
+    snapshot_path = tmp_path / "reframe_module1_snapshot_10k.csv"
+    provenance_path = tmp_path / "reframe_module1_snapshot_10k.provenance.json"
+    frame = workshop_common.pd.DataFrame(
+        [
+            {
+                "smile": "CC",
+                "canonical_ikey": f"TEST-KEY-{index}",
+                "name": f"test compound {index}",
+                "source": "test",
+                "source_id": f"test-{index}",
+                "status": "approved",
+                "reframedb_url": f"https://example.invalid/{index}",
+            }
+            for index in range(100)
+        ]
+    )
+
+    if corruption == "wrong_row_count":
+        frame = frame.iloc[:-1]
+    elif corruption == "incomplete_schema":
+        frame = frame.drop(columns="status")
+    elif corruption == "duplicate_canonical_ikey":
+        frame.loc[frame.index[-1], "canonical_ikey"] = frame.loc[
+            frame.index[0], "canonical_ikey"
+        ]
+    elif corruption == "invalid_smiles":
+        frame.loc[frame.index[-1], "smile"] = "not-a-smiles"
+
+    frame.to_csv(snapshot_path, index=False, lineterminator="\n")
+    observed_hash = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+    if corruption == "malformed_provenance_json":
+        provenance_path.write_text("{", encoding="utf-8")
+    else:
+        final_hash = "0" * 64 if corruption == "hash_mismatch" else observed_hash
+        provenance_path.write_text(
+            json.dumps({"final_sha256": final_hash}) + "\n", encoding="utf-8"
+        )
+
+    monkeypatch.setattr(workshop_common, "MODULE1_SNAPSHOT_PATH", snapshot_path)
+    monkeypatch.setattr(
+        workshop_common, "MODULE1_PROVENANCE_PATH", provenance_path
+    )
+    monkeypatch.setattr(workshop_common, "MODULE1_MIN_SAMPLE_SIZE", 96)
+    monkeypatch.setattr(workshop_common, "MODULE1_MAX_SAMPLE_SIZE", 100)
 
 
 def test_configured_csv_opt_in_requires_environment_value(monkeypatch):
@@ -183,6 +245,32 @@ def test_default_snapshot_is_local_deterministic_and_complete(monkeypatch):
     assert first.attrs["source"] == second.attrs["source"] == "bundled_snapshot"
 
 
+def test_legacy_module1_snapshot_order_is_unchanged():
+    frame = workshop_common.load_reframe(
+        sample_size=96,
+        anchor_terms=("imatinib", "linezolid", "ritonavir"),
+        source="snapshot",
+    )
+    observed = hashlib.sha256(
+        "\n".join(frame["canonical_ikey"]).encode("utf-8")
+    ).hexdigest()
+
+    assert len(frame) == 96
+    assert observed == LEGACY_MODULE1_ORDER_SHA256
+
+
+def test_legacy_module3_snapshot_orders_are_unchanged():
+    frame = workshop_common.load_reframe(sample_size=96, source="snapshot")
+    identifiers = frame["canonical_ikey"].tolist()
+
+    assert hashlib.sha256("\n".join(identifiers).encode("utf-8")).hexdigest() == (
+        LEGACY_MODULE3_ORDER_SHA256
+    )
+    assert hashlib.sha256("\n".join(identifiers[:24]).encode("utf-8")).hexdigest() == (
+        LEGACY_MODULE3_FIRST_24_ORDER_SHA256
+    )
+
+
 def test_snapshot_rejects_a_request_larger_than_its_inventory(monkeypatch):
     monkeypatch.delenv("REFRAME_CSV", raising=False)
 
@@ -194,9 +282,128 @@ def test_snapshot_rejects_a_request_larger_than_its_inventory(monkeypatch):
 
 
 @pytest.mark.parametrize("source", [None, "", "auto", "Snapshot", True, 1])
-def test_loader_accepts_only_explicit_snapshot_or_live_sources(source):
-    with pytest.raises(ValueError, match=r"^source must be 'snapshot' or 'live'\.$"):
+def test_loader_accepts_only_explicit_supported_sources(source):
+    with pytest.raises(
+        ValueError,
+        match=r"^source must be 'snapshot', 'snapshot_10k', or 'live'\.$",
+    ):
         workshop_common.load_reframe(sample_size=1, source=source)
+
+
+@pytest.mark.parametrize("sample_size", [95, 10_001])
+def test_snapshot_10k_rejects_sizes_outside_the_exercise(sample_size):
+    with pytest.raises(
+        ValueError,
+        match=r"^source='snapshot_10k' supports 96 through 10,000 rows\.$",
+    ):
+        workshop_common.load_reframe(sample_size=sample_size, source="snapshot_10k")
+
+
+@pytest.mark.parametrize(
+    "sample_size", [None, True, 96.0, "96", workshop_common.np.int64(96)]
+)
+def test_snapshot_10k_rejects_non_builtin_integers(sample_size):
+    with pytest.raises(TypeError, match=r"^sample_size must be a positive integer\.$"):
+        workshop_common.load_reframe(sample_size=sample_size, source="snapshot_10k")
+
+
+def test_snapshot_10k_returns_nested_local_prefixes(monkeypatch):
+    real_read_csv = workshop_common.pd.read_csv
+    reads = []
+
+    def local_read_csv(source, *args, **kwargs):
+        reads.append(source)
+        if str(source).startswith(("http://", "https://")):
+            raise AssertionError("snapshot_10k attempted network access")
+        return real_read_csv(source, *args, **kwargs)
+
+    monkeypatch.setattr(workshop_common.pd, "read_csv", local_read_csv)
+    sizes = (96, 97, 512, 2_048, 9_999, 10_000)
+    samples = {
+        size: workshop_common.load_reframe(
+            sample_size=size,
+            anchor_terms=("imatinib", "linezolid", "ritonavir"),
+            source="snapshot_10k",
+        )
+        for size in sizes
+    }
+
+    assert reads == [workshop_common.MODULE1_SNAPSHOT_PATH] * len(sizes)
+    for size in sizes:
+        assert len(samples[size]) == size
+    for smaller, larger in zip(sizes, sizes[1:]):
+        assert samples[smaller]["canonical_ikey"].tolist() == samples[larger][
+            "canonical_ikey"
+        ].iloc[:smaller].tolist()
+    assert samples[96].attrs == {
+        "source": "bundled_snapshot_10k",
+        "invalid_count": 0,
+    }
+
+
+def test_snapshot_10k_missing_asset_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        workshop_common, "MODULE1_SNAPSHOT_PATH", tmp_path / "missing.csv"
+    )
+    monkeypatch.setattr(
+        workshop_common,
+        "MODULE1_PROVENANCE_PATH",
+        tmp_path / "missing.provenance.json",
+    )
+    with pytest.raises(ValueError, match=MODULE1_INTEGRITY_ERROR):
+        workshop_common.load_reframe(sample_size=96, source="snapshot_10k")
+
+
+def test_snapshot_10k_malformed_provenance_fails_closed(monkeypatch, tmp_path):
+    _write_corrupt_module1_snapshot(
+        tmp_path, monkeypatch, "malformed_provenance_json"
+    )
+
+    with pytest.raises(ValueError, match=MODULE1_INTEGRITY_ERROR):
+        workshop_common.load_reframe(sample_size=96, source="snapshot_10k")
+
+
+def test_snapshot_10k_hash_mismatch_fails_closed(monkeypatch, tmp_path):
+    _write_corrupt_module1_snapshot(tmp_path, monkeypatch, "hash_mismatch")
+
+    with pytest.raises(ValueError, match=MODULE1_INTEGRITY_ERROR):
+        workshop_common.load_reframe(sample_size=96, source="snapshot_10k")
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "wrong_row_count",
+        "incomplete_schema",
+        "duplicate_canonical_ikey",
+        "invalid_smiles",
+    ],
+)
+def test_snapshot_10k_semantic_corruption_fails_closed(
+    monkeypatch, tmp_path, corruption
+):
+    _write_corrupt_module1_snapshot(tmp_path, monkeypatch, corruption)
+
+    with pytest.raises(ValueError, match=MODULE1_INTEGRITY_ERROR):
+        workshop_common.load_reframe(sample_size=96, source="snapshot_10k")
+
+
+def test_snapshot_10k_rejects_configured_csv_before_read(monkeypatch):
+    reads = []
+    monkeypatch.setattr(workshop_common.pd, "read_csv", reads.append)
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"^source='snapshot_10k' cannot be combined with "
+            r"use_configured_csv=True\.$"
+        ),
+    ):
+        workshop_common.load_reframe(
+            sample_size=96,
+            source="snapshot_10k",
+            use_configured_csv=True,
+        )
+    assert reads == []
 
 
 def test_explicit_live_read_failure_is_generic_and_does_not_fallback(monkeypatch):
