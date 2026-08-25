@@ -1,8 +1,8 @@
 # Module 1 deterministic 10,000-molecule sample design
 
-**Date:** 2026-08-24  
+**Date:** 2026-08-24
 **Status:** Approved 2026-08-24
-**Target:** `nvMolKit + Nemotron Notebook` Brev Launchable  
+**Target:** `nvMolKit + Nemotron Notebook` Brev Launchable
 **Launchable ID:** `env-3HJtJW3qHg4Dw1I3xt75BfpBmZW`
 
 ## Goal
